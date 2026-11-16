@@ -90,6 +90,7 @@ fn universal_job_lipos_thins_and_scans_each_slice_and_the_app() {
     assert!(script.contains("both_archs() {"));
     assert!(script.contains("scan_release() {"));
     assert!(script.contains("require_minos() {"));
+    assert!(script.contains("-arch all"));
     assert!(script.contains("=== otool minos "));
     assert!(script.contains("minos 11.0"));
     assert!(script.contains("SOFTLOCK_RELEASE_SCAN_DIR"));

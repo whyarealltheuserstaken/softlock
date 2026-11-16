@@ -21,11 +21,11 @@ both_archs() {
   esac
 }
 
-# Print every minimum-macOS line, then require macOS 11.0.
+# Print every minimum-macOS line from each slice, then require macOS 11.0.
 require_minos() {
   bin="$1"
   echo "=== otool minos ${bin} ==="
-  lines="$(otool -l "${bin}" | grep 'minos ' || true)"
+  lines="$(otool -arch all -l "${bin}" | grep 'minos ' || true)"
   printf '%s\n' "${lines}"
   if [ -z "${lines}" ]; then
     echo "no minos in ${bin}"
@@ -35,6 +35,22 @@ require_minos() {
   if [ -n "${bad}" ]; then
     echo "deployment target is not 11.0:"
     printf '%s\n' "${bad}"
+    exit 1
+  fi
+  minos_count="$(printf '%s\n' "${lines}" | grep -c 'minos 11.0' || true)"
+  fat=0
+  if lipo -info "${bin}" >/dev/null 2>&1; then
+    archs="$(lipo -archs "${bin}")"
+    case "${archs}" in
+      *x86_64*)
+        case "${archs}" in
+          *arm64*) fat=1 ;;
+        esac
+        ;;
+    esac
+  fi
+  if [ "${fat}" -eq 1 ] && [ "${minos_count}" -lt 2 ]; then
+    echo "fat binary needs at least two minos 11.0 lines, found ${minos_count}"
     exit 1
   fi
 }
