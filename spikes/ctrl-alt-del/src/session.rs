@@ -173,7 +173,9 @@ where
             reports.push(confirm_write(self.store, entry.policy, &entry.previous)?);
         }
         for key_id in &state.created_keys {
-            self.store.delete_key_if_empty(key_id)?;
+            if crate::policy::is_deletable_policy_key(key_id) {
+                self.store.delete_key_if_empty(key_id)?;
+            }
         }
 
         self.journal_store.remove()?;

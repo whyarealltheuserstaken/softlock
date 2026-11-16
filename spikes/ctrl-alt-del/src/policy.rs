@@ -36,6 +36,18 @@ pub fn split_key_id(key_id: &str) -> Option<(Hive, &str)> {
     Some((Hive::from_label(label)?, path))
 }
 
+/// True only for the System and Explorer policy keys this program may remove.
+pub fn is_deletable_policy_key(key_id: &str) -> bool {
+    let Some((hive, path)) = split_key_id(key_id) else {
+        return false;
+    };
+    match hive {
+        Hive::CurrentUser | Hive::LocalMachine if path == SYSTEM_KEY => true,
+        Hive::CurrentUser if path == EXPLORER_KEY => true,
+        _ => false,
+    }
+}
+
 /// One Ctrl+Alt+Del policy value from the spike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PolicyId {

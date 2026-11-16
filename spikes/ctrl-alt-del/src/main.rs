@@ -99,7 +99,7 @@ fn cmd_status() -> Result<(), Error> {
     match console_account() {
         Some(account) => println!("The person at the keyboard is {account}."),
         None => println!(
-            "Could not see who is at the keyboard. If Windows asks for a password instead of just Yes, stop."
+            "Could not see who is at the keyboard, so a change will be refused. If Windows asks for a password instead of just Yes, stop."
         ),
     }
 
@@ -349,6 +349,7 @@ fn cmd_watch() -> Result<(), Error> {
     let _pid = PidGuard(pid_path);
     append_log(&dir, "watcher started");
 
+    let started = std::time::Instant::now();
     let mut seen: Option<FileStamp> = None;
     let mut deadline_ms: Option<u64> = None;
     let mut failures = 0u32;
@@ -356,7 +357,7 @@ fn cmd_watch() -> Result<(), Error> {
         let path = dir.join(JOURNAL_FILE);
         match file_stamp(&path) {
             None => {
-                if seen.is_some() {
+                if seen.is_some() || spike_ctrl_alt_del::watcher_gave_up(false, started.elapsed()) {
                     let _ = std::fs::remove_file(dir.join(WATCHER_LOG));
                     return Ok(());
                 }

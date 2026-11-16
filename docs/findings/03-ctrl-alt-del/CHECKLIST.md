@@ -114,7 +114,7 @@ Keep the photos on that computer, for example in your Pictures folder. You can a
 
 5. If Windows SmartScreen warns you, choose **More info → Run anyway**. That click is part of what school IT has to allow.
 
-6. On each computer, do steps 7 through 19 from `C:\Temp\softlock-spike`. Use an account that is you, not a different person.
+6. On each computer, do steps 7 through 18 from `C:\Temp\softlock-spike`. Use an account that is you, not a different person. Step 19 is only if you are stuck.
 
 7. Right-click the Start button. Click **Terminal (Admin)** or **Windows PowerShell (Admin)**. Click **Yes**. If Windows asks for a password instead of just **Yes**, click **No**, stop, and write "asked for a password". Do not type a password.
 
@@ -123,7 +123,7 @@ Keep the photos on that computer, for example in your Pictures folder. You can a
    .\spike-ctrl-alt-del.exe status
    ```
 
-   Read the account lines. They must be your account. If any of the six settings is not `absent`, stop and ask school IT before changing anything. Write those values in Notes. If it says you need an Administrator window and clicking Yes does not get you one, write "not an administrator" and stop for that computer.
+   Read the account lines. They must be your account. If any of the six settings is not `absent`, stop before changing anything and write those values in Notes. On your own laptop, stop and ask the SoftLock bot. On the school computer, stop and ask school IT. If it says you need an Administrator window and clicking Yes does not get you one, write "not an administrator" and stop for that computer.
 
 8. Press the Windows key, type `winver`, and press Enter. Write the version (Windows 10 or Windows 11), the edition (Home, Pro, or the words in the window), and the OS Build number in that computer's table. Take photo 1. Close the window.
 
@@ -154,7 +154,7 @@ Keep the photos on that computer, for example in your Pictures folder. You can a
     .\spike-ctrl-alt-del.exe clear DisableTaskMgr
     ```
 
-    Press Ctrl+Alt+Del again. Did that thing come back right away, with no sign-out? Write yes or no under "Back right after clear?". Take a photo. Press **Escape**.
+    Press Ctrl+Alt+Del again. Did that thing come back right away, with no sign-out? Write yes or no under "Back right after clear?". Take a photo. Press **Escape**. If a setting will not stay, or comes back by itself within a minute, write "came back by itself" in Notes and go on. Do not keep fighting it. The school computer may put its own settings back.
 
 14. After all six names, put the computer back, then turn all six on for the icon step. This step can take a while, so give it 20 minutes. 30 is the longest the program allows. Run `status` before each photo in this step so you know the timer has not already put the settings back.
 
@@ -178,11 +178,25 @@ Keep the photos on that computer, for example in your Pictures folder. You can a
 
     A window stays open until you press Enter. It should say the read-back matched the saved values. The same text is in `C:\ProgramData\spike-ctrl-alt-del\restore-result.txt`. Press Ctrl+Alt+Del one last time. It should look like photo 2. Take photo 10. Press **Escape**.
 
-17. Run `status` again. It must say **Nothing is waiting to be put back.** If it does not, run `restore` again and check `status` once more. Do not leave the computer until it says that. On the school computer, this is the last thing you do before you walk away.
+17. Run `status` again. It must say **Nothing is waiting to be put back.** If it does not, run `restore` again and check `status` once more. Do not leave the computer until it says that.
 
-18. If a setting will not stay, or comes back by itself within a minute, write "came back by itself" in Notes and go on. Do not keep fighting it. The school computer may put its own settings back.
+18. After that status says nothing is waiting, clean up from the administrator terminal. Do this on your laptop and on the school computer. If you want to keep the result, copy it to the Desktop first. Then delete both folders:
 
-19. If you are stuck and `restore` fails, do not delete `C:\ProgramData\spike-ctrl-alt-del\journal.json`. Send that file first. A restart still leaves all six settings on until restore runs.
+    ```text
+    copy C:\ProgramData\spike-ctrl-alt-del\restore-result.txt %USERPROFILE%\Desktop
+    rmdir /s /q C:\Temp\softlock-spike
+    rmdir /s /q C:\ProgramData\spike-ctrl-alt-del
+    ```
+
+    This is the last thing you do on that computer before you walk away.
+
+19. If you are stuck and `restore` fails, do not delete `C:\ProgramData\spike-ctrl-alt-del\journal.json`. Send that file to the SoftLock bot first. Paste it in the chat, or attach it. From the administrator terminal, copy it to the Desktop with:
+
+    ```text
+    copy C:\ProgramData\spike-ctrl-alt-del\journal.json %USERPROFILE%\Desktop
+    ```
+
+    A restart still leaves all six settings on until restore runs.
 
     Only if restore still fails, open Registry Editor and delete **only** the values that the first `status` showed as `absent`. If the first status showed anything other than `absent`, do not delete that value.
 

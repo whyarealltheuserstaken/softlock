@@ -22,10 +22,12 @@ pub use error::Error;
 pub use journal::{
     FileJournal, FileLock, JOURNAL_ENV, JOURNAL_FILE, Journal, JournalEntry, JournalStore,
     MemoryJournal, RESTORE_RESULT, WATCHER_LOG, default_journal_dir, remaining, retry_delay,
-    time_from_millis, unix_millis, watcher_journal_dir,
+    time_from_millis, unix_millis, watcher_gave_up, watcher_journal_dir,
 };
 pub use parse::{Command, MAX_TIMEOUT_MINUTES, parse_args, quote_windows_arg, run_once_command};
-pub use policy::{EXPLORER_KEY, Hive, Policy, PolicyId, SYSTEM_KEY, split_key_id};
+pub use policy::{
+    EXPLORER_KEY, Hive, Policy, PolicyId, SYSTEM_KEY, is_deletable_policy_key, split_key_id,
+};
 pub use process::process_is_running;
 pub use proof::prove_exact_restore;
 pub use session::{

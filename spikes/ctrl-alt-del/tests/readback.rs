@@ -470,11 +470,70 @@ fn a_different_account_is_refused() {
         name: "SCHOOL\\Admin".to_string(),
     };
     assert!(same_account(&henry, Some(&henry)).is_ok());
-    assert!(same_account(&henry, None).is_ok());
+    let unknown = same_account(&henry, None).unwrap_err();
+    assert!(
+        unknown
+            .to_string()
+            .contains("Could not see who is at the keyboard")
+    );
+    assert!(unknown.to_string().contains("Nothing was changed"));
     let error = same_account(&admin, Some(&henry)).unwrap_err();
     let text = error.to_string();
     assert!(text.contains("Nothing was changed"));
     assert!(text.contains("password"));
+}
+
+#[test]
+fn restore_ignores_keys_outside_the_two_policy_paths() {
+    use std::sync::{Arc, Mutex};
+
+    use spike_ctrl_alt_del::{
+        EXPLORER_KEY, Journal, JournalEntry, JournalStore, SYSTEM_KEY, is_deletable_policy_key,
+    };
+
+    assert!(is_deletable_policy_key(&format!("HKCU\\{SYSTEM_KEY}")));
+    assert!(is_deletable_policy_key(&format!("HKLM\\{SYSTEM_KEY}")));
+    assert!(is_deletable_policy_key(&format!("HKCU\\{EXPLORER_KEY}")));
+    assert!(!is_deletable_policy_key(
+        r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run"
+    ));
+    assert!(!is_deletable_policy_key(
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+    ));
+
+    let deleted = Arc::new(Mutex::new(Vec::new()));
+    let mut journal = MemoryJournal::new();
+    let mut state = Journal::fresh(clock(), DEFAULT_TIMEOUT).unwrap();
+    state.entries.push(JournalEntry {
+        policy: PolicyId::DisableTaskMgr,
+        previous: RecordedValue::Absent,
+        applied: RecordedValue::dword(1),
+    });
+    state.created_keys = vec![
+        format!("HKCU\\{SYSTEM_KEY}"),
+        format!("HKCU\\{EXPLORER_KEY}"),
+        format!("HKLM\\{SYSTEM_KEY}"),
+        r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run".to_string(),
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce".to_string(),
+    ];
+    journal.flush(&state).unwrap();
+    let mut store = KeyLog {
+        deleted: deleted.clone(),
+        inner: MemoryStore::new(),
+    };
+    let mut session = Session::open(&mut store, journal, NoSafety, DEFAULT_TIMEOUT).unwrap();
+    session.restore_all().unwrap();
+    let deleted = deleted.lock().expect("deleted");
+    assert_eq!(deleted.len(), 3);
+    assert!(deleted.iter().all(|key| is_deletable_policy_key(key)));
+}
+
+#[test]
+fn watcher_leaves_when_the_journal_never_appears() {
+    use spike_ctrl_alt_del::watcher_gave_up;
+    assert!(!watcher_gave_up(false, Duration::from_secs(4)));
+    assert!(watcher_gave_up(false, Duration::from_secs(5)));
+    assert!(!watcher_gave_up(true, Duration::from_secs(60)));
 }
 
 #[test]
@@ -548,6 +607,29 @@ fn repo_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .unwrap()
+}
+
+struct KeyLog {
+    deleted: Arc<Mutex<Vec<String>>>,
+    inner: MemoryStore,
+}
+
+impl PolicyStore for KeyLog {
+    fn read(&self, policy: PolicyId) -> Result<RecordedValue, Error> {
+        self.inner.read(policy)
+    }
+
+    fn apply(&mut self, policy: PolicyId, value: &RecordedValue) -> Result<(), Error> {
+        self.inner.apply(policy, value)
+    }
+
+    fn delete_key_if_empty(&mut self, key_id: &str) -> Result<(), Error> {
+        self.deleted
+            .lock()
+            .expect("deleted")
+            .push(key_id.to_string());
+        Ok(())
+    }
 }
 
 struct LogStore {

@@ -243,6 +243,14 @@ fn lock_owner_alive(path: &Path) -> bool {
     crate::process::process_is_running(pid)
 }
 
+/// How long the watcher waits for a journal that never shows up.
+pub const WATCHER_JOURNAL_WAIT: Duration = Duration::from_secs(5);
+
+/// The watcher leaves when restore already finished and no journal appears.
+pub fn watcher_gave_up(seen_journal: bool, waited: Duration) -> bool {
+    !seen_journal && waited >= WATCHER_JOURNAL_WAIT
+}
+
 /// Delay before another restore attempt. The delay grows and then stays at 30 seconds.
 pub fn retry_delay(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(5);

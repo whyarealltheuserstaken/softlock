@@ -39,8 +39,11 @@ impl PolicyStore for WindowsStore {
     }
 
     fn delete_key_if_empty(&mut self, key_id: &str) -> Result<(), Error> {
+        if !crate::policy::is_deletable_policy_key(key_id) {
+            return Ok(());
+        }
         let Some((hive, path)) = split_key_id(key_id) else {
-            return Err(Error::new(format!("Unknown policy key {key_id}.")));
+            return Ok(());
         };
         let Some(opened) = open_existing(hive, path, KEY_READ, key_id)? else {
             return Ok(());
@@ -402,7 +405,9 @@ pub fn console_account() -> Option<Account> {
     if session == 0 || session == u32::MAX {
         return None;
     }
-    account_from_session_token(session).or_else(|| account_from_explorer(session))
+    account_from_session_token(session)
+        .or_else(|| account_from_explorer(session))
+        .or_else(|| account_from_session_name(session))
 }
 
 /// Refuse to change settings when this window is a different account.
@@ -464,6 +469,92 @@ fn folder_lock_error() -> Error {
     Error::new(
         "Could not lock the saved-settings folder. Copy the program to C:\\Temp\\softlock-spike and run it from there. Nothing was changed.",
     )
+}
+
+fn account_from_session_name(session: u32) -> Option<Account> {
+    use windows_sys::Win32::System::RemoteDesktop::{WTSDomainName, WTSUserName};
+
+    let user = session_string(session, WTSUserName)?;
+    let domain = session_string(session, WTSDomainName).unwrap_or_default();
+    let account = if domain.is_empty() {
+        user
+    } else {
+        format!("{domain}\\{user}")
+    };
+    account_from_lookup_name(&account)
+}
+
+fn session_string(session: u32, class: i32) -> Option<String> {
+    use windows_sys::Win32::System::RemoteDesktop::{WTSFreeMemory, WTSQuerySessionInformationW};
+
+    unsafe {
+        let mut buffer = std::ptr::null_mut();
+        let mut bytes = 0u32;
+        if WTSQuerySessionInformationW(
+            std::ptr::null_mut(),
+            session,
+            class,
+            &mut buffer,
+            &mut bytes,
+        ) == 0
+            || buffer.is_null()
+        {
+            return None;
+        }
+        let text = utf16_ptr(buffer);
+        WTSFreeMemory(buffer.cast());
+        let text = text.trim().to_string();
+        if text.is_empty() { None } else { Some(text) }
+    }
+}
+
+fn account_from_lookup_name(account: &str) -> Option<Account> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::LookupAccountNameW;
+
+    let wide_name = wide(account);
+    unsafe {
+        let mut sid_len = 0u32;
+        let mut domain_len = 0u32;
+        let mut use_name = 0;
+        LookupAccountNameW(
+            std::ptr::null(),
+            wide_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut sid_len,
+            std::ptr::null_mut(),
+            &mut domain_len,
+            &mut use_name,
+        );
+        if sid_len == 0 {
+            return None;
+        }
+        let mut sid = vec![0u8; sid_len as usize];
+        let mut domain = vec![0u16; domain_len.max(1) as usize];
+        if LookupAccountNameW(
+            std::ptr::null(),
+            wide_name.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut use_name,
+        ) == 0
+        {
+            return None;
+        }
+        let mut text = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid.as_mut_ptr().cast(), &mut text) == 0 || text.is_null() {
+            return None;
+        }
+        let sid = utf16_ptr(text);
+        LocalFree(text.cast());
+        Some(Account {
+            sid,
+            name: account.to_string(),
+        })
+    }
 }
 
 fn account_from_session_token(session: u32) -> Option<Account> {
