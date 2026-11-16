@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 pub const SYSTEM_ONLY_SDDL: &str = "D:P(A;;FA;;;SY)";
 
+/// Owner plus that DACL. The DACL string alone has no owner, and applying it
+/// by pointer drops the protected flag.
+#[cfg(windows)]
+const SYSTEM_SECURITY_SDDL: &str = "O:SYD:P(A;;FA;;;SY)";
+
 pub struct PinStore {
     path: PathBuf,
 }
@@ -58,7 +63,7 @@ impl PinStore {
             let _ = remove_path_nofollow(&tmp);
             return Err(error);
         }
-        if is_reparse_point(&self.path)? || dacl_sddl(&self.path)?.as_str() != SYSTEM_ONLY_SDDL {
+        if is_reparse_point(&self.path)? || !system_dacl_exact(&self.path)? {
             let _ = remove_path_nofollow(&self.path);
             return Err(io::Error::other("pin dacl is not system-only"));
         }
@@ -138,10 +143,12 @@ fn write_hash_without_system(parent: &Path, dest: &Path, hash: &str) -> io::Resu
             return Err(error);
         }
         replace_file(&tmp, dest)?;
-        apply_system_dacl(dest)?;
-        if dacl_sddl(dest)?.as_str() != SYSTEM_ONLY_SDDL {
+        let handle = open_for_control(dest)?;
+        let secured = apply_security_on_handle(handle).and_then(|()| verify_handle(handle));
+        drop_handle(handle);
+        if let Err(error) = secured {
             let _ = fs::remove_file(dest);
-            return Err(io::Error::other("pin dacl is not system-only"));
+            return Err(error);
         }
         Ok(())
     }
@@ -185,7 +192,7 @@ fn directory_needs_replace(dir: &Path) -> io::Result<bool> {
         Ok(true) => Ok(true),
         Ok(false) => {
             let owner_ok = owner_is_system(dir).unwrap_or(false);
-            let dacl_ok = dacl_sddl(dir).ok().as_deref() == Some(SYSTEM_ONLY_SDDL);
+            let dacl_ok = system_dacl_exact(dir).unwrap_or(false);
             Ok(!owner_ok || !dacl_ok)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -200,7 +207,7 @@ pub(crate) fn open_secured_log(path: &Path) -> io::Result<fs::File> {
     if is_reparse_point(path).unwrap_or(false)
         || (path.exists()
             && (owner_is_system(path).ok() != Some(true)
-                || dacl_sddl(path).ok().as_deref() != Some(SYSTEM_ONLY_SDDL)))
+                || !system_dacl_exact(path).unwrap_or(false)))
     {
         remove_path_nofollow(path)?;
     }
@@ -347,43 +354,6 @@ fn already_exists(error: &windows::core::Error) -> bool {
         || code & 0xFFFF == ERROR_ALREADY_EXISTS.0
 }
 
-#[cfg(all(windows, feature = "simulated-physical"))]
-fn apply_system_dacl(path: &Path) -> io::Result<()> {
-    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
-    use windows::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
-        PROTECTED_DACL_SECURITY_INFORMATION,
-    };
-    use windows::core::PCWSTR;
-    let descriptor = security_descriptor()?;
-    unsafe {
-        let mut present = windows::core::BOOL::default();
-        let mut dacl = std::ptr::null_mut();
-        let mut defaulted = windows::core::BOOL::default();
-        if GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted).is_err()
-            || !present.as_bool()
-        {
-            free_descriptor(&descriptor);
-            return Err(io::Error::other("security descriptor has no dacl"));
-        }
-        let wide_path = wide(path);
-        let status = SetNamedSecurityInfoW(
-            PCWSTR(wide_path.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(dacl as *const ACL),
-            None,
-        );
-        free_descriptor(&descriptor);
-        if status.0 != 0 {
-            return Err(io::Error::from_raw_os_error(status.0 as i32));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(windows)]
 fn owner_is_system(path: &Path) -> io::Result<bool> {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
@@ -437,7 +407,7 @@ fn security_descriptor() -> io::Result<windows::Win32::Security::PSECURITY_DESCR
     use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows::Win32::Security::PSECURITY_DESCRIPTOR;
     use windows::core::PCWSTR;
-    let sddl = wide_str(SYSTEM_ONLY_SDDL);
+    let sddl = wide_str(SYSTEM_SECURITY_SDDL);
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -645,8 +615,9 @@ fn verify_handle(handle: windows::Win32::Foundation::HANDLE) -> io::Result<()> {
     if handle_is_reparse(handle)? {
         return Err(io::Error::other("refusing a reparse point"));
     }
-    if dacl_sddl_handle(handle)?.as_str() != SYSTEM_ONLY_SDDL {
-        return Err(io::Error::other("dacl is not system-only"));
+    let dacl = dacl_sddl_handle(handle)?;
+    if canonical_dacl(&dacl) != SYSTEM_ONLY_SDDL {
+        return Err(io::Error::other(format!("dacl is not system-only: {dacl}")));
     }
     if !owner_is_system_handle(handle)? {
         return Err(io::Error::other("owner is not LocalSystem"));
@@ -656,41 +627,22 @@ fn verify_handle(handle: windows::Win32::Foundation::HANDLE) -> io::Result<()> {
 
 #[cfg(windows)]
 fn apply_security_on_handle(handle: windows::Win32::Foundation::HANDLE) -> io::Result<()> {
-    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        SetKernelObjectSecurity,
     };
     let descriptor = security_descriptor()?;
-    let sid_buf = system_sid()?;
-    let sid = windows::Win32::Security::PSID(sid_buf.as_ptr() as *mut core::ffi::c_void);
-    unsafe {
-        let mut present = windows::core::BOOL::default();
-        let mut dacl = std::ptr::null_mut();
-        let mut defaulted = windows::core::BOOL::default();
-        if GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted).is_err()
-            || !present.as_bool()
-        {
-            free_descriptor(&descriptor);
-            return Err(io::Error::other("security descriptor has no dacl"));
-        }
-        let status = SetSecurityInfo(
+    let applied = unsafe {
+        SetKernelObjectSecurity(
             handle,
-            SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION
                 | DACL_SECURITY_INFORMATION
                 | PROTECTED_DACL_SECURITY_INFORMATION,
-            Some(sid),
-            None,
-            Some(dacl as *const ACL),
-            None,
-        );
-        free_descriptor(&descriptor);
-        if status.0 != 0 {
-            return Err(io::Error::from_raw_os_error(status.0 as i32));
-        }
-    }
-    Ok(())
+            descriptor,
+        )
+    };
+    free_descriptor(&descriptor);
+    applied.map_err(|error| io::Error::from_raw_os_error(error.code().0))
 }
 
 #[cfg(windows)]
@@ -754,9 +706,21 @@ fn dacl_sddl_handle(handle: windows::Win32::Foundation::HANDLE) -> io::Result<St
     }
     if rendered.is_empty() {
         Err(io::Error::other("dacl could not be read"))
+    } else if canonical_dacl(&rendered) == SYSTEM_ONLY_SDDL {
+        Ok(SYSTEM_ONLY_SDDL.to_string())
     } else {
         Ok(rendered)
     }
+}
+
+#[cfg(windows)]
+fn canonical_dacl(text: &str) -> String {
+    text.trim().replace("S-1-5-18", "SY")
+}
+
+#[cfg(windows)]
+fn system_dacl_exact(path: &Path) -> io::Result<bool> {
+    Ok(dacl_sddl(path)? == SYSTEM_ONLY_SDDL)
 }
 
 #[cfg(windows)]
