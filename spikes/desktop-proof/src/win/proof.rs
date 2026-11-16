@@ -57,16 +57,28 @@ fn run_interactive(args: &Args) -> i32 {
     );
     let mut shots = Vec::new();
     let mut topmost = false;
+    let mut topmost_hit = false;
+    let mut adjacent_hit = false;
+    let mut topmost_above = "none".to_string();
     let mut error = None;
     match window::show_markers() {
         Ok(markers) => {
             window::pump(200);
-            topmost = window::is_topmost(&markers);
-            log_line(&log, &format!("topmost={topmost}"));
+            window::nudge(&markers);
+            let status = window::topmost_status(&markers);
+            topmost = status.style;
+            topmost_hit = status.hit;
+            adjacent_hit = status.adjacent_hit;
+            topmost_above = status.above;
+            log_line(
+                &log,
+                &format!(
+                    "topmost={topmost} topmost-hit={topmost_hit} adjacent-hit={adjacent_hit} topmost-above={topmost_above}"
+                ),
+            );
             if let Err(failure) = window::set_excluded(&markers, false) {
                 error = Some(failure);
             }
-            window::nudge(&markers);
             window::pump(100);
             shots.extend(capture::capture_all(&markers, &args.output_dir, false));
             if let Err(failure) = window::set_excluded(&markers, true) {
@@ -88,12 +100,15 @@ fn run_interactive(args: &Args) -> i32 {
         log_line(
             &log,
             &format!(
-                "{} exclusion={} verdict={} marker={} control={} error={}",
+                "{} exclusion={} verdict={} marker={} control={} marker-region={} adjacent-control={} under-marker-control={} error={}",
                 shot.method,
                 shot.exclusion,
                 shot.verdict,
                 shot.marker_pixels,
                 shot.control_pixels,
+                shot.marker_region_pixels,
+                shot.adjacent_control_pixels,
+                shot.marker_region_control_pixels,
                 shot.error.as_deref().unwrap_or("none")
             ),
         );
@@ -112,6 +127,9 @@ fn run_interactive(args: &Args) -> i32 {
         screen_h,
         hook: hook_report,
         topmost,
+        topmost_hit,
+        adjacent_hit,
+        topmost_above,
         shots,
         error,
     };
@@ -126,6 +144,13 @@ fn run_interactive(args: &Args) -> i32 {
 }
 
 fn run_orchestrator(args: &Args) -> i32 {
+    if let Err(error) = crate::guard::service_install_allowed(
+        std::env::var("GITHUB_ACTIONS").ok().as_deref(),
+        args.allow_local_service,
+    ) {
+        eprintln!("{error}");
+        return 2;
+    }
     let _ = fs::create_dir_all(&args.output_dir);
     clear_previous(&args.output_dir);
     let exercise = service::exercise(args);

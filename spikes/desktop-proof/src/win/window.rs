@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use windows::Win32::Foundation::HINSTANCE;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetStockObject, HBRUSH, HDC,
@@ -12,22 +12,32 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWLP_USERDATA,
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, RegisterClassExW,
-    SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowDisplayAffinity,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDPREV, GWL_EXSTYLE,
+    GWLP_USERDATA, GetClassNameW, GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    HWND_TOPMOST, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::PCWSTR;
 use windows::core::w;
 
-use crate::verdict::Rgb;
+use crate::verdict::{Rgb, ScreenRect};
 
 use super::util::{explain, last_error};
 
 pub struct MarkerWindows {
     pub background: HWND,
     pub marker: HWND,
+    pub marker_rect: ScreenRect,
+    pub adjacent_rect: ScreenRect,
+}
+
+pub struct TopmostStatus {
+    pub style: bool,
+    pub hit: bool,
+    pub adjacent_hit: bool,
+    pub above: String,
 }
 
 pub fn per_monitor_dpi() {
@@ -43,30 +53,70 @@ pub fn show_markers() -> Result<MarkerWindows, String> {
     if screen_w < 200 || screen_h < 200 {
         return Err(format!("screen is {screen_w}x{screen_h}"));
     }
-    let background_size = 360.min(screen_w - 16).min(screen_h - 16);
-    let marker_size = 180.min(background_size - 80);
-    let background_at = (8, 8);
-    let marker_at = (background_at.0 + 40, background_at.1 + 40);
+    let background_size = 320.min(screen_w - 32).min(screen_h - 32);
+    let marker_size = 140.min(background_size / 2);
+    if marker_size < 80 || background_size - marker_size < 80 {
+        return Err(format!(
+            "screen {screen_w}x{screen_h} is too small for a marker and an adjacent control region"
+        ));
+    }
+    // Bottom-right, away from the runner console that usually occupies the top-left.
+    let background_at = (
+        screen_w - 16 - background_size,
+        screen_h - 16 - background_size,
+    );
     let background = create_window(
         background_at.0,
         background_at.1,
         background_size,
         background_size,
         crate::verdict::CONTROL,
-        false,
+        true,
     )?;
     let marker = create_window(
-        marker_at.0,
-        marker_at.1,
+        background_at.0,
+        background_at.1,
         marker_size,
         marker_size,
         crate::verdict::MARKER,
         true,
     )?;
     unsafe {
+        let _ = SetWindowPos(
+            marker,
+            Some(HWND_TOPMOST),
+            background_at.0,
+            background_at.1,
+            marker_size,
+            marker_size,
+            SWP_SHOWWINDOW,
+        );
         let _ = DwmFlush();
     }
-    Ok(MarkerWindows { background, marker })
+    let marker_rect = screen_rect(marker).unwrap_or(ScreenRect {
+        x: background_at.0,
+        y: background_at.1,
+        width: marker_size,
+        height: marker_size,
+    });
+    let background_rect = screen_rect(background).unwrap_or(ScreenRect {
+        x: background_at.0,
+        y: background_at.1,
+        width: background_size,
+        height: background_size,
+    });
+    let adjacent_rect = ScreenRect {
+        x: marker_rect.x + marker_rect.width,
+        y: marker_rect.y,
+        width: (background_rect.x + background_rect.width) - (marker_rect.x + marker_rect.width),
+        height: marker_rect.height,
+    };
+    Ok(MarkerWindows {
+        background,
+        marker,
+        marker_rect,
+        adjacent_rect,
+    })
 }
 
 pub fn nudge(windows: &MarkerWindows) {
@@ -114,9 +164,63 @@ pub fn set_excluded(windows: &MarkerWindows, excluded: bool) -> Result<(), Strin
     }
 }
 
-pub fn is_topmost(windows: &MarkerWindows) -> bool {
+pub fn topmost_status(windows: &MarkerWindows) -> TopmostStatus {
     let style = unsafe { GetWindowLongPtrW(windows.marker, GWL_EXSTYLE) };
-    (style as u32) & WS_EX_TOPMOST.0 != 0
+    let style_topmost = (style as u32) & WS_EX_TOPMOST.0 != 0;
+    let hit = point_hits(windows.marker_rect, windows.marker);
+    let adjacent_hit = point_hits(windows.adjacent_rect, windows.background);
+    let above = window_above(windows.marker);
+    TopmostStatus {
+        style: style_topmost,
+        hit,
+        adjacent_hit,
+        above,
+    }
+}
+
+fn point_hits(rect: ScreenRect, expected: HWND) -> bool {
+    if rect.width <= 0 || rect.height <= 0 {
+        return false;
+    }
+    let point = POINT {
+        x: rect.x + rect.width / 2,
+        y: rect.y + rect.height / 2,
+    };
+    let hit = unsafe { WindowFromPoint(point) };
+    hit == expected
+}
+
+fn window_above(hwnd: HWND) -> String {
+    match unsafe { GetWindow(hwnd, GW_HWNDPREV) } {
+        Ok(above) if above != hwnd && !above.0.is_null() => class_name(above),
+        _ => "none".to_string(),
+    }
+}
+
+fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 128];
+    let copied = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if copied <= 0 {
+        return "unknown".to_string();
+    }
+    let end = copied as usize;
+    String::from_utf16_lossy(&buf[..end.min(buf.len())])
+}
+
+fn screen_rect(hwnd: HWND) -> Option<ScreenRect> {
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect).ok()? };
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some(ScreenRect {
+        x: rect.left,
+        y: rect.top,
+        width,
+        height,
+    })
 }
 
 pub fn destroy(windows: &MarkerWindows) {
@@ -164,8 +268,8 @@ fn create_window(
     let hwnd = unsafe {
         CreateWindowExW(
             ex_style,
-            w!("P7DesktopProof"),
-            w!("p7"),
+            w!("RunnerDesktopProbe"),
+            w!("runner-desktop-probe"),
             WS_POPUP | WS_VISIBLE,
             x,
             y,
@@ -207,7 +311,7 @@ fn register_class() -> Result<(), String> {
                 lpfnWndProc: Some(wnd_proc),
                 hInstance: instance(),
                 hbrBackground: HBRUSH(unsafe { GetStockObject(NULL_BRUSH) }.0),
-                lpszClassName: w!("P7DesktopProof"),
+                lpszClassName: w!("RunnerDesktopProbe"),
                 ..WNDCLASSEXW::default()
             };
             let atom = unsafe { RegisterClassExW(&class) };

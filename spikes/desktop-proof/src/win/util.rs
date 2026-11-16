@@ -5,7 +5,7 @@ use serde::Serialize;
 use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, WIN32_ERROR};
 use windows::core::PWSTR;
 
-pub const SERVICE_NAME: &str = "P7DesktopProbe";
+pub const SERVICE_NAME: &str = "RunnerDesktopProbe";
 
 pub fn explain(error: windows::core::Error, what: &str) -> String {
     format!("{what}: {error} ({:#010x})", error.code().0 as u32)

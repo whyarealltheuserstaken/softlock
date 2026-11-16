@@ -1,6 +1,7 @@
 //! Throwaway desktop probe. Not linked into product binaries.
 
 mod bmp;
+mod guard;
 mod report;
 mod verdict;
 

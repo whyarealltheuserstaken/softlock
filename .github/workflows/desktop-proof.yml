@@ -1,12 +1,16 @@
 name: Desktop proof
 
+# Manual runs, and pull requests that touch the probe or this file.
+# No push trigger: a push to main after merge must not install the SYSTEM service.
 on:
-  push:
+  workflow_dispatch:
   pull_request:
+    paths:
+      - 'spikes/**'
+      - '.github/workflows/desktop-proof.yml'
 
 permissions:
   contents: read
-  actions: write
 
 concurrency:
   group: desktop-proof-${{ github.workflow }}-${{ github.ref }}
@@ -48,9 +52,11 @@ jobs:
       - name: Run the desktop proof
         shell: cmd
         run: cargo run --release --manifest-path spikes/desktop-proof/Cargo.toml -- --runner-image ${{ matrix.image }} --output-dir proof-output
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: Remove the throwaway service
         if: always()
-        with:
-          name: desktop-proof-${{ matrix.image }}
-          path: proof-output
-          if-no-files-found: warn
+        shell: powershell
+        run: |
+          $svc = 'RunnerDesktopProbe'
+          sc.exe stop $svc
+          sc.exe delete $svc
+          exit 0

@@ -25,6 +25,9 @@ pub struct ShotReport {
     pub exclusion: bool,
     pub marker_pixels: u32,
     pub control_pixels: u32,
+    pub marker_region_pixels: u32,
+    pub marker_region_control_pixels: u32,
+    pub adjacent_control_pixels: u32,
     pub verdict: String,
     pub note: Option<String>,
     pub error: Option<String>,
@@ -53,6 +56,9 @@ pub struct InteractiveReport {
     pub screen_h: i32,
     pub hook: HookReport,
     pub topmost: bool,
+    pub topmost_hit: bool,
+    pub adjacent_hit: bool,
+    pub topmost_above: String,
     pub shots: Vec<ShotReport>,
     pub error: Option<String>,
 }
@@ -139,6 +145,16 @@ pub fn failure_reasons(report: &ProofReport) -> Vec<String> {
     if !interactive.topmost {
         reasons.push("marker window was not topmost".to_string());
     }
+    if !interactive.topmost_hit {
+        reasons.push(
+            "WindowFromPoint at the marker centre did not return the marker window".to_string(),
+        );
+    }
+    if !interactive.adjacent_hit {
+        reasons.push(
+            "WindowFromPoint beside the marker did not return the control window".to_string(),
+        );
+    }
     for method in METHODS {
         reasons.extend(shot_reason(interactive, method, false));
         reasons.extend(shot_reason(interactive, method, true));
@@ -191,6 +207,9 @@ pub fn render(report: &ProofReport) -> String {
             lines.push(format!("hook-error={error}"));
         }
         lines.push(format!("topmost={}", interactive.topmost));
+        lines.push(format!("topmost-hit={}", interactive.topmost_hit));
+        lines.push(format!("adjacent-hit={}", interactive.adjacent_hit));
+        lines.push(format!("topmost-above={}", interactive.topmost_above));
         for method in METHODS {
             for exclusion in [false, true] {
                 lines.push(shot_line(interactive, method, exclusion));
@@ -262,6 +281,18 @@ fn shot_reason(interactive: &InteractiveReport, method: &str, exclusion: bool) -
             shot.verdict
         ));
     }
+    if shot.adjacent_control_pixels < CONTROL_PIXELS {
+        return Some(format!(
+            "{method} adjacent control region with exclusion {phase} has {} control pixels",
+            shot.adjacent_control_pixels
+        ));
+    }
+    if !exclusion && shot.marker_region_pixels < PRESENT_PIXELS {
+        return Some(format!(
+            "{method} marker region with exclusion off has {} marker pixels",
+            shot.marker_region_pixels
+        ));
+    }
     None
 }
 
@@ -282,7 +313,7 @@ fn shot_line(interactive: &InteractiveReport, method: &str, exclusion: bool) -> 
         );
     }
     format!(
-        "{method}-exclusion-{phase}=marker-{} control-{} marker-pixels={} control-pixels={}",
+        "{method}-exclusion-{phase}=marker-{} control-{} marker-pixels={} control-pixels={} marker-region={} adjacent-control={} under-marker-control={}",
         word(shot.marker_pixels, PRESENT_PIXELS, ABSENT_PIXELS),
         if shot.control_pixels >= CONTROL_PIXELS {
             "present"
@@ -290,7 +321,10 @@ fn shot_line(interactive: &InteractiveReport, method: &str, exclusion: bool) -> 
             "absent"
         },
         shot.marker_pixels,
-        shot.control_pixels
+        shot.control_pixels,
+        shot.marker_region_pixels,
+        shot.adjacent_control_pixels,
+        shot.marker_region_control_pixels
     )
 }
 
@@ -377,6 +411,9 @@ pub fn passing_fixture() -> ProofReport {
                 error: None,
             },
             topmost: true,
+            topmost_hit: true,
+            adjacent_hit: true,
+            topmost_above: "none".to_string(),
             shots,
             error: None,
         }),
@@ -391,6 +428,9 @@ fn shot(method: &str, exclusion: bool, marker: u32, control: u32, verdict: &str)
         marker_pixels: marker,
         control_pixels: control,
         verdict: verdict.to_string(),
+        marker_region_pixels: marker,
+        marker_region_control_pixels: if exclusion { control } else { 0 },
+        adjacent_control_pixels: control,
         note: None,
         error: None,
         bmp: None,
@@ -414,6 +454,9 @@ mod tests {
         assert!(text.contains("gdi-exclusion-on=marker-absent control-present"));
         assert!(text.contains("dxgi-exclusion-on=marker-absent control-present"));
         assert!(text.contains("wgc-exclusion-off=marker-present control-present"));
+        assert!(text.contains("topmost-hit=true"));
+        assert!(text.contains("adjacent-hit=true"));
+        assert!(text.contains("adjacent-control="));
         assert!(text.contains("service-session=0"));
         assert!(text.contains("child-session=1"));
         assert!(text.contains("result=pass"));
@@ -465,6 +508,18 @@ mod tests {
         );
         assert!(reasons.iter().any(|reason| reason.contains("dxgi")));
         assert!(reasons.iter().any(|reason| reason.contains("gdi")));
+        assert!(render(&report).contains("result=fail"));
+    }
+
+    #[test]
+    fn global_control_pixels_do_not_excuse_an_empty_adjacent_region() {
+        let mut report = passing_fixture();
+        let interactive = report.interactive.as_mut().expect("interactive");
+        for shot in &mut interactive.shots {
+            shot.adjacent_control_pixels = 0;
+        }
+        let reasons = failure_reasons(&report);
+        assert!(reasons.iter().any(|reason| reason.contains("adjacent")));
         assert!(render(&report).contains("result=fail"));
     }
 }

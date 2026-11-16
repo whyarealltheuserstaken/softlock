@@ -1,6 +1,6 @@
 # 02: GitHub-hosted Windows runners can host the desktop tests
 
-Measured on 16 November 2026 by the workspace-excluded probe `spikes/desktop-proof`, workflow [Desktop proof run 43805604323](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604323).
+Measured on 16 November 2026 UTC (15 November 2026 in Pacific time) by the workspace-excluded probe `spikes/desktop-proof`, workflow [Desktop proof run 43805604323](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604323).
 
 - [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604323/job/133095547751)
 - [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604323/job/133095547957)
@@ -13,11 +13,15 @@ Use the GitHub-hosted `windows-2022` and `windows-2025` runners for seam 3. A se
 
 Fail-closed cases still belong in their own job. They end the runner's interactive session, which is a property of the test, not of these images. Spike 04 still has to prove that the real lock is reachable on these runners.
 
+## CI only
+
+Do not run this probe on a local machine. The orchestrator installs a SYSTEM service from the binary under `target/`, and that directory is user-writable. The probe refuses to install the service unless `GITHUB_ACTIONS=true` or `--allow-local-service` is passed. The workflow's last step runs `sc.exe stop` and `sc.exe delete` for `RunnerDesktopProbe` even when the proof step is cancelled, so cleanup does not depend on the probe process staying alive.
+
 ## What works, on both images
 
 The job process runs as `runneradmin` on the console, session 2, window station `WinSta0`, desktop `Default`. The screen is a single 1024x768 display. Session 0 (`Services`) is disconnected. The active console session id is 2, not 1.
 
-A throwaway service named `P7DesktopProbe` (not the product service) was created, started, stopped, and deleted. It ran as `SYSTEM` in session 0. With `SeTcbPrivilege` enabled it called `WTSQueryUserToken` on the console session (`token-source=console-user`) and `CreateProcessAsUser` onto `winsta0\default`. The child was session 2, `WinSta0` / `Default`, user `runneradmin`, and exited 0.
+A throwaway service (not the product service) was created, started, stopped, and deleted. The first measurement registered it as `P7DesktopProbe`. That name was the school machine's, so the probe now registers `RunnerDesktopProbe`. It ran as `SYSTEM` in session 0. With `SeTcbPrivilege` enabled it called `WTSQueryUserToken` on the console session (`token-source=console-user`) and `CreateProcessAsUser` onto `winsta0\default`. The child was session 2, `WinSta0` / `Default`, user `runneradmin`, and exited 0.
 
 In that child:
 
@@ -26,6 +30,8 @@ In that child:
 - A topmost tool window painted the marker colour (180x180, 32400 pixels) over a control-coloured window.
 - With capture exclusion off, GDI `BitBlt`, DXGI Desktop Duplication, and Windows.Graphics.Capture all reported the marker present and the control colour present.
 - With `WDA_EXCLUDEFROMCAPTURE` on the marker only, all three captures reported the marker absent (0 pixels) and the control colour still present.
+
+The first measurement placed a non-topmost control window at the top-left. Its global control-pixel counts were about 25k–29k, not the full window, which fits the runner console covering part of that window. The marker was topmost and fully visible (exactly 32400 pixels), so the marker count was not the console. The follow-up probe moves both windows to the bottom-right, makes the control window topmost as well, counts marker pixels inside the marker rectangle, and requires the control colour in the strip immediately to the right of the marker. `topmost=` is still the style flag. `topmost-hit=` is `WindowFromPoint` at the marker centre, and `adjacent-hit=` is `WindowFromPoint` on that strip. The window above the marker in z-order is logged as `topmost-above=`.
 
 ### windows-2022
 

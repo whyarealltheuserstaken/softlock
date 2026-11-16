@@ -97,6 +97,59 @@ pub fn count_rgb(image: &BgraImage, color: Rgb, tolerance: u8) -> u32 {
     count
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+pub fn rect_inside(image: &BgraImage, origin_x: i32, origin_y: i32, rect: ScreenRect) -> bool {
+    if rect.width <= 0 || rect.height <= 0 {
+        return false;
+    }
+    let x0 = rect.x.saturating_sub(origin_x);
+    let y0 = rect.y.saturating_sub(origin_y);
+    if rect.x < origin_x || rect.y < origin_y {
+        return false;
+    }
+    let x1 = x0.saturating_add(rect.width);
+    let y1 = y0.saturating_add(rect.height);
+    x1 <= image.width as i32 && y1 <= image.height as i32
+}
+
+pub fn count_rgb_rect(
+    image: &BgraImage,
+    origin_x: i32,
+    origin_y: i32,
+    rect: ScreenRect,
+    color: Rgb,
+    tolerance: u8,
+) -> Option<u32> {
+    if !rect_inside(image, origin_x, origin_y, rect) {
+        return None;
+    }
+    let x0 = (rect.x - origin_x) as usize;
+    let y0 = (rect.y - origin_y) as usize;
+    let width = rect.width as usize;
+    let height = rect.height as usize;
+    let mut count = 0u32;
+    for y in y0..y0 + height {
+        for x in x0..x0 + width {
+            let index = (y * image.width + x) * 4;
+            let pixel = &image.pixels[index..index + 4];
+            if channel_near(pixel[2], color.r, tolerance)
+                && channel_near(pixel[1], color.g, tolerance)
+                && channel_near(pixel[0], color.b, tolerance)
+            {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    Some(count)
+}
+
 pub fn counts(image: &BgraImage) -> PixelCounts {
     PixelCounts {
         marker: count_rgb(image, MARKER, 2),
@@ -154,6 +207,47 @@ mod tests {
         };
         image.pixels[..40 * 40 * 4].copy_from_slice(&BgraImage::solid(40, 40, drifted).pixels);
         assert!(counts(&image).marker >= PRESENT_PIXELS);
+    }
+
+    #[test]
+    fn adjacent_region_counts_only_inside_its_rectangle() {
+        let mut image = BgraImage::solid(80, 40, CONTROL);
+        let marker_pixels = BgraImage::solid(40, 40, MARKER);
+        for y in 0..40 {
+            let row = y * 80 * 4;
+            let source = y * 40 * 4;
+            image.pixels[row..row + 40 * 4]
+                .copy_from_slice(&marker_pixels.pixels[source..source + 40 * 4]);
+        }
+        let marker = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 40,
+        };
+        let adjacent = ScreenRect {
+            x: 40,
+            y: 0,
+            width: 40,
+            height: 40,
+        };
+        assert!(count_rgb_rect(&image, 0, 0, marker, MARKER, 2).unwrap() >= PRESENT_PIXELS);
+        assert_eq!(
+            count_rgb_rect(&image, 0, 0, adjacent, MARKER, 2).unwrap(),
+            0
+        );
+        assert!(count_rgb_rect(&image, 0, 0, adjacent, CONTROL, 2).unwrap() >= CONTROL_PIXELS);
+        let shifted = ScreenRect {
+            x: 100,
+            y: 20,
+            width: 40,
+            height: 40,
+        };
+        assert_eq!(
+            count_rgb_rect(&image, 100, 20, shifted, MARKER, 2).unwrap(),
+            count_rgb_rect(&image, 0, 0, marker, MARKER, 2).unwrap()
+        );
+        assert!(count_rgb_rect(&image, 0, 0, shifted, CONTROL, 2).is_none());
     }
 
     #[test]

@@ -86,9 +86,27 @@ fn desktop_proof_workflow_covers_both_runner_images_and_pins_actions() {
     assert!(text.contains("windows-2022"));
     assert!(text.contains("windows-2025"));
     assert!(text.contains("spikes/desktop-proof"));
+    assert!(text.contains("workflow_dispatch:"));
+    assert!(text.contains("pull_request:"));
+    assert!(text.contains("spikes/**"));
+    assert!(text.contains(".github/workflows/desktop-proof.yml"));
+    assert!(text.contains("contents: read"));
+    assert!(text.contains("if: always()"));
+    assert!(text.contains("RunnerDesktopProbe"));
+    assert!(
+        !text.contains("actions: write"),
+        "proof workflow must not request actions: write"
+    );
     assert!(
         !text.contains(PRODUCT_DISPLAY_NAME),
         "proof workflow must not hard-code the product name"
+    );
+    let trigger = text.split("permissions:").next().expect("permissions");
+    assert!(
+        !trigger
+            .lines()
+            .any(|line| line.trim() == "push:" || line.trim().starts_with("push:")),
+        "proof workflow must not run on every push"
     );
 
     let mut uses = 0;
@@ -112,6 +130,49 @@ fn desktop_proof_workflow_covers_both_runner_images_and_pins_actions() {
         uses >= 3,
         "proof workflow should pin checkout, toolchain, and cache"
     );
+}
+
+#[test]
+fn desktop_proof_does_not_use_the_school_machine_name() {
+    let root = common::repo_root();
+    let mut files = Vec::new();
+    collect_text(&root.join("spikes/desktop-proof"), &mut files);
+    files.push(root.join(PROOF_WORKFLOW));
+    assert!(!files.is_empty());
+    for path in files {
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            !text.contains("P7Desktop") && !text.contains("P7 desktop"),
+            "{rel} still names the probe after the school machine"
+        );
+    }
+}
+
+fn collect_text(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+    for entry in entries {
+        let entry = entry.expect("directory entry");
+        let path = entry.path();
+        if path.is_dir() {
+            if entry.file_name() == "target" {
+                continue;
+            }
+            collect_text(&path, files);
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".rs") || name.ends_with(".md") || name == "Cargo.toml" {
+            files.push(path);
+        }
+    }
 }
 
 fn collect_manifests(dir: &std::path::Path, manifests: &mut Vec<std::path::PathBuf>) {

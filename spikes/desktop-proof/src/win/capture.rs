@@ -37,17 +37,31 @@ use windows::core::Interface;
 
 use crate::bmp::write_bmp;
 use crate::report::ShotReport;
-use crate::verdict::{self, BgraImage};
+use crate::verdict::{self, BgraImage, ScreenRect};
 
 use super::util::explain;
 use super::window::{self, MarkerWindows};
 
+struct Frame {
+    image: BgraImage,
+    origin_x: i32,
+    origin_y: i32,
+}
+
 pub fn capture_all(windows: &MarkerWindows, output: &Path, exclusion: bool) -> Vec<ShotReport> {
     let _ = ensure_mta();
+    let marker = windows.marker_rect;
+    let adjacent = windows.adjacent_rect;
     vec![
-        one("gdi", exclusion, output, capture_gdi),
-        one("dxgi", exclusion, output, || capture_dxgi(windows)),
-        one("wgc", exclusion, output, || capture_wgc(windows)),
+        one("gdi", exclusion, output, marker, adjacent, || {
+            capture_gdi(marker, adjacent)
+        }),
+        one("dxgi", exclusion, output, marker, adjacent, || {
+            capture_dxgi(windows)
+        }),
+        one("wgc", exclusion, output, marker, adjacent, || {
+            capture_wgc(windows)
+        }),
     ]
 }
 
@@ -55,23 +69,62 @@ fn one(
     method: &str,
     exclusion: bool,
     output: &Path,
-    capture: impl FnOnce() -> Result<BgraImage, String>,
+    marker: ScreenRect,
+    adjacent: ScreenRect,
+    capture: impl FnOnce() -> Result<Frame, String>,
 ) -> ShotReport {
     let phase = if exclusion { "on" } else { "off" };
     match capture() {
-        Ok(image) => {
-            let counts = verdict::counts(&image);
+        Ok(frame) => {
+            let counts = verdict::counts(&frame.image);
             let verdict = verdict::judge(counts);
             let bmp_name = format!("{method}-exclusion-{phase}.bmp");
             let bmp_path = output.join(&bmp_name);
-            let note = write_bmp(&bmp_path, &image)
+            let mut note = write_bmp(&bmp_path, &frame.image)
                 .err()
                 .map(|error| error.to_string());
+            let marker_region = verdict::count_rgb_rect(
+                &frame.image,
+                frame.origin_x,
+                frame.origin_y,
+                marker,
+                verdict::MARKER,
+                2,
+            );
+            let marker_region_control = verdict::count_rgb_rect(
+                &frame.image,
+                frame.origin_x,
+                frame.origin_y,
+                marker,
+                verdict::CONTROL,
+                2,
+            );
+            let adjacent_control = verdict::count_rgb_rect(
+                &frame.image,
+                frame.origin_x,
+                frame.origin_y,
+                adjacent,
+                verdict::CONTROL,
+                2,
+            );
+            if marker_region.is_none() || adjacent_control.is_none() {
+                let outside = format!(
+                    "sample region is outside the capture origin={},{} size={}x{}",
+                    frame.origin_x, frame.origin_y, frame.image.width, frame.image.height
+                );
+                note = Some(match note {
+                    Some(existing) => format!("{existing}; {outside}"),
+                    None => outside,
+                });
+            }
             ShotReport {
                 method: method.to_string(),
                 exclusion,
                 marker_pixels: counts.marker,
                 control_pixels: counts.control,
+                marker_region_pixels: marker_region.unwrap_or(0),
+                marker_region_control_pixels: marker_region_control.unwrap_or(0),
+                adjacent_control_pixels: adjacent_control.unwrap_or(0),
                 verdict: verdict.as_str().to_string(),
                 note,
                 error: None,
@@ -83,6 +136,9 @@ fn one(
             exclusion,
             marker_pixels: 0,
             control_pixels: 0,
+            marker_region_pixels: 0,
+            marker_region_control_pixels: 0,
+            adjacent_control_pixels: 0,
             verdict: verdict::Verdict::Unusable.as_str().to_string(),
             note: None,
             error: Some(error),
@@ -91,7 +147,7 @@ fn one(
     }
 }
 
-fn capture_gdi() -> Result<BgraImage, String> {
+fn capture_gdi(marker: ScreenRect, adjacent: ScreenRect) -> Result<Frame, String> {
     let primary = rect_capture(
         0,
         0,
@@ -115,10 +171,10 @@ fn capture_gdi() -> Result<BgraImage, String> {
     } else {
         Err("virtual screen skipped".to_string())
     };
-    choose_image(primary, virtual_shot)
+    choose_image(primary, virtual_shot, marker, adjacent)
 }
 
-fn rect_capture(x: i32, y: i32, width: i32, height: i32, label: &str) -> Result<BgraImage, String> {
+fn rect_capture(x: i32, y: i32, width: i32, height: i32, label: &str) -> Result<Frame, String> {
     if width <= 0 || height <= 0 {
         return Err(format!("{label} capture size is {width}x{height}"));
     }
@@ -142,7 +198,11 @@ fn rect_capture(x: i32, y: i32, width: i32, height: i32, label: &str) -> Result<
         let copied = BitBlt(memory, 0, 0, width, height, Some(screen), x, y, SRCCOPY);
         let _ = SelectObject(memory, previous);
         let image = match copied {
-            Ok(()) => read_bitmap(memory, bitmap, width, height, label),
+            Ok(()) => read_bitmap(memory, bitmap, width, height, label).map(|image| Frame {
+                image,
+                origin_x: x,
+                origin_y: y,
+            }),
             Err(error) => Err(explain(error, &format!("{label} BitBlt"))),
         };
         let _ = DeleteObject(HGDIOBJ(bitmap.0));
@@ -203,13 +263,23 @@ fn flip_rows(pixels: &mut [u8], width: usize, height: usize) {
 }
 
 fn choose_image(
-    first: Result<BgraImage, String>,
-    second: Result<BgraImage, String>,
-) -> Result<BgraImage, String> {
+    first: Result<Frame, String>,
+    second: Result<Frame, String>,
+    marker: ScreenRect,
+    adjacent: ScreenRect,
+) -> Result<Frame, String> {
     match (first, second) {
         (Ok(left), Ok(right)) => {
-            let left_control = verdict::counts(&left).control;
-            let right_control = verdict::counts(&right).control;
+            let left_covers = frame_covers(&left, marker, adjacent);
+            let right_covers = frame_covers(&right, marker, adjacent);
+            if right_covers && !left_covers {
+                return Ok(right);
+            }
+            if left_covers && !right_covers {
+                return Ok(left);
+            }
+            let left_control = verdict::counts(&left.image).control;
+            let right_control = verdict::counts(&right.image).control;
             if right_control > left_control {
                 Ok(right)
             } else {
@@ -221,7 +291,12 @@ fn choose_image(
     }
 }
 
-fn capture_dxgi(windows: &MarkerWindows) -> Result<BgraImage, String> {
+fn frame_covers(frame: &Frame, marker: ScreenRect, adjacent: ScreenRect) -> bool {
+    verdict::rect_inside(&frame.image, frame.origin_x, frame.origin_y, marker)
+        && verdict::rect_inside(&frame.image, frame.origin_x, frame.origin_y, adjacent)
+}
+
+fn capture_dxgi(windows: &MarkerWindows) -> Result<Frame, String> {
     let mut errors = Vec::new();
     match duplicate_from_hardware(windows) {
         Ok(image) => return Ok(image),
@@ -236,7 +311,7 @@ fn capture_dxgi(windows: &MarkerWindows) -> Result<BgraImage, String> {
     }
 }
 
-fn duplicate_from_hardware(windows: &MarkerWindows) -> Result<BgraImage, String> {
+fn duplicate_from_hardware(windows: &MarkerWindows) -> Result<Frame, String> {
     let (device, context) = hardware_device()?;
     let dxgi: IDXGIDevice = device
         .cast()
@@ -251,7 +326,7 @@ fn duplicate_from_hardware(windows: &MarkerWindows) -> Result<BgraImage, String>
 fn duplicate_from_factory(
     windows: &MarkerWindows,
     errors: &mut Vec<String>,
-) -> Result<BgraImage, String> {
+) -> Result<Frame, String> {
     let factory: IDXGIFactory1 =
         unsafe { CreateDXGIFactory1().map_err(|error| explain(error, "CreateDXGIFactory1"))? };
     let mut index = 0u32;
@@ -289,7 +364,7 @@ fn duplicate_adapter_outputs(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     windows: &MarkerWindows,
-) -> Result<BgraImage, String> {
+) -> Result<Frame, String> {
     let mut errors = Vec::new();
     for output_index in 0..8 {
         let output = match unsafe { adapter.EnumOutputs(output_index) } {
@@ -303,6 +378,13 @@ fn duplicate_adapter_outputs(
                 continue;
             }
         };
+        let origin = match unsafe { output.GetDesc() } {
+            Ok(desc) => (desc.DesktopCoordinates.left, desc.DesktopCoordinates.top),
+            Err(error) => {
+                errors.push(explain(error, "output description"));
+                (0, 0)
+            }
+        };
         let duplication = match unsafe { output1.DuplicateOutput(device) } {
             Ok(duplication) => duplication,
             Err(error) => {
@@ -310,7 +392,7 @@ fn duplicate_adapter_outputs(
                 continue;
             }
         };
-        match acquire_frame(&duplication, device, context, windows) {
+        match acquire_frame(&duplication, device, context, windows, origin) {
             Ok(image) => return Ok(image),
             Err(error) => errors.push(error),
         }
@@ -327,7 +409,8 @@ fn acquire_frame(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     windows: &MarkerWindows,
-) -> Result<BgraImage, String> {
+    origin: (i32, i32),
+) -> Result<Frame, String> {
     let mut lost = false;
     for _ in 0..12 {
         window::nudge(windows);
@@ -341,7 +424,11 @@ fn acquire_frame(
                 let texture: ID3D11Texture2D = resource
                     .cast()
                     .map_err(|error| explain(error, "duplication texture"))?;
-                let image = copy_texture(device, context, &texture);
+                let image = copy_texture(device, context, &texture).map(|image| Frame {
+                    image,
+                    origin_x: origin.0,
+                    origin_y: origin.1,
+                });
                 unsafe {
                     let _ = duplication.ReleaseFrame();
                 }
@@ -362,7 +449,7 @@ fn acquire_frame(
     }
 }
 
-fn capture_wgc(windows: &MarkerWindows) -> Result<BgraImage, String> {
+fn capture_wgc(windows: &MarkerWindows) -> Result<Frame, String> {
     ensure_mta()?;
     let supported = GraphicsCaptureSession::IsSupported()
         .map_err(|error| explain(error, "GraphicsCaptureSession::IsSupported"))?;
@@ -433,22 +520,22 @@ fn capture_wgc(windows: &MarkerWindows) -> Result<BgraImage, String> {
     let image = copy_texture(&device, &context, &texture);
     let _ = session.Close();
     let _ = pool.Close();
-    let _ = monitor_note(monitor);
-    image
+    let (origin_x, origin_y) = monitor_origin(monitor);
+    image.map(|image| Frame {
+        image,
+        origin_x,
+        origin_y,
+    })
 }
 
-fn monitor_note(monitor: HMONITOR) -> String {
+fn monitor_origin(monitor: HMONITOR) -> (i32, i32) {
     let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     let ok = unsafe { GetMonitorInfoW(monitor, &mut info) };
     if ok.as_bool() {
-        format!(
-            "{}x{}",
-            info.rcMonitor.right - info.rcMonitor.left,
-            info.rcMonitor.bottom - info.rcMonitor.top
-        )
+        (info.rcMonitor.left, info.rcMonitor.top)
     } else {
-        "monitor info unavailable".to_string()
+        (0, 0)
     }
 }
 

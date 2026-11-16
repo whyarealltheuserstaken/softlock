@@ -101,7 +101,7 @@ pub fn exercise(args: &Args) -> Exercise {
         }
     };
     let binary_wide = wide(&binary);
-    let display = wide("P7 desktop probe");
+    let display = wide("Runner desktop probe");
     let service = match create_service(scm, &name, &display, &binary_wide) {
         Ok(service) => service,
         Err(error) => {
