@@ -4,7 +4,7 @@ Read against `23b5a39bc92c2ee32f470256d78be27d030dc59f`. The addendum is [`docs/
 
 Each item has a recommendation until someone decides it. Changing an answer rewrites the tickets that name it. It does not rewrite the Windows spec.
 
-Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7 on 16 November 2026, as written. The lead also decided D8 the same day. Henry's Intel Mac is recorded in D1. The number of external displays, and whether a second keyboard is available, are still open.
+Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7 on 16 November 2026, as written. The lead also decided D8 the same day. Henry's Intel Mac is recorded in D1. He sometimes uses an external display. How many are attached at once, and whether a second keyboard is available, are still open. D9 is SPEC.md Decision 20. It is open. The lead's recommendation is written there. This file does not close it.
 
 ## D1. Universal 2, macOS 11, his Intel Mac, arm64 on macos-latest
 
@@ -16,7 +16,7 @@ GitHub `macos-latest` is an arm64 image of macOS 15 or macOS 26 (the runner docs
 
 macOS 26.7.3 is well above the macOS 11 floor. Arm64 CI on `macos-latest` plus this Intel machine on 26.x means macOS 11 through 15 are untested. That is a known gap. m02 still prints the runner's `sw_vers`. It does not close the gap.
 
-**Still open:** the number of external displays, and whether a second keyboard is available. The kits say "if the machine has one" only for those two.
+**Still open:** how many external displays are attached at once, and whether a second keyboard is available. He sometimes uses an external display with this Mac. The kits say "if the machine has one" for a second keyboard, and for a display, AirPlay receiver, iPad, or DisplayLink device that is not already connected.
 
 ## D2. Developer ID now, or unsigned like Windows
 
@@ -55,7 +55,7 @@ GitHub lists `macos-15-intel` and `macos-26-intel` as well as the arm64 `macos-l
 
 `SACLockScreenImmediate` has no Apple documentation page. It is a private symbol in `login.framework`. The public pages we have do not offer a "lock the screen now" call. The screen-saver-plus-password path is weaker and is the documented lock path.
 
-**Decision, Henry, 16 November 2026:** use `SACLockScreenImmediate`, resolved with `dlopen` and `dlsym`. The binary does not link `login.framework`. If the symbol is missing, or the call fails, use the documented lock path (start the screen saver and require the account password). A missing symbol is not a crash. The login window is not the fallback. When that documented path cannot guarantee a password, D8 applies. His Intel Mac is the machine in D1. The number of external displays is still open.
+**Decision, Henry, 16 November 2026:** use `SACLockScreenImmediate`, resolved with `dlopen` and `dlsym`. The binary does not link `login.framework`. If the symbol is missing, or the call fails, use the documented lock path (start the screen saver and require the account password). A missing symbol is not a crash. The login window is not the fallback. When that documented path cannot guarantee a password, D8 applies. His Intel Mac is the machine in D1. He sometimes uses an external display. How many are attached at once is still open (D1).
 
 ## D6. Capture exclusion may be unprovable
 
@@ -83,3 +83,11 @@ Windows does not return to Unlocked when arming fails or the real lock fails. ma
 - At run time, if both lock paths fail, keep the guard and the overlay up, show an error, keep retrying, and release only on a verified unlock.
 
 Tickets m08 and m17 add the chooser row: documented path unavailable or password not required → never Unlocked; refuse to arm. m08's sheet records the password-after-screensaver setting and the delay.
+
+## D9. Capture exclusion and a remote view (macOS only)
+
+This is the macOS entry in SPEC.md Implementation Decision 20. Henry decided the behavior on 16 November 2026, for Windows 11, Windows 10, Linux, and the macOS Universal build, both slices. He did not decide how a capture-excluded overlay stays visible on a remote view. Windows and Linux have their own open entries in that decision, because the mechanism is not this flag.
+
+`NSWindow.SharingType.none` is the macOS flag under test (D6), on Intel and on Apple Silicon. Screen Sharing, VNC, AirPlay, and DisplayLink are capture or pixel-forwarding paths, so a window excluded from capture can be invisible on the remote view. The macOS options and the lead recommendation are in Decision 20. They are A (a second surface for the remote view) and C (a documented limit, and the limit that matches his words is that the remote viewer sees the lock). The Windows per-session option is not a macOS option.
+
+**Open.** Henry decides. m21 measures the arm64 runner. m23 measures the Intel Mac. m22 waits until this is closed. Accepting D2, D3, D4, D6, and D7 does not close D9.

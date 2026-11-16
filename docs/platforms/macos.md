@@ -2,13 +2,13 @@
 
 | | |
 |---|---|
-| **Status** | Planning only. Not approved as a set, and the tickets are not GitHub issues. Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7, and decided D8 (a failure never ends Unlocked). His Intel Mac is recorded in D1: MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), macOS Tahoe 26.7.3, laptop, Touch ID, T2. The number of external displays is still open. macOS 11 through 15 are untested. No product code comes with it. |
+| **Status** | Planning only. Not approved as a set, and the tickets are not GitHub issues. Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7, and decided D8 (a failure never ends Unlocked). His Intel Mac is recorded in D1: MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), macOS Tahoe 26.7.3, laptop, Touch ID, T2. He sometimes uses an external display. How many are attached at once is still open. Whether a second keyboard is available is still unknown. macOS 11 through 15 are untested. No product code comes with it. Connected displays and remote views are SPEC.md Decision 20, which is open on the capture-exclusion conflict. |
 | **Date** | 16 November 2026 |
 | **Read against** | `23b5a39bc92c2ee32f470256d78be27d030dc59f` on `main` |
 | **Supersedes** | The macOS bullets that used to live in SPEC.md Implementation Decision 16, and the short phase-2 note that used to be this file |
 | **Does not change** | Windows v1, the lock state machine, the Broker nonce rule, the open-core boundary, or the Linux note |
 
-This is the macOS half of the product, planned in parallel with Windows. Henry decided D1 in [`docs/tickets/macos/decisions.md`](../tickets/macos/decisions.md): Universal 2, macOS 11 or later, his Intel Mac for the Intel slice, and `macos-latest` for arm64. That Mac is a MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), 2 GHz quad-core Intel Core i5, Intel Iris Plus Graphics, 16 GB LPDDR4X, running macOS Tahoe 26.7.3. It is a laptop, and it has Touch ID and the T2 chip. The number of external displays is still open. macOS 26.7.3 is well above the macOS 11 floor, so arm64 CI on `macos-latest` plus this machine on 26.x leaves macOS 11 through 15 untested.
+This is the macOS half of the product, planned in parallel with Windows. Henry decided D1 in [`docs/tickets/macos/decisions.md`](../tickets/macos/decisions.md): Universal 2, macOS 11 or later, his Intel Mac for the Intel slice, and `macos-latest` for arm64. That Mac is a MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), 2 GHz quad-core Intel Core i5, Intel Iris Plus Graphics, 16 GB LPDDR4X, running macOS Tahoe 26.7.3. It is a laptop, and it has Touch ID and the T2 chip. He sometimes uses an external display. How many are attached at once is still open. Whether a second keyboard is available is still unknown. macOS 26.7.3 is well above the macOS 11 floor, so arm64 CI on `macos-latest` plus this machine on 26.x leaves macOS 11 through 15 untested.
 
 Every claim below is tagged.
 
@@ -213,14 +213,39 @@ The arm64 slice is executed on that runner. The x86_64 slice is executed on Henr
 
 Simulated physical input on a runner is the nonce in `kCGEventSourceUserData`, and only in the test-only build. It is not a claim that the runner has a keyboard. Physical keys are m05 and the m14 checklist on Henry's Mac.
 
-## 9. What this addendum will not pretend
+## 9. Connected displays and remote views
+
+Henry's decision is SPEC.md Implementation Decision 20, 16 November 2026. Locking covers a remote view that is already up. Connecting to a locked Mac shows the SoftLock screen. Unlock is the same Broker. Remote input before unlock reaches only the unlock UI. A crash or any other failure ends in the D5 lock for that session and never in Unlocked (D8). Displays added, removed, mirrored, rescaled, or changed, including AirPlay, Sidecar, a DisplayLink or other USB display, and a closed lid with an external display still awake, are covered or the failure is fail-closed.
+
+D7 still stands. Closing the lid with no external display is forced sleep on the QA1340 page, and phase 2 does not offer lid-close takeover. A closed lid with an external display is a different case. Apple's current MacBook Pro guide says that after an external display is connected, the lid can be closed and work continues with connected accessories such as a keyboard and mouse. m23 records that case. It does not turn D7 into a feature.
+
+**Verified, read 16 November 2026.** Apple's [Notification of Configuration Changes](https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/QuartzDisplayServicesConceptual/Articles/Notification.html) says Quartz calls `CGDisplayRegisterReconfigurationCallback` when this app reconfigures a local display, when another app does that while this app is listening on the event-processing thread, and when the user changes the display hardware, for example by disconnecting a display or changing a setting. Before the change, the callback runs once per online display with `kCGDisplayBeginConfigurationFlag`. After the change, it runs once for each added, removed, and online display. The same page says Cocoa already reacts when a display mode changes, mirroring is turned on, or a display is disconnected, and repositions windows itself. The symbol's current page is [`CGDisplayRegisterReconfigurationCallback`](https://developer.apple.com/documentation/coregraphics/cgdisplayregisterreconfigurationcallback(_:_:)). Fetched on 16 November 2026, that page returned its title and no body, so the sentences above are from the archive page.
+
+**Verified.** Apple's SDK header [`CGDisplayConfiguration.h`](https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.15.sdk/System/Library/Frameworks/CoreGraphics.framework/Versions/A/Headers/CGDisplayConfiguration.h) (macOS 10.15 SDK, Apple copyright) defines `kCGDisplayAddFlag`, `kCGDisplayRemoveFlag`, `kCGDisplaySetModeFlag`, `kCGDisplayMirrorFlag`, `kCGDisplayUnMirrorFlag`, and `kCGDisplayDesktopShapeChangedFlag`. The header's comment on `CGConfigureDisplayMirrorOfDisplay` says hardware mirroring directs drawing to the primary display, and software mirroring draws the same content to each display in the set. It says applications that draw through the window system need not special-case software mirroring, and applications that capture the display must draw the same content to each mirrored display. m20 logs the flags a mode change actually produces. m23 is the physical mirror.
+
+**Verified, read 16 November 2026.** [Share the screen of another Mac](https://support.apple.com/guide/mac-help/share-the-screen-of-another-mac-mh14066/mac) says the Screen Sharing app views and controls another Mac's screen, and that the viewer can switch between Observe mode and Control mode. [Turn Mac screen sharing on or off](https://support.apple.com/guide/mac-help/turn-screen-sharing-on-or-off-mh11848/mac) says that while the screen is shared, the other computer sees what is on the screen and can open, move, and close files and windows. The same page has the option "VNC viewers may control screen with password." Screen Sharing and VNC are remote views of the screen. They are capture or remote-render paths. Whether `sharingType` `.none` removes the overlay from them is m21, and Decision 20 is open.
+
+**Verified, read 16 November 2026.** [Use an iPad as a second display for a Mac](https://support.apple.com/en-us/102597) says Sidecar uses an iPad as a display that extends or mirrors the Mac desktop, and that a keyboard connected to the iPad can type during the session. [Continuity features and requirements](https://support.apple.com/en-us/108046) lists Sidecar on macOS Catalina 10.15 or later for Mac models introduced in 2016 or later (plus two named older models). This 2020 MacBook Pro is in that Mac list. Whether an iPad is available is unknown. m23 runs Sidecar only if one is.
+
+**Verified, read 16 November 2026.** [Extend or mirror your Mac desktop across multiple displays](https://support.apple.com/guide/mac-help/extend-mirror-mac-desktop-multiple-displays-mchlb5f905a1/mac) says an external display can mirror the desktop or extend it, and that connecting to a TV or using AirPlay can share a window or an app instead of the whole desktop. [Connect an external display to MacBook Pro](https://support.apple.com/guide/macbook-pro/connect-an-external-display-apd8cdd74f57/mac) says the lid can be closed and work can continue when an external display and accessories such as a keyboard and mouse are connected. The page's display counts are for current Apple-silicon models and say most steps apply to all models. m23 records what this Intel Mac actually does. It does not copy the M5 and M6 display counts onto it.
+
+**Verified, read 16 November 2026.** [DisplayLink Manager on macOS](https://support.displaylink.com/knowledgebase/articles/1932214-displaylink-manager-app-for-macos-introduction-in) says that from macOS Catalina the user must allow Screen Recording so the driver can access the pixels it needs to render a mirrored or extended screen and send those pixels over USB. The page says the screen is not being recorded and that DisplayLink Manager does not store screen content. The permission is still a capture of pixels. An overlay excluded from capture can be missing from that display. m21 cannot attach a DisplayLink device on the runner. m23 does, if Henry has one.
+
+**Spike m20 (runner) and m23 (Henry's Intel Mac).** m20 registers the callback and changes the virtual display's mode. It states, in the finding, that the runner cannot prove a physical hot-plug, a closed lid, AirPlay, Sidecar, DisplayLink, or a second physical panel. m23 is those rows. m06 keeps the displays already attached when its probe starts.
+
+**Spike m21 and m22.** m21 counts the marker on any remote-view path the runner can open, with `.none` and with the default, and writes a miss where the runner has no Screen Sharing client. m22 is the lock and the Broker on that view, after Henry closes Decision 20. Neither ticket chooses the option.
+
+## 10. What this addendum will not pretend
 
 - That `kCGEventSourceStateHIDSystemState` means a human pressed a key.
 - That `NSWindow.SharingType.none` hides the overlay from ScreenCaptureKit.
+- That `sharingType` `.none` is visible to Screen Sharing, VNC, AirPlay, or DisplayLink. m21 measures that. Decision 20 is open.
+- That `sharingType` `.none` is invisible to those paths either.
 - That `CGShieldingWindowLevel()` is the overlay level.
-- That an assertion keeps a Mac awake with the lid shut.
+- That an assertion keeps a Mac awake with the lid shut. A closed lid with an external display awake is m23, and it is not lid-close takeover (D7).
 - That `SACLockScreenImmediate` is a public API.
 - That a missing symbol or a failed call leaves the session unlocked. Both take the documented screen-saver path when that path can require an immediate password. Otherwise D8 refuses to arm, or keeps the guard and the overlay up.
-- That Touch ID can be tested on a GitHub runner. His Intel Mac has a sensor, so m12 runs there.
+- That Touch ID can be tested on a GitHub runner. His Intel Mac has a sensor, so m12 runs there. Touch ID over a remote view is m22, and only where that stack supports it.
 - That macOS 11 through 15 have been tested. His Mac is on 26.7.3, and arm64 CI is `macos-latest`.
 - That a Rosetta run of the x86_64 slice replaces Henry's Mac.
+- That `macos-latest` proves a physical display hot-plug, AirPlay, Sidecar, DisplayLink, or a closed lid. m20 says so in its finding. m23 is the kit.

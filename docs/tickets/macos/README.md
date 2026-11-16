@@ -34,8 +34,13 @@ A ticket whose tests are CI and whose checklist line is his Mac is labeled with 
 | [m17](m17-fail-closed.md) | Fail closed on `SACLockScreenImmediate`, then the documented path | m08, m15 | CI and Henry's Intel Mac |
 | [m18](m18-password-unlock.md) | Unlock with the Mac password through the Broker | m09, m15 | Henry's Intel Mac |
 | [m19](m19-touch-id-unlock.md) | Unlock with Touch ID through the same Broker | m12, m18 | Henry's Intel Mac |
+| [m20](m20-display-reconfigure-ci.md) | CI probe: display reconfiguration callback, arm64 slice | m01, m02 | CI only |
+| [m21](m21-capture-remote-spike.md) | Spike: `sharingType` none versus a remote view | m04 | CI only |
+| [m22](m22-remote-session-lock.md) | Remote session lock and unlock | m14, m18, m19, m21, D9 | CI only and Henry's Intel Mac |
+| [m23](m23-display-kit-intel.md) | Kit: hot-plug, clamshell, AirPlay, Sidecar, DisplayLink, inbound Screen Sharing, x86_64 slice | m06, m20; Screen Sharing row also m22 | Henry's Intel Mac |
+| [m24](m24-display-kit-arm64.md) | Kit: the same display rows on a physical Apple Silicon Mac | a named Apple Silicon Mac | No machine recorded |
 
-m13 is unused so the tracer bullet can keep the numbers m14, m15, m16 in the same order as the Windows first bullet (lock host, service, app).
+m13 is unused so the tracer bullet can keep the numbers m14, m15, m16 in the same order as the Windows first bullet (lock host, service, app). m20–m23 are the 16 November 2026 display and remote-view tickets. They are not on the first-demo critical path.
 
 ## Can start immediately
 
@@ -87,6 +92,19 @@ m15 --> m16
 m15 --> m17
 m15 --> m18
 m18 --> m19
+m01 --> m20
+m02 --> m20
+m04 --> m21
+m06 --> m23
+m14 --> m22
+m18 --> m22
+m19 --> m22
+m20 --> m23
+m21 --> m22
+m21 --> m23
+m22 --> m23
 ```
 
-D3 is accepted by the lead and does not block m10. Henry decided D1 (Universal 2, macOS 11, his Intel Mac, arm64 on `macos-latest`) and D5 (`SACLockScreenImmediate` via `dlopen`, then the documented screen-saver path). D5 does not block m08. The lead accepted D2, D4, D6, and D7. The lead decided D8: a failure never ends Unlocked. His Intel Mac is recorded in D1 and on [Henry's sheet](henry-sheet.md): MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), macOS Tahoe 26.7.3, laptop, Touch ID, T2. The number of external displays is still open. macOS 11 through 15 are untested. D6 blocks any ticket that would claim capture exclusion beyond what m04 and m06 measured. D2 blocks a signing ticket, and this set does not contain one.
+D9 is the macOS entry in SPEC.md Decision 20. It blocks m22. It is open. Windows and Linux have their own entries. m20 and m21 do not wait on it. m23's inbound Screen Sharing row waits on m22. The other m23 rows wait on m06 and m20. m24 waits on a named Apple Silicon Mac, and its Screen Sharing row also waits on m22. No Apple Silicon Mac is recorded.
+
+D3 is accepted by the lead and does not block m10. Henry decided D1 (Universal 2, macOS 11, his Intel Mac, arm64 on `macos-latest`) and D5 (`SACLockScreenImmediate` via `dlopen`, then the documented screen-saver path). D5 does not block m08. The lead accepted D2, D4, D6, and D7. The lead decided D8: a failure never ends Unlocked. His Intel Mac is recorded in D1 and on [Henry's sheet](henry-sheet.md): MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), macOS Tahoe 26.7.3, laptop, Touch ID, T2. He sometimes uses an external display. How many are attached at once is still open. Whether a second keyboard is available is still unknown. macOS 11 through 15 are untested. D6 blocks any ticket that would claim capture exclusion beyond what m04 and m06 measured. D2 blocks a signing ticket, and this set does not contain one.

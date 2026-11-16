@@ -14,7 +14,7 @@ Recorded 16 November 2026 from About This Mac. The same list is decision D1 in [
 | Laptop or desktop | Laptop |
 | Touch ID | Present |
 | T2 | Present. That model has Touch ID and the T2 chip |
-| External displays | Unknown. Still open |
+| External displays | He sometimes uses an external display. How many are attached at once is still unknown |
 | Second keyboard | Unknown. Still open |
 
 macOS 26.7.3 is well above the macOS 11 floor. Arm64 CI on `macos-latest` plus this Intel machine on 26.x means macOS 11 through 15 are untested. That is a known gap. A finding on this machine does not close it.

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Approved. Ticket breakdown approved 15 Nov 2026 (31 v1 tickets, 1 deferred). Gaps resolved during ticketing are in Implementation Decision 17. Amended 15 Nov 2026 with two Henry-approved v1 features: the battery and heat floor (Decision 10) and pausing background apps (Decision 18), summarized in Decision 19; ticket 35 added. On 16 Nov 2026 Henry decided v1 ships both pause modes, with gentle pause as the default. The macOS phase 2 addendum of 16 Nov 2026 (`docs/platforms/macos.md`, tickets in `docs/tickets/macos/`) is planning only: it does not change Windows v1 behavior and it is not approved until Henry says so |
+| **Status** | Approved. Ticket breakdown approved 15 Nov 2026 (31 v1 tickets, 1 deferred). Gaps resolved during ticketing are in Implementation Decision 17. Amended 15 Nov 2026 with two Henry-approved v1 features: the battery and heat floor (Decision 10) and pausing background apps (Decision 18), summarized in Decision 19; ticket 35 added. On 16 Nov 2026 Henry decided v1 ships both pause modes, with gentle pause as the default. The same day he decided connected, multi-display, and remote-display support on Windows 11, Windows 10, Linux, and the macOS Universal build, both slices (Decision 20). Each platform has its own open capture-versus-remote entry in that decision. The macOS phase 2 addendum of 16 Nov 2026 (`docs/platforms/macos.md`, tickets in `docs/tickets/macos/`) is planning only: it does not change Windows v1 behavior and it is not approved until Henry says so |
 | **Owner** | Henry |
 | **Date** | 15 November 2026 |
 | **Working name** | SoftLock. Pick a new name before public launch (see Further Notes) |
@@ -175,6 +175,17 @@ Stories 80–89 were added on 15 November 2026. They're numbered after the origi
 78. As a future macOS user, I want the same lock behavior on macOS 11+ on Apple Silicon and Intel, so that SoftLock works on all my computers.
 79. As a future Linux user, I want the same lock behavior on mainstream distributions under Wayland and X11, so that SoftLock works on my Linux workstation.
 
+### Connected displays and remote views (16 November 2026)
+
+Stories 90–95 are Henry's Decision 20. They sit after 80–89 so the earlier numbers stay valid. They apply on Windows 11, Windows 10 (version 2004 or later), Linux under X11 and under Wayland, and the macOS Universal 2 build, both the `x86_64` slice and the `arm64` slice. AirPlay and Sidecar are the macOS names for a wireless or iPad display. On Windows and Linux the same requirement is every person-visible display, including a USB display and a remote view.
+
+90. As an owner, I want a lock that starts while a remote session is already up (Remote Desktop, Screen Sharing, VNC, Chrome Remote Desktop, and a remote view of the same kind) to cover that remote view with the same SoftLock screen the console shows.
+91. As a person connecting remotely to a machine that is already SoftLocked, I want to see the SoftLock lock screen, so that the remote view is not an unlocked desktop.
+92. As an owner, I want unlock from a remote session to be the same Broker flow as at the console: the SoftLock PIN, Windows Hello or Touch ID where that remote stack supports it, and otherwise the PIN or the account password, with no weaker path.
+93. As a bystander on a remote session, I want keys, clicks, and touch from that session, before unlock, to reach only the unlock UI, so that the remote view is not a way into the desktop.
+94. As an owner, I want a crash or any other failure while a remote session is covered to end in the operating system's lock for that session, and never in Unlocked.
+95. As an owner, I want every person-visible display covered while locked, including one that is added, removed, mirrored, rescaled, or whose DPI changes, an AirPlay display, a Sidecar iPad, a DisplayLink or other USB display, and a closed laptop lid that leaves an external display awake.
+
 ---
 ## Implementation Decisions
 
@@ -183,11 +194,11 @@ Stories 80–89 were added on 15 November 2026. They're numbered after the origi
 | Adversary | v1 position |
 |---|---|
 | **T1: A person physically at the computer** (keyboard, mouse, touch, pen, gamepad, USB devices, voice, power and lid buttons) | **In scope, and must be loophole-free.** They can't get to the desktop or any running app without an enabled unlock method. Their best options are a forced power-off or reboot (accepted, because it lands at the real Windows sign-in, which is why disk encryption is recommended) or disrupting the session (for example unplugging the network). Both are denial of service, not access. |
-| **T2: Software running as the owner** (agents, scripts, remote-control tools) | **Trusted to run, not trusted to unlock.** Software input passes through by design. SoftLock's own interfaces offer no unlock path. SoftLock doesn't claim to stop *malicious* code running as the owner, because such code already has the owner's files and session. Remote-control tools such as TeamViewer, AnyDesk and VNC inject input like agents do, so they keep working while locked. This is documented. |
+| **T2: Software running as the owner** (agents, scripts, remote-control tools) | **Trusted to run, not trusted to unlock.** Software input from an agent in the session passes through by design. SoftLock's own interfaces offer no unlock path. SoftLock doesn't claim to stop *malicious* code running as the owner, because such code already has the owner's files and session. A remote view (Remote Desktop, Screen Sharing, VNC, Chrome Remote Desktop, and the same kind of view, including TeamViewer or AnyDesk when that is the view the person is looking at) is a bystander, not an agent. Decision 20 covers that view and blocks its input except the unlock UI. |
 | **T3: Hardware and pre-boot attacks** (DMA, cold boot, keyloggers, booting another OS) | Out of scope. Covered by BitLocker or Device Encryption and firmware settings. |
 
 **Physical vs. software input, defined:** on Windows, an input event is *software* if the low-level hook reports it as injected (`LLKHF_INJECTED` for keyboard, `LLMHF_INJECTED` for mouse) and *physical* otherwise. Some consequences:
-- Input from RDP sessions, Hyper-V basic sessions, KVM-over-IP and other virtual-HID tools looks physical inside the guest, so it's blocked.
+- Input from RDP sessions, Hyper-V basic sessions, KVM-over-IP and other virtual-HID tools looks physical inside the guest, so it's blocked. Decision 20 keeps that outcome for a remote viewer (blocked except the unlock UI) and has ticket 37 record the hook's injected flag for console input and for RDP-session input separately. The terminal page cited there treats those as different devices and does not document the flag.
 - Some accessibility tools inject input or act through UI Automation without any input event at all. That's why they're stopped while locked (Hardening section).
 
 ### 2. Windows limits we design around (stated honestly)
@@ -198,7 +209,7 @@ Stories 80–89 were added on 15 November 2026. They're numbered after the origi
 - **Win+L is handled by the system, not delivered to low-level hooks** in the normal case. The `DisableLockWorkstation` policy is the only reliable way to neutralize it. That same policy also makes `LockWorkStation()` fail, so every code path that needs the real lock (hard lock, fail-closed) **clears that policy first** or uses the session-disconnect primitive (section 7).
 - **No uiAccess in v1.** uiAccess windows sit in a higher z-band, but they need an Authenticode-signed binary in a secure location. v1 is unsigned, so the overlay is a normal topmost window. Shell surfaces (Start menu, Task View, some toasts, the secure-desktop dim background) can draw above it if an agent opens them. Physical input to them is still blocked. The remaining risk is that their contents are visible on screen (see Risks).
 - **Low-level hooks are removed silently** if a callback exceeds `LowLevelHooksTimeout`. The hook therefore runs on a dedicated high-priority thread, does no I/O and no allocation in the callback, and is checked continuously for liveness.
-- **Capture exclusion** (`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`) needs Windows 10 version 2004 (build 19041) or later. That sets the minimum supported version. DWM applies it, so BitBlt/GDI capture, DXGI Desktop Duplication and Windows.Graphics.Capture all skip the overlay.
+- **Capture exclusion** (`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`) needs Windows 10 version 2004 (build 19041) or later. That sets the minimum supported version. DWM applies it, so BitBlt/GDI capture, DXGI Desktop Duplication and Windows.Graphics.Capture all skip the overlay. The same affinity is what can hide the overlay from a remote view. That conflict is Decision 20, and it is open.
 
 ### 3. Architecture and modules
 
@@ -217,7 +228,7 @@ SoftLock is a Rust workspace with thin native layers. Each module is deep: a sma
 
 **Why the Lock Host runs as SYSTEM in the user's session:** a low-level hook only sees input headed to windows at or below its own integrity level. A hook at medium integrity misses input to elevated windows, which would be a loophole. Running the guard as SYSTEM in the session covers every window on the Default desktop, and UIPI stops lower-integrity processes (agents) from sending messages to or tampering with it. The Unlock Broker exists because Windows Hello must be called in the user's context. *This choice is confirmed by prototype P2. The fallback is to use the owner's elevated linked token for administrators.*
 
-**The overlay never takes focus or mouse input.** Its windows use `WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` plus `WDA_EXCLUDEFROMCAPTURE`. Agents' injected clicks fall through to the real windows underneath, and keyboard focus stays where it was. The overlay receives physical keystrokes only from its own input guard, which swallows them in the hook and forwards them in-process to the unlock prompt (translated with `ToUnicodeEx` and the owner's active keyboard layout). The overlay re-asserts topmost on a timer and on `WM_WINDOWPOSCHANGED`, and re-covers monitors on `WM_DISPLAYCHANGE`. IME composition isn't supported in the unlock field in v1.
+**The overlay never takes focus or mouse input.** Its windows use `WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` plus `WDA_EXCLUDEFROMCAPTURE`. Agents' injected clicks fall through to the real windows underneath, and keyboard focus stays where it was. The overlay receives physical keystrokes only from its own input guard, which swallows them in the hook and forwards them in-process to the unlock prompt (translated with `ToUnicodeEx` and the owner's active keyboard layout). The overlay re-asserts topmost on a timer and on `WM_WINDOWPOSCHANGED`, and re-covers monitors on `WM_DISPLAYCHANGE` and on `WM_DPICHANGED` (a DPI or scale change). One window per person-visible display, including a monitor on a remote terminal. Whether that remote window keeps `WDA_EXCLUDEFROMCAPTURE` is Decision 20 and is open. IME composition isn't supported in the unlock field in v1.
 
 **Input guard rules (on the Lock Host's dedicated hook thread):**
 - Injected keyboard or mouse event: pass to the next hook.
@@ -536,6 +547,7 @@ pub enum PauseMode { Efficiency, Suspend }                       // Efficiency i
   - Overlay: a `wlr-layer-shell` overlay where available, with an X11 override-redirect fallback.
   - Capture exclusion has no portable Wayland mechanism and is an open risk.
   - Unlock: PAM.
+  - Connected displays and remote views are Decision 20, on both X11 and Wayland. [`docs/platforms/linux.md`](platforms/linux.md) is this sketch. It is not a ticketed Linux platform plan, and there are no other Linux product tickets. The display tickets in [`docs/tickets/linux/`](tickets/linux/README.md) are blocked on that plan. They do not add an architecture.
 
 ### 17. Decisions resolved during ticketing (15 November 2026)
 
@@ -602,6 +614,110 @@ Henry approved both features for v1 after the Insomnia review (market research a
 - **Open-core boundary:** pausing is a flat per-user list in the free core. It isn't the planned allowlist or rules feature and has no rules, schedules, conditions, profiles, remote control or fleet management.
 - **Tickets:** the battery and heat floor goes into ticket 20. Pausing is the new ticket 35 (GitHub #38), blocked by 16, 20 and 23. Its settings page is in 25 and its wizard step in 29.
 
+### 20. Connected displays and remote views (16 November 2026)
+
+**Decision, Henry, 16 November 2026,** in his words:
+
+> Our app should have support for connected display/multi-display/remote display/etc. support.
+
+> If RD is running and softlock is applied, it should be applied to the RD screen too, same procedures to unlock, if anything crashes or fails should lock. If RDing in to a softlocked device it should show the softlock screen, same unlock process.
+
+**Scope, Henry, 16 November 2026,** in his words:
+
+> this should be for all versions (Windows 11, 10, Linux, and MacOS Universal), not just MacOS.
+
+That decision is the behavior on every one of those platforms. The mechanism that keeps a lock visible on a remote view is **open on each platform whose capture path differs**. Henry has not picked any of them. This section does not pick them.
+
+#### What the decision requires, on each platform
+
+These are the invariants. A test that needs the open mechanism waits until Henry closes that platform's entry. Until then the tickets measure, and they do not promise a mechanism.
+
+- **Remote view while locking.** Locking while a remote view is already connected covers that view with the same SoftLock screen, and the same unlock procedure.
+- **Connecting to a locked machine.** A remote connection to a machine that is already SoftLocked shows the SoftLock lock screen.
+- **Same unlock.** Unlock is the Broker already specified for that platform: a `Verified` verdict carrying the nonce from the Broker launch this service started. Windows offers the SoftLock PIN, Windows Hello where that stack supports it, and otherwise the PIN or the account password. macOS offers Touch ID where that stack supports it, and otherwise the account password or the dev PIN. Linux offers whatever the Linux plan's unlock is (the phase-3 sketch names PAM) and no weaker path. A remote session adds no method.
+- **Remote input.** Keys, pointer, and touch from the remote view, before unlock, reach only the unlock UI.
+- **Fail closed.** A crash or any other failure ends in the operating system's lock for that session. The state machine does not enter Unlocked because of the failure. "That session" is the interactive session the person is in. A second logged-on user stays out of scope.
+- **Displays.** While locked, every person-visible display shows the lock: a panel that is added, removed, mirrored, rescaled, or whose scale or DPI changes; a USB display; and a laptop lid that is closed while an external display stays awake. A gap that shows the desktop is a failure, and the failure takes the fail-closed path.
+
+**Windows 11 and Windows 10 (version 2004 or later).** The five invariants and the display rule are the same on both. Remote Desktop is the remote view, plus a remote tool of the same kind (Chrome Remote Desktop, TeamViewer, AnyDesk) when that is the view. `WDA_EXCLUDEFROMCAPTURE` is the capture-exclusion API on both, from Windows 10 version 2004. The differences that are documented, read 16 November 2026:
+
+- [Connect to a remote Microsoft Entra joined device](https://learn.microsoft.com/en-us/windows/client-management/client-tools/connect-to-remote-aadj-pc) says that starting in Windows 10, version 1809, biometrics can authenticate to a remote desktop session. The same page says Microsoft Entra authentication for that connection needs Windows 11 with the 2022-10 cumulative update, or Windows 10 version 20H2 or later with the 2022-10 cumulative update. It also says the Windows lock screen in that remote session does not support Microsoft Entra tokens or passwordless methods such as FIDO keys, so trying to lock the remote session disconnects it instead. Fail-closed on that configuration records the disconnect. The disconnect is not Unlocked.
+- The [Hello for Business FAQ](https://learn.microsoft.com/en-us/windows/security/identity-protection/hello-for-business/faq) says using Hello for Business for authentication on the remote device itself is not supported. That sentence is not split by Windows 10 and Windows 11. The same page says an external Hello camera with the lid closed was unreliable on some laptops, and that this was addressed in Windows 11, version 22H2. Where the stack in front of the person does not support Hello, unlock is the PIN or the account password on both versions.
+- `windows-2022` is Windows Server 2022 (finding 02: build 20348), the Windows 10 family. `windows-2025` is Windows Server 2025 (finding 02: build 26100, 24H2), the Windows 11 family. Tickets 36 and 37 run on both images and compare them. They do not prove a client SKU, Home versus Pro as an RDP host, or Hello. The client kit is ticket 39 for the P7, whose edition the sheet records, and ticket 40 for a Windows 10 client. No Windows 10 client machine is identified (roadmap issue 33, still-open item 7). Ticket 40 stays blocked on that.
+
+**macOS Universal 2, both slices.** The same invariants, with Screen Sharing, VNC, and Chrome Remote Desktop as the remote views, and AirPlay, Sidecar, and DisplayLink as displays. The `arm64` slice is what `macos-latest` runs (m20, m21). The `x86_64` slice runs on Henry's Intel Mac (m23 runs that slice of the display probe). Intel and Apple Silicon differ where Apple's pages differ, not in the requirement:
+
+- Sidecar's Mac list on [Continuity features](https://support.apple.com/en-us/108046), read 16 November 2026, is macOS Catalina 10.15 or later and Mac models introduced in 2016 or later, plus two named older models. This 2020 Intel Mac is in that list. An Apple Silicon Mac of 2016 or later is in it too. Whether an iPad is available is unknown on both.
+- [Connect an external display to MacBook Pro](https://support.apple.com/guide/macbook-pro/connect-an-external-display-apd8cdd74f57/mac) gives display counts for the Apple-silicon chips named on that page and says most steps apply to all models, with older models on a different article. m23 records the Intel machine. It does not copy those counts onto it. A physical Apple Silicon Mac is not in the kit. Ticket m24 is those rows, and it is blocked until a machine is named. `macos-latest` is the arm64 CI proof of the callback, not a physical hot-plug.
+
+**Linux, X11 and Wayland.** The same invariants. There is no ticketed Linux platform plan. [`docs/platforms/linux.md`](platforms/linux.md) is a phase-3 sketch (a root daemon, an evdev grab, a layer-shell or X11 overlay, PAM) and it says the crate does not lock the machine. There are no other Linux product tickets. The display and remote-display tickets under [`docs/tickets/linux/`](tickets/linux/README.md) are blocked on a Linux platform plan. They do not add an architecture.
+
+The paths differ, and the tickets name them without designing SoftLock around them:
+
+- X11 and Wayland are both in scope. A hot-plug, a mode change, and mirroring are proved on `ubuntu-latest` only to the extent that image already has a display server. Ticket l01 prints the session type and stops when there is none. It does not install a desktop in order to invent one.
+- Remote views the requirement covers, read 16 November 2026: [xrdp](https://github.com/neutrinolabs/xrdp/blob/devel/README.md) is an RDP server for Linux and can use an Xorg module or Xvnc. [GNOME's desktop sharing help](https://help.gnome.org/gnome-help/sharing-desktop.html) lets another device view and control the desktop, and [GNOME Connections](https://help.gnome.org/connections/connect.html) connects with `rdp://`, `vnc://`, or `spice://`. [RustDesk](https://github.com/rustdesk/rustdesk/blob/master/README.md) describes itself as a remote desktop solution and its tree has a screen-capture library (`libs/scrap`). VNC is the same class of view. These are the Linux remote paths. Which compositor or server a future plan uses is not decided here.
+
+Ticket 18 keeps topmost re-assert, shell surfaces, and toast banners. Display add, remove, and change on Windows are ticket 36 (both runner images) and tickets 39 and 40. macOS is m20, m21, m22, m23, and m24. m06 keeps Spaces, full-screen, click-through, and the displays already attached when the probe starts. Linux is l01 through l04. Those files are the rows. This decision does not copy them.
+
+#### Windows facts, read 16 November 2026
+
+**Verified.** [`SetWindowDisplayAffinity`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowdisplayaffinity) says `WDA_EXCLUDEFROMCAPTURE` (`0x00000011`) means the window is displayed only on a monitor and everywhere else does not appear at all. One use the page names is video-recording controls, so the controls are not included in the capture. The remarks say the function protects window content from being captured or copied through a specific set of public operating system features and APIs, only while DWM is composing the desktop, and that it is not a guarantee the way DRM would be. The page does not name Remote Desktop. Setting the value on a Windows older than Windows 10 version 2004 behaves as `WDA_MONITOR`. `WDA_MONITOR` shows the window with no content everywhere except a monitor.
+
+**Verified.** [`WM_DISPLAYCHANGE`](https://learn.microsoft.com/en-us/windows/win32/gdi/wm-displaychange) is sent to top-level windows when the display resolution has changed. [`WM_DPICHANGED`](https://learn.microsoft.com/en-us/windows/win32/hidpi/wm-dpichanged) is sent when the window's DPI changes, including a move onto a monitor with a different DPI, or a DPI change on the monitor that hosts the window.
+
+**Verified.** [Remote and console terminal differences](https://learn.microsoft.com/en-us/windows/win32/termserv/consoles-vs-terminals) says there is one console terminal, and the local input and output devices are attached to it. A remote terminal's keyboard, mouse, and monitor are on another system. The page's RDP scenario says that when someone remotes in, the console terminal is no longer used for the active session and is attached to an empty session with the login screen, and a remote terminal is attached to the session. When the person comes back and signs in at the console, the console terminal is reattached and the remote terminal is terminated. On Windows 10 Multisession and on Windows Server with the Remote Desktop Session Host role, the page says there can be multiple remote terminals and still only one console terminal. A WDDM remote indirect display driver, one instance per remote terminal, sends the desktop image to the client and can expose up to 16 monitors. Local WDDM adapters display the console terminal. The page says programs can call `WTSQuerySessionInformation` to tell that the user is connected remotely. It does not say whether input from the remote terminal is marked injected in a low-level hook. Console input and RDP-session input are both classified, by ticket 37, because they are different devices on that page.
+
+**Verified.** The [Windows Hello for Business FAQ](https://learn.microsoft.com/en-us/windows/security/identity-protection/hello-for-business/faq), section "Why can't I use Windows Hello for Business when connecting remotely to a Windows device?", says Hello for Business is for local interactive sign-in, the credentials are accessible on the device where the user is physically present, and it is not supported to enroll Hello for Business or to use it for authentication on the remote device itself. The same page says Hello on the local device can sign in to a remote virtual machine and can handle redirected prompts. The key-trust section says RDP does not support key-based authentication as a supplied credential, and that a certificate deployed for that purpose can enable RDP. The cloud Kerberos section says cloud Kerberos trust cannot be used as a supplied credential with RDP or VDI. [Remote Desktop sign-in with Windows Hello for Business](https://learn.microsoft.com/en-us/windows/security/identity-protection/hello-for-business/rdp-sign-in) is a different step: a certificate in the Hello container, unlocked by a biometric gesture or a PIN on the client that is connecting, and on a Microsoft Entra hybrid joined device the page says the user must use the PIN. That is signing in to the remote session. It is not SoftLock's Broker inside a session that is already connected. Where the stack in front of the person does not support Hello, Decision 20 uses the PIN or the account password.
+
+Finding 02 already measured the GitHub runners: one 1024×768 console display, session 2, and `WDA_EXCLUDEFROMCAPTURE` removed the marker from GDI, DXGI Desktop Duplication, and Windows.Graphics.Capture. That measurement is local capture. It is not a remote terminal.
+
+#### The conflict, open, one entry per platform
+
+Story 20 says an agent's screenshot, recording, and screen-sharing capture show the desktop without the overlay. A remote viewer is a person and has to see the lock. Those two sentences collide wherever the remote view is itself a capture. Henry decides each entry. This spec does not.
+
+**Windows. Open.** The mechanism is `WDA_EXCLUDEFROMCAPTURE`. The affinity page says the window does not appear at all except on a monitor, through a specific set of public capture APIs, and it does not name Remote Desktop. The same API is on Windows 10 version 2004 and on Windows 11. The terminal page gives a remote terminal its own monitors. A Windows client moves the one interactive session onto that terminal, so there may be no second session. Server SKUs can have more than one remote session. Ticket 37 measures both runner images. It does not choose.
+
+- **A.** Tell agent capture (GDI, DXGI, Windows.Graphics.Capture) apart from the remote terminal, and exclude only the agent path.
+- **B.** Where the remote terminal is a separate session, draw that session's overlay without `WDA_EXCLUDEFROMCAPTURE`. A client SKU that has only the one session is not this case.
+- **C.** A documented limit. The limit that matches Henry's words is that the remote viewer sees the lock, and an agent on that same path may see it too.
+
+**Lead recommendation for Windows, not a decision:** A, and B where a separate remote session exists. C only for a path that cannot be split, with the remote viewer seeing the lock.
+
+**macOS. Open.** This is decision D9. The mechanism under test is `NSWindow.SharingType.none`. Apple's page says not to use it to hide content from capture. Screen Sharing, VNC, AirPlay, and DisplayLink are capture or pixel-forwarding paths. DisplayLink's page, read 16 November 2026, says the driver needs Screen Recording permission to read pixels and send them over USB ([DisplayLink Manager on macOS](https://support.displaylink.com/knowledgebase/articles/1932214-displaylink-manager-app-for-macos-introduction-in)). The flag is the same on Intel and on Apple Silicon. m21 measures the arm64 runner. m23 measures the Intel Mac. m24 is a physical Apple Silicon Mac, and no such machine is named. Option B is the Windows session split and is not a macOS option.
+
+- **A.** Keep `.none` for the paths m04 and m06 measured as excluded, and put a second surface on the remote-view path if m21 or m23 shows `.none` hides the marker there.
+- **C.** The same documented limit as Windows: the remote viewer sees the lock.
+
+**Lead recommendation for macOS, not a decision:** A, then C for a path that cannot be split, with the remote viewer seeing the lock.
+
+**Linux. Open.** The phase-3 sketch already says capture exclusion has no portable Wayland mechanism. That is a different mechanism from Windows affinity and from macOS `sharingType`, so it is its own entry. X11 capture (a VNC server or xrdp's Xvnc path reading the X framebuffer) and Wayland capture (a portal or PipeWire source, which is what a GNOME remote-desktop session and RustDesk's screen-capture library have to read) are different again. This entry does not choose an X11 extension or a Wayland protocol, and it does not extend the sketch.
+
+- **A.** Tell agent capture apart from the remote viewer's path, once a Linux plan names those paths.
+- **C.** The same documented limit: the remote viewer sees the lock, and an agent on that same path may see it too.
+
+**Lead recommendation for Linux, not a decision:** do not pick A or C until a Linux platform plan exists and l02 has measured the runner. The recommendation, when that measurement exists, is the same as the other two: the remote viewer sees the lock.
+
+#### Tickets
+
+Windows files are in [`docs/tickets/`](tickets/README.md). macOS files are in [`docs/tickets/macos/`](tickets/macos/README.md). Linux files are in [`docs/tickets/linux/`](tickets/linux/README.md). None of them are GitHub issues.
+
+| Ticket | What it is | Blocked by |
+|---|---|---|
+| 36 | Seam 3 on `windows-2022` and `windows-2025`: display add, remove, and change | 11, 12 |
+| 37 | Spike, both images: capture exclusion versus a remote view | 11, and finding 02 |
+| 38 | Remote-session lock and unlock, Windows 10 and Windows 11 | 15, 21, 22, 37, and the Windows entry above once Henry closes it |
+| 39 | P7 kit | 36; the RDP row also 38 |
+| 40 | Windows 10 client kit | a named Windows 10 client machine; the RDP row also 38 |
+| m20 | CI probe on `macos-latest` (arm64 slice) | m01, m02 |
+| m21 | Spike: `sharingType` none versus a remote view | m04 |
+| m22 | Remote-session lock and unlock | m14, m18, m19, m21, and the macOS entry once Henry closes it |
+| m23 | Intel Mac kit, including the `x86_64` slice of the display probe | m06, m20; Screen Sharing also m22 |
+| m24 | Apple Silicon hardware kit | a named Apple Silicon Mac; no such machine is recorded |
+| l01 | `ubuntu-latest` display-session probe | a Linux platform plan |
+| l02 | Spike: capture versus xrdp, VNC, GNOME Remote Desktop, RustDesk | the plan, and l01 |
+| l03 | Remote-session lock and unlock | the plan, l02, and the Linux entry once Henry closes it |
+| l04 | Hardware kit | the plan, and a named Linux machine; remote rows also l03 |
+
 ---
 ## Testing Decisions
 
@@ -623,7 +739,8 @@ Henry approved both features for v1 after the Insomnia review (market research a
 3. **Windows desktop end to end (probe harness).** A probe app on a Windows runner, with the test-only physical feature, checks what the OS actually does:
    - Injected input reaches the probe window, and simulated-physical input doesn't.
    - Focus is unchanged.
-   - Captures (GDI, DXGI duplication, Windows.Graphics.Capture) don't contain the overlay's marker color.
+   - Captures (GDI, DXGI duplication, Windows.Graphics.Capture) don't contain the overlay's marker color. A remote view is not this bullet. Ticket 37 measures it, and Decision 20 is open.
+   - A display change leaves every monitor covered (ticket 36) on both `windows-2022` (Windows 10 family) and `windows-2025` (Windows 11 family). The runner's known display is one 1024×768 console screen (finding 02). A resolution change is the change the job can do. An add and a remove run only if a virtual display driver is already on the image. Otherwise the log says add and remove are unproven in CI, and tickets 39 and 40 have the hardware rows.
    - The hardening registry values, device states and power requests are applied and then restored exactly.
    - Killing or suspending the Lock Host, or stopping the Service, ends in an OS-locked or disconnected session.
    - Recovery after a simulated crash (journal present at Service start) restores everything.
@@ -655,7 +772,7 @@ Run on one Windows 11 laptop (Modern Standby, touchscreen if available) and one 
 5. Close the lid with `lid_close` on. Run a 30-minute agent task, then a 60-minute one with the display on and the lid closed. Verify the agent made progress.
 6. The power button tap does nothing while locked.
 7. Run an agent (for example Computer Use, or a Playwright headed run) end to end while locked. Its screenshots show the desktop.
-8. TeamViewer or AnyDesk control still works (document the result).
+8. A remote view under test (Remote Desktop, and TeamViewer or AnyDesk when that product is the view) shows the SoftLock screen. Input from that view before unlock does not reach the desktop. The sheet is ticket 39. This line does not add a second copy of those rows.
 9. Battery floor: on battery, set the floor 2% below the current level, lock and run an agent. When the battery passes the floor, the real Windows lock appears, the laptop sleeps, and after sign-in the notice shows the reading. Note which heat sources the laptop and the P7 report in status.
 10. Pausing: pick one app in Efficiency mode and one in Suspend (for example a chat app and a music app), lock for 10 minutes, then unlock, and both work normally. Repeat, holding the power button while locked, and check that nothing is stuck after the restart.
 Each item is a one-line pass or fail in the release notes.
@@ -678,7 +795,7 @@ Each item is a one-line pass or fail in the release notes.
 - Replacing or restyling the real Windows sign-in or lock screen (LogonUI). SoftLock never imitates it.
 - Anti-theft, device tracking, or remote wipe.
 - Protection against malicious software already running as the owner, hardware attacks, or a forced power-off without disk encryption.
-- Multiple simultaneous interactive users, and RDP-session (non-console) SoftLocking.
+- Multiple simultaneous interactive users. A second person logged on at the same time, including a second Remote Desktop Services session on a server SKU, stays out. One interactive session that moves between the console terminal and a remote terminal is in scope (Decision 20).
 - IME composition in the unlock field, and localization beyond English (strings are externalized for later).
 
 ---
@@ -690,7 +807,7 @@ Each item is a one-line pass or fail in the release notes.
 | # | Risk | Prototype (spike) | What happens if it fails |
 |---|---|---|---|
 | **P1** | **Do the Ctrl+Alt+Del policies take effect instantly, without a sign-out, and what does that screen still show?** `DisableTaskMgr`, `NoLogoff`, `DisableChangePassword`, `HideFastUserSwitching` and `DisableLockWorkstation` must hide their options the very next time Ctrl+Alt+Del is pressed, on Windows 10 and 11, Home and Pro. Also check whether `NoClose` hides the power icon, what the accessibility icon can launch, and whether the network icon matters. | A service that sets and clears each value, then manual Ctrl+Alt+Del presses on two machines | If an option needs a sign-out to disappear, that piece can't be fully loophole-free on that edition. We document it, use Keyboard Filter where available, or keep that option and make sure its action can't reach the desktop |
-| **P2** | **Physical vs. software input classification gaps.** Will a SYSTEM-in-session hook see input to elevated windows? Does blocking at the low-level hook also stop Raw Input (`WM_INPUT`) and apps that read HID devices directly? Do touch, pen and gamepads really need device disabling? Do Voice Access and the on-screen keyboard bypass the guard? Is the hook ever dropped under load? How do remote tools classify (RDP, VMs and KVMs look physical and are blocked; TeamViewer and AnyDesk are injected and pass)? | A hook prototype plus a test matrix of input sources and target apps (elevated window, raw-input app, game, browser) | Each gap gets a hardening item (device disable, process stop) or a documented limitation. Raw Input leakage is the most serious possible result |
+| **P2** | **Physical vs. software input classification gaps.** Will a SYSTEM-in-session hook see input to elevated windows? Does blocking at the low-level hook also stop Raw Input (`WM_INPUT`) and apps that read HID devices directly? Do touch, pen and gamepads really need device disabling? Do Voice Access and the on-screen keyboard bypass the guard? Is the hook ever dropped under load? How do remote tools classify? The 15 Nov guess was that RDP, VMs and KVMs look physical and are blocked, and that TeamViewer and AnyDesk are injected and pass. Decision 20 keeps a remote viewer's input blocked except the unlock UI, whatever the injected flag is. Ticket 37 records the flag for console input and for RDP-session input. | A hook prototype plus a test matrix of input sources and target apps (elevated window, raw-input app, game, browser) | Each gap gets a hardening item (device disable, process stop) or a documented limitation. Raw Input leakage is the most serious possible result |
 | **P3** | **Can the overlay stay on top and private?** Without uiAccess (unsigned builds), a topmost window can be drawn over by the Start menu, Task View, toasts, UAC's secure-desktop dimmed background (which may be a snapshot of the real desktop that ignores capture exclusion), and full-screen exclusive apps. | Open each surface by injected input while locked and photograph the physical screen | Physical input still can't reach them, so this is information exposure, not access. Mitigations: suppress toasts, close shell surfaces when they open, document it. uiAccess becomes possible once the builds are signed |
 | **P4** | **Does fail-closed work under the policies?** `LockWorkStation` fails while `DisableLockWorkstation` is set. Check that clearing the policy and then locking, or `WTSDisconnectSession` from session 0 and from the user session, reliably reaches the sign-in screen within 1 s. Also check the Lock Host's own fall-back when the Service is killed. | Kill and suspend tests on a real machine and on a CI runner | This is the core promise. If any path is unreliable, it gets fixed before anything else ships |
 | **P5** | **Keep-awake on Modern Standby and with the lid closed.** Do the System- plus Display-required power requests stop standby and Desktop Activity Moderator throttling when the screen is dim or black, and with the lid closed (internal panel off)? | A 60-minute agent run on a Modern Standby laptop: lid open with the screen dimmed, then lid closed, plugged in and on battery | Document hardware limits. `lid_close` stays off by default, and some devices may only be able to keep the lid open |
