@@ -7,6 +7,18 @@ members = [
     "crates/softlock-lockhost",
     "crates/softlock-broker",
     "crates/softlock-app/src-tauri",
+    "spikes/keep-awake",
+]
+
+# The keep-awake spike is a member so CI can build and test it. It is not a
+# default member, so `cargo build --release` does not produce it.
+default-members = [
+    "crates/softlock-core",
+    "crates/softlock-windows",
+    "crates/softlock-service",
+    "crates/softlock-lockhost",
+    "crates/softlock-broker",
+    "crates/softlock-app/src-tauri",
 ]
 
 [workspace.package]

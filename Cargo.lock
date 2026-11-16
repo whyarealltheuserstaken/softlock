@@ -2962,6 +2962,15 @@ name = "softlock-service"
 version = "0.1.0"
 
 [[package]]
+name = "softlock-spike-keep-awake"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "softlock-core",
+ "windows",
+]
+
+[[package]]
 name = "softlock-windows"
 version = "0.1.0"
 

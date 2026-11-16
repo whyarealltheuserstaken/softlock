@@ -47,6 +47,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Seam 1
         run: cargo test --workspace --all-targets
+      - name: Keep-awake spike smoke
+        if: runner.os == 'Windows'
+        run: cargo run -p softlock-spike-keep-awake -- smoke
 
   deny:
     name: licenses and advisories
