@@ -10,6 +10,8 @@ members = [
     "crates/softlock-seam3",
     "crates/softlock-broker",
     "crates/softlock-app/src-tauri",
+    # Proof only. Not linked from any product crate and not installed.
+    "spikes/overlay",
 ]
 exclude = [
     "spikes/desktop-proof",

@@ -85,6 +85,32 @@ jobs:
             cargo test --locked -p softlock-lockhost --test release_binary -- --nocapture product_release_binaries \
             2>&1 | tee target/release-scan.txt
           grep -F "scanned release binaries" target/release-scan.txt
+      - name: Overlay spike smoke
+        if: runner.os == 'Windows'
+        run: cargo run -p softlock-spike-overlay -- smoke --timeout-secs 30 --reassert-timer --reassert-pos --close-shell --shell-fixture --allow-admin
+      - name: Overlay tour opens while the overlay is up
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $output = cargo run -p softlock-spike-overlay -- tour --only Fullscreen --no-prompt --pause-secs 2 --timeout-secs 30 --allow-admin 2>&1 | Out-String
+          Write-Host $output
+          if ($LASTEXITCODE -ne 0) { Write-Error $output; exit $LASTEXITCODE }
+          if ($output -notmatch 'Pink overlay is up') {
+            Write-Error "The overlay was not shown.`n$output"
+            exit 1
+          }
+          if ($output -notmatch 'fullscreen_mode:') {
+            Write-Error "The full-screen window did not open.`n$output"
+            exit 1
+          }
+          if ($output -notmatch 'surface_opened_while_overlay: Full-screen exclusive window') {
+            Write-Error "The full-screen window was not open while the overlay was up.`n$output"
+            exit 1
+          }
+          if ($output -match 'surface_opened_while_overlay: overlay-closed') {
+            Write-Error "The tour ran after the overlay closed.`n$output"
+            exit 1
+          }
 
   deny:
     name: licenses and advisories
