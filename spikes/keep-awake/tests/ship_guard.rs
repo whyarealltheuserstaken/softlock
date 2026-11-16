@@ -108,7 +108,19 @@ fn checklist_has_one_command_per_scenario_and_the_new_columns() {
     assert!(checklist.contains("60 minutes"));
     assert!(checklist.contains("Modern Standby (AoAc): no"));
     assert!(checklist.contains("Lowest battery %"));
-    assert!(checklist.contains("Thermal or throttling"));
+    assert!(checklist.contains("Heat"));
+    assert!(checklist.contains("Policy or cap"));
+    assert!(checklist.contains("hard surface"));
+    assert!(checklist.contains("bag"));
+    assert!(checklist.contains("80%"));
+    assert!(checklist.contains("20%"));
+    assert!(checklist.contains("critical-battery"));
+    assert!(checklist.contains("drag"));
+    assert!(checklist.contains("issue #8"));
+    assert!(checklist.contains("stray key"));
+    assert!(checklist.contains("Ctrl+C"));
+    assert!(checklist.contains("4 hours 45 minutes"));
+    assert!(checklist.contains("40 minutes"));
     for id in MEASUREMENT_SCENARIOS {
         assert!(checklist.contains(&run_command(id)), "{id}");
         assert!(
@@ -127,11 +139,15 @@ fn finding_leaves_results_blank_and_names_dependents() {
     let finding = read(&repo_root().join("docs/findings/08-keep-awake/FINDING.md"));
     assert!(finding.contains("(blank)"));
     assert!(finding.contains("Lowest battery %"));
-    assert!(finding.contains("Thermal or throttling"));
+    assert!(finding.contains("Heat"));
+    assert!(finding.contains("Policy or cap"));
     assert!(finding.contains("#20"));
     assert!(finding.contains("#27"));
     assert!(finding.contains("Part of #8"));
-    assert!(finding.contains("Default battery percent: (blank)"));
+    assert!(
+        finding
+            .contains("Default battery floor: 15% proposed (spec Decision 10); confirm from logs")
+    );
     assert!(!finding.contains("- [x]") && !finding.contains("- [X]"));
     assert!(finding.contains("- [ ]"));
 }

@@ -113,6 +113,12 @@ pub struct PowerSignals {
     pub mhz_limit: Option<u32>,
     pub mhz_current: Option<u32>,
     pub execution_throttled: Option<bool>,
+    /// The heat sources were queried. `None` fields then mean unavailable.
+    pub heat_checked: bool,
+    pub passive_limit: Option<u8>,
+    pub throttle_reasons: Option<u32>,
+    pub zone_dc: Option<i32>,
+    pub battery_dc: Option<i32>,
 }
 
 impl PowerSignals {
@@ -126,6 +132,11 @@ impl PowerSignals {
             || self.mhz_limit.is_some()
             || self.mhz_current.is_some()
             || self.execution_throttled.is_some()
+            || self.heat_checked
+            || self.passive_limit.is_some()
+            || self.throttle_reasons.is_some()
+            || self.zone_dc.is_some()
+            || self.battery_dc.is_some()
     }
 
     /// Processor speed cap below the maximum. A zero limit is not treated as a cap.
@@ -140,7 +151,7 @@ impl PowerSignals {
         if !self.is_recorded() {
             return String::new();
         }
-        format!(
+        let mut text = format!(
             " battery={battery} ac={ac} saver={saver} flag={flag} cooling={cooling} mhz_max={mhz_max} mhz_limit={mhz_limit} mhz_now={mhz_now} throttle={throttle}",
             battery = percent_token(self.battery_percent),
             ac = bool_token(self.ac_online),
@@ -154,6 +165,36 @@ impl PowerSignals {
             mhz_limit = mhz_token(self.mhz_limit),
             mhz_now = mhz_token(self.mhz_current),
             throttle = bool_token(self.execution_throttled),
+        );
+        if self.heat_checked
+            || self.passive_limit.is_some()
+            || self.throttle_reasons.is_some()
+            || self.zone_dc.is_some()
+            || self.battery_dc.is_some()
+        {
+            text.push_str(&format!(
+                " passive_limit={passive} throttle_reasons={reasons} zone_dc={zone} battery_dc={battery_temp}",
+                passive = unavailable_token(self.passive_limit),
+                reasons = unavailable_token(self.throttle_reasons),
+                zone = unavailable_token(self.zone_dc),
+                battery_temp = unavailable_token(self.battery_dc),
+            ));
+        }
+        text
+    }
+
+    pub fn progress_note(self) -> String {
+        format!(
+            "battery={}% cooling={} cap={} heat_zone={} heat_battery={}",
+            percent_token(self.battery_percent),
+            self.cooling.map(Cooling::token).unwrap_or("unknown"),
+            match (self.speed_limited(), self.execution_throttled) {
+                (Some(true), _) | (_, Some(true)) => "yes",
+                (Some(false), Some(false)) => "no",
+                _ => "unknown",
+            },
+            unavailable_token(self.zone_dc),
+            unavailable_token(self.battery_dc),
         )
     }
 }
@@ -177,6 +218,13 @@ fn mhz_token(value: Option<u32>) -> String {
     match value {
         Some(mhz) => mhz.to_string(),
         None => "unknown".to_string(),
+    }
+}
+
+fn unavailable_token(value: Option<impl ToString>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => "unavailable".to_string(),
     }
 }
 
@@ -219,6 +267,11 @@ pub struct SignalRollup {
     pub battery_critical: usize,
     pub battery_low: usize,
     pub recorded_samples: usize,
+    pub heat_samples: usize,
+    pub passive_below: usize,
+    pub throttle_bit: usize,
+    pub hottest_zone_dc: Option<i32>,
+    pub hottest_battery_dc: Option<i32>,
 }
 
 impl SignalRollup {
@@ -252,6 +305,32 @@ impl SignalRollup {
                 self.battery_low += 1;
             }
         }
+        if signals.heat_checked
+            || signals.passive_limit.is_some()
+            || signals.throttle_reasons.is_some()
+            || signals.zone_dc.is_some()
+            || signals.battery_dc.is_some()
+        {
+            self.heat_samples += 1;
+            if signals.passive_limit.is_some_and(|limit| limit < 100) {
+                self.passive_below += 1;
+            }
+            if signals
+                .throttle_reasons
+                .is_some_and(|reasons| reasons & 1 != 0)
+            {
+                self.throttle_bit += 1;
+            }
+            if let Some(zone) = signals.zone_dc {
+                self.hottest_zone_dc = Some(self.hottest_zone_dc.map_or(zone, |hot| hot.max(zone)));
+            }
+            if let Some(battery) = signals.battery_dc {
+                self.hottest_battery_dc = Some(
+                    self.hottest_battery_dc
+                        .map_or(battery, |hot| hot.max(battery)),
+                );
+            }
+        }
     }
 
     pub fn summary_lines(self) -> String {
@@ -263,11 +342,11 @@ impl SignalRollup {
             ),
             None => "lowest battery: not recorded".to_string(),
         };
-        let thermal = if self.recorded_samples == 0 {
-            "thermal or throttling: not recorded".to_string()
+        let policy = if self.recorded_samples == 0 {
+            "policy/cap: not recorded".to_string()
         } else {
             format!(
-                "thermal or throttling: passive cooling {}, cpu speed limit {}, process throttle {}, battery saver {}, battery critical {}, battery low {}",
+                "policy/cap: passive cooling {}, cpu speed limit {}, process throttle {}, battery saver {}, battery critical {}, battery low {}",
                 self.passive_cooling,
                 self.speed_limited,
                 self.process_throttled,
@@ -276,7 +355,39 @@ impl SignalRollup {
                 self.battery_low
             )
         };
-        format!("  {battery}\n  {thermal}\n")
+        let heat = if self.heat_samples == 0 {
+            "heat: not recorded".to_string()
+        } else if self.passive_below == 0
+            && self.throttle_bit == 0
+            && self.hottest_zone_dc.is_none()
+            && self.hottest_battery_dc.is_none()
+        {
+            "heat: unavailable".to_string()
+        } else {
+            format!(
+                "heat: passive limit below 100 on {} samples, thermal throttle bit on {} samples, hottest zone {}, hottest battery {}",
+                self.passive_below,
+                self.throttle_bit,
+                format_dc(self.hottest_zone_dc),
+                format_dc(self.hottest_battery_dc)
+            )
+        };
+        format!("  {battery}\n  {heat}\n  {policy}\n")
+    }
+}
+
+fn format_dc(tenths: Option<i32>) -> String {
+    match tenths {
+        None => "not recorded".to_string(),
+        Some(tenths) => {
+            let whole = tenths / 10;
+            let frac = tenths.abs() % 10;
+            if frac == 0 {
+                format!("{whole} C")
+            } else {
+                format!("{whole}.{frac} C")
+            }
+        }
     }
 }
 
@@ -326,6 +437,7 @@ mod tests {
             mhz_limit: Some(2000),
             mhz_current: Some(1900),
             execution_throttled: Some(false),
+            ..PowerSignals::default()
         });
         rollup.observe(PowerSignals {
             battery_percent: Some(41),
@@ -337,6 +449,7 @@ mod tests {
             mhz_limit: Some(900),
             mhz_current: Some(900),
             execution_throttled: Some(true),
+            ..PowerSignals::default()
         });
         assert_eq!(rollup.battery_min, Some(41));
         assert_eq!(rollup.battery_max, Some(80));

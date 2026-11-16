@@ -69,7 +69,7 @@ pub fn print_finished(spec: &RunSpec, report: &RunReport) {
     if spec.scenario.is_measurement() {
         println!("After all four tests, run: {}", analyze_command());
         println!(
-            "Copy the lowest battery and the thermal or throttling line into the checklist table."
+            "Copy the lowest battery, the heat line, and the policy or cap line into the checklist table."
         );
     }
 }

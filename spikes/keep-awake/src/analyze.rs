@@ -30,6 +30,8 @@ pub struct ScenarioReport {
     pub missing: bool,
     pub span_ms: Option<u64>,
     pub signals: SignalRollup,
+    pub ac_mismatches: usize,
+    pub complete: bool,
 }
 
 impl ScenarioReport {
@@ -44,6 +46,8 @@ impl ScenarioReport {
             missing: true,
             span_ms: None,
             signals: SignalRollup::default(),
+            ac_mismatches: 0,
+            complete: false,
         }
     }
 
@@ -143,6 +147,8 @@ fn report_for(scenario: &str, events: &[LogEvent], meta: Option<&HeaderMeta>) ->
     let mut stop = None;
     let mut signals = SignalRollup::default();
     let mut times = Vec::with_capacity(events.len());
+    let mut ac_mismatches = 0usize;
+    let expected_ac = expects_ac(scenario);
     for event in events {
         times.push(event.at_ms());
         match event {
@@ -154,6 +160,11 @@ fn report_for(scenario: &str, events: &[LogEvent], meta: Option<&HeaderMeta>) ->
                 samples += 1;
                 if !ui_ok {
                     ui_failures += 1;
+                }
+                if let (Some(expected), Some(actual)) = (expected_ac, sample.ac_online)
+                    && expected != actual
+                {
+                    ac_mismatches += 1;
                 }
                 signals.observe(*sample);
             }
@@ -176,6 +187,8 @@ fn report_for(scenario: &str, events: &[LogEvent], meta: Option<&HeaderMeta>) ->
         .copied()
         .zip(times.first().copied())
         .map(|(end, start)| end.saturating_sub(start));
+    let planned_secs = meta.and_then(|header| header.planned_secs);
+    let complete = run_is_complete(span, planned_secs, stop.as_deref());
     ScenarioReport {
         scenario: scenario.to_string(),
         samples,
@@ -186,7 +199,27 @@ fn report_for(scenario: &str, events: &[LogEvent], meta: Option<&HeaderMeta>) ->
         missing: false,
         span_ms: span,
         signals,
+        ac_mismatches,
+        complete,
     }
+}
+
+fn expects_ac(scenario: &str) -> Option<bool> {
+    match scenario {
+        "lid-open-plugged" | "lid-closed-plugged" => Some(true),
+        "lid-open-battery" | "lid-closed-battery" => Some(false),
+        _ => None,
+    }
+}
+
+/// A finished hour ends on the timer and covers the planned length, with about a minute of slack.
+pub const COMPLETE_SLACK_MS: u64 = 60_000;
+
+fn run_is_complete(span_ms: Option<u64>, planned_secs: Option<u64>, stop: Option<&str>) -> bool {
+    let (Some(span), Some(planned)) = (span_ms, planned_secs) else {
+        return false;
+    };
+    stop == Some("timer") && span.saturating_add(COMPLETE_SLACK_MS) >= planned.saturating_mul(1000)
 }
 
 fn assemble(found: Vec<ScenarioReport>, required: &[&str]) -> Summary {
@@ -255,6 +288,12 @@ pub fn format_summary(reports: &[ScenarioReport]) -> String {
             "  stop: {}\n",
             report.stop.as_deref().unwrap_or("not recorded")
         ));
+        text.push_str(if report.complete {
+            "  result: complete\n"
+        } else {
+            "  result: INCOMPLETE\n"
+        });
+        text.push_str(&format!("  ac mismatches: {}\n", report.ac_mismatches));
         push_meta(
             &mut text,
             "modern standby (AoAc)",
@@ -499,7 +538,80 @@ mod tests {
             summary.text
         );
         assert!(summary.text.contains("battery saver 1"), "{}", summary.text);
+        assert!(summary.text.contains("policy/cap:"), "{}", summary.text);
+        assert!(
+            summary.text.contains("heat: not recorded"),
+            "{}",
+            summary.text
+        );
+        assert!(!summary.text.contains("thermal or throttling"));
         assert_eq!(summary.gaps, 0);
+    }
+
+    #[test]
+    fn a_short_or_early_stop_is_incomplete_and_the_wrong_cord_is_flagged() {
+        let header = "# scenario=lid-open-battery\n# planned_secs=3600\n";
+        let tick = LogEvent::Tick {
+            at_ms: 0,
+            scenario: "lid-open-battery".to_string(),
+            ui_ok: true,
+            kind: "uia".to_string(),
+            signals: PowerSignals {
+                battery_percent: Some(90),
+                ac_online: Some(true),
+                ..PowerSignals::default()
+            },
+        };
+        let end = LogEvent::End {
+            at_ms: 5_000,
+            scenario: "lid-open-battery".to_string(),
+            reason: "key".to_string(),
+        };
+        let text = format!("{header}{}\n{}\n", tick.format_line(), end.format_line());
+        let summary = summarize_text(&text, &["lid-open-battery"]).unwrap();
+        assert!(
+            summary.text.contains("result: INCOMPLETE"),
+            "{}",
+            summary.text
+        );
+        assert!(
+            summary.text.contains("ac mismatches: 1"),
+            "{}",
+            summary.text
+        );
+
+        let done = format!(
+            "# scenario=lid-open-plugged\n# planned_secs=60\n{}\n{}\n",
+            LogEvent::Tick {
+                at_ms: 0,
+                scenario: "lid-open-plugged".to_string(),
+                ui_ok: true,
+                kind: "uia".to_string(),
+                signals: PowerSignals {
+                    ac_online: Some(true),
+                    battery_percent: Some(100),
+                    ..PowerSignals::default()
+                },
+            }
+            .format_line(),
+            LogEvent::End {
+                at_ms: 60_000,
+                scenario: "lid-open-plugged".to_string(),
+                reason: "timer".to_string(),
+            }
+            .format_line()
+        );
+        let summary = summarize_text(&done, &["lid-open-plugged"]).unwrap();
+        assert!(
+            summary.text.contains("result: complete"),
+            "{}",
+            summary.text
+        );
+        assert!(
+            summary.text.contains("ac mismatches: 0"),
+            "{}",
+            summary.text
+        );
     }
 
     fn unix_tail() -> u128 {

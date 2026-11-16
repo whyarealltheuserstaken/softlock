@@ -136,6 +136,10 @@ fn parse_event(line: &str, line_number: usize) -> Result<LogEvent, ParseError> {
                     "mhz_limit",
                     "mhz_now",
                     "throttle",
+                    "passive_limit",
+                    "throttle_reasons",
+                    "zone_dc",
+                    "battery_dc",
                 ],
                 line_number,
             )?;
@@ -228,6 +232,42 @@ fn parse_signals(
         None => None,
         Some(token) => parse_bool_token(token).map_err(|_| bad(line_number, "bad throttle"))?,
     };
+    let heat = |key: &str| match value(key) {
+        None => Ok(None),
+        Some("unavailable" | "unknown") => Ok(None),
+        Some(token) => token
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| bad(line_number, "bad heat value")),
+    };
+    let passive = match heat("passive_limit")? {
+        None => None,
+        Some(value) if (0..=100).contains(&value) => Some(value as u8),
+        Some(_) => return Err(bad(line_number, "bad passive limit")),
+    };
+    let reasons = match heat("throttle_reasons")? {
+        None => None,
+        Some(value) if (0..=i64::from(u32::MAX)).contains(&value) => Some(value as u32),
+        Some(_) => return Err(bad(line_number, "bad throttle reasons")),
+    };
+    let zone_dc = match heat("zone_dc")? {
+        None => None,
+        Some(value) if (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&value) => {
+            Some(value as i32)
+        }
+        Some(_) => return Err(bad(line_number, "bad zone temperature")),
+    };
+    let battery_dc = match heat("battery_dc")? {
+        None => None,
+        Some(value) if (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&value) => {
+            Some(value as i32)
+        }
+        Some(_) => return Err(bad(line_number, "bad battery temperature")),
+    };
+    let heat_checked = value("passive_limit").is_some()
+        || value("throttle_reasons").is_some()
+        || value("zone_dc").is_some()
+        || value("battery_dc").is_some();
     Ok(PowerSignals {
         battery_percent: percent,
         ac_online,
@@ -238,6 +278,11 @@ fn parse_signals(
         mhz_limit: mhz("mhz_limit")?,
         mhz_current: mhz("mhz_now")?,
         execution_throttled,
+        heat_checked,
+        passive_limit: passive,
+        throttle_reasons: reasons,
+        zone_dc,
+        battery_dc,
     })
 }
 
@@ -266,6 +311,7 @@ pub struct HeaderMeta {
     pub execution_state: Option<String>,
     pub overlay: Option<String>,
     pub probe: Option<String>,
+    pub planned_secs: Option<u64>,
 }
 
 /// Header keys attach to the scenario named by the latest `# scenario=` line.
@@ -301,6 +347,7 @@ pub fn parse_headers(text: &str) -> std::collections::BTreeMap<String, HeaderMet
             "execution_state" => meta.execution_state = Some(value.to_string()),
             "overlay" => meta.overlay = Some(value.to_string()),
             "probe" => meta.probe = Some(value.to_string()),
+            "planned_secs" => meta.planned_secs = value.parse().ok(),
             _ => {}
         }
     }

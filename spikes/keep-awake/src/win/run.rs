@@ -12,6 +12,8 @@ use windows::core::BOOL;
 
 use crate::analyze::summarize_dir_with;
 use crate::cli::RunSpec;
+use crate::clock::{deadline_reached, sleep_aware_now_ms};
+use crate::guard::RunGuard;
 use crate::logfile::LogFile;
 use crate::logline::format_header;
 use crate::plan::{
@@ -19,12 +21,11 @@ use crate::plan::{
     holding_lines, ready_line, refuse_reason, requests_label, spike_power_plan, status_report,
 };
 use crate::session::RunReport;
+use crate::stop::StopReason;
 use crate::timefmt::{format_unix_millis, unix_now_ms};
 
-use super::overlay::{
-    self, Overlay, STOP_CTRL, STOP_KEY, STOP_MESSAGE, STOP_TIMER, mark_loop_finished, request_stop,
-    stop_reason,
-};
+use super::heat::HeatReader;
+use super::overlay::{self, Overlay, STOP_MESSAGE, mark_loop_finished, request_stop, stop_reason};
 use super::power::{self, PowerHold};
 use super::probe::Probe;
 
@@ -50,20 +51,27 @@ pub fn run(spec: &RunSpec) -> Result<RunReport, String> {
     println!("{}", holding_lines(&spike_power_plan()));
     let overlay = Overlay::show(spec.look)?;
     let probe = Probe::start();
+    let heat = HeatReader::open();
+    let mut guard = RunGuard::default();
     let header = header_text(spec, &machine, probe.mode());
     let mut log = LogFile::create(&spec.log_path(), &header)
         .map_err(|error| format!("Could not write {}: {error}", spec.log_path().display()))?;
     let started = Instant::now();
-    let started_ms = unix_now_ms();
-    let deadline_ms = started_ms.saturating_add(spec.duration_secs.saturating_mul(1000));
+    let start_mono = sleep_aware_now_ms();
+    let duration_ms = spec.duration_secs.saturating_mul(1000);
     let _ctrl = install_ctrl_handler();
     let _finish = FinishGuard;
-    spawn_watchdog(deadline_ms);
+    spawn_watchdog(start_mono, duration_ms);
     let mut ticks = 0usize;
     let mut last_tick = Instant::now();
-    write_tick(&mut log, &probe, &hold, &mut ticks, started)?;
+    note_guard(
+        &mut guard,
+        &write_tick(&mut log, &probe, &heat, &hold, &mut ticks, started)?,
+    );
     println!("Logging to: {}", spec.log_path().display());
     println!("{}", ready_line(spec.scenario, spec.duration_secs));
+    println!("The run stops by itself at 20% battery or if a heat guard trips.");
+    // SAFETY: the timer belongs to the overlay window and is killed before the window is destroyed.
     let timer = unsafe { SetTimer(Some(overlay.hwnd()), 1, 250, None) };
     if timer == 0 {
         return Err("Could not start the timer, so the run was stopped.".to_string());
@@ -71,41 +79,46 @@ pub fn run(spec: &RunSpec) -> Result<RunReport, String> {
 
     let mut message = unsafe { MaybeUninit::<MSG>::zeroed().assume_init() };
     loop {
+        // SAFETY: this thread created the window, so it owns the message queue.
         let rc = unsafe { GetMessageW(&mut message, None, 0, 0) };
         if rc.0 == 0 {
             break;
         }
         if rc.0 < 0 {
-            let _ = log.end(unix_now_ms(), "window");
-            return Err("The window loop failed, so the run was stopped.".to_string());
+            let _ = log.end(unix_now_ms(), StopReason::Window.token());
+            return Err(StopReason::Window.sentence().to_string());
         }
         if message.message == STOP_MESSAGE {
             break;
         }
         if message.message == WM_TIMER {
-            let now = unix_now_ms();
-            if now >= deadline_ms {
-                request_stop(STOP_TIMER);
+            if deadline_reached(start_mono, sleep_aware_now_ms(), duration_ms) {
+                request_stop(StopReason::Timer);
             } else if last_tick.elapsed() >= Duration::from_secs(spec.interval_secs) {
-                write_tick(&mut log, &probe, &hold, &mut ticks, started)?;
+                note_guard(
+                    &mut guard,
+                    &write_tick(&mut log, &probe, &heat, &hold, &mut ticks, started)?,
+                );
                 last_tick = Instant::now();
             }
         }
+        // SAFETY: the message was returned by GetMessageW on this thread.
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
+    // SAFETY: the timer id was set on this window above.
     let _ = unsafe { KillTimer(Some(overlay.hwnd()), 1) };
-    let reason = stop_token(stop_reason());
-    log.end(unix_now_ms(), reason)
+    let reason = stop_reason();
+    log.end(unix_now_ms(), reason.token())
         .map_err(|error| format!("Could not finish the log: {error}"))?;
-    println!("{}", stop_sentence(reason));
+    println!("{}", reason.sentence());
     Ok(RunReport {
         ticks,
-        overlay_shown: true,
-        power_held: true,
-        stop: reason.to_string(),
+        overlay_shown: overlay.is_shown(),
+        power_held: hold.is_held(),
+        stop: reason.token().to_string(),
         log_path: spec.log_path(),
     })
 }
@@ -131,51 +144,50 @@ pub fn smoke() -> Result<(), String> {
     if !report.power_held || !report.overlay_shown || report.ticks < 2 || summary.gaps != 0 {
         let raw = std::fs::read_to_string(spec.log_path()).unwrap_or_default();
         return Err(format!(
-            "Smoke check failed. ticks={} overlay={} gaps={}\n{}\n{raw}",
-            report.ticks, report.overlay_shown, summary.gaps, summary.text
+            "Smoke check failed. ticks={} overlay={} power={} gaps={}\n{}\n{raw}",
+            report.ticks, report.overlay_shown, report.power_held, summary.gaps, summary.text
         ));
     }
     Ok(())
 }
 
+fn note_guard(guard: &mut RunGuard, signals: &crate::signals::PowerSignals) {
+    if let Some(reason) = guard.observe(
+        signals.battery_percent,
+        signals.passive_limit,
+        signals.throttle_reasons,
+        signals.zone_dc,
+        signals.battery_dc,
+        sleep_aware_now_ms(),
+    ) {
+        request_stop(reason);
+    }
+}
+
 fn write_tick(
     log: &mut LogFile,
     probe: &Probe,
+    heat: &HeatReader,
     hold: &PowerHold,
     ticks: &mut usize,
     started: Instant,
-) -> Result<(), String> {
+) -> Result<crate::signals::PowerSignals, String> {
     let at = unix_now_ms();
-    let signals = power::read_signals();
+    let mut signals = power::read_signals();
+    heat.sample_into(&mut signals);
     let (kind, ok) = probe.sample();
     hold.refresh();
     log.tick(at, ok, kind, signals)
         .map_err(|error| format!("Could not write a log line: {error}"))?;
     *ticks += 1;
-    let battery = signals
-        .battery_percent
-        .map(|percent| percent.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let cooling = signals
-        .cooling
-        .map(|mode| match mode {
-            crate::signals::Cooling::Active => "active",
-            crate::signals::Cooling::Passive => "passive",
-            crate::signals::Cooling::Invalid => "invalid",
-        })
-        .unwrap_or("unknown");
-    let throttle = match (signals.speed_limited(), signals.execution_throttled) {
-        (Some(true), _) | (_, Some(true)) => "yes",
-        (Some(false), Some(false)) => "no",
-        _ => "unknown",
-    };
     println!(
-        "+{} {} battery={battery}% cooling={cooling} throttle={throttle} ui={}",
+        "+{} {} {} ui={}",
         format_elapsed(started.elapsed()),
         format_unix_millis(at),
+        signals.progress_note(),
         if ok { "ok" } else { "fail" }
     );
-    Ok(())
+    Ok(signals)
 }
 
 fn header_text(spec: &RunSpec, machine: &crate::plan::MachineView, probe: &str) -> String {
@@ -214,36 +226,18 @@ fn format_elapsed(elapsed: Duration) -> String {
     format!("{:02}:{:02}", total / 60, total % 60)
 }
 
-fn stop_token(code: usize) -> &'static str {
-    match code {
-        STOP_KEY => "key",
-        STOP_CTRL => "ctrl-c",
-        STOP_TIMER => "timer",
-        _ => "stopped",
-    }
-}
-
-fn stop_sentence(reason: &str) -> &'static str {
-    match reason {
-        "key" => "Stopped because a key was pressed.",
-        "ctrl-c" => "Stopped because Ctrl+C was pressed.",
-        "timer" => "The run finished.",
-        _ => "The run stopped.",
-    }
-}
-
-fn spawn_watchdog(deadline_ms: u64) {
+fn spawn_watchdog(start_ms: u64, duration_ms: u64) {
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_millis(200));
             if overlay::loop_finished() {
                 return;
             }
-            let now = unix_now_ms();
-            if now >= deadline_ms {
-                request_stop(STOP_TIMER);
+            let now = sleep_aware_now_ms();
+            if deadline_reached(start_ms, now, duration_ms) {
+                request_stop(StopReason::Timer);
             }
-            if now >= deadline_ms.saturating_add(10_000) {
+            if deadline_reached(start_ms, now, duration_ms.saturating_add(10_000)) {
                 eprintln!("The run did not stop when its time was up.");
                 std::process::exit(1);
             }
@@ -263,6 +257,7 @@ struct CtrlGuard;
 
 impl Drop for CtrlGuard {
     fn drop(&mut self) {
+        // SAFETY: the handler was added on this thread when the guard was created.
         unsafe {
             let _ = SetConsoleCtrlHandler(Some(ctrl_handler), false);
         }
@@ -270,6 +265,7 @@ impl Drop for CtrlGuard {
 }
 
 fn install_ctrl_handler() -> Option<CtrlGuard> {
+    // SAFETY: the handler only posts a stop message. It does not unwind.
     if unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), true) }.is_ok() {
         Some(CtrlGuard)
     } else {
@@ -279,7 +275,7 @@ fn install_ctrl_handler() -> Option<CtrlGuard> {
 }
 
 unsafe extern "system" fn ctrl_handler(_ctrl: u32) -> BOOL {
-    request_stop(STOP_CTRL);
+    request_stop(StopReason::CtrlC);
     BOOL(1)
 }
 

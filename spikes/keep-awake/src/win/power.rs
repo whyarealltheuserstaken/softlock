@@ -32,6 +32,7 @@ pub struct PowerHold {
     flags: EXECUTION_STATE,
     _reason: Box<[u16]>,
     warned: Cell<bool>,
+    held: bool,
 }
 
 impl PowerHold {
@@ -82,7 +83,12 @@ impl PowerHold {
             flags,
             _reason: reason,
             warned: Cell::new(false),
+            held: true,
         })
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.held
     }
 
     pub fn refresh(&self) {
@@ -107,6 +113,7 @@ impl Drop for PowerHold {
 }
 
 fn release_request(request: HANDLE) {
+    // SAFETY: the handle came from PowerCreateRequest and the execution state was set on this thread.
     unsafe {
         let _ = CloseHandle(request);
         let _ = SetThreadExecutionState(ES_CONTINUOUS);

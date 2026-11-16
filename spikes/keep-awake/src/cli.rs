@@ -51,7 +51,9 @@ pub fn usage() -> String {
            --log-dir <path>        where to write logs (default {LOG_DIR})\n\
          \n\
          Each log line has a UTC timestamp, a small UI-automation result, the battery\n\
-         percent, and thermal / power-throttling signals. Logs go to {LOG_DIR}/<scenario>.log.\n",
+         percent, real heat signals, and power-policy throttling readings.\n\
+         A battery test starts only at 80% or more. Any run stops at 20% battery or on a heat guard.\n\
+         Logs go to {LOG_DIR}/<scenario>.log.\n",
         name = PRODUCT_DISPLAY_NAME,
         practice = practice_command(),
         analyze = analyze_command(),

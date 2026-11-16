@@ -10,12 +10,15 @@
 
 mod analyze;
 mod cli;
+mod clock;
+mod guard;
 mod logfile;
 mod logline;
 mod plan;
 mod scenario;
 mod session;
 mod signals;
+mod stop;
 mod timefmt;
 
 #[cfg(windows)]

@@ -288,13 +288,19 @@ pub fn refuse_reason(
         );
     }
     match check_source(scenario.expects_battery(), machine.power_source) {
-        SourceCheck::Match | SourceCheck::Unchecked => None,
-        SourceCheck::UnknownSource => Some(
-            "Windows did not say whether the power cord is plugged in, so the long test was not started."
-                .to_string(),
-        ),
-        SourceCheck::WrongSource => Some(wrong_cord_message(scenario)),
+        SourceCheck::Match | SourceCheck::Unchecked => {}
+        SourceCheck::UnknownSource => {
+            return Some(
+                "Windows did not say whether the power cord is plugged in, so the long test was not started."
+                    .to_string(),
+            );
+        }
+        SourceCheck::WrongSource => return Some(wrong_cord_message(scenario)),
     }
+    if scenario.expects_battery() == Some(true) {
+        return crate::guard::battery_start_refusal(machine.battery_percent);
+    }
+    None
 }
 
 fn wrong_cord_message(scenario: Scenario) -> String {
@@ -508,6 +514,24 @@ mod tests {
             refuse_reason(Scenario::LidClosedBattery, &machine, false)
                 .unwrap()
                 .contains("did not say")
+        );
+        machine.power_source = PowerSource::OnBattery;
+        machine.battery_percent = Some(100);
+        assert_eq!(
+            refuse_reason(Scenario::LidOpenBattery, &machine, false),
+            None
+        );
+        machine.battery_percent = Some(79);
+        assert!(
+            refuse_reason(Scenario::LidClosedBattery, &machine, false)
+                .unwrap()
+                .contains("79%")
+        );
+        machine.battery_percent = None;
+        assert!(
+            refuse_reason(Scenario::LidOpenBattery, &machine, false)
+                .unwrap()
+                .contains("80%")
         );
     }
 
