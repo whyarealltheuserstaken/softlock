@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Approved. Ticket breakdown approved 15 Nov 2026 (31 v1 tickets, 1 deferred). Gaps resolved during ticketing are in Implementation Decision 17. Amended 15 Nov 2026 with two Henry-approved v1 features: the battery and heat floor (Decision 10) and pausing background apps (Decision 18), summarized in Decision 19; ticket 35 added |
+| **Status** | Approved. Ticket breakdown approved 15 Nov 2026 (31 v1 tickets, 1 deferred). Gaps resolved during ticketing are in Implementation Decision 17. Amended 15 Nov 2026 with two Henry-approved v1 features: the battery and heat floor (Decision 10) and pausing background apps (Decision 18), summarized in Decision 19; ticket 35 added. On 16 Nov 2026 Henry decided v1 ships both pause modes, with gentle pause as the default |
 | **Owner** | Henry |
 | **Date** | 15 November 2026 |
 | **Working name** | SoftLock. Pick a new name before public launch (see Further Notes) |
@@ -123,7 +123,7 @@ Stories 80–89 were added on 15 November 2026. They're numbered after the origi
 ### Pausing background apps (optional, off by default)
 
 84. As an owner, I want to pick apps, or confirm a suggested list of busy background apps, that SoftLock pauses while locked, so that my battery and fans go to my agent instead of chat, music or launcher apps.
-85. As an owner, I want a gentle option (Windows Efficiency mode) by default, and a strong option (fully suspend) that I choose per app after a plain warning, so that I decide how hard each app is paused.
+85. As an owner, I want v1 to ship both a gentle pause (Windows Efficiency mode, the default) and a strong pause (fully suspend, opt-in per app), and I want the wizard and settings to say that strong mode freezes the app so its network connections and timers may drop, so that I can choose.
 86. As an owner, I want every paused app resumed when I unlock, when SoftLock falls back to the Windows lock, and after a crash or restart, so that an app is never left frozen.
 87. As an agent, I want SoftLock never to pause my own process tree, the app that was in the foreground when the lock started, or an Efficiency-mode app I bring to the foreground, so that pausing never stalls my task.
 88. As an owner, I want SoftLock never to pause Windows system processes, security software or SoftLock itself, whatever the config file says, so that the pause list can't be used to weaken the lock or my computer's protection.
@@ -495,12 +495,12 @@ pub enum PauseMode { Efficiency, Suspend }                       // Efficiency i
   4. Unlock methods (Hello detected, optional PIN).
   5. Hotkey.
   6. Display mode, with a live preview.
-  7. Keep awake and online: the battery floor (default 15%), whether this computer reports its temperature, and an optional "Pause background apps while locked" picker (off by default, Efficiency mode preselected).
+  7. Keep awake and online: the battery floor (default 15%), whether this computer reports its temperature, and an optional "Pause background apps while locked" picker (off by default). Gentle pause (Efficiency mode, EcoQoS) is preselected. Choosing strong pause (fully suspend) explains that the app is frozen, so its network connections and timers may drop.
   8. Takeover options (all off, each explained).
   9. Disk-encryption check.
   10. Try it: a guided 10-second test lock.
 - **Settings, Keep awake page:** keep awake on or off, keep display on, a battery-floor slider (5–50%), the heat check with the sources this computer reports (or the "doesn't report its temperature" note), and network status.
-- **Settings, Pause background apps page:** an on/off switch, the picker built from `ListRunningApps` with the suggested apps marked for the owner to confirm, a per-app Efficiency or Suspend choice (Suspend shows its warning), and apps that can't be paused shown with the reason. No rules, schedules or conditions.
+- **Settings, Pause background apps page:** an on/off switch, the picker built from `ListRunningApps` with the suggested apps marked for the owner to confirm, and a per-app choice. Gentle pause (Efficiency mode, EcoQoS) is preselected. Strong pause (fully suspend) is opt-in, and choosing it explains that the app is frozen, so its network connections and timers may drop. Apps that can't be paused are shown with the reason. No rules, schedules or conditions.
 - **Tray menu:** Lock now, Lock for real, Open settings, status line, Quit (Quit doesn't stop the Service).
 - The native lock-screen overlay is **not** a webview. It's drawn with Direct2D. The App only *previews* it, by asking the Lock Host to render a preview into a normal window.
 
@@ -550,12 +550,12 @@ Agreed with Henry when the ticket breakdown was approved:
 
 ### 18. Pausing background apps while locked (opt-in)
 
-It's off by default. The owner picks apps in settings, or confirms suggestions, and SoftLock lowers their power use while locked. It's a flat per-user list of up to 32 apps, each with one of two modes. It decides nothing about which apps may run, show through or receive input, so it isn't the planned per-app allowlist or rules feature (Out of Scope).
+It's off by default. v1 ships both modes. Gentle pause is the default, and strong pause is opt-in per app. The owner picks apps in settings, or confirms suggestions, and SoftLock lowers their power use while locked. It's a flat per-user list of up to 32 apps, each with one of two modes. It decides nothing about which apps may run, show through or receive input, so it isn't the planned per-app allowlist or rules feature (Out of Scope). Both modes journal every pause before it happens, resume it on unlock, on fall-back to the Windows lock, and after a crash or restart, act only with the owner's own rights, and never touch system or security processes, SoftLock itself, or the agent's process tree.
 
 | Mode | Mechanism | Undo | Caveats |
 |---|---|---|---|
 | **Efficiency** (default, gentle) | `SetProcessInformation(ProcessPowerThrottling)` with `PROCESS_POWER_THROTTLING_EXECUTION_SPEED` in both the control and state masks (EcoQoS on Windows 11; Low QoS on Windows 10), plus `SetPriorityClass(IDLE_PRIORITY_CLASS)`. This is what Task Manager's Efficiency mode does | Restore the journaled throttling state and priority class | The app keeps running, just slower and on efficient cores. The app can change its own setting back |
-| **Suspend** (strong, chosen per app after a warning) | `NtSuspendProcess` / `NtResumeProcess` from `ntdll`. They're undocumented but have been stable since Windows XP, and Resource Monitor's "Suspend process" uses them | `NtResumeProcess` exactly once for each recorded suspend | The suspend count outlives SoftLock, hence the journal. A suspended app stops answering window messages, drops network and audio, and keeps any locks it held, so anything waiting on it can hang. Use it only for apps the agent never touches |
+| **Suspend** (strong, opt-in per app) | `NtSuspendProcess` / `NtResumeProcess` from `ntdll`. They're undocumented but have been stable since Windows XP, and Resource Monitor's "Suspend process" uses them | `NtResumeProcess` exactly once for each recorded suspend | The app is fully frozen, so network connections and timers may drop. It also stops answering window messages, drops audio, and keeps any locks it held, so anything waiting on it can hang. The wizard and settings say this before the owner can choose it. The suspend count outlives SoftLock, hence the journal. Use it only for apps the agent never touches |
 
 Rejected alternatives:
 - `DebugActiveProcess` freezes the target, but it makes SoftLock its debugger. Only one debugger is allowed, the app can see it (anti-cheat, DRM and apps already being debugged break), and SoftLock would have to pump debug events.
@@ -599,7 +599,7 @@ Henry approved both features for v1 after the Insomnia review (market research a
 - **Battery floor:** default 15%, range 5–50%. It's checked only while Locked with keep-awake on and the computer not charging. A lock asked for below the floor uses the real Windows lock straight away.
 - **Heat floor:** best effort and documented that way. No kernel drivers and no vendor SDKs. If the computer reports nothing, SoftLock says so.
 - **Both floors fail closed** to the real Windows lock, then release keep-awake so the computer can sleep, and show a notice after sign-in.
-- **Pausing:** off by default. Efficiency is the default mode, and Suspend is a per-app choice behind a warning. It runs with the owner's token only, with the fixed denylist and the protected set.
+- **Pausing:** off by default. On 16 Nov 2026 Henry decided v1 ships both modes. Gentle pause (Efficiency mode, EcoQoS throttling) is the default. Strong pause (`NtSuspendProcess`) is an opt-in per-app setting. The setup wizard and the settings page explain that strong mode fully freezes the app, so network connections and timers may drop. Both modes journal every pause and resume it on unlock, on fall-back, and after a crash or restart. Both run with the owner's token only, and neither touches system or security processes, SoftLock itself, or the agent's process tree.
 - **Open-core boundary:** pausing is a flat per-user list in the free core. It isn't the planned allowlist or rules feature and has no rules, schedules, conditions, profiles, remote control or fleet management.
 - **Tickets:** the battery and heat floor goes into ticket 20. Pausing is the new ticket 35 (GitHub #38), blocked by 16, 20 and 23. Its settings page is in 25 and its wizard step in 29.
 
@@ -631,7 +631,7 @@ Henry approved both features for v1 after the Insomnia review (market research a
    - Pausing: probe child processes in the pause list are throttled (read back with `GetProcessInformation`) or suspended (their heartbeat stops), and they're resumed exactly on unlock, on fail-closed, and after the Service is killed and restarted. Denylisted, elevated, foreground-tree and lock-requester-tree probes are never touched.
    - Battery and heat: a simulated low battery or thermal trip while locked ends in the OS lock, and the power requests are released only after that.
    The fail-closed cases run last, in their own job, because they end the runner's interactive session.
-4. **Settings app UI (front end against a mocked IPC).** The wizard flow, settings validation errors, read-only state while locked, sensitive-change confirmation, updater prompts, the battery-floor and heat-check settings, and the pause picker (suggestions, per-app mode, Suspend warning, unpausable apps with reasons), tested with Playwright against the Tauri front end and a fake IPC bridge.
+4. **Settings app UI (front end against a mocked IPC).** The wizard flow, settings validation errors, read-only state while locked, sensitive-change confirmation, updater prompts, the battery-floor and heat-check settings, and the pause picker (suggestions, gentle mode preselected, the strong-mode explanation that the app is fully frozen so network connections and timers may drop, unpausable apps with reasons), tested with Playwright against the Tauri front end and a fake IPC bridge.
 
 Everything else (the Windows backend internals, overlay drawing, hook details) is covered by these seams and doesn't get tests of its own.
 
@@ -698,7 +698,7 @@ Each item is a one-line pass or fail in the release notes.
 | P7 | **CI feasibility.** Do GitHub-hosted Windows runners give a usable interactive desktop for low-level hooks, `SendInput`, overlays and capture, and can the Service be installed there? | A one-day CI spike | Use a self-hosted Windows runner for seam 3 |
 | P8 | **Antivirus and SmartScreen.** An unsigned input-blocking "screen locker" that runs as SYSTEM is likely to trigger false positives. | Scan release candidates with VirusTotal and Microsoft Defender | Submit false-positive reports to Microsoft. Bring code signing forward if blocking is widespread |
 | P9 | **Heat readings are often missing or fake on consumer laptops.** Thermal zones depend on the firmware, and CPU temperature needs a kernel driver. | No separate spike. Ticket 20 records which sources the laptop and the P7 report | The heat floor is documented as best effort, and status says when the computer reports nothing. The battery floor and the firmware's own thermal shutdown still apply |
-| P10 | **Suspending apps can hang other apps** (window messages, held locks, low-level hooks), and `NtSuspendProcess` is undocumented. | No separate spike. Ticket 35 tests it on the runner and on Henry's laptop | Efficiency stays the default. Suspend is per app, behind a warning, and resumed on every exit path. If it proves unsafe, ship Efficiency only |
+| P10 | **Suspending apps can hang other apps** (window messages, held locks, low-level hooks), and `NtSuspendProcess` is undocumented. | No separate spike. Ticket 35 tests it on the runner and on Henry's laptop | v1 ships both modes. Gentle pause (Efficiency) stays the default. Strong pause (Suspend) is opt-in per app: the wizard and settings say the app is fully frozen, so network connections and timers may drop. Every pause is journaled and resumed on every exit path |
 
 ### Contribution, licensing and the open-core split
 
@@ -716,7 +716,7 @@ Candidates to check properly before launch: SoftLatch, SoftVeil, ForegroundLock.
 
 ### Docs that ship with v1
 
-- **User guide:** what SoftLock protects against and what it doesn't, unlock methods, takeover options, display modes, the battery and heat floor (and that the heat check is best effort), pausing background apps (including the Suspend warning), and what to do after a fall-back.
+- **User guide:** what SoftLock protects against and what it doesn't, unlock methods, takeover options, display modes, the battery and heat floor (and that the heat check is best effort), pausing background apps (gentle Efficiency mode by default, and the strong-mode explanation that the app is fully frozen so network connections and timers may drop), and what to do after a fall-back.
 - **"What the background service does":** the same text as the installer page and the hardening table.
 - **Terms and disclaimer:** Apache-2.0 "as is". It must include: "If SoftLock fails while locked, it switches to the real Windows lock, and your agents will pause until you sign in." It also says SoftLock is not anti-theft and not a substitute for disk encryption.
 - **Recovery guide:** how the Service repairs settings after a crash or power loss, and a manual "repair settings" command available from the Start menu for administrators.
