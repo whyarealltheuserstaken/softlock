@@ -40,7 +40,7 @@ struct Session {
 }
 
 impl Session {
-    fn start(panic_after_arm: bool, dev_app: bool) -> Self {
+    fn start(panic: Option<&str>, dev_app: bool) -> Self {
         let _ = gate;
         let root = std::env::temp_dir().join(format!("svc-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -70,8 +70,8 @@ impl Session {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if panic_after_arm {
-            command.env("SOFTLOCK_PANIC", "after-arm");
+        if let Some(mode) = panic {
+            command.env("SOFTLOCK_PANIC", mode);
         } else {
             command.env_remove("SOFTLOCK_PANIC");
         }
@@ -254,7 +254,7 @@ fn type_pin(extra: u64) {
 #[test]
 fn lock_host_idles_before_lock_and_arms_within_500ms() {
     let _guard = gate();
-    let session = Session::start(false, false);
+    let session = Session::start(None, false);
     let probe = Probe::open().expect("probe");
     probe.claim_focus();
     send_virtual_key(VK_F13, 0).expect("idle key");
@@ -280,7 +280,7 @@ fn lock_host_idles_before_lock_and_arms_within_500ms() {
 #[test]
 fn lock_client_lock_blocks_physical_input_and_passes_injected() {
     let _guard = gate();
-    let session = Session::start(false, false);
+    let session = Session::start(None, false);
     let probe = Probe::open().expect("probe");
     probe.claim_focus();
     session.lock().expect("lock");
@@ -309,7 +309,7 @@ fn lock_client_lock_blocks_physical_input_and_passes_injected() {
 #[test]
 fn private_pin_unlocks_and_the_hash_is_not_user_readable() {
     let _guard = gate();
-    let session = Session::start(false, true);
+    let session = Session::start(None, true);
     let probe = Probe::open().expect("probe");
     probe.claim_focus();
     let stored = session.set_pin().expect("set pin");
@@ -372,7 +372,7 @@ fn private_pin_unlocks_and_the_hash_is_not_user_readable() {
 #[test]
 fn service_log_omits_the_pin_and_the_note() {
     let _guard = gate();
-    let session = Session::start(false, true);
+    let session = Session::start(None, true);
     session.set_pin().expect("set pin");
     session.lock().expect("lock");
     thread::sleep(Duration::from_millis(300));
@@ -390,7 +390,7 @@ fn service_log_omits_the_pin_and_the_note() {
 #[test]
 fn panic_while_os_lock_is_down_is_closed_by_the_service() {
     let _guard = gate();
-    let session = Session::start(true, false);
+    let session = Session::start(Some("after-arm"), false);
     let probe = Probe::open().expect("probe");
     probe.claim_focus();
     session.lock().expect("lock");
@@ -410,6 +410,57 @@ fn panic_while_os_lock_is_down_is_closed_by_the_service() {
         "the service reported Unlocked during recovery"
     );
     assert!(recovered, "the service did not restore the guard");
+    let status = session.status().expect("status");
+    assert!(
+        !status.contains("\"Unlocked\""),
+        "recovery ended Unlocked: {status}"
+    );
+}
+
+#[test]
+fn emergency_after_both_os_locks_fail_is_closed_by_the_service() {
+    let _guard = gate();
+    let session = Session::start(Some("callback"), false);
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    session.lock().expect("lock");
+    // The hook callback panics on the next physical key. Both OS locks are
+    // stubbed, so the window thread runs emergency() and drops the hooks.
+    let _ = send_virtual_key(VK_F13, session.extra);
+    let mut saw_unlocked = false;
+    let dropped = wait_for(Duration::from_secs(8), || {
+        if session
+            .status()
+            .ok()
+            .is_some_and(|status| status.contains("\"Unlocked\""))
+        {
+            saw_unlocked = true;
+        }
+        !physical_is_blocked(&probe, session.extra)
+    });
+    assert!(
+        !saw_unlocked,
+        "the service reported Unlocked after emergency()"
+    );
+    assert!(dropped, "emergency() did not drop the hooks");
+    let recovered = wait_for(Duration::from_secs(20), || {
+        if session
+            .status()
+            .ok()
+            .is_some_and(|status| status.contains("\"Unlocked\""))
+        {
+            saw_unlocked = true;
+        }
+        physical_is_blocked(&probe, session.extra)
+    });
+    assert!(
+        !saw_unlocked,
+        "the service reported Unlocked during recovery"
+    );
+    assert!(
+        recovered,
+        "the service did not restore the guard after emergency()"
+    );
     let status = session.status().expect("status");
     assert!(
         !status.contains("\"Unlocked\""),

@@ -365,6 +365,7 @@ Invariants (each one is a test):
   - SCM recovery restarts the Service on crash.
   - While Locked, the Service doesn't accept `SERVICE_CONTROL_STOP`. An uninstall or stop request leads to fail-closed first.
   - If the Service process is killed outright (an administrator-level action), the Lock Host's fall-back covers it.
+- **Closed by the Service watchdog:** a dead Lock Host, and the case where both OS locks fail and a panic then runs `emergency()` (which releases the session and drops the hooks), are closed by the Service. It treats HostExited, missed heartbeats, and a guard-down report as the host being gone, keeps retrying the OS lock, and respawns the Lock Host until the session is locked. That recovery never reports Unlocked.
 
 ### 8. Hardening applied while locked (Windows)
 

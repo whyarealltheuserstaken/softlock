@@ -256,6 +256,15 @@ impl DevLock {
     pub fn panic_in_callback(&self) {
         self.shared.panic_in_callback.store(true, Ordering::Release);
     }
+
+    /// The hook thread has been joined. Its id is 0 only after `remove`.
+    /// Tests wait for this before sending a key that must reach the probe.
+    /// The product path tries the OS lock first and drops the hooks only
+    /// when that lock is unavailable.
+    #[cfg(feature = "simulated-physical")]
+    pub fn hooks_removed(&self) -> bool {
+        self.shared.hook_thread_id.load(Ordering::Acquire) == 0
+    }
 }
 
 impl Drop for DevLock {
@@ -447,6 +456,13 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             monitors: shared.monitors.load(Ordering::Acquire),
         },
     );
+    // After Ready, so the service has a locked host to watch. The next hook
+    // callback panics. With the OS lock stubbed, this thread then runs
+    // `emergency()` and drops the hooks.
+    #[cfg(feature = "simulated-physical")]
+    if std::env::var("SOFTLOCK_PANIC").ok().as_deref() == Some("callback") {
+        shared.panic_in_callback.store(true, Ordering::Release);
+    }
     if ready.send(Ok(elapsed)).is_err() {
         shutdown(&shared);
         return;

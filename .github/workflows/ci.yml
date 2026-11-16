@@ -195,12 +195,35 @@ jobs:
           grep -F "the_heartbeat_watchdog_fires ... ok" target/seam3-lock-host.txt
           grep -F "both_os_lock_paths_failing_keeps_the_guard_and_retries ... ok" target/seam3-lock-host.txt
           grep -F "a_liveness_miss_fail_closes ... ok" target/seam3-lock-host.txt
-          grep -F "a_window_thread_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
+          awk '/^test a_window_thread_panic_tries_the_os_lock_then_drops_the_hooks \.\.\./ { found = 1; pending = 1; next }
+               pending && /^test / { exit 1 }
+               pending && /^ok$/ { pending = 0; exit 0 }
+               END { exit (found && !pending ? 0 : 1) }' target/seam3-lock-host.txt
           grep -F "failing_closed_wrong_pins_then_a_correct_pin_during_backoff_stays_locked ... ok" target/seam3-lock-host.txt
           grep -F "failing_closed_correct_pin_releases_after_backoff ... ok" target/seam3-lock-host.txt
           grep -F "a_hook_thread_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
-          grep -F "a_liveness_thread_panic_tries_the_os_lock_without_trapping_input ... ok" target/seam3-lock-host.txt
+          awk '/^test a_liveness_thread_panic_tries_the_os_lock_without_trapping_input \.\.\./ { found = 1; pending = 1; next }
+               pending && /^test / { exit 1 }
+               pending && /^ok$/ { pending = 0; exit 0 }
+               END { exit (found && !pending ? 0 : 1) }' target/seam3-lock-host.txt
           grep -F "a_callback_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
+      - name: Callback panic loop
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p softlock-seam3 --features dev-launch \
+            --target x86_64-pc-windows-msvc --test lock_host --no-run \
+            --message-format=json > target/lock-host-build.json
+          exe_win=$(python .github/lock-host-test-exe.py target/lock-host-build.json)
+          exe=$(cygpath -u "$exe_win")
+          test -f "$exe"
+          passes=0
+          for i in $(seq 1 20); do
+            "$exe" --exact a_callback_panic_tries_the_os_lock_then_drops_the_hooks --test-threads=1 --nocapture
+            passes=$((passes + 1))
+          done
+          echo "callback panic loop: ${passes} passed"
+          test "$passes" -eq 20
       - name: Service authority
         shell: bash
         run: |
@@ -231,6 +254,7 @@ jobs:
           grep -F "private_pin_unlocks_and_the_hash_is_not_user_readable ... ok" target/seam3-service.txt
           grep -F "service_log_omits_the_pin_and_the_note ... ok" target/seam3-service.txt
           grep -F "panic_while_os_lock_is_down_is_closed_by_the_service ... ok" target/seam3-service.txt
+          grep -F "emergency_after_both_os_locks_fail_is_closed_by_the_service ... ok" target/seam3-service.txt
           grep -F "installed_service_runs_as_local_system_and_rejects_session_zero ... ok" target/seam3-service.txt
       - name: Release build of the Windows target omits the test feature
         shell: bash

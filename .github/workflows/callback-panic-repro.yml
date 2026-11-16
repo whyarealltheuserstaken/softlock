@@ -1,0 +1,81 @@
+name: Callback panic repro
+
+# CI gates the same test at 20 runs on each Windows image.
+# This loop is 50 runs and writes the panic location when SOFTLOCK_PANIC_LOG is set.
+# Manual only. One-off 50-run evidence: run 43956651555 on ecf6a0f.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: callback-panic-repro-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  loop:
+    name: callback panic x50 (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Windows target
+        run: rustup target add x86_64-pc-windows-msvc
+      - name: Loop the callback panic test
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          msys_log="$PWD/target/callback-panic.log"
+          win_log=$(cygpath -w "$msys_log")
+          export SOFTLOCK_PANIC_LOG="$win_log"
+          echo "image=${IMAGE_NAME}" > "$msys_log"
+          cargo test --locked -p softlock-seam3 --features dev-launch \
+            --target x86_64-pc-windows-msvc --test lock_host --no-run \
+            --message-format=json > target/lock-host-build.json
+          exe_win=$(python .github/lock-host-test-exe.py target/lock-host-build.json)
+          exe=$(cygpath -u "$exe_win")
+          if [[ ! -f "$exe" ]]; then
+            echo "test executable not found: $exe"
+            exit 1
+          fi
+          echo "exe=$exe" | tee -a target/callback-panic-runs.txt
+          fails=0
+          for i in $(seq 1 50); do
+            set +e
+            "$exe" --exact a_callback_panic_tries_the_os_lock_then_drops_the_hooks --test-threads=1 --nocapture >"target/run-$i.txt" 2>&1
+            code=$?
+            set -e
+            echo "run $i exit $code" | tee -a target/callback-panic-runs.txt
+            if [[ "$code" -ne 0 ]]; then
+              fails=$((fails + 1))
+              {
+                echo "----- run $i output -----"
+                cat "target/run-$i.txt"
+              } >> target/callback-panic-runs.txt
+            fi
+          done
+          echo "failures=$fails" | tee -a target/callback-panic-runs.txt
+          if [[ "$fails" -ne 0 ]]; then
+            exit 1
+          fi
+      - name: Upload panic log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: callback-panic-${{ matrix.image }}
+          path: |
+            target/callback-panic.log
+            target/callback-panic-runs.txt
+          if-no-files-found: warn

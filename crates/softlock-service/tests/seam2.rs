@@ -278,6 +278,14 @@ fn spec_invariant_3_names_the_emergency_path() {
         spec.contains("never reports Unlocked"),
         "invariant 3 does not say how the service closes the path"
     );
+    assert!(
+        spec.contains("runs `emergency()`"),
+        "section 7 does not name the emergency() case the watchdog closes"
+    );
+    assert!(
+        !spec.contains("Known gap, until ticket 13"),
+        "section 7 still leaves the emergency() case open"
+    );
 }
 
 #[test]
