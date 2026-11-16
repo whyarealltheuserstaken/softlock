@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -9,7 +10,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
@@ -44,9 +45,25 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --features softlock-core/test-support -- -D warnings
+      - name: Core has no Windows-only dependency
+        run: cargo build -p softlock-core --all-targets
       - name: Seam 1
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --features softlock-core/test-support
+      - name: test-support stays out of product builds
+        shell: bash
+        run: |
+          mkdir -p target
+          cargo tree -e features --locked \
+            -p softlock-app -p softlock-service -p softlock-lockhost \
+            -p softlock-broker -p softlock-windows -p softlock-macos -p softlock-linux \
+            > target/product-features.txt
+          if grep -F test-support target/product-features.txt; then
+            echo "test-support feature reached a product crate"
+            exit 1
+          fi
 
   deny:
     name: licenses and advisories

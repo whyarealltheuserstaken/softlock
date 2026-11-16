@@ -17,5 +17,12 @@ crate-type = ["rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 softlock-core = { path = "../../softlock-core" }
 tauri = { version = "2", features = [] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+softlock-linux = { path = "../../softlock-linux" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+softlock-macos = { path = "../../softlock-macos" }

@@ -1,0 +1,11 @@
+[package]
+name = "softlock-macos"
+description = "macOS platform backend. Not implemented."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+softlock-core = { path = "../softlock-core" }

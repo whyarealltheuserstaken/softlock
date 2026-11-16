@@ -1,0 +1,11 @@
+---
+source: crates/softlock-core/tests/seam1.rs
+expression: value
+---
+{
+  "id": 11,
+  "kind": "Config",
+  "revision": 4,
+  "toml": "schema_version = 1\n",
+  "v": 1
+}

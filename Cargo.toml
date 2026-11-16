@@ -3,11 +3,14 @@ resolver = "3"
 members = [
     "crates/softlock-core",
     "crates/softlock-windows",
+    "crates/softlock-macos",
+    "crates/softlock-linux",
     "crates/softlock-service",
     "crates/softlock-lockhost",
     "crates/softlock-broker",
     "crates/softlock-app/src-tauri",
 ]
+exclude = ["spikes/desktop-proof"]
 
 [workspace.package]
 version = "0.1.0"

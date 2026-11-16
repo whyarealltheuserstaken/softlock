@@ -13,3 +13,7 @@ No contributor agreement is required while the maintainer is the only author. A 
 ## Tests
 
 Behavior changes at the seams in `docs/SPEC.md` (Testing Decisions) are test-first: one failing seam test, then the code that makes it pass. `cargo test --workspace` runs seam 1. `npm run test:e2e` in `crates/softlock-app` runs seam 4.
+
+## Platforms
+
+macOS and Linux are not implemented. Their backends compile, report every capability as unsupported, and the settings app shows the unsupported-platform message on those systems. Design notes for the later phases live in `docs/platforms/macos.md` and `docs/platforms/linux.md`.

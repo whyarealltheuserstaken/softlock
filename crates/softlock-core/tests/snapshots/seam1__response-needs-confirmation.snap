@@ -1,0 +1,12 @@
+---
+source: crates/softlock-core/tests/seam1.rs
+expression: value
+---
+{
+  "fields": [
+    "unlock.methods"
+  ],
+  "id": 11,
+  "kind": "NeedsConfirmation",
+  "v": 1
+}

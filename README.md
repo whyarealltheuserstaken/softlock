@@ -10,6 +10,8 @@ If SoftLock fails while locked, it switches to the real Windows lock, and your a
 
 - `crates/softlock-core` — shared library with no operating-system calls
 - `crates/softlock-windows` — Windows backend
+- `crates/softlock-macos` — macOS backend stub (not implemented)
+- `crates/softlock-linux` — Linux backend stub (not implemented)
 - `crates/softlock-service` — background service
 - `crates/softlock-lockhost` — lock screen and input guard
 - `crates/softlock-broker` — Windows Hello broker

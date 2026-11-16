@@ -1,0 +1,14 @@
+---
+source: crates/softlock-core/tests/seam1.rs
+expression: value
+---
+{
+  "capabilities": [
+    "lock"
+  ],
+  "id": 11,
+  "kind": "Hello",
+  "service_version": "0.1.0",
+  "state": "Unlocked",
+  "v": 1
+}

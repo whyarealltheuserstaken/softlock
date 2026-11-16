@@ -1,0 +1,10 @@
+---
+source: crates/softlock-core/tests/seam1.rs
+expression: value
+---
+{
+  "id": 11,
+  "kind": "InstallUpdate",
+  "v": 1,
+  "version": "0.2.0"
+}
