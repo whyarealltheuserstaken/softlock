@@ -7,6 +7,17 @@ members = [
     "crates/softlock-lockhost",
     "crates/softlock-broker",
     "crates/softlock-app/src-tauri",
+    "spikes/ctrl-alt-del",
+]
+# `cargo build --release` builds these crates only. The spike is a member so
+# `cargo test --workspace` still runs it, and it is not part of a release build.
+default-members = [
+    "crates/softlock-core",
+    "crates/softlock-windows",
+    "crates/softlock-service",
+    "crates/softlock-lockhost",
+    "crates/softlock-broker",
+    "crates/softlock-app/src-tauri",
 ]
 
 [workspace.package]
