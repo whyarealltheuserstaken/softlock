@@ -37,6 +37,12 @@ Seam 3 runs on the `windows-2022` and `windows-2025` GitHub runners. It opens a 
 cargo test -p softlock-lockhost --features simulated-physical --lib
 ```
 
+The dev launch is also off in a release build. On Windows, pass an Argon2id PHC string with the spec parameters. The PIN is typed after the overlay is up; it is not an argument:
+
+```bash
+cargo run -p softlock-lockhost --features dev-launch -- <argon2id-phc>
+```
+
 Seam 4 runs the Tauri front end against an empty fake IPC bridge:
 
 ```bash

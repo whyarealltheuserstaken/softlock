@@ -14,6 +14,7 @@ mod heartbeat;
 mod ipc;
 mod journal;
 mod name;
+mod pin;
 mod platform;
 mod state;
 
@@ -35,6 +36,10 @@ pub use journal::{Journal, JournalEntry};
 pub use name::{
     APP_BUNDLE_ID, APP_PACKAGE_NAME, PRODUCT_DISPLAY_NAME, SERVICE_DISPLAY_NAME, SERVICE_ID,
     SERVICE_NAME, pipe_name, registry_key,
+};
+pub use pin::{
+    PIN_MEMORY_KIB, PIN_PARALLELISM, PIN_SALT_LEN, PIN_TIME_COST, PinHashError, hash_softlock_pin,
+    verify_softlock_pin,
 };
 pub use platform::{
     AwakeGuard, AwakeRequest, CapabilityReport, Credentials, DiskEncryption, EncryptionStatus,
