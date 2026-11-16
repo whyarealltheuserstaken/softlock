@@ -493,6 +493,12 @@ pub fn pin_directory() -> PathBuf {
     if let Ok(dir) = std::env::var("SOFTLOCK_PIN_DIR") {
         return PathBuf::from(dir);
     }
+    service_data_directory()
+}
+
+/// `C:\ProgramData\<service name>` on Windows. Ignores the test override so
+/// service start can secure this directory before any log write.
+pub fn service_data_directory() -> PathBuf {
     default_pin_directory()
 }
 

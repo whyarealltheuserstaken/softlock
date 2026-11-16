@@ -135,8 +135,17 @@ pub struct FileLog {
 
 impl FileLog {
     pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        // The parent is created by `secure_service_directory` before this
+        // call. `create_dir_all` here would inherit ProgramData's DACL and
+        // let Users plant files in the service directory.
+        #[cfg(windows)]
+        let data_dir = crate::service_data_directory();
+        #[cfg(windows)]
+        if path.parent() == Some(data_dir.as_path()) && crate::secrets::running_as_system() {
+            let file = crate::secrets::open_secured_log(path)?;
+            return Ok(Self {
+                file: Mutex::new(file),
+            });
         }
         let file = std::fs::OpenOptions::new()
             .create(true)

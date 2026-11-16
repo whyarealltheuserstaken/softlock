@@ -15,7 +15,7 @@ mod windows;
 
 pub use authority::{
     Authority, HostAction, HostFault, HostLoss, admit_client, dev_pin_allowed, image_is_inside,
-    log_path, pin_directory, pipe_path, role_for_image, stub_os_lock,
+    log_path, pin_directory, pipe_path, role_for_image, service_data_directory, stub_os_lock,
 };
 pub use log::{Capture, FileLog, allowed_field, audit};
 pub use pincheck::PinChecker;
@@ -23,7 +23,7 @@ pub use platform::{ArmWait, OsLock, ServicePlatform};
 pub use secrets::PinStore;
 
 #[cfg(windows)]
-pub use secrets::user_read_denied;
+pub use secrets::{SYSTEM_ONLY_SDDL, dacl_sddl, is_reparse_point, user_read_denied};
 
 #[cfg(windows)]
 pub use windows::{run_foreground, run_service, run_session_probe};

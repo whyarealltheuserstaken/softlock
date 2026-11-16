@@ -240,6 +240,7 @@ jobs:
           grep -F "correct_pin_consumes_the_service_nonce ... ok" target/seam2-service.txt
           grep -F "spec_invariant_3_names_the_emergency_path ... ok" target/seam2-service.txt
           grep -F "os_lock_success_moves_to_os_locked_until_the_session_unlocks ... ok" target/seam2-service.txt
+          grep -F "another_sessions_lock_does_not_move_the_console ... ok" target/seam2-service.txt
           cargo build --locked -p softlock-service -p softlock-lockhost \
             --features softlock-service/simulated-physical,softlock-lockhost/simulated-physical \
             --target x86_64-pc-windows-msvc
@@ -260,6 +261,8 @@ jobs:
           grep -F "lock_host_token_is_system_in_the_console_session ... ok" target/seam3-service.txt
           grep -F "service_stop_while_locked_keeps_input_blocked ... ok" target/seam3-service.txt
           grep -F "local_system_pin_file_is_rewritten_and_unreadable ... ok" target/seam3-service.txt
+          grep -F "planted_directory_junction_and_temp_file_are_not_adopted ... ok" target/seam3-service.txt
+          grep -F "several_pipe_instances_accept_at_once ... ok" target/seam3-service.txt
       - name: Service race loops
         shell: bash
         run: |

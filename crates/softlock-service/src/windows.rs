@@ -37,7 +37,9 @@ use windows::Win32::System::Pipes::{
     GetNamedPipeClientProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
-use windows::Win32::System::RemoteDesktop::{WTSDisconnectSession, WTSGetActiveConsoleSessionId};
+use windows::Win32::System::RemoteDesktop::{
+    WTSDisconnectSession, WTSGetActiveConsoleSessionId, WTSSESSION_NOTIFICATION,
+};
 use windows::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_SESSIONCHANGE, SERVICE_ACCEPT_STOP,
     SERVICE_CONTROL_SESSIONCHANGE, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_STATUS,
@@ -144,7 +146,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
 unsafe extern "system" fn control_handler(
     control: u32,
     event_type: u32,
-    _data: *mut core::ffi::c_void,
+    data: *mut core::ffi::c_void,
     _context: *mut core::ffi::c_void,
 ) -> u32 {
     if control == SERVICE_CONTROL_STOP {
@@ -153,7 +155,7 @@ unsafe extern "system" fn control_handler(
         set_status(SERVICE_STOP_PENDING, 0, 2_000);
         STOP_REQUESTED.store(true, Ordering::Release);
     }
-    if let Some(event) = session_event(control, event_type)
+    if let Some(event) = session_event(control, event_type, data, console_session())
         && let Some(sender) = SESSION_TX
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -164,8 +166,23 @@ unsafe extern "system" fn control_handler(
     0
 }
 
-fn session_event(control: u32, event_type: u32) -> Option<SessionEvent> {
-    if control != SERVICE_CONTROL_SESSIONCHANGE {
+/// A lock or unlock for any session other than the console session is ignored.
+/// `data` is the `WTSSESSION_NOTIFICATION` the service control manager passes
+/// for `SERVICE_CONTROL_SESSIONCHANGE`.
+fn session_event(
+    control: u32,
+    event_type: u32,
+    data: *mut core::ffi::c_void,
+    console: u32,
+) -> Option<SessionEvent> {
+    if control != SERVICE_CONTROL_SESSIONCHANGE || data.is_null() {
+        return None;
+    }
+    let note = unsafe { &*data.cast::<WTSSESSION_NOTIFICATION>() };
+    if note.cbSize < std::mem::size_of::<WTSSESSION_NOTIFICATION>() as u32 {
+        return None;
+    }
+    if note.dwSessionId != console {
         return None;
     }
     match event_type {
@@ -176,7 +193,17 @@ fn session_event(control: u32, event_type: u32) -> Option<SessionEvent> {
 }
 
 fn serve(probe: Option<PathBuf>) -> i32 {
-    let _ = FileLog::create(&log_path()).map(tracing::subscriber::set_global_default);
+    // Secure ProgramData before the log exists. FileLog must not create that
+    // directory itself: create_dir_all would inherit a DACL that lets Users
+    // plant files there.
+    let _ = crate::secrets::secure_service_directory(&crate::service_data_directory());
+    let log = log_path();
+    if let Some(parent) = log.parent()
+        && parent != crate::service_data_directory()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = FileLog::create(&log).map(tracing::subscriber::set_global_default);
     let mode = if stub_os_lock() {
         OsLock::Fails
     } else {
@@ -1184,5 +1211,75 @@ fn set_status(
     };
     unsafe {
         let _ = SetServiceStatus(handle, &status);
+    }
+}
+
+#[cfg(test)]
+mod session_filter {
+    use super::session_event;
+    use softlock_core::SessionEvent;
+    use windows::Win32::System::RemoteDesktop::WTSSESSION_NOTIFICATION;
+    use windows::Win32::System::Services::SERVICE_CONTROL_SESSIONCHANGE;
+    use windows::Win32::UI::WindowsAndMessaging::{WTS_SESSION_LOCK, WTS_SESSION_UNLOCK};
+
+    #[test]
+    fn another_sessions_lock_does_not_move_the_console() {
+        let console = 2u32;
+        let mut other = WTSSESSION_NOTIFICATION {
+            cbSize: std::mem::size_of::<WTSSESSION_NOTIFICATION>() as u32,
+            dwSessionId: 5,
+        };
+        let other_ptr = (&mut other as *mut WTSSESSION_NOTIFICATION).cast::<core::ffi::c_void>();
+        assert!(
+            session_event(
+                SERVICE_CONTROL_SESSIONCHANGE,
+                WTS_SESSION_LOCK,
+                other_ptr,
+                console
+            )
+            .is_none()
+        );
+        assert!(
+            session_event(
+                SERVICE_CONTROL_SESSIONCHANGE,
+                WTS_SESSION_UNLOCK,
+                other_ptr,
+                console
+            )
+            .is_none()
+        );
+        let mut same = WTSSESSION_NOTIFICATION {
+            cbSize: std::mem::size_of::<WTSSESSION_NOTIFICATION>() as u32,
+            dwSessionId: console,
+        };
+        let same_ptr = (&mut same as *mut WTSSESSION_NOTIFICATION).cast::<core::ffi::c_void>();
+        assert_eq!(
+            session_event(
+                SERVICE_CONTROL_SESSIONCHANGE,
+                WTS_SESSION_LOCK,
+                same_ptr,
+                console
+            ),
+            Some(SessionEvent::OsLocked)
+        );
+        assert_eq!(
+            session_event(
+                SERVICE_CONTROL_SESSIONCHANGE,
+                WTS_SESSION_UNLOCK,
+                same_ptr,
+                console
+            ),
+            Some(SessionEvent::OsUnlocked)
+        );
+        assert!(session_event(SERVICE_CONTROL_SESSIONCHANGE, 1, same_ptr, console).is_none());
+        assert!(
+            session_event(
+                SERVICE_CONTROL_SESSIONCHANGE,
+                WTS_SESSION_LOCK,
+                std::ptr::null_mut(),
+                console
+            )
+            .is_none()
+        );
     }
 }
