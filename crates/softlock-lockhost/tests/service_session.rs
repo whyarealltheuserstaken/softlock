@@ -344,10 +344,29 @@ fn private_pin_unlocks_and_the_hash_is_not_user_readable() {
         }),
         "the correct pin did not unlock"
     );
-    send_virtual_key(VK_F13, session.extra).expect("after unlock");
-    probe
-        .wait_for_key(VK_F13, Duration::from_secs(3))
-        .expect("input stayed blocked after unlock");
+    // Status flips when the service accepts the PIN. The host drops its hooks
+    // when the following Disarm arrives, so a physical key is retried until
+    // one reaches the probe.
+    let before = probe
+        .inputs()
+        .iter()
+        .filter(|input| input.virtual_key == VK_F14)
+        .count();
+    assert!(
+        wait_for(Duration::from_secs(8), || {
+            if send_virtual_key(VK_F14, session.extra).is_err() {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(40));
+            probe
+                .inputs()
+                .iter()
+                .filter(|input| input.virtual_key == VK_F14)
+                .count()
+                > before
+        }),
+        "input stayed blocked after unlock"
+    );
 }
 
 #[test]
@@ -424,15 +443,18 @@ fn installed_service_runs_as_local_system_and_rejects_session_zero() {
     let _ = Command::new("sc.exe").args(["stop", &name]).output();
     let _ = Command::new("sc.exe").args(["delete", &name]).output();
     thread::sleep(Duration::from_millis(500));
-    let bin = format!(
-        r#""{}" --scm --probe "{}""#,
-        service.display(),
-        probe.display()
+    // sc.exe takes everything after the binPath value as its own options.
+    // The exe and `--scm` have to be one quoted ImagePath, or `--scm` is
+    // parsed as an sc option and create prints its usage.
+    let bin_path = format!(
+        "binPath= \"{} --scm --probe {}\"",
+        sc_image(&service),
+        sc_image(&probe)
     );
     let created = Command::new("sc.exe")
         .raw_arg("create")
         .raw_arg(&name)
-        .raw_arg(format!("binPath= {bin}"))
+        .raw_arg(bin_path)
         .raw_arg("start= demand")
         .raw_arg("obj= LocalSystem")
         .raw_arg(format!("DisplayName= \"{display}\""))
@@ -465,6 +487,18 @@ fn installed_service_runs_as_local_system_and_rejects_session_zero() {
         body.contains("kind=Unauthorized"),
         "session 0 client was not rejected: {body}"
     );
+}
+
+/// A path with a space is quoted inside the binPath value. sc.exe keeps
+/// `\"` as a quote in that value, which is what the service control manager
+/// needs in order to find the executable.
+fn sc_image(path: &Path) -> String {
+    let text = path.display().to_string();
+    if text.contains(' ') {
+        format!("\\\"{text}\\\"")
+    } else {
+        text
+    }
 }
 
 fn physical_is_blocked(probe: &Probe, extra: u64) -> bool {

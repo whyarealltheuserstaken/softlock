@@ -336,6 +336,10 @@ impl Authority {
             });
             bytes.zeroize();
             audit("unlock", &[("method", "softlock_pin")]);
+            // The host is still up until it reads Disarm and removes its hooks.
+            // Clearing the launch flag here must not look like a lost host, or
+            // the supervisor kills the process before that Disarm is applied.
+            self.controller.acknowledge_recovery();
             self.host_ready = false;
             return ServiceToHost::Disarm;
         }
