@@ -40,8 +40,8 @@ fn bundle_identity_uses_the_internal_id() {
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("missing {}: {error}", path.display()));
     let value: serde_json::Value = serde_json::from_str(&text).expect("tauri config");
-    assert_eq!(value["productName"], "deskguard");
-    assert_eq!(value["identifier"], "com.deskguard.app");
+    assert_eq!(value["productName"], "SoftLock");
+    assert_eq!(value["identifier"], "com.softlock.agent");
 }
 
 #[test]
@@ -51,5 +51,5 @@ fn npm_package_is_private_and_uses_the_internal_id() {
         .unwrap_or_else(|error| panic!("missing {}: {error}", path.display()));
     let value: serde_json::Value = serde_json::from_str(&text).expect("package.json");
     assert_eq!(value["private"], true);
-    assert_eq!(value["name"], "deskguard-app");
+    assert_eq!(value["name"], "softlock-agent");
 }

@@ -577,8 +577,8 @@ Each item is a one-line pass or fail in the release notes.
 ### Name
 
 "SoftLock" is a **working name only**. The research found an iPhone security app called SoftLock (softlock.app), a long-running security vendor at softlock.net, HMD's "Softlock" device lock, a near-identical macOS GitHub project, a live "SOFTLOCK STUDIO" Class 9 filing, and the gaming meaning of "softlock". All the obvious softlock domains are taken. To keep a rename cheap:
-- Keep the product name in one constant and in the string resources.
-- Use a neutral internal identifier for the service name, pipe name and registry keys, chosen at the rename.
+- Keep the product name in one constant and in the string resources. The settings app uses that name.
+- The background service's display name is "SoftLock Agent". Its internal ids are derived from that name and live next to the product-name constant: `softlock-agent` where a hyphenated id is conventional (named pipe, package name), and `SoftLockAgent` where Windows wants a PascalCase identifier (service name and registry subkey).
 - Don't publish the crate or package under `softlock`.
 Candidates to check properly before launch: SoftLatch, SoftVeil, ForegroundLock. AgentLock and OverlayLock should be avoided (already used by similar projects).
 

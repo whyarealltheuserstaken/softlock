@@ -1,21 +1,29 @@
-/// User-visible product name. Rename this constant and the string resources together.
+/// User-visible product name. The settings app and the docs use this.
+/// Rename this constant and the string resources together.
 pub const PRODUCT_DISPLAY_NAME: &str = "SoftLock";
 
-/// Stable identifier for the Windows service name, named pipe, and registry key.
-/// It is not the product display name and stays put when the product is renamed.
-pub const INTERNAL_ID: &str = "deskguard";
+/// Display name of the background service.
+pub const SERVICE_DISPLAY_NAME: &str = "SoftLock Agent";
 
-/// Windows service name. This is the internal identifier, not the display name.
+/// Hyphenated id derived from the service display name.
+/// Named pipes and other path-like ids use this form.
+pub const SERVICE_ID: &str = "softlock-agent";
+
+/// PascalCase id derived from the service display name.
+/// The Windows service name and registry subkey use this form.
+pub const SERVICE_ID_PASCAL: &str = "SoftLockAgent";
+
+/// Windows service name.
 pub fn service_name() -> &'static str {
-    INTERNAL_ID
+    SERVICE_ID_PASCAL
 }
 
-/// Named-pipe path. This is the internal identifier, not the display name.
+/// Named-pipe path.
 pub fn pipe_name() -> String {
-    format!(r"\\.\pipe\{INTERNAL_ID}")
+    format!(r"\\.\pipe\{SERVICE_ID}")
 }
 
-/// Registry subkey under HKLM or HKCU. This is the internal identifier, not the display name.
+/// Registry subkey under HKLM or HKCU.
 pub fn registry_key() -> String {
-    format!(r"Software\{INTERNAL_ID}")
+    format!(r"Software\{SERVICE_ID_PASCAL}")
 }

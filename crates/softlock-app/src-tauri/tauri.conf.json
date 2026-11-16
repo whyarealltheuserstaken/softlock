@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "deskguard",
+  "productName": "SoftLock",
   "version": "0.1.0",
-  "identifier": "com.deskguard.app",
+  "identifier": "com.softlock.agent",
   "build": {
     "beforeDevCommand": {
       "script": "npm run dev",
@@ -19,7 +19,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "deskguard",
+        "title": "SoftLock",
         "width": 800,
         "height": 600
       }

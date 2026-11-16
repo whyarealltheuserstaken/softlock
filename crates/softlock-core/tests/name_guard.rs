@@ -1,4 +1,4 @@
-//! Seam 1. The display name stays in one constant and the string resources.
+//! Seam 1. The product name stays in the name constants and the string resources.
 
 mod common;
 
@@ -6,14 +6,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const DISPLAY_NAME: &str = "SoftLock";
-const CONSTANT_REL: &str = "crates/softlock-core/src/name.rs";
-const CONSTANT_LINE: &str = "pub const PRODUCT_DISPLAY_NAME: &str = \"SoftLock\";";
+const NAME_CONSTANTS: &str = "crates/softlock-core/src/name.rs";
+const SETTINGS_APP_CONFIG: &str = "crates/softlock-app/src-tauri/tauri.conf.json";
 const STRING_RESOURCES: &str = "crates/softlock-app/src/strings/";
+
+/// Lines that are allowed to contain the product name. Each must appear once.
+const NAME_CONSTANT_LINES: &[&str] = &[
+    "pub const PRODUCT_DISPLAY_NAME: &str = \"SoftLock\";",
+    "pub const SERVICE_DISPLAY_NAME: &str = \"SoftLock Agent\";",
+    "pub const SERVICE_ID_PASCAL: &str = \"SoftLockAgent\";",
+];
+
+/// The settings app's installed name and window title. Tauri cannot read the Rust constant.
+const SETTINGS_APP_NAME_LINES: &[&str] =
+    &["\"productName\": \"SoftLock\",", "\"title\": \"SoftLock\","];
 
 /// These files quote the spec's required literals. They are not a general exemption.
 const SPEC_LITERAL_FILES: &[&str] = &[
     "crates/softlock-core/tests/name_guard.rs",
     "crates/softlock-core/tests/doc_lint.rs",
+    "crates/softlock-core/tests/publish_guard.rs",
     "crates/softlock-app/e2e/smoke.spec.ts",
 ];
 
@@ -47,7 +59,7 @@ fn display_name_appears_only_in_the_constant_and_string_resources() {
     let mut files = Vec::new();
     collect_source_files(&root, &mut files);
 
-    let mut constant_hits = 0;
+    let mut constant_hits = [0usize; NAME_CONSTANT_LINES.len()];
     let mut violations = Vec::new();
 
     for path in files {
@@ -62,8 +74,15 @@ fn display_name_appears_only_in_the_constant_and_string_resources() {
                 continue;
             }
             let trimmed = line.trim();
-            if rel == CONSTANT_REL && trimmed == CONSTANT_LINE {
-                constant_hits += 1;
+            if rel == NAME_CONSTANTS
+                && let Some(slot) = NAME_CONSTANT_LINES
+                    .iter()
+                    .position(|allowed| trimmed == *allowed)
+            {
+                constant_hits[slot] += 1;
+                continue;
+            }
+            if rel == SETTINGS_APP_CONFIG && SETTINGS_APP_NAME_LINES.contains(&trimmed) {
                 continue;
             }
             if allowed_occurrence(&rel) {
@@ -73,10 +92,9 @@ fn display_name_appears_only_in_the_constant_and_string_resources() {
         }
     }
 
-    assert_eq!(
-        constant_hits, 1,
-        "expected exactly one display-name constant"
-    );
+    for (line, hits) in NAME_CONSTANT_LINES.iter().zip(constant_hits) {
+        assert_eq!(hits, 1, "expected exactly one name constant: {line}");
+    }
     assert!(
         violations.is_empty(),
         "display name found outside the constant and string resources:\n{}",
@@ -86,9 +104,12 @@ fn display_name_appears_only_in_the_constant_and_string_resources() {
 
 #[test]
 fn service_pipe_and_registry_share_one_internal_id() {
-    assert_eq!(softlock_core::service_name(), "deskguard");
-    assert_eq!(softlock_core::pipe_name(), r"\\.\pipe\deskguard");
-    assert_eq!(softlock_core::registry_key(), r"Software\deskguard");
+    assert_eq!(softlock_core::SERVICE_DISPLAY_NAME, "SoftLock Agent");
+    assert_eq!(softlock_core::SERVICE_ID, "softlock-agent");
+    assert_eq!(softlock_core::SERVICE_ID_PASCAL, "SoftLockAgent");
+    assert_eq!(softlock_core::service_name(), "SoftLockAgent");
+    assert_eq!(softlock_core::pipe_name(), r"\\.\pipe\softlock-agent");
+    assert_eq!(softlock_core::registry_key(), r"Software\SoftLockAgent");
 }
 
 #[test]
