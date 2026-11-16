@@ -52,7 +52,9 @@ m01 and m02, in parallel, after Henry approves this set. They do not wait on his
 7. m16, and in parallel m17 and m18
 8. m12 and m19 when an Apple silicon Mac with Touch ID exists
 
-Critical path for the first demo on his Intel Mac: m02, then m03, then m05, then m14, then m15, then m16. m01 and m11 join at m14. m07 joins at m16. Touch ID stays off this path.
+Critical path for the first demo on his Intel Mac, the longest chain in the Blocked-by lines: m02 → m03 → m05 → m10 → m14 → m15 → m16.
+
+m14 is also blocked by m04 → m06, by m01, and by m11. Those chains are shorter and join at m14: m02 → m04 → m06 → m14, and m01 → m11 → m14. m07 joins at m16 (m02 → m07 → m16) and is shorter than the chain through m15. D3 is already accepted, so it adds no ticket. Touch ID stays off this path.
 
 ## Blocking edges
 
@@ -87,4 +89,4 @@ m15 --> m18
 m18 --> m19
 ```
 
-D3 blocks m10. D5 is decided: `SACLockScreenImmediate` via `dlopen`, and the documented screen-saver path when that symbol is missing or the call fails. It does not block m08. D1, D2, D4, D6, and D7 do not block a spike. The Intel Mac details in D1 are still open. D6 blocks any ticket that would claim capture exclusion beyond what m04 and m06 measured. D2 blocks a signing ticket, and this set does not contain one.
+D3 is accepted by the lead and does not block m10. Henry decided D1 (Universal 2, macOS 11, his Intel Mac, arm64 on `macos-latest`) and D5 (`SACLockScreenImmediate` via `dlopen`, then the documented screen-saver path). D5 does not block m08. The lead accepted D2, D4, D6, and D7. The lead decided D8: a failure never ends Unlocked. The Intel Mac details in D1 are still open. D6 blocks any ticket that would claim capture exclusion beyond what m04 and m06 measured. D2 blocks a signing ticket, and this set does not contain one.

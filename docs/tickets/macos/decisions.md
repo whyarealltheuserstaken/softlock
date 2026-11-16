@@ -2,21 +2,17 @@
 
 Read against `23b5a39bc92c2ee32f470256d78be27d030dc59f`. The addendum is [`docs/platforms/macos.md`](../../platforms/macos.md). Nothing here is product code. These are not GitHub issues.
 
-Each item has a recommendation. The tickets assume the recommendation until Henry writes a different answer. Changing an answer rewrites the tickets that name it. It does not rewrite the Windows spec.
+Each item has a recommendation until someone decides it. Changing an answer rewrites the tickets that name it. It does not rewrite the Windows spec.
 
-The lead accepted D1, D2, D3, D4, D6, and D7 on 16 November 2026, as written. D1 stays at macOS 11. D5 is Henry's decision the same day, recorded in that section. The Intel Mac details in D1 are still open.
+Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7 on 16 November 2026, as written. The lead also decided D8 the same day. The Intel Mac details in D1 are still open.
 
-## D1. Minimum macOS version
+## D1. Universal 2, macOS 11, his Intel Mac, arm64 on macos-latest
 
-The approved spec says macOS 11 or later. The deployment target in ticket m01 is 11.0 for both slices.
+**Decision, Henry, from the original grilling:** the macOS build is Universal 2 (`x86_64` and `arm64`). The minimum is macOS 11 or later, and ticket m01 keeps `MACOSX_DEPLOYMENT_TARGET=11.0`. His Intel Mac is the Intel machine. Apple silicon CI is `macos-latest`, which is arm64.
 
-GitHub `macos-latest` is an arm64 image of macOS 15 or macOS 26 (the runner docs and the runner-images list disagreed on 16 November 2026). It will not boot macOS 11. Henry's Intel Mac is the only machine in this plan that might.
+GitHub `macos-latest` is an arm64 image of macOS 15 or macOS 26 (the runner docs and the runner-images list disagreed on 16 November 2026). It will not boot macOS 11. Ticket m02 records the runner's `sw_vers`.
 
-**Recommendation:** keep 11.0 as the deployment target. Do not raise it in this plan. Ticket m02 records the runner's `sw_vers`. If he wants the promise to be "the OS his Intel Mac is running, and whatever `macos-latest` is," he says so and m01's `MACOSX_DEPLOYMENT_TARGET` changes.
-
-**Accepted by the lead, 16 November 2026.** The deployment target stays 11.0. The machine details in the next paragraph are still open.
-
-**Also needed, not a product choice:** the model, the macOS version, laptop or desktop, how many displays, whether it has Touch ID, and whether a second keyboard is available. The kits say "if the machine has one."
+**Still open, not a product choice:** the model, the macOS version, laptop or desktop, how many displays, whether it has Touch ID, and whether a second keyboard is available. The kits say "if the machine has one."
 
 ## D2. Developer ID now, or unsigned like Windows
 
@@ -45,7 +41,7 @@ The spec puts fleet and MDM management out of the public tree.
 
 ## D4. GitHub's Intel macOS runners
 
-GitHub lists `macos-15-intel` and `macos-26-intel` as well as the arm64 `macos-latest` labels. Henry's instruction for this plan is that his Intel Mac is the Intel machine, and Apple silicon is `macos-latest`.
+GitHub lists `macos-15-intel` and `macos-26-intel` as well as the arm64 `macos-latest` labels. D1 already puts the Intel slice on his Mac and the arm64 slice on `macos-latest`. This item is whether the plan also adds GitHub's Intel labels.
 
 **Recommendation:** m01 builds both slices on `macos-latest` and does not add the Intel labels. He runs the x86_64 slice (m11). A Rosetta run on the arm64 runner is not that test. He can add the Intel labels later if he wants a second Intel data point that is not his hardware.
 
@@ -55,7 +51,7 @@ GitHub lists `macos-15-intel` and `macos-26-intel` as well as the arm64 `macos-l
 
 `SACLockScreenImmediate` has no Apple documentation page. It is a private symbol in `login.framework`. The public pages we have do not offer a "lock the screen now" call. The screen-saver-plus-password path is weaker and is the documented lock path.
 
-**Decision, Henry, 16 November 2026:** use `SACLockScreenImmediate`, resolved with `dlopen` and `dlsym`. The binary does not link `login.framework`. If the symbol is missing, or the call fails, use the documented lock path (start the screen saver and require the account password). A missing symbol is not a crash. The login window is not the fallback. Tickets m08 and m17 record a CI test of both failure rows. The Intel Mac details in D1 are still open.
+**Decision, Henry, 16 November 2026:** use `SACLockScreenImmediate`, resolved with `dlopen` and `dlsym`. The binary does not link `login.framework`. If the symbol is missing, or the call fails, use the documented lock path (start the screen saver and require the account password). A missing symbol is not a crash. The login window is not the fallback. When that documented path cannot guarantee a password, D8 applies. The Intel Mac details in D1 are still open.
 
 ## D6. Capture exclusion may be unprovable
 
@@ -72,3 +68,14 @@ Apple's QA1340 says a power assertion cannot prevent forced sleep, and closing t
 **Recommendation:** phase 2 does not offer a lid-close takeover. Keep-awake is idle-sleep and display-sleep only. If his Mac is a laptop, m07 records what the lid actually does and does not turn that into a feature unless the measurement contradicts the QA.
 
 **Accepted by the lead, 16 November 2026,** as written.
+
+## D8. A failure never ends Unlocked
+
+Windows does not return to Unlocked when arming fails or the real lock fails. macOS uses the same rule.
+
+**Decision, the lead, 16 November 2026:**
+
+- At arm time, if `SACLockScreenImmediate` is unavailable and the documented fallback cannot guarantee a password, refuse to arm. "Cannot guarantee" means password-after-screensaver is off, or the delay is not zero. The message tells the owner how to turn that setting on and set the delay to zero.
+- At run time, if both lock paths fail, keep the guard and the overlay up, show an error, keep retrying, and release only on a verified unlock.
+
+Tickets m08 and m17 add the chooser row: documented path unavailable or password not required → never Unlocked; refuse to arm. m08's sheet records the password-after-screensaver setting and the delay.

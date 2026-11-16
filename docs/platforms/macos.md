@@ -2,13 +2,13 @@
 
 | | |
 |---|---|
-| **Status** | Planning only. Not approved as a set, and the tickets are not GitHub issues. The lead accepted D1, D2, D3, D4, D6, and D7 on 16 November 2026. Decision D5 is recorded in section 4. The Intel Mac details in D1 are still open. No product code comes with it. |
+| **Status** | Planning only. Not approved as a set, and the tickets are not GitHub issues. Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7, and decided D8 (a failure never ends Unlocked). The Intel Mac details in D1 are still open. No product code comes with it. |
 | **Date** | 16 November 2026 |
 | **Read against** | `23b5a39bc92c2ee32f470256d78be27d030dc59f` on `main` |
 | **Supersedes** | The macOS bullets that used to live in SPEC.md Implementation Decision 16, and the short phase-2 note that used to be this file |
 | **Does not change** | Windows v1, the lock state machine, the Broker nonce rule, the open-core boundary, or the Linux note |
 
-This is the macOS half of the product, planned in parallel with Windows. The minimum the approved spec already named is macOS 11 on Apple Silicon and Intel. Whether that minimum holds is decision D1 in [`docs/tickets/macos/decisions.md`](../tickets/macos/decisions.md).
+This is the macOS half of the product, planned in parallel with Windows. Henry decided D1 in [`docs/tickets/macos/decisions.md`](../tickets/macos/decisions.md): Universal 2, macOS 11 or later, his Intel Mac for the Intel slice, and `macos-latest` for arm64. The machine details in that decision are still open.
 
 Every claim below is tagged.
 
@@ -63,13 +63,13 @@ Until m05, the guard's draft rule, which the spike may replace, is:
 
 - State id is HID system state and source pid is 0: treat as physical and swallow.
 - Any other state id, or a non-zero source pid: treat as software and pass.
-- A test-only build may also treat a posted event as physical when `kCGEventSourceUserData` equals a per-run random nonce, so CI can exercise the swallow path. Release builds do not contain that path. Ticket m14 adds the release-scan coverage in the same change, as SPEC.md Testing Decisions already require for the Windows feature. The marker strings already scanned are `softlock-simulated-physical-marker` and `softlock_simulated_physical_marker` in `crates/softlock-lockhost/tests/release_binary.rs` at the commit above.
+- A test-only build may also treat a posted event as physical when `kCGEventSourceUserData` equals a per-run random nonce, so CI can exercise the swallow path. Release builds do not contain that path. Ticket m14 adds the release-scan coverage in the same change, as SPEC.md Testing Decisions already require for the Windows feature. The marker strings already scanned are `softlock-simulated-physical-marker` and `softlock_simulated_physical_marker` in `crates/softlock-lockhost/tests/release_binary.rs` at the commit above. Once PR #48 merges, the same scan also names `softlock-dev-launch-marker` and `softlock_dev_launch_marker`.
 
 ### Permissions
 
 **Verified.** Apple's [resetting access to protected resources](https://developer.apple.com/documentation/xcode/resetting-access-to-protected-resources-in-macos) lists three different services: `Accessibility`, `ListenEvent` ("Input Monitoring"), and `PostEvent` ("sending keystrokes"). `tccutil reset <service>` clears a remembered choice so the prompt can appear again.
 
-**Spike m05 and m10.** Which of those three a swallowing session tap actually prompts for. The `tapCreate` page still says "assistive devices," which is the old name for the Accessibility grant. It does not mention Input Monitoring. A listen-only tap and a modifying tap may prompt for different services. SoftLock's tap modifies the stream (it deletes events), so the guess is Accessibility plus Input Monitoring, and PostEvent is not required because SoftLock does not need to inject user-visible input except its own liveness marker. m10 writes the prompt the owner sees, with no MDM profile (decision D3).
+**Spike m05 and m10.** Which of those three a swallowing session tap actually prompts for. The `tapCreate` page still says "assistive devices," which is the old name for the Accessibility grant. It does not mention Input Monitoring. A listen-only tap and a modifying tap may prompt for different services. SoftLock's tap changes the stream (it deletes events). An event tap that changes events usually needs only Accessibility. m10 confirms whether Input Monitoring is also needed. PostEvent is not required because SoftLock does not need to inject user-visible input except its own liveness marker. m10 writes the prompt the owner sees, with no MDM profile (decision D3, accepted by the lead).
 
 Grants stick to the code signature. An ad-hoc signature changes when the binary changes, and the prompt comes back. That is decision D2, not a guess about Apple's policy.
 
@@ -126,7 +126,7 @@ A developer forum thread ([792152](https://developer.apple.com/forums/thread/792
 
 **Spike m07.** Hold `PreventUserIdleSystemSleep` and `PreventUserIdleDisplaySleep` if the SDK still has those names (the spike prints the names that compile). Run a small process that increments a counter on a timer, with the overlay up and with it down, and compare the counts. If the covered process slows, that is a product limit and the wizard says so. `caffeinate` is only a probe. The product calls `IOPMAssertionCreateWithName` so the reason string shows up in `pmset -g assertions`. The spike checks that `caffeinate` exists before using it as a control.
 
-Lid close is forced sleep on the QA1340 page. Phase 2 does not offer lid-close takeover on macOS. Decision D7 is Henry confirming he accepts that. If his Intel Mac is a desktop, m07 records "no lid" and the lid case stays unproven on every machine this plan has.
+Lid close is forced sleep on the QA1340 page. Phase 2 does not offer lid-close takeover on macOS. That is decision D7, accepted by the lead. If his Intel Mac is a desktop, m07 records "no lid" and the lid case stays unproven on every machine this plan has.
 
 ## 4. Fail closed, and FileVault
 
@@ -134,7 +134,12 @@ Fail closed still means the real lock, within about a second, and agents pause u
 
 **Decision D5, Henry, 16 November 2026.** The lock call is `SACLockScreenImmediate` in the private `login.framework`. The binary resolves it with `dlopen` and `dlsym`. It does not link `login.framework`. There is no Apple documentation page for this symbol. It is private SPI. A missing symbol does not crash. A call that returns failure does not crash. Either one takes the documented lock path: start the screen saver and require the account password to leave it. That path is what the public pages give us. It is the weaker path. It depends on the password-after-screensaver setting, and a bystander must not be able to click or type through it back to the desktop. The login window is not this fallback.
 
-**Spike m08.** On Henry's Intel Mac, time both paths. The private call has to show the real lock screen within about a second. The documented path is timed the same way, including whether a click or a key reached the desktop without the account password. Forcing a missing symbol on his OS may be impossible. When it is, the sheet says so, and the CI rows below are the proof of that branch.
+**Decision D8, the lead, 16 November 2026.** A failure never ends Unlocked, the same rule as Windows.
+
+- At arm time, if the private call is unavailable and the documented fallback cannot guarantee a password, refuse to arm. "Cannot guarantee" means password-after-screensaver is off, or the delay is not zero. The message tells the owner how to turn that setting on and set the delay to zero.
+- At run time, if both lock paths fail, keep the guard and the overlay up, show an error, keep retrying, and release only on a verified unlock.
+
+**Spike m08.** On Henry's Intel Mac, time both paths. The private call has to show the real lock screen within about a second. The documented path is timed the same way, including whether a click or a key reached the desktop without the account password. The sheet records the password-after-screensaver setting and the delay. Forcing a missing symbol on his OS may be impossible. When it is, the sheet says so, and the CI rows below are the proof of that branch.
 
 **Verified.** Apple's [FileVault deployment introduction](https://support.apple.com/guide/deployment/intro-to-filevault-dep82064ec40/web) says that after FileVault is on, the user's credentials are required during boot. On Apple silicon and on a Mac with the T2 chip, key handling stays in the Secure Enclave. A forced power-off or reboot is the accepted denial of service, and it lands at that prompt when FileVault is on. That is the same story as BitLocker on Windows.
 
@@ -142,13 +147,14 @@ Fail closed still means the real lock, within about a second, and agents pause u
 
 **Spike m08.** Run `fdesetup status` and `fdesetup isactive` as the console user, not root, and record the output. The wizard's disk-encryption check uses whichever of those works without an admin password. An Intel Mac without a T2 chip does not prove the Secure Enclave path. GitHub runners are not rebooted into the FileVault prompt, so the pre-boot screen is Henry's checklist line if his disk has FileVault on, and it is unproven if it does not.
 
-**Test, tickets m08 and m17, runs in CI.** The chooser is a pure function of two results: whether `dlsym` returned the symbol, and whether that call succeeded. It lives with the macOS `SessionControl` work and the workspace test calls it. The test does not call the live symbol, so the job does not lock the runner. The existing verify job (`cargo test --workspace` on `ubuntu-latest`, `windows-latest`, and `macos-latest` in `.github/workflows/ci.yml`) runs these three rows:
+**Test, tickets m08 and m17, runs in CI.** The chooser is a pure function of three results: whether `dlsym` returned the symbol, whether that call succeeded, and whether the documented path can require a password with a zero delay. It lives with the macOS `SessionControl` work and the workspace test calls it. The test does not call the live symbol, so the job does not lock the runner. The existing verify job (`cargo test --workspace` on `ubuntu-latest`, `windows-latest`, and `macos-latest` in `.github/workflows/ci.yml`) runs these four rows:
 
-1. Symbol missing. The documented path is the one requested.
-2. Symbol present, call failed. The documented path is the one requested.
+1. Symbol missing, and the documented path can require an immediate password. The documented path is the one requested.
+2. Symbol present, call failed, and the documented path can require an immediate password. The documented path is the one requested.
 3. Call succeeded. The documented path is not requested.
+4. Documented path unavailable or password not required → never Unlocked; refuse to arm. This is the private call unavailable while password-after-screensaver is off or the delay is not zero.
 
-A row that skips the documented path, or that takes it after a successful private call, fails the job. m08 lands the function and the test with the probe. m17 keeps the same test green when the service and the lock host call the chooser. Henry's Mac remains the proof that either path shows a lock screen.
+A row that skips the documented path, that takes it after a successful private call, or that arms when row 4 should refuse, fails the job. m08 lands the function and the test with the probe. m17 keeps the same test green when the service and the lock host call the chooser, and it keeps the guard and the overlay up when both paths fail at run time. Henry's Mac remains the proof that either path shows a lock screen, and the sheet there records the setting and the delay.
 
 ## 5. Unlock, against the lock core
 
@@ -182,7 +188,7 @@ The socket is the named-pipe analogue. Same length-prefixed JSON, same verbs, st
 
 **Verified.** The Tauri 2 CLI documents `--target universal-apple-darwin` as the universal macOS target, and says both `aarch64-apple-darwin` and `x86_64-apple-darwin` must be installed. The page is the [Tauri CLI reference](https://v2.tauri.app/reference/cli/). Tauri's own note, from the CLI maintainer on the docs issue, is that this target is built on a Mac.
 
-**Verified, read 16 November 2026.** GitHub's [hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) list `macos-latest` as arm64 (Apple silicon, M1), in the same row as `macos-15` and `macos-26`. The runner-images README and the 1 October 2026 changelog disagree about whether `macos-latest` is still macOS 15 or has moved to macOS 26. Ticket m02 prints `sw_vers` and does not assume which. The same GitHub page lists Intel labels `macos-15-intel` and `macos-26-intel`. This plan does not use them. Decision D4.
+**Verified, read 16 November 2026.** GitHub's [hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) list `macos-latest` as arm64 (Apple silicon, M1), in the same row as `macos-15` and `macos-26`. The runner-images README and the 1 October 2026 changelog disagree about whether `macos-latest` is still macOS 15 or has moved to macOS 26. Ticket m02 prints `sw_vers` and does not assume which. The same GitHub page lists Intel labels `macos-15-intel` and `macos-26-intel`. This plan does not use them. Henry's D1 puts the Intel slice on his Mac and the arm64 slice on `macos-latest`. The lead accepted D4, which is the choice not to add the Intel labels.
 
 **Spike m01.** On `macos-latest`:
 
@@ -203,7 +209,7 @@ The arm64 slice is executed on that runner. The x86_64 slice is executed on Henr
 | **2** | Stays the Windows named pipe. The macOS socket gets the same JSON contract when m15 builds it, as its own test, not as a change to the Windows pipe test. |
 | **3** | Stays `windows-2022` and `windows-2025`. The macOS probe is a separate workflow. It does not grow GDI, DXGI, or Windows.Graphics.Capture assumptions, and seam 3 does not grow ScreenCaptureKit assumptions. |
 | **4** | Stays the Linux Playwright job. The unsupported-platform string stays until a macOS backend reports a capability as supported. |
-| **Release scan** | The test `product_release_binaries` in `crates/softlock-lockhost/tests/release_binary.rs` reads `SOFTLOCK_RELEASE_SCAN_DIR` and prints `scanned release binaries`. It does not understand a fat Mach-O. m01 thins each slice and points the variable at each thinned directory, then scans the fat file as well so a marker that is not inside a slice still fails the job. A later ticket that adds a macOS test-only feature adds the scan in that same change. |
+| **Release scan** | The test `product_release_binaries` in `crates/softlock-lockhost/tests/release_binary.rs` reads `SOFTLOCK_RELEASE_SCAN_DIR` and prints `scanned release binaries`. It does not understand a fat Mach-O. m01 thins each slice and points the variable at each thinned directory, then scans the fat file as well so a marker that is not inside a slice still fails the job. At the commit above the markers are `softlock-simulated-physical-marker` and `softlock_simulated_physical_marker`. Once PR #48 merges, the scan also names `softlock-dev-launch-marker` and `softlock_dev_launch_marker`. A later ticket that adds a macOS test-only feature adds the scan in that same change. |
 
 Simulated physical input on a runner is the nonce in `kCGEventSourceUserData`, and only in the test-only build. It is not a claim that the runner has a keyboard. Physical keys are m05 and the m14 checklist on Henry's Mac.
 
@@ -214,6 +220,6 @@ Simulated physical input on a runner is the nonce in `kCGEventSourceUserData`, a
 - That `CGShieldingWindowLevel()` is the overlay level.
 - That an assertion keeps a Mac awake with the lid shut.
 - That `SACLockScreenImmediate` is a public API.
-- That a missing symbol or a failed call leaves the session unlocked. Both take the documented screen-saver path.
+- That a missing symbol or a failed call leaves the session unlocked. Both take the documented screen-saver path when that path can require an immediate password. Otherwise D8 refuses to arm, or keeps the guard and the overlay up.
 - That Touch ID can be tested on an Intel Mac that has no sensor, or on a GitHub runner.
 - That a Rosetta run of the x86_64 slice replaces Henry's Mac.
