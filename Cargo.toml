@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/softlock-core",
+    "crates/softlock-windows",
+    "crates/softlock-service",
+    "crates/softlock-lockhost",
+    "crates/softlock-broker",
+    "crates/softlock-app/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+rust-version = "1.90"
