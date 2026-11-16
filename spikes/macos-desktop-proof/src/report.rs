@@ -492,7 +492,7 @@ fn window_failure(window: &WindowReport) -> Option<String> {
     if probe_crashed(window.error.as_deref()) {
         return Some("window proof crashed in the probe".to_string());
     }
-    if window.ordered_front && window.key_received {
+    if window.key_received {
         return None;
     }
     match window.error.as_deref() {
@@ -997,10 +997,24 @@ mod tests {
         assert!(failure_reasons(&report).is_empty());
         assert!(render(&report).contains("window-error=CGEventPost"));
 
-        report.window.as_mut().expect("window").error = Some(
-            "CGEventPost reaches the session event stream (taps saw keyCode 0); the window was not key (activation did not make it key), so the app did not receive it"
-                .to_string(),
-        );
+        {
+            let window = report.window.as_mut().expect("window");
+            window.ordered_front = false;
+            window.key_window = true;
+            window.key_received = true;
+            window.error = None;
+        }
+        assert!(failure_reasons(&report).is_empty());
+
+        {
+            let window = report.window.as_mut().expect("window");
+            window.key_received = false;
+            window.ordered_front = false;
+            window.error = Some(
+                "CGEventPost reaches the session event stream (taps saw keyCode 0); the window was not key (activation did not make it key), so the app did not receive it"
+                    .to_string(),
+            );
+        }
         assert!(failure_reasons(&report).is_empty());
 
         report.window.as_mut().expect("window").error = Some("nope".to_string());

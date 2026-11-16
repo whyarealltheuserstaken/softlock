@@ -347,6 +347,10 @@ int macos_window_open(WindowOut *out) {
             }
             stage_line(out, "CGEventPost-done");
             stage_line(out, "key-received");
+            BOOL on_screen_after = window.isVisible && window.screen != nil;
+            BOOL unoccluded_after = (window.occlusionState & NSWindowOcclusionStateVisible) != 0;
+            out->ordered_front = (on_screen_after && unoccluded_after) ? 1 : 0;
+            out->key_window = window.isKeyWindow ? 1 : 0;
             out->key_received = g_key_received != 0 ? 1 : 0;
             stage_line(out, "key-received-done");
             if (monitor != nil) {
