@@ -32,7 +32,11 @@ pub enum HostLoss {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostAction {
     Hold,
-    Respawn,
+    /// `arm` is set only while the session is still locked. After a normal
+    /// unlock the replacement host stays idle.
+    Respawn {
+        arm: bool,
+    },
     RetryLock,
 }
 
@@ -253,11 +257,15 @@ impl Authority {
             if self.controller.recovery_due() {
                 self.controller.acknowledge_recovery();
             }
-            return HostAction::Respawn;
+            return HostAction::Respawn {
+                arm: self.session_needs_a_host(),
+            };
         }
         if self.controller.recovery_due() && !self.host_ready {
             self.controller.acknowledge_recovery();
-            return HostAction::Respawn;
+            return HostAction::Respawn {
+                arm: self.session_needs_a_host(),
+            };
         }
         if self.os_retry_due(now) {
             self.retry_os_lock();

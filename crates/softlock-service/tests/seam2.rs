@@ -99,6 +99,21 @@ fn verified_nonce_is_single_use() {
 }
 
 #[test]
+fn a_dead_host_after_unlock_is_replaced_idle() {
+    let mut authority = authority();
+    authority.install_pin_hash(hash_pin(PIN));
+    let nonce = lock(&mut authority, LockSource::LocalApi);
+    authority
+        .accept_host(secret_message(&nonce, PIN))
+        .expect("unlock");
+    assert!(matches!(authority.state(), LockState::Unlocked));
+    assert_eq!(
+        authority.poll_host(Instant::now(), false),
+        HostAction::Respawn { arm: false }
+    );
+}
+
+#[test]
 fn non_console_client_is_rejected() {
     assert!(!admit_client(0, 1));
     assert!(!admit_client(u32::MAX, 4));
@@ -218,7 +233,7 @@ fn host_loss_while_the_os_lock_is_down_never_unlocks() {
         .unwrap();
     assert_eq!(
         authority.poll_host(Instant::now(), false),
-        HostAction::Respawn
+        HostAction::Respawn { arm: true }
     );
     assert!(matches!(
         authority.state(),

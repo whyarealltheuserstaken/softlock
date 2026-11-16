@@ -223,11 +223,7 @@ fn supervise(
             .try_lock()
             .map(|mut guard| guard.poll_host(Instant::now(), alive))
             .unwrap_or(HostAction::Hold);
-        if action == HostAction::Respawn {
-            let arm_again = authority
-                .try_lock()
-                .map(|guard| guard.session_needs_a_host())
-                .unwrap_or(true);
+        if let HostAction::Respawn { arm: arm_again } = action {
             if let Some(child) = host
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())

@@ -3,6 +3,7 @@
 #![cfg(all(windows, feature = "simulated-physical"))]
 
 use std::fs;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -168,6 +169,20 @@ fn service_exe() -> PathBuf {
 }
 
 fn open_pipe(name: &str) -> Result<HANDLE, String> {
+    let started = Instant::now();
+    loop {
+        match open_pipe_once(name) {
+            Err(error)
+                if error.contains("0x800700E7") && started.elapsed() < Duration::from_secs(2) =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn open_pipe_once(name: &str) -> Result<HANDLE, String> {
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         CreateFileW(
@@ -415,14 +430,12 @@ fn installed_service_runs_as_local_system_and_rejects_session_zero() {
         probe.display()
     );
     let created = Command::new("sc.exe")
-        .args([
-            "create",
-            &name,
-            &format!("binPath= {bin}"),
-            "start= demand",
-            "obj= LocalSystem",
-            &format!("DisplayName= \"{display}\""),
-        ])
+        .raw_arg("create")
+        .raw_arg(&name)
+        .raw_arg(format!("binPath= {bin}"))
+        .raw_arg("start= demand")
+        .raw_arg("obj= LocalSystem")
+        .raw_arg(format!("DisplayName= \"{display}\""))
         .output()
         .expect("sc create");
     assert!(
