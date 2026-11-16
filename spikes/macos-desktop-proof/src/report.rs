@@ -1879,7 +1879,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn sharing_none_omits_the_marker_only_when_the_default_capture_shows_it() {
         let shown = measured_sharing(40, 0);
         let hidden = shown
