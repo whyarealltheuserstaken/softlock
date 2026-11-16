@@ -477,10 +477,16 @@ impl<P: Platform> LockController<P> {
     fn fail_closed(&mut self, reason: FailReason) {
         push_bounded(&mut self.failure_events, reason);
         self.request_os_lock();
+        self.enter(LockState::FailingClosed { reason });
+        // A successful OS lock is confirmation, not another guarded state.
+        // Sitting in FailingClosed here would arm a replacement host while
+        // the workstation is already locked.
         if self.os_lock_unavailable {
             self.recovery_due = true;
+        } else {
+            self.recovery_due = false;
+            self.on_os_lock_confirmed();
         }
-        self.enter(LockState::FailingClosed { reason });
     }
 
     fn on_os_lock_confirmed(&mut self) {
@@ -524,7 +530,8 @@ impl<P: Platform> LockController<P> {
     }
 
     /// Host gone, heartbeats missed, or the guard dropped. A repeat while
-    /// already `FailingClosed` retries the OS lock and asks for a new host.
+    /// already `FailingClosed` retries the OS lock. Success leaves `OsLocked`
+    /// and does not ask for another armed host. Failure stays guarded.
     /// Neither path enters `Unlocked`.
     fn on_host_lost(&mut self, reason: FailReason) {
         let label = match reason {
@@ -537,20 +544,36 @@ impl<P: Platform> LockController<P> {
             LockState::FailingClosed { .. } => {
                 push_bounded(&mut self.failure_events, reason);
                 self.request_os_lock();
-                self.recovery_due = self.os_lock_unavailable;
+                if self.os_lock_unavailable {
+                    self.recovery_due = true;
+                } else {
+                    self.recovery_due = false;
+                    self.on_os_lock_confirmed();
+                }
             }
             _ => self.reject(label),
         }
     }
 
+    /// Stop is not an unlock. `Locked` and `Arming` fail closed, which confirms
+    /// the OS lock when that call works. `FailingClosed` confirms it too, and
+    /// stays guarded when the call still fails.
     fn on_stop(&mut self) {
-        if matches!(
-            self.state,
-            LockState::Locked { .. } | LockState::Arming { .. }
-        ) {
-            self.fail_closed(FailReason::ServiceStop);
-        } else {
-            self.reject("ServiceStopRequested");
+        match self.state.clone() {
+            LockState::Locked { .. } | LockState::Arming { .. } => {
+                self.fail_closed(FailReason::ServiceStop);
+            }
+            LockState::FailingClosed { .. } => {
+                self.request_os_lock();
+                if self.os_lock_unavailable {
+                    self.recovery_due = true;
+                    self.reject("ServiceStopRequested");
+                } else {
+                    self.recovery_due = false;
+                    self.on_os_lock_confirmed();
+                }
+            }
+            _ => self.reject("ServiceStopRequested"),
         }
     }
 

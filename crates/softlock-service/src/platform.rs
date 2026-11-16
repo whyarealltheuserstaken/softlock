@@ -15,17 +15,30 @@ use softlock_core::{
     Secret, SessionControl, SessionEvent, SessionId, UserId, Verdict,
 };
 
+/// How [`SessionControl::os_lock`] behaves.
+///
+/// `Succeeds` reports the lock as held and does not call the operating
+/// system. Seam 2 uses that. `System` is the service process, which calls
+/// `LockWorkStation` or disconnects the console session. `Fails` is the stub
+/// and every test where the OS lock is down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsLock {
+    Fails,
+    Succeeds,
+    System,
+}
+
 pub struct ServicePlatform {
-    fail_os_lock: bool,
+    os_lock: OsLock,
     guard: GuardHealth,
     overlay: OverlayHealth,
     arm: Option<ArmWait>,
 }
 
 impl ServicePlatform {
-    pub fn new(fail_os_lock: bool) -> Self {
+    pub fn new(os_lock: OsLock) -> Self {
         Self {
-            fail_os_lock,
+            os_lock,
             guard: GuardHealth {
                 hook_alive: false,
                 last_physical_input_ms: None,
@@ -43,13 +56,13 @@ impl ServicePlatform {
         self.arm = Some(arm);
     }
 
+    pub fn arm_wait(&self) -> Option<ArmWait> {
+        self.arm.clone()
+    }
+
     pub fn set_report(&mut self, guard: GuardHealth, overlay: OverlayHealth) {
         self.guard = guard;
         self.overlay = overlay;
-    }
-
-    pub fn fail_os_lock(&mut self, fail: bool) {
-        self.fail_os_lock = fail;
     }
 }
 
@@ -81,7 +94,10 @@ impl ArmWait {
         }
     }
 
-    pub fn request(&self) -> bool {
+    /// Marks the slot waiting. Does not block: the caller has to drop the
+    /// authority mutex before [`Self::wait_ready`], or the reader cannot
+    /// accept `HostReady` and the wait never ends.
+    pub fn mark(&self) {
         let mut slot = self
             .inner
             .slot
@@ -89,6 +105,16 @@ impl ArmWait {
             .unwrap_or_else(|poison| poison.into_inner());
         *slot = ArmSlot::Waiting;
         self.inner.cv.notify_all();
+    }
+
+    /// Blocks until [`Self::ready`] or the arm deadline. Call this only after
+    /// releasing the authority mutex.
+    pub fn wait_ready(&self) -> bool {
+        let mut slot = self
+            .inner
+            .slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let deadline = Instant::now() + Duration::from_secs(8);
         while matches!(*slot, ArmSlot::Waiting) {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -166,10 +192,11 @@ impl Default for ArmWait {
 
 impl InputGuard for ServicePlatform {
     fn arm(&mut self, _sink: PhysicalInputSink) -> Result<(), GuardError> {
-        if let Some(wait) = &self.arm
-            && !wait.request()
-        {
-            return Err(GuardError::Failed);
+        if let Some(wait) = &self.arm {
+            // The request thread still holds the authority mutex. Waiting
+            // here deadlocks the reader, which has to accept HostReady
+            // before it may wake this slot.
+            wait.mark();
         }
         self.guard.hook_alive = true;
         Ok(())
@@ -222,17 +249,23 @@ impl SessionControl for ServicePlatform {
     }
 
     fn os_lock(&mut self, session: SessionId) -> Result<(), OsLockError> {
-        if self.fail_os_lock {
-            return Err(OsLockError::Failed);
-        }
-        #[cfg(windows)]
-        {
-            crate::windows::lock_session(session.0)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = session;
-            Ok(())
+        match self.os_lock {
+            OsLock::Fails => Err(OsLockError::Failed),
+            OsLock::Succeeds => {
+                let _ = session;
+                Ok(())
+            }
+            OsLock::System => {
+                #[cfg(windows)]
+                {
+                    crate::windows::lock_session(session.0)
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = session;
+                    Ok(())
+                }
+            }
         }
     }
 

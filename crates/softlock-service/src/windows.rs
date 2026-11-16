@@ -9,53 +9,67 @@ use std::io::Write;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use softlock_core::{
-    NonceBytes, OsLockError, ServiceToHost, decode_host_frame, encode_frame, encode_service,
-    message_json, read_prefixed_frame, write_prefixed_frame,
+    Event, LockState, NonceBytes, OsLockError, ServiceToHost, SessionEvent, decode_host_frame,
+    encode_frame, encode_service, message_json, read_prefixed_frame, write_prefixed_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED,
-    GetLastError, HANDLE, WAIT_TIMEOUT,
+    GetLastError, HANDLE, HLOCAL, LocalFree, WAIT_TIMEOUT,
 };
-use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+};
 use windows::Win32::Security::{
-    CheckTokenMembership, CreateWellKnownSid, PSECURITY_DESCRIPTOR, SE_ASSIGNPRIMARYTOKEN_NAME,
-    SE_INCREASE_QUOTA_NAME, SE_TCB_NAME, SECURITY_ATTRIBUTES, TOKEN_QUERY, WinLocalSystemSid,
+    CheckTokenMembership, CreateWellKnownSid, DuplicateTokenEx, GetTokenInformation,
+    PSECURITY_DESCRIPTOR, SE_ASSIGNPRIMARYTOKEN_NAME, SE_INCREASE_QUOTA_NAME, SE_TCB_NAME,
+    SECURITY_ATTRIBUTES, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_QUERY, TOKEN_USER,
+    TokenPrimary, TokenSessionId, TokenUser, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, CreatePipe, DisconnectNamedPipe,
     GetNamedPipeClientProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-    PIPE_WAIT,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::RemoteDesktop::{WTSDisconnectSession, WTSGetActiveConsoleSessionId};
 use windows::Win32::System::Services::{
-    RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_STOP, SERVICE_RUNNING,
-    SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED,
-    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus, StartServiceCtrlDispatcherW,
+    RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_SESSIONCHANGE, SERVICE_ACCEPT_STOP,
+    SERVICE_CONTROL_SESSIONCHANGE, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_STATUS,
+    SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
+    SERVICE_WIN32_OWN_PROCESS, SetServiceStatus, StartServiceCtrlDispatcherW,
 };
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, CreateProcessW, GetCurrentProcess, GetCurrentProcessId, OpenProcess,
-    OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateProcessAsUserW, CreateProcessW, GetCurrentProcess, GetCurrentProcessId, GetProcessId,
+    OpenProcess, OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
+use windows::Win32::UI::WindowsAndMessaging::{WTS_SESSION_LOCK, WTS_SESSION_UNLOCK};
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::authority::{Authority, HostAction};
 use crate::log::FileLog;
-use crate::platform::{ArmWait, ServicePlatform};
+use crate::platform::{ArmWait, OsLock, ServicePlatform};
 use crate::secrets::PinStore;
 use crate::{
     admit_client, dev_pin_allowed, log_path, pin_directory, pipe_path, role_for_image, stub_os_lock,
 };
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static STATUS: AtomicIsize = AtomicIsize::new(0);
+static HOST_USER: Mutex<String> = Mutex::new(String::new());
+static HOST_SESSION: AtomicU64 = AtomicU64::new(u64::MAX);
+static PIN_STATUS: Mutex<String> = Mutex::new(String::new());
+static SESSION_TX: Mutex<Option<Sender<SessionEvent>>> = Mutex::new(None);
+
+const ACCEPT_CONTROLS: u32 = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SESSIONCHANGE;
 
 pub fn console_session() -> u32 {
     unsafe { WTSGetActiveConsoleSessionId() }
@@ -117,7 +131,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
             None,
         ) {
             STATUS.store(handle.0 as isize, Ordering::Release);
-            set_status(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0);
+            set_status(SERVICE_RUNNING, ACCEPT_CONTROLS, 0);
         }
         let probe = probe_arg();
         let _ = std::panic::catch_unwind(|| {
@@ -129,26 +143,57 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
 
 unsafe extern "system" fn control_handler(
     control: u32,
-    _event_type: u32,
+    event_type: u32,
     _data: *mut core::ffi::c_void,
     _context: *mut core::ffi::c_void,
 ) -> u32 {
     if control == SERVICE_CONTROL_STOP {
-        set_status(SERVICE_STOP_PENDING, 0, 0);
-        STOP.store(true, Ordering::Release);
+        // The supervisor confirms an OS lock before the host is killed.
+        // Setting STOP here would drop the guard while the session is open.
+        set_status(SERVICE_STOP_PENDING, 0, 2_000);
+        STOP_REQUESTED.store(true, Ordering::Release);
+    }
+    if let Some(event) = session_event(control, event_type)
+        && let Some(sender) = SESSION_TX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+    {
+        let _ = sender.send(event);
     }
     0
 }
 
+fn session_event(control: u32, event_type: u32) -> Option<SessionEvent> {
+    if control != SERVICE_CONTROL_SESSIONCHANGE {
+        return None;
+    }
+    match event_type {
+        WTS_SESSION_LOCK => Some(SessionEvent::OsLocked),
+        WTS_SESSION_UNLOCK => Some(SessionEvent::OsUnlocked),
+        _ => None,
+    }
+}
+
 fn serve(probe: Option<PathBuf>) -> i32 {
     let _ = FileLog::create(&log_path()).map(tracing::subscriber::set_global_default);
-    let mut authority = Authority::new(ServicePlatform::new(stub_os_lock()), dev_pin_allowed());
+    let mode = if stub_os_lock() {
+        OsLock::Fails
+    } else {
+        OsLock::System
+    };
+    let mut authority = Authority::new(ServicePlatform::new(mode), dev_pin_allowed());
     if let Ok(Some(hash)) = PinStore::in_dir(&pin_directory()).load() {
         authority.install_pin_hash(hash);
     }
+    remember_pin_status();
     let arm = ArmWait::new();
     authority.platform_mut().set_arm_wait(arm.clone());
     let authority = Arc::new(Mutex::new(authority));
+    let (session_tx, session_rx) = std::sync::mpsc::channel();
+    *SESSION_TX
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(session_tx);
     let writer = Arc::new(Mutex::new(None::<std::sync::mpsc::Sender<Vec<u8>>>));
     let host = Arc::new(Mutex::new(None::<HostChild>));
     if let Ok(child) = spawn_host(&authority, &arm, true) {
@@ -176,7 +221,9 @@ fn serve(probe: Option<PathBuf>) -> i32 {
         thread::spawn(move || supervise(authority, writer, host, arm))
     };
     while !STOP.load(Ordering::Acquire) {
-        thread::sleep(Duration::from_millis(200));
+        apply_session_events(&authority, &session_rx);
+        poll_stop(&authority);
+        thread::sleep(Duration::from_millis(20));
     }
     if let Some(child) = host
         .lock()
@@ -185,9 +232,64 @@ fn serve(probe: Option<PathBuf>) -> i32 {
     {
         let _ = child.stop();
     }
-    let _ = server.join();
+    // The accept loop blocks inside ConnectNamedPipe. Dropping the join
+    // handle lets the process exit once the service reports STOPPED.
+    drop(server);
     let _ = supervisor.join();
+    *SESSION_TX
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
     0
+}
+
+fn remember_pin_status() {
+    #[cfg(feature = "simulated-physical")]
+    {
+        if std::env::var("SOFTLOCK_PIN_SELFTEST").ok().as_deref() == Some("1") {
+            *PIN_STATUS
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) =
+                crate::secrets::exercise_pin_store();
+            return;
+        }
+    }
+    *PIN_STATUS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = "skipped".to_string();
+}
+
+fn apply_session_events(authority: &Arc<Mutex<Authority>>, events: &Receiver<SessionEvent>) {
+    while let Ok(event) = events.try_recv() {
+        let mut guard = authority
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard.notify(Event::Session(event));
+    }
+}
+
+/// Stop is accepted only from `Unlocked` or after the OS lock is confirmed.
+/// `Locked`, `Arming`, and `FailingClosed` stay up when that confirmation fails.
+fn poll_stop(authority: &Arc<Mutex<Authority>>) {
+    if !STOP_REQUESTED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let allow = {
+        let mut guard = authority
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard.notify(Event::ServiceStopRequested);
+        matches!(
+            guard.state(),
+            LockState::Unlocked | LockState::OsLocked { .. }
+        )
+    };
+    if allow {
+        crate::audit("service-stop", &[("result", "accepted")]);
+        STOP.store(true, Ordering::Release);
+    } else {
+        crate::audit("service-stop", &[("result", "refused")]);
+        set_status(SERVICE_RUNNING, ACCEPT_CONTROLS, 0);
+    }
 }
 
 fn supervise(
@@ -250,7 +352,6 @@ fn supervise(
 struct HostChild {
     process: isize,
     writer: std::sync::mpsc::Sender<Vec<u8>>,
-    generation: u64,
 }
 
 impl HostChild {
@@ -268,7 +369,6 @@ impl HostChild {
             let _ = CloseHandle(self.handle());
         }
         GENERATION.fetch_add(1, Ordering::Release);
-        let _ = self.generation;
         Ok(())
     }
 }
@@ -325,7 +425,6 @@ fn spawn_host(
     Ok(HostChild {
         process: process.0 as isize,
         writer: tx,
-        generation,
     })
 }
 
@@ -346,11 +445,11 @@ fn host_reader(
             Ok(message) => message,
             Err(_) => continue,
         };
-        // The request thread holds the authority mutex inside `arm`. Wake it
-        // before taking that mutex.
-        if matches!(message, softlock_core::HostToService::HostReady { .. }) {
-            arm.ready();
-        }
+        // Wake the Lock waiter only after the nonce is accepted. A forged
+        // HostReady must not look like the host is armed. `arm` no longer
+        // waits while holding the authority mutex, so taking it here cannot
+        // deadlock the request thread.
+        let announce = matches!(message, softlock_core::HostToService::HostReady { .. });
         let reply = {
             let mut guard = match authority.lock() {
                 Ok(guard) => guard,
@@ -358,6 +457,9 @@ fn host_reader(
             };
             guard.accept_host(message)
         };
+        if announce && reply.is_ok() {
+            arm.ready();
+        }
         if let Ok(Some(body)) = reply {
             id = id.saturating_add(1);
             if let Ok(frame) = encode_service(id, &body) {
@@ -478,22 +580,25 @@ fn launch_in_console(
 ) -> windows::core::Result<()> {
     let _ = enable_launch_privileges();
     let console = console_session();
-    let mut token = HANDLE::default();
+    let mut process_token = HANDLE::default();
     unsafe {
-        windows::Win32::System::RemoteDesktop::WTSQueryUserToken(console, &mut token)?;
+        // The service token, not the interactive user's. Session 0 is
+        // LocalSystem. Duplicating it and moving only the session id keeps
+        // the Lock Host as S-1-5-18 inside the console session.
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut process_token)?;
         let mut primary = HANDLE::default();
-        windows::Win32::Security::DuplicateTokenEx(
-            token,
-            windows::Win32::Security::TOKEN_ALL_ACCESS,
+        DuplicateTokenEx(
+            process_token,
+            TOKEN_ALL_ACCESS,
             None,
             windows::Win32::Security::SecurityImpersonation,
-            windows::Win32::Security::TokenPrimary,
+            TokenPrimary,
             &mut primary,
         )?;
-        let _ = CloseHandle(token);
-        windows::Win32::Security::SetTokenInformation(
+        let _ = CloseHandle(process_token);
+        SetTokenInformation(
             primary,
-            windows::Win32::Security::TokenSessionId,
+            TokenSessionId,
             (&console as *const u32).cast(),
             std::mem::size_of::<u32>() as u32,
         )?;
@@ -511,7 +616,61 @@ fn launch_in_console(
             info,
         );
         let _ = CloseHandle(primary);
+        if created.is_ok() {
+            record_host_identity(info.hProcess);
+        }
         created
+    }
+}
+
+fn record_host_identity(process: HANDLE) {
+    if let Some(user) = token_user(process) {
+        *HOST_USER
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = user;
+    }
+    let pid = unsafe { GetProcessId(process) };
+    let mut session = 0u32;
+    unsafe {
+        let _ = windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(pid, &mut session);
+    }
+    HOST_SESSION.store(u64::from(session), Ordering::Release);
+}
+
+fn token_user(process: HANDLE) -> Option<String> {
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        if needed == 0 {
+            let _ = CloseHandle(token);
+            return None;
+        }
+        let words = (needed as usize).div_ceil(std::mem::size_of::<u64>());
+        let mut buffer = vec![0u64; words.max(1)];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )
+        .is_err()
+        {
+            let _ = CloseHandle(token);
+            return None;
+        }
+        let user = &*(buffer.as_ptr().cast::<TOKEN_USER>());
+        let mut text = PWSTR::null();
+        if ConvertSidToStringSidW(user.User.Sid, &mut text).is_err() || text.is_null() {
+            let _ = CloseHandle(token);
+            return None;
+        }
+        let value = text.to_string().ok();
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        let _ = CloseHandle(token);
+        value
     }
 }
 
@@ -598,26 +757,45 @@ fn lock_host_exe() -> std::io::Result<PathBuf> {
 }
 
 fn pipe_loop(name: &str, authority: &Arc<Mutex<Authority>>) {
-    let Ok(pipe) = create_public_pipe(name) else {
-        return;
-    };
+    // One instance at a time would let an idle client hold the only pipe and
+    // block Lock. Each connection gets its own instance. The first create
+    // claims the name; later ones join it.
+    let mut first = true;
     while !STOP.load(Ordering::Acquire) {
+        let pipe = match create_public_pipe(name, first) {
+            Ok(pipe) => pipe,
+            Err(_) if first => {
+                first = false;
+                continue;
+            }
+            Err(_) => {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
+        first = false;
         let connected = unsafe { ConnectNamedPipe(pipe, None) };
         let already = connected.is_err() && unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
         if connected.is_err() && !already {
+            unsafe {
+                let _ = CloseHandle(pipe);
+            }
             if unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
                 continue;
             }
             thread::sleep(Duration::from_millis(20));
             continue;
         }
-        serve_client(pipe, authority);
-        unsafe {
-            let _ = DisconnectNamedPipe(pipe);
-        }
-    }
-    unsafe {
-        let _ = CloseHandle(pipe);
+        let authority = Arc::clone(authority);
+        let raw = pipe.0 as usize;
+        thread::spawn(move || {
+            let pipe = HANDLE(raw as *mut core::ffi::c_void);
+            serve_client(pipe, &authority);
+            unsafe {
+                let _ = DisconnectNamedPipe(pipe);
+                let _ = CloseHandle(pipe);
+            }
+        });
     }
 }
 
@@ -652,13 +830,28 @@ fn serve_client(pipe: HANDLE, authority: &Arc<Mutex<Authority>>) {
         if !read_exact(pipe, &mut frame[4..]) {
             break;
         }
-        let response = {
+        let mut response = {
             let mut guard = authority
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             guard.handle_public_frame(role, &frame)
         };
         frame.fill(0);
+        // Lock has marked the arm slot. Wait only after the authority mutex
+        // is released, and only once HostReady has been accepted.
+        if matches!(response, softlock_core::ResponseKind::Accepted) {
+            let arm = authority
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .arm_wait();
+            if let Some(arm) = arm.filter(|arm| arm.is_waiting())
+                && !arm.wait_ready()
+            {
+                response = softlock_core::ResponseKind::NeedsConfirmation {
+                    fields: vec!["guard".to_string()],
+                };
+            }
+        }
         if write_response(pipe, 0, &response).is_err() {
             break;
         }
@@ -712,20 +905,27 @@ fn client_identity(pipe: HANDLE) -> std::io::Result<(u32, String)> {
     Ok((session, image))
 }
 
-fn create_public_pipe(name: &str) -> std::io::Result<HANDLE> {
-    let descriptor = security_descriptor("D:P(A;;GA;;;SY)(A;;GA;;;IU)")?;
+fn create_public_pipe(name: &str, first: bool) -> std::io::Result<HANDLE> {
+    // IU gets read and write (FILE_GENERIC_READ | FILE_GENERIC_WRITE), not
+    // generic-all. SYSTEM keeps full control of the pipe.
+    let descriptor = security_descriptor("D:P(A;;GA;;;SY)(A;;0x12019f;;;IU)")?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0.0,
         bInheritHandle: false.into(),
     };
     let wide_name = wide(name);
+    let access = if first {
+        FILE_FLAG_FIRST_PIPE_INSTANCE | PIPE_ACCESS_DUPLEX
+    } else {
+        PIPE_ACCESS_DUPLEX
+    };
     let handle = unsafe {
         CreateNamedPipeW(
             PCWSTR(wide_name.as_ptr()),
-            FILE_FLAG_FIRST_PIPE_INSTANCE | PIPE_ACCESS_DUPLEX,
+            access,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-            1,
+            PIPE_UNLIMITED_INSTANCES,
             64 * 1024,
             64 * 1024,
             0,
@@ -862,11 +1062,26 @@ fn write_self_probe(pipe_name: &str, path: &Path) -> std::io::Result<()> {
         thread::sleep(Duration::from_millis(100));
     };
     let system = if is_local_system() { "yes" } else { "no" };
+    let host_user = HOST_USER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let host_session = HOST_SESSION.load(Ordering::Acquire);
+    let host_session = if host_session == u64::MAX {
+        "missing".to_string()
+    } else {
+        host_session.to_string()
+    };
+    let pin = PIN_STATUS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
     write_probe(
         path,
         &format!(
-            "session={}\nsystem={system}\nkind={kind}\n",
-            current_session()
+            "session={}\nsystem={system}\nkind={kind}\nhost_user={host_user}\nhost_session={host_session}\nconsole={}\npin_reload={pin}\n",
+            current_session(),
+            console_session()
         ),
     )
 }

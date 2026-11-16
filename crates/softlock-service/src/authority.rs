@@ -3,7 +3,9 @@
 //! A public request cannot unlock. The only unlock is `Verified` carrying the
 //! nonce this service drew for the Lock Host, compared with `eq_ct` and then
 //! dropped. Host exit, missed heartbeats, and a guard-down report retry the
-//! OS lock and ask for a new Lock Host. That path does not enter Unlocked.
+//! OS lock. When that lock is held the session is `OsLocked` and a replacement
+//! host is not armed. When it is not, the guard stays up. Neither path enters
+//! Unlocked.
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +19,7 @@ use softlock_core::{
 };
 
 use crate::log::{audit, source_name};
-use crate::platform::ServicePlatform;
+use crate::platform::{ArmWait, ServicePlatform};
 
 const SILENCE: Duration = Duration::from_millis(750);
 const OS_LOCK_RETRY: Duration = Duration::from_secs(1);
@@ -74,6 +76,14 @@ impl Authority {
         self.controller.platform_mut()
     }
 
+    pub fn arm_wait(&self) -> Option<ArmWait> {
+        self.controller.platform().arm_wait()
+    }
+
+    pub fn notify(&mut self, event: Event) {
+        self.controller.handle(event);
+    }
+
     pub fn state(&self) -> &LockState {
         self.controller.state()
     }
@@ -114,13 +124,16 @@ impl Authority {
         self.host_ready
     }
 
-    /// The replacement Lock Host has to arm immediately when the session is
-    /// already in a locked state. After unlock it waits for the next Lock.
+    /// The replacement Lock Host arms only while this service is still the
+    /// thing holding the session. `OsLocked`, and `FailingClosed` after the
+    /// OS lock has succeeded, do not get another armed host. After unlock the
+    /// replacement waits for the next Lock.
     pub fn session_needs_a_host(&self) -> bool {
-        matches!(
-            self.controller.state(),
-            LockState::Locked { .. } | LockState::Arming { .. } | LockState::FailingClosed { .. }
-        )
+        match self.controller.state() {
+            LockState::Locked { .. } | LockState::Arming { .. } => true,
+            LockState::FailingClosed { .. } => self.os_lock_unavailable(),
+            _ => false,
+        }
     }
 
     /// Records a heartbeat time. The desktop service does this when a frame arrives.
@@ -328,6 +341,12 @@ impl Authority {
                 };
             };
             let mut bytes = *stored.as_bytes();
+            // AdoptLaunchNonce followed by Verified always matches. Both
+            // events carry these same bytes, the nonce just taken from
+            // `self.launch`. That pair is not the gate. The gate already
+            // ran: `matches_launch` compared every private message with
+            // `eq_ct`, and Argon2 accepted the PIN before this nonce was
+            // adopted.
             self.controller.handle(Event::AdoptLaunchNonce {
                 nonce: LaunchNonce::from_bytes(bytes),
             });

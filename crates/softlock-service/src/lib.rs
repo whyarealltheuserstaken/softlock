@@ -19,7 +19,7 @@ pub use authority::{
 };
 pub use log::{Capture, FileLog, allowed_field, audit};
 pub use pincheck::PinChecker;
-pub use platform::{ArmWait, ServicePlatform};
+pub use platform::{ArmWait, OsLock, ServicePlatform};
 pub use secrets::PinStore;
 
 #[cfg(windows)]

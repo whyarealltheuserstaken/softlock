@@ -11,8 +11,10 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use softlock_core::pipe_name;
 use softlock_lockhost::{RunNonce, set_run_nonce};
 use softlock_seam3::{Probe, send_virtual_key};
+use softlock_service::{pin_directory, user_read_denied};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
@@ -283,12 +285,13 @@ fn lock_client_lock_blocks_physical_input_and_passes_injected() {
     let session = Session::start(None, false);
     let probe = Probe::open().expect("probe");
     probe.claim_focus();
-    session.lock().expect("lock");
+    let locked = session.lock().expect("lock");
     assert!(
-        wait_for(Duration::from_secs(3), || physical_is_blocked(
-            &probe,
-            session.extra
-        )),
+        locked.contains("Accepted"),
+        "lock was not accepted: {locked}"
+    );
+    assert!(
+        physical_is_blocked(&probe, session.extra),
         "physical input reached the probe"
     );
     send_virtual_key(VK_F13, 0).expect("injected");
@@ -395,6 +398,26 @@ fn panic_while_os_lock_is_down_is_closed_by_the_service() {
     probe.claim_focus();
     session.lock().expect("lock");
     let mut saw_unlocked = false;
+    let lost = wait_for(Duration::from_secs(8), || {
+        if session
+            .status()
+            .ok()
+            .is_some_and(|status| status.contains("\"Unlocked\""))
+        {
+            saw_unlocked = true;
+        }
+        fs::read_to_string(&session.log)
+            .unwrap_or_default()
+            .contains("host-lost")
+    });
+    assert!(
+        !saw_unlocked,
+        "the service reported Unlocked during recovery"
+    );
+    assert!(
+        lost,
+        "the service log did not record host-lost after the window panic"
+    );
     let recovered = wait_for(Duration::from_secs(20), || {
         if session
             .status()
@@ -405,10 +428,6 @@ fn panic_while_os_lock_is_down_is_closed_by_the_service() {
         }
         physical_is_blocked(&probe, session.extra)
     });
-    assert!(
-        !saw_unlocked,
-        "the service reported Unlocked during recovery"
-    );
     assert!(recovered, "the service did not restore the guard");
     let status = session.status().expect("status");
     assert!(
@@ -478,7 +497,138 @@ fn emergency_after_both_os_locks_fail_is_closed_by_the_service() {
 fn installed_service_runs_as_local_system_and_rejects_session_zero() {
     let _guard = gate();
     let service = service_exe();
-    let names = Command::new(&service)
+    let (name, display) = service_names(&service);
+    let probe = std::env::temp_dir().join(format!("svc-probe-{}.txt", std::process::id()));
+    let body = install_service(&service, &name, &display, &probe, &[]);
+    remove_service(&name);
+    assert!(body.contains("session=0"), "not session 0: {body}");
+    assert!(body.contains("system=yes"), "not LocalSystem: {body}");
+    assert!(
+        body.contains("kind=Unauthorized"),
+        "session 0 client was not rejected: {body}"
+    );
+}
+
+#[test]
+fn lock_host_token_is_system_in_the_console_session() {
+    let _guard = gate();
+    let service = service_exe();
+    let (name, display) = service_names(&service);
+    let probe = std::env::temp_dir().join(format!("svc-host-{}.txt", std::process::id()));
+    let body = install_service(&service, &name, &display, &probe, &[]);
+    remove_service(&name);
+    assert!(body.contains("system=yes"), "not LocalSystem: {body}");
+    assert!(
+        body.contains("host_user=S-1-5-18"),
+        "lock host is not LocalSystem: {body}"
+    );
+    let host_session = probe_value(&body, "host_session");
+    let console = probe_value(&body, "console");
+    assert_eq!(
+        host_session, console,
+        "host session {host_session} is not the console session {console}: {body}"
+    );
+    assert_ne!(
+        host_session, "missing",
+        "host session was not recorded: {body}"
+    );
+    assert_ne!(host_session, "0", "host stayed in session 0: {body}");
+}
+
+#[test]
+fn service_stop_while_locked_keeps_input_blocked() {
+    let _guard = gate();
+    let service = service_exe();
+    let (name, display) = service_names(&service);
+    let nonce = RunNonce::random().expect("run nonce");
+    set_run_nonce(nonce);
+    let extra = nonce.as_extra_info();
+    let probe = std::env::temp_dir().join(format!("svc-stop-{}.txt", std::process::id()));
+    let log = std::env::temp_dir().join(format!("svc-stop-{}.log", std::process::id()));
+    let _ = fs::remove_file(&log);
+    let env = [
+        "SOFTLOCK_STUB_OS_LOCK=1".to_string(),
+        format!("SOFTLOCK_RUN_NONCE={extra}"),
+        r"SOFTLOCK_INSTALL_DIR=C:\no\such\install".to_string(),
+        format!("SOFTLOCK_LOG={}", log.display()),
+    ];
+    let body = install_service(&service, &name, &display, &probe, &env);
+    assert!(body.contains("system=yes"), "not LocalSystem: {body}");
+    let input = Probe::open().expect("probe");
+    input.claim_focus();
+    let locked = transact(
+        &pipe_name(),
+        &format!(r#"{{"v":1,"id":2,"kind":"Lock","source":"LocalApi","note":"{NOTE}"}}"#),
+    )
+    .expect("lock");
+    assert!(
+        locked.contains("Accepted"),
+        "lock was not accepted: {locked}"
+    );
+    assert!(
+        physical_is_blocked(&input, extra),
+        "physical input was not blocked before stop"
+    );
+    let name_for_stop = name.clone();
+    thread::spawn(move || {
+        let _ = Command::new("sc.exe")
+            .args(["stop", &name_for_stop])
+            .output();
+    });
+    let saw_stop = wait_for(Duration::from_secs(15), || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("service-stop")
+    });
+    let log_text = fs::read_to_string(&log).unwrap_or_default();
+    assert!(saw_stop, "sc stop was not handled: {log_text}");
+    assert!(
+        log_text.contains("result=refused"),
+        "stop was accepted without an OS lock: {log_text}"
+    );
+    assert!(
+        physical_is_blocked(&input, extra),
+        "sc stop dropped the guard while the OS lock was not confirmed"
+    );
+    let status = transact(&pipe_name(), r#"{"v":1,"id":3,"kind":"GetStatus"}"#).unwrap_or_default();
+    assert!(
+        !status.contains("\"Unlocked\""),
+        "stop ended Unlocked: {status}"
+    );
+    remove_service(&name);
+}
+
+#[test]
+fn local_system_pin_file_is_rewritten_and_unreadable() {
+    let _guard = gate();
+    let service = service_exe();
+    let (name, display) = service_names(&service);
+    let dir = pin_directory();
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(dir.join("pin.phc"), b"planted-by-user");
+    let probe = std::env::temp_dir().join(format!("svc-pin-{}.txt", std::process::id()));
+    let body = install_service(
+        &service,
+        &name,
+        &display,
+        &probe,
+        &["SOFTLOCK_PIN_SELFTEST=1".to_string()],
+    );
+    remove_service(&name);
+    assert!(
+        body.contains("pin_reload=ok"),
+        "LocalSystem did not save and reload the pin file: {body}"
+    );
+    let path = dir.join("pin.phc");
+    assert!(
+        user_read_denied(&path),
+        "the interactive user could read {}",
+        path.display()
+    );
+}
+
+fn service_names(service: &Path) -> (String, String) {
+    let names = Command::new(service)
         .arg("--print-names")
         .output()
         .expect("names");
@@ -495,22 +645,38 @@ fn installed_service_runs_as_local_system_and_rejects_session_zero() {
         .unwrap_or(name.as_str())
         .trim()
         .to_string();
-    let probe = std::env::temp_dir().join(format!("svc-probe-{}.txt", std::process::id()));
-    let _ = fs::remove_file(&probe);
-    let _ = Command::new("sc.exe").args(["stop", &name]).output();
-    let _ = Command::new("sc.exe").args(["delete", &name]).output();
+    (name, display)
+}
+
+fn probe_value(body: &str, key: &str) -> String {
+    body.lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn install_service(
+    service: &Path,
+    name: &str,
+    display: &str,
+    probe: &Path,
+    env: &[String],
+) -> String {
+    let _ = fs::remove_file(probe);
+    remove_service(name);
     thread::sleep(Duration::from_millis(500));
     // sc.exe takes everything after the binPath value as its own options.
     // The exe and `--scm` have to be one quoted ImagePath, or `--scm` is
     // parsed as an sc option and create prints its usage.
     let bin_path = format!(
         "binPath= \"{} --scm --probe {}\"",
-        sc_image(&service),
-        sc_image(&probe)
+        sc_image(service),
+        sc_image(probe)
     );
     let created = Command::new("sc.exe")
         .raw_arg("create")
-        .raw_arg(&name)
+        .raw_arg(name)
         .raw_arg(bin_path)
         .raw_arg("start= demand")
         .raw_arg("obj= LocalSystem")
@@ -523,27 +689,83 @@ fn installed_service_runs_as_local_system_and_rejects_session_zero() {
         String::from_utf8_lossy(&created.stdout),
         String::from_utf8_lossy(&created.stderr)
     );
+    if !env.is_empty() {
+        set_service_environment(name, env);
+    }
     let started = Command::new("sc.exe")
-        .args(["start", &name])
+        .args(["start", name])
         .output()
         .expect("sc start");
-    let body = wait_for_file(&probe, Duration::from_secs(25));
-    let _ = Command::new("sc.exe").args(["stop", &name]).output();
-    thread::sleep(Duration::from_millis(500));
-    let _ = Command::new("sc.exe").args(["delete", &name]).output();
+    let body = wait_for_file(probe, Duration::from_secs(25));
     assert!(
         started.status.success() || body.is_some(),
         "sc start failed: {} {}",
         String::from_utf8_lossy(&started.stdout),
         String::from_utf8_lossy(&started.stderr)
     );
-    let body = body.expect("the service did not write the session probe");
-    assert!(body.contains("session=0"), "not session 0: {body}");
-    assert!(body.contains("system=yes"), "not LocalSystem: {body}");
-    assert!(
-        body.contains("kind=Unauthorized"),
-        "session 0 client was not rejected: {body}"
+    body.expect("the service did not write the session probe")
+}
+
+fn set_service_environment(name: &str, env: &[String]) {
+    let values = env
+        .iter()
+        .map(|value| format!("'{value}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$p = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\{name}'; New-ItemProperty -Path $p -Name Environment -PropertyType MultiString -Value @({values}) -Force | Out-Null"
     );
+    let wrote = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .expect("service environment");
+    assert!(
+        wrote.status.success(),
+        "service environment failed: {} {}",
+        String::from_utf8_lossy(&wrote.stdout),
+        String::from_utf8_lossy(&wrote.stderr)
+    );
+}
+
+fn remove_service(name: &str) {
+    if let Some(pid) = service_pid(name) {
+        let _ = Command::new("taskkill.exe")
+            .args(["/F", "/PID", &pid])
+            .output();
+    }
+    let _ = Command::new("sc.exe").args(["stop", name]).output();
+    thread::sleep(Duration::from_millis(300));
+    let _ = Command::new("sc.exe").args(["delete", name]).output();
+}
+
+fn service_pid(name: &str) -> Option<String> {
+    let output = Command::new("sc.exe")
+        .args(["queryex", name])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("PID") {
+            let pid = rest.trim().trim_start_matches(':').trim();
+            if pid.chars().all(|ch| ch.is_ascii_digit()) && pid != "0" {
+                return Some(pid.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn transact(pipe: &str, json: &str) -> Result<String, String> {
+    let handle = open_pipe(pipe)?;
+    let mut frame = (json.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(json.as_bytes());
+    write_all(handle, &frame)?;
+    let response = read_frame(handle)?;
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+    }
+    String::from_utf8(response).map_err(|error| error.to_string())
 }
 
 /// A path with a space is quoted inside the binPath value. sc.exe keeps

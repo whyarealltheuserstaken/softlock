@@ -4,11 +4,11 @@ use std::time::{Duration, Instant};
 
 use proptest::prelude::*;
 use softlock_core::{
-    GuardHealth, HostToService, LaunchNonce, LockSource, LockState, OverlayHealth, RequestKind,
-    ResponseKind, Role, Secret, host_hello_frame, host_secret_frame,
+    Event, GuardHealth, HostToService, LaunchNonce, LockSource, LockState, OverlayHealth,
+    RequestKind, ResponseKind, Role, Secret, SessionEvent, host_hello_frame, host_secret_frame,
 };
 use softlock_service::{
-    Authority, Capture, HostAction, HostFault, HostLoss, ServicePlatform, admit_client,
+    Authority, Capture, HostAction, HostFault, HostLoss, OsLock, ServicePlatform, admit_client,
     role_for_image,
 };
 
@@ -16,7 +16,7 @@ const PIN: &str = "z9-pin-4e7c1b";
 const NOTE: &str = "Quarterly Report - Notepad";
 
 fn authority() -> Authority {
-    Authority::new(ServicePlatform::new(true), true)
+    Authority::new(ServicePlatform::new(OsLock::Fails), true)
 }
 
 fn lock(authority: &mut Authority, source: LockSource) -> LaunchNonce {
@@ -171,7 +171,7 @@ fn get_status_snapshots_source_and_health() {
 fn correct_pin_consumes_the_service_nonce() {
     let capture = Capture::new();
     tracing::subscriber::with_default(capture.clone(), || {
-        let mut authority = Authority::new(ServicePlatform::new(true), true);
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), true);
         let stored = authority.handle_public(
             Role::App,
             RequestKind::SetPin {
@@ -200,7 +200,7 @@ fn correct_pin_consumes_the_service_nonce() {
 
 #[test]
 fn release_build_does_not_store_a_pin() {
-    let mut authority = Authority::new(ServicePlatform::new(true), false);
+    let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), false);
     let response = authority.handle_public(
         Role::App,
         RequestKind::SetPin {
@@ -261,6 +261,37 @@ fn host_loss_while_the_os_lock_is_down_never_unlocks() {
     authority.note_host_lost(HostLoss::Silent);
     assert!(!matches!(authority.state(), LockState::Unlocked));
     assert!(!authority.returned_to_unlocked());
+}
+
+#[test]
+fn os_lock_success_moves_to_os_locked_until_the_session_unlocks() {
+    let mut authority = Authority::new(ServicePlatform::new(OsLock::Succeeds), true);
+    let nonce = lock(&mut authority, LockSource::Hotkey);
+    authority
+        .accept_host(HostToService::HostReady { monitors: 1, nonce })
+        .unwrap();
+    authority.note_host_lost(HostLoss::Exited);
+    assert!(
+        matches!(
+            authority.state(),
+            LockState::OsLocked {
+                after_fail: Some(softlock_core::FailReason::HostExited)
+            }
+        ),
+        "a held OS lock left {:?}",
+        authority.state()
+    );
+    assert_eq!(
+        authority.poll_host(Instant::now(), false),
+        HostAction::Respawn { arm: false },
+        "FailingClosed must not arm a replacement while the OS lock is held"
+    );
+    authority.notify(Event::Session(SessionEvent::OsUnlocked));
+    assert!(
+        matches!(authority.state(), LockState::Unlocked),
+        "session unlock left {:?}",
+        authority.state()
+    );
 }
 
 #[test]
