@@ -1,6 +1,6 @@
 # Windows tickets for connected and remote displays
 
-Planning files, 16 November 2026. They are not GitHub issues. The behavior is SPEC.md Implementation Decision 20, closed by Henry the same day: a remote viewer sees the SoftLock lock screen until a separate configurable pass, and remote-tool input is blocked until that pass except what the unlock screen needs. Connected and multi-display rows stay in scope. Remote rows are post-v1. Ticket 31's v1 gating is unchanged.
+Planning files, 16 November 2026. They are not GitHub issues. The behavior is SPEC.md Implementation Decision 20, closed by Henry the same day: a remote viewer sees the SoftLock lock screen until a separate configurable pass, and remote-tool input is blocked until that pass except what the unlock screen needs. Connected and multi-display rows stay in scope. Each remote ticket has a v1 framework slice (detection hook, remote-pass types, fail-closed with a fake session) and a v1.x or v2 slice for implementation, hardware, and enablement. v1 does not ship remote display as a feature. Ticket 31's v1 gating is unchanged.
 
 Windows v1 tickets 1–31 and 35 stay the GitHub issues linked from [issue 33](https://github.com/whyarealltheuserstaken/softlock/issues/33). The next free ticket number after 35 is 36. These files are 36–40. Linux display tickets are a separate set in [`linux/`](linux/README.md), blocked on a Linux platform plan. macOS is [`macos/`](macos/README.md).
 
@@ -19,10 +19,10 @@ When the lead edits #18, the proposed text is: keep topmost re-assert, the shell
 | Id | Title | Blocked by | Where |
 |---|---|---|---|
 | [36](36-display-change-ci.md) | Seam 3: display add, remove, and change | 11, 12 | CI, `windows-2022` and `windows-2025` |
-| [37](37-capture-remote-spike.md) | Spike: capture exclusion versus a remote view. Post-v1 | 11, finding 02 | CI, and a written miss if the runner has no remote terminal |
-| [38](38-remote-session-lock.md) | Remote session lock, the remote pass, and remote-tool input. Post-v1 | 15, 21, 22, 37 | CI for the rules that do not need a second machine; the client-SKU session move is 39 |
-| [39](39-display-kit-p7.md) | Kit: hot-plug and DisplayLink in scope. Inbound RDP is post-v1 | 36; the RDP row also 38 | ThinkStation P7 |
-| [40](40-windows-10-client-kit.md) | Kit: display rows in scope. Inbound RDP is post-v1 | a named Windows 10 client; the RDP row also 38 | No machine identified |
+| [37](37-capture-remote-spike.md) | Spike: capture versus a remote view. v1 type, v1.x/v2 probe | 11, finding 02, for the probe | CI, and a written miss if the runner has no remote terminal |
+| [38](38-remote-session-lock.md) | Remote lock. v1 hook, pass types, fail-closed. v1.x/v2 the view | v1: 15, 21, 22. v1.x/v2 also 37 | CI for the fake session; the client-SKU move is 39 |
+| [39](39-display-kit-p7.md) | Kit: display rows in scope. RDP row is v1 note, v1.x/v2 sheet | 36; the RDP row also 38 | ThinkStation P7 |
+| [40](40-windows-10-client-kit.md) | Kit: display rows in scope. RDP row is v1 note, v1.x/v2 sheet | a named Windows 10 client; the RDP row also 38 | No machine identified |
 
 ## Blocking edges
 
@@ -39,6 +39,6 @@ When the lead edits #18, the proposed text is: keep topmost re-assert, the shell
 38 --> 40
 ```
 
-Henry closed the Windows entries. 38 is post-v1 and waits on 15, 21, 22, and 37, not on a choice. 36 stays in scope. It runs on `windows-2022` (Windows 10 family, Server) and `windows-2025` (Windows 11 family, Server) and compares the two. 37 is the post-v1 spike on those same images. The Windows 10 versus Windows 11 behavior list is in SPEC.md Decision 20. Ticket 40 is the Windows 10 client, and no such machine is identified. Ticket 31 stays blocked by 18. This file does not change ticket 31's gating. Display rows live on 36, 39, and 40. Inbound RDP lives on 39 and 40 and is post-v1.
+Henry closed the Windows entries. 38's v1 slice waits on 15, 21, and 22. Its v1.x or v2 slice also waits on 37. 36 stays in scope. It runs on `windows-2022` (Windows 10 family, Server) and `windows-2025` (Windows 11 family, Server) and compares the two. 37's probe is v1.x or v2 on those same images. The Windows 10 versus Windows 11 behavior list is in SPEC.md Decision 20. Ticket 40 is the Windows 10 client, and no such machine is identified. Ticket 31 stays blocked by 18. This file does not change ticket 31's gating. Display rows live on 36, 39, and 40. Inbound RDP lives on 39 and 40: a v1 note, and a v1.x or v2 sheet.
 
 GitHub issue #18 is not edited by these files. The proposed issue text is the follow-up above. This change does not create or edit GitHub issues.

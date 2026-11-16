@@ -8,7 +8,7 @@
 
 **Needs Henry's hardware:** No. Add, remove, a real DPI change, and mirroring, when the runner cannot do them, are ticket 39.
 
-**Status:** in scope. Not post-v1. Not a GitHub issue. This ticket is display change, not a remote view. Ticket 31's v1 gating is unchanged.
+**Status:** in scope. Not a GitHub issue. This ticket is display change, not a remote view. Ticket 31's v1 gating is unchanged.
 
 `windows-2022` is Windows Server 2022, the Windows 10 family (finding 02: build 20348). `windows-2025` is Windows Server 2025, 24H2, the Windows 11 family (finding 02: build 26100). Both images run this job. A difference in whether the resolution change stays covered fails the job. Hello, a client SKU, and a Windows 10 client machine are not this ticket. Those are 38, 39, and 40.
 

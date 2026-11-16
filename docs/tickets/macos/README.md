@@ -35,8 +35,8 @@ A ticket whose tests are CI and whose checklist line is his Mac is labeled with 
 | [m18](m18-password-unlock.md) | Unlock with the Mac password through the Broker | m09, m15 | Henry's Intel Mac |
 | [m19](m19-touch-id-unlock.md) | Unlock with Touch ID through the same Broker | m12, m18 | Henry's Intel Mac |
 | [m20](m20-display-reconfigure-ci.md) | CI probe: display reconfiguration callback, arm64 slice | m01, m02 | CI only |
-| [m21](m21-capture-remote-spike.md) | Spike: `sharingType` none versus a remote view. Post-v1 | m04 | CI only |
-| [m22](m22-remote-session-lock.md) | Remote session lock, the remote pass, and remote-tool input. Post-v1 | m14, m17, m18, m19, m21 | CI only and Henry's Intel Mac |
+| [m21](m21-capture-remote-spike.md) | Spike: `sharingType` none versus a remote view. v1 type, v1.x/v2 probe | m04, for the probe | CI only |
+| [m22](m22-remote-session-lock.md) | Remote lock. v1 hook, pass types, fail-closed. v1.x/v2 the view | v1: m15, m17. v1.x/v2 also m14, m18, m19, m21 | CI only and Henry's Intel Mac |
 | [m23](m23-display-kit-intel.md) | Kit: hot-plug, clamshell, AirPlay, Sidecar, DisplayLink, inbound Screen Sharing, x86_64 slice | m06, m20; Screen Sharing row also m22 | Henry's Intel Mac |
 | [m24](m24-display-kit-arm64.md) | Kit: the same display rows on a physical Apple Silicon Mac | a named Apple Silicon Mac; Screen Sharing row also m22 | No machine recorded |
 
@@ -90,6 +90,7 @@ m12 --> m19
 m14 --> m15
 m15 --> m16
 m15 --> m17
+m15 --> m22
 m17 --> m22
 m15 --> m18
 m18 --> m19
@@ -107,6 +108,6 @@ m22 --> m23
 m22 --> m24
 ```
 
-D9 is closed in SPEC.md Decision 20. It does not block m22. m22 is post-v1 and waits on m14, m17, m18, m19, and m21. m20 is the display callback and stays in scope. m21 is the post-v1 spike. m23's inbound Screen Sharing row is post-v1 and waits on m22. The other m23 rows wait on m06 and m20. m24 waits on a named Apple Silicon Mac, and its Screen Sharing row also waits on m22. No Apple Silicon Mac is recorded.
+D9 is closed in SPEC.md Decision 20. It does not block m22. m22's v1 slice waits on m15 and m17. Its v1.x or v2 slice also waits on m14, m18, m19, and m21. m20 is the display callback and stays in scope. m21's probe is v1.x or v2. m23's inbound Screen Sharing row is a v1 note and a v1.x or v2 sheet, and the sheet waits on m22. The other m23 rows wait on m06 and m20. m24 waits on a named Apple Silicon Mac, and its Screen Sharing sheet also waits on m22. No Apple Silicon Mac is recorded.
 
 D3 is accepted by the lead and does not block m10. Henry decided D1 (Universal 2, macOS 11, his Intel Mac, arm64 on `macos-latest`) and D5 (`SACLockScreenImmediate` via `dlopen`, then the documented screen-saver path). D5 does not block m08. The lead accepted D2, D4, D6, and D7. The lead decided D8: a failure never ends Unlocked. His Intel Mac is the paragraph in D1, which cites Henry, 16 November 2026, on an external display. D6 blocks any ticket that would claim capture exclusion beyond what m04 and m06 measured. D2 blocks a signing ticket, and this set does not contain one.

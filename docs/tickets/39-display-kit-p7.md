@@ -8,14 +8,15 @@
 
 **Needs Henry's hardware:** Yes. The ThinkStation P7.
 
-**Status:** waiting for Henry. Not a GitHub issue. Not ready-for-agent. The display rows stay in scope. The inbound Remote Desktop row is post-v1 and also waits on 38. Ticket 31's v1 gating is unchanged.
+**Status:** waiting for Henry. Not a GitHub issue. Not ready-for-agent. The display rows stay in scope. The inbound Remote Desktop row has a v1 note that it is not run, and the sheet itself is v1.x or v2. Ticket 31's v1 gating is unchanged.
 
 - [ ] External display hot-plug while locked: the new display shows the lock, and unplugging it leaves the remaining displays covered (sheet)
 - [ ] A scale, DPI, or resolution change while locked leaves every display covered (sheet)
 - [ ] Mirroring, if the P7 can do it, shows the lock on both outputs; if it cannot, the sheet says so
 - [ ] Closed lid with an external display: the P7 has no lid, so the row says not runnable and unproven (sheet)
 - [ ] DisplayLink or another USB display, if one is available: the lock is visible on it. If none is available, the sheet says so
-- [ ] Inbound Remote Desktop to the locked P7: the remote view shows the SoftLock screen, unlock is the Broker methods 38 allows on that stack, and remote input before unlock does not reach the desktop (sheet)
+- [ ] v1: the inbound Remote Desktop row names ticket 38's detection hook and remote-pass type, and the sheet is not run. v1 does not enable Remote Desktop as a feature
+- [ ] v1.x/v2: Inbound Remote Desktop to the locked P7: the remote view shows the SoftLock screen, the real screen appears only after the remote pass, and remote-tool input before that pass does not reach the desktop (sheet)
 - [ ] The sheet names the Windows edition and does not contain a serial number
 
 Common to every ticket: red-green TDD at the named seams, CI green, no planned paid or enterprise features (allowlists, rules, fleet management, remote triggers, the CLI), the product name only via the name constant.

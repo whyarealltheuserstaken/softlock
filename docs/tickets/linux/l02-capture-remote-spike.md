@@ -10,11 +10,16 @@
 
 **Type:** Prototype spike. No product code.
 
-**Status:** post-v1, and still blocked on a Linux platform plan. Not ready-for-agent. Not a GitHub issue. Henry closed the rule in Decision 20. This spike records the paths. If it cannot tell remote-tool input from input an agent posts, the finding names that risk and does not weaken the rule.
+**v1 framework:** The detection-hook result type exists, including a field for "remote input could not be told from an agent's." A seam test feeds a fake. v1 does not install a remote server and does not enable the feature. This slice still waits on a Linux platform plan, because the plan is what the type will sit in. The sketch is not that plan.
 
-- [ ] The finding names the display server l01 found, or says there was none (finding)
-- [ ] Marker counts for a local capture, if a capture tool was already installed. Otherwise the log says no capture tool was installed
-- [ ] Each of xrdp, VNC, GNOME Remote Desktop, and RustDesk is either measured or recorded unavailable (job log)
-- [ ] The finding names any remote input it could not tell from an agent's post. It does not recommend letting that input through, and it does not recommend blocking local agent input
+**v1.x or v2:** The checkboxes below. A path that cannot be told from an agent's post is a risk. The rule does not weaken.
+
+**Status:** v1 framework plus a v1.x or v2 probe, both still blocked on a Linux platform plan. Not ready-for-agent. Not a GitHub issue. Henry closed the rule in Decision 20.
+
+- [ ] v1: the detection-hook result type has the "could not tell apart" field, set from a fake. No remote server is installed (seam 1)
+- [ ] v1.x/v2: The finding names the display server l01 found, or says there was none (finding)
+- [ ] v1.x/v2: Marker counts for a local capture, if a capture tool was already installed. Otherwise the log says no capture tool was installed
+- [ ] v1.x/v2: Each of xrdp, VNC, GNOME Remote Desktop, and RustDesk is either measured or recorded unavailable (job log)
+- [ ] v1.x/v2: The finding names any remote input it could not tell from an agent's post. It does not recommend letting that input through, and it does not recommend blocking local agent input
 
 Common to every ticket: red-green TDD at the named seams, CI green, no planned paid or enterprise features (allowlists, rules, fleet management, remote triggers, the CLI), the product name only via the name constant.

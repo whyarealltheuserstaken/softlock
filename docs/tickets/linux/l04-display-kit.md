@@ -10,14 +10,15 @@
 
 **Type:** Hardware kit.
 
-**Status:** blocked. No machine is named, and there is no Linux platform plan. Not ready-for-agent. Not a GitHub issue. The display rows are not post-v1. The remote-view rows are post-v1 and also wait on l03.
+**Status:** blocked. No machine is named, and there is no Linux platform plan. Not ready-for-agent. Not a GitHub issue. The display rows stay with the plan. The remote-view rows have a v1 note that they are not run, and the sheet itself is v1.x or v2.
 
 - [ ] The machine is named, and the sheet records the distribution and whether the session is X11 or Wayland (sheet)
 - [ ] Hot-plug of an external display while locked covers the new display, on each session type the machine can run (sheet)
 - [ ] A mode or scale change while locked leaves every display covered (sheet)
 - [ ] Closed lid with an external display, if the machine has a lid. If it has no lid, the row says not runnable (sheet)
 - [ ] A USB display, if one is available (sheet)
-- [ ] Inbound xrdp, VNC, GNOME Remote Desktop, and RustDesk: the viewer sees the lock, or the sheet says that server is not on the machine (sheet)
+- [ ] v1: the remote-view rows name l03's detection hook and remote-pass type, and the sheet is not run. v1 does not enable a remote server as a feature
+- [ ] v1.x/v2: Inbound xrdp, VNC, GNOME Remote Desktop, and RustDesk: the viewer sees the lock until the remote pass, or the sheet says that server is not on the machine (sheet)
 - [ ] The sheet does not contain a serial number
 
 Common to every ticket: red-green TDD at the named seams, CI green, no planned paid or enterprise features (allowlists, rules, fleet management, remote triggers, the CLI), the product name only via the name constant.

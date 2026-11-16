@@ -8,14 +8,15 @@
 
 **Needs Henry's hardware:** Yes, and no machine is identified. Henry's laptop is not assumed to be Windows 10. The sheet on that laptop, if it is Windows 11, stays with the Hello tickets already on the roadmap. This ticket starts when someone records a Windows 10 client.
 
-**Status:** blocked. No Windows 10 client is identified. Not a GitHub issue. Not ready-for-agent. The display rows stay in scope once a machine is named. The inbound Remote Desktop row is post-v1 and also waits on 38. Ticket 31's v1 gating is unchanged.
+**Status:** blocked. No Windows 10 client is identified. Not a GitHub issue. Not ready-for-agent. The display rows stay in scope once a machine is named. The inbound Remote Desktop row has a v1 note that it is not run, and the sheet itself is v1.x or v2. Ticket 31's v1 gating is unchanged.
 
 - [ ] The machine is named, and the sheet records Windows 10 and the build (sheet)
 - [ ] External display hot-plug while locked covers the new display (sheet)
 - [ ] A scale or DPI change while locked leaves every display covered (sheet)
 - [ ] Closed lid with an external display, if the machine has a lid. If it has no lid, the row says not runnable (sheet)
 - [ ] DisplayLink, if a device is available. If none is available, the sheet says so
-- [ ] Inbound Remote Desktop shows the SoftLock screen, unlock is the Broker methods 38 allows on Windows 10, and remote input before unlock does not reach the desktop (sheet)
+- [ ] v1: the inbound Remote Desktop row names ticket 38's detection hook and remote-pass type, and the sheet is not run. v1 does not enable Remote Desktop as a feature
+- [ ] v1.x/v2: Inbound Remote Desktop shows the SoftLock screen, the real screen appears only after the remote pass, and remote-tool input before that pass does not reach the desktop (sheet)
 - [ ] If the machine is Microsoft Entra joined, locking the remote session is recorded as a disconnect or as a lock screen, and the result is not Unlocked (sheet)
 - [ ] The sheet does not contain a serial number
 

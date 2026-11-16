@@ -8,12 +8,17 @@
 
 **Needs Henry's hardware:** No for the runner measurement. The client-SKU session move, if this image cannot show it, is ticket 39.
 
-**Status:** post-v1. Not a GitHub issue. Henry closed the rule in Decision 20. This spike does not reopen it. Both images run. A Windows 10 client and a Windows 11 client are tickets 40 and 39, not this runner. If a remote-tool key shares the injected flag of an agent's `SendInput`, the finding names that risk. The rule stays: remote-tool input is blocked until the remote pass, and local agent input is not blocked because of the shared flag.
+**v1 framework:** The detection-hook result type exists, including a field for "remote input could not be told from agent input." A seam test feeds a fake connected session. v1 does not run the capture probe, does not open a remote tool, and does not enable the feature.
 
-- [ ] Marker counts with exclusion off and on, for GDI, DXGI, and Windows.Graphics.Capture (job log)
-- [ ] A remote-render path is counted the same way, or the log says the runner has no remote terminal and no remote indirect display (job log)
-- [ ] Console input, RDP-session input, and an RDP shadow each have a row: injected flag, or the path was not available (job log)
-- [ ] TeamViewer, AnyDesk, and Chrome Remote Desktop each have a marker count with exclusion off and on, and an injected-flag row, or the log says that program was not on the image (job log)
-- [ ] Written finding under `docs/findings/` names the paths that hid the marker and the paths that showed it, and names any remote-tool input that shares the agent's injected flag. The finding does not recommend letting that input through, and it does not recommend blocking local agent input
+**v1.x or v2:** The checkboxes below. Both images run. A shared injected flag is a risk. The rule stays: remote-tool input is blocked until the remote pass, and local agent input is not blocked because of the shared flag.
+
+**Status:** v1 framework plus a v1.x or v2 probe. Not a GitHub issue. Henry closed the rule in Decision 20. This spike does not reopen it. A Windows 10 client and a Windows 11 client are tickets 40 and 39, not this runner.
+
+- [ ] v1: the detection-hook result type includes "could not tell remote input from agent input," and a seam test sets it from a fake. No remote tool is opened (seam 1)
+- [ ] v1.x/v2: Marker counts with exclusion off and on, for GDI, DXGI, and Windows.Graphics.Capture (job log)
+- [ ] v1.x/v2: A remote-render path is counted the same way, or the log says the runner has no remote terminal and no remote indirect display (job log)
+- [ ] v1.x/v2: Console input, RDP-session input, and an RDP shadow each have a row: injected flag, or the path was not available (job log)
+- [ ] v1.x/v2: TeamViewer, AnyDesk, and Chrome Remote Desktop each have a marker count with exclusion off and on, and an injected-flag row, or the log says that program was not on the image (job log)
+- [ ] v1.x/v2: Written finding under `docs/findings/` names the paths that hid the marker and the paths that showed it, and names any remote-tool input that shares the agent's injected flag. The finding does not recommend letting that input through, and it does not recommend blocking local agent input
 
 Common to every ticket: red-green TDD at the named seams, CI green, no planned paid or enterprise features (allowlists, rules, fleet management, remote triggers, the CLI), the product name only via the name constant.

@@ -12,7 +12,7 @@
 
 **Type:** Hardware kit. Deliverable is the filled sheet under `docs/findings/`.
 
-**Status:** waiting for Henry. Not ready-for-agent. Not a GitHub issue. The display rows stay in scope. The inbound Screen Sharing row is post-v1 and also waits on m22.
+**Status:** waiting for Henry. Not ready-for-agent. Not a GitHub issue. The display rows stay in scope. The inbound Screen Sharing row has a v1 note that it is not run, and the sheet itself is v1.x or v2.
 
 - [ ] External display hot-plug while locked: the new display shows the lock, or the sheet names the miss (sheet)
 - [ ] Closed lid with an external display awake: the external display shows the lock. If no second keyboard is available, the sheet says the row could not be run (sheet)
@@ -20,7 +20,8 @@
 - [ ] AirPlay, if a receiver is available: mirror or extend shows the lock on that display. If no receiver is available, the sheet says so
 - [ ] Sidecar, if an iPad that meets Apple's requirements is available: the iPad shows the lock, and touch or a keyboard on the iPad before unlock reaches only the unlock UI. If no iPad is available, the sheet says so
 - [ ] DisplayLink, if a device is available: the USB display shows the lock. If none is available, the sheet says so
-- [ ] Inbound Screen Sharing to the locked Mac: the viewer sees the SoftLock screen, unlock is the Broker, and remote input before unlock does not reach the desktop (sheet)
+- [ ] v1: the inbound Screen Sharing row names m22's detection hook and remote-pass type, and the sheet is not run. v1 does not enable Screen Sharing as a feature
+- [ ] v1.x/v2: Inbound Screen Sharing to the locked Mac: the viewer sees the SoftLock screen, the real screen appears only after the remote pass, and remote-tool input before that pass does not reach the desktop (sheet)
 - [ ] The `x86_64` slice of the m20 display probe runs on this Mac, and the sheet records `uname -m` (sheet). The arm64 run stays on `macos-latest`. A physical Apple Silicon Mac is m24
 - [ ] The sheet does not contain a serial number
 

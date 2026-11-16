@@ -12,7 +12,7 @@
 
 **Type:** Probe. Deliverable is a written finding. No product code, and no new lock behavior.
 
-**Status:** blocked on a Linux platform plan. Not ready-for-agent. Not a GitHub issue. This probe is the display session. It is not a remote-view ticket and it is not marked post-v1 for that reason.
+**Status:** blocked on a Linux platform plan. Not ready-for-agent. Not a GitHub issue. This probe is the display session. It is not a remote-view ticket.
 
 - [ ] The job prints the session type and whether `DISPLAY` and `WAYLAND_DISPLAY` are set (job log)
 - [ ] An X11 mode change is logged only when an X server and `xrandr` were already there. Otherwise the log says X11 was not running (job log)
