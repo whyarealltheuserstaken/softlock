@@ -44,3 +44,6 @@ name = "publish_guard"
 
 [[test]]
 name = "spike_isolation"
+
+[[test]]
+name = "universal_ci"

@@ -1,0 +1,360 @@
+name: Universal
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: universal-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  universal:
+    name: universal 2
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/softlock-app/package-lock.json
+
+      - name: Print the runner OS
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          echo "MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}"
+
+      - name: Install both Apple targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          rustup target list --installed
+
+      - name: Build the front end
+        working-directory: crates/softlock-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Build product crates for both slices
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target x86_64-apple-darwin \
+            -p softlock-app -p softlock-service -p softlock-lockhost \
+            -p softlock-broker -p softlock-windows -p softlock-macos -p softlock-linux
+          cargo build --release --locked --target aarch64-apple-darwin \
+            -p softlock-app -p softlock-service -p softlock-lockhost \
+            -p softlock-broker -p softlock-windows -p softlock-macos -p softlock-linux
+
+      - name: Lipo, thin, and scan each slice
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          require_minos() {
+            bin="$1"
+            lines="$(otool -l "${bin}" | grep 'minos ' || true)"
+            if [ -z "${lines}" ]; then
+              echo "no minos in ${bin}"
+              exit 1
+            fi
+            bad="$(printf '%s\n' "${lines}" | grep -v 'minos 11.0' || true)"
+            if [ -n "${bad}" ]; then
+              echo "deployment target is not 11.0:"
+              printf '%s\n' "${bad}"
+              exit 1
+            fi
+          }
+
+          scan_release() {
+            dir="$1"
+            log="$2"
+            echo "=== release scan ${dir} ==="
+            SOFTLOCK_RELEASE_SCAN_DIR="${PWD}/${dir}" \
+              cargo test --locked -p softlock-lockhost --test release_binary -- --nocapture product_release_binaries \
+              2>&1 | tee "${log}"
+            grep -F "scanned release binaries" "${log}"
+          }
+
+          both_archs() {
+            label="$1"
+            value="$2"
+            case "${value}" in
+              *x86_64*) ;;
+              *)
+                echo "${label} missing x86_64: ${value}"
+                exit 1
+                ;;
+            esac
+            case "${value}" in
+              *arm64*) ;;
+              *)
+                echo "${label} missing arm64: ${value}"
+                exit 1
+                ;;
+            esac
+          }
+
+          mkdir -p target/universal/fat target/universal/x86_64 target/universal/arm64
+          x86_dir="target/x86_64-apple-darwin/release"
+          arm_dir="target/aarch64-apple-darwin/release"
+          merged=0
+          for path in "${arm_dir}"/*; do
+            if [ ! -f "${path}" ]; then
+              continue
+            fi
+            if ! lipo -info "${path}" >/dev/null 2>&1; then
+              continue
+            fi
+            kind="$(file -b "${path}")"
+            case "${kind}" in
+              *executable*) ;;
+              *) continue ;;
+            esac
+            name="$(basename "${path}")"
+            other="${x86_dir}/${name}"
+            if [ ! -f "${other}" ]; then
+              echo "x86_64 build has no ${name}"
+              exit 1
+            fi
+            fat="target/universal/fat/${name}"
+            x86_thin="target/universal/x86_64/${name}"
+            arm_thin="target/universal/arm64/${name}"
+            lipo -create "${other}" "${path}" -output "${fat}"
+            echo "=== lipo -info ${fat} ==="
+            lipo -info "${fat}"
+            echo "=== lipo -archs ${fat} ==="
+            lipo -archs "${fat}"
+            both_archs "lipo -info" "$(lipo -info "${fat}")"
+            both_archs "lipo -archs" "$(lipo -archs "${fat}")"
+            require_minos "${fat}"
+            lipo -thin x86_64 "${fat}" -output "${x86_thin}"
+            lipo -thin arm64 "${fat}" -output "${arm_thin}"
+            chmod +x "${fat}" "${x86_thin}" "${arm_thin}"
+            codesign --force --sign - "${fat}"
+            codesign --force --sign - "${x86_thin}"
+            codesign --force --sign - "${arm_thin}"
+            merged=$((merged + 1))
+          done
+          if [ "${merged}" -lt 1 ]; then
+            echo "no product executable to merge"
+            exit 1
+          fi
+          scan_release target/universal/x86_64 target/universal/x86_64-scan.txt
+          scan_release target/universal/arm64 target/universal/arm64-scan.txt
+          scan_release target/universal/fat target/universal/fat-scan.txt
+          scan_release target/x86_64-apple-darwin/release target/universal/x86_64-crates-scan.txt
+          scan_release target/aarch64-apple-darwin/release target/universal/arm64-crates-scan.txt
+
+      - name: Build the settings app universal binary and scan it
+        working-directory: crates/softlock-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run tauri build -- --target universal-apple-darwin
+          cd "${GITHUB_WORKSPACE}"
+
+          both_archs() {
+            label="$1"
+            value="$2"
+            case "${value}" in
+              *x86_64*) ;;
+              *)
+                echo "${label} missing x86_64: ${value}"
+                exit 1
+                ;;
+            esac
+            case "${value}" in
+              *arm64*) ;;
+              *)
+                echo "${label} missing arm64: ${value}"
+                exit 1
+                ;;
+            esac
+          }
+
+          scan_release() {
+            dir="$1"
+            log="$2"
+            echo "=== release scan ${dir} ==="
+            SOFTLOCK_RELEASE_SCAN_DIR="${PWD}/${dir}" \
+              cargo test --locked -p softlock-lockhost --test release_binary -- --nocapture product_release_binaries \
+              2>&1 | tee "${log}"
+            grep -F "scanned release binaries" "${log}"
+          }
+
+          require_minos() {
+            bin="$1"
+            lines="$(otool -l "${bin}" | grep 'minos ' || true)"
+            if [ -z "${lines}" ]; then
+              echo "no minos in ${bin}"
+              exit 1
+            fi
+            bad="$(printf '%s\n' "${lines}" | grep -v 'minos 11.0' || true)"
+            if [ -n "${bad}" ]; then
+              echo "deployment target is not 11.0:"
+              printf '%s\n' "${bad}"
+              exit 1
+            fi
+          }
+
+          stage_universal() {
+            path="$1"
+            echo "=== lipo -info ${path} ==="
+            lipo -info "${path}"
+            echo "=== lipo -archs ${path} ==="
+            lipo -archs "${path}"
+            both_archs "lipo -info" "$(lipo -info "${path}")"
+            both_archs "lipo -archs" "$(lipo -archs "${path}")"
+            require_minos "${path}"
+            name="$(basename "${path}")"
+            cp "${path}" "target/universal/tauri/${name}"
+            thin="target/universal/arm64/${name}"
+            if [ -e "${thin}" ]; then
+              thin="target/universal/arm64/universal-${name}"
+            fi
+            lipo -thin arm64 "${path}" -output "${thin}"
+            chmod +x "${thin}"
+            codesign --force --sign - "${thin}"
+          }
+
+          consider_app() {
+            path="$1"
+            if [ ! -f "${path}" ]; then
+              return 0
+            fi
+            if ! lipo -info "${path}" >/dev/null 2>&1; then
+              return 0
+            fi
+            kind="$(file -b "${path}")"
+            case "${kind}" in
+              *executable*) ;;
+              *) return 0 ;;
+            esac
+            archs="$(lipo -archs "${path}")"
+            case "${archs}" in
+              *x86_64*) ;;
+              *) return 0 ;;
+            esac
+            case "${archs}" in
+              *arm64*) ;;
+              *) return 0 ;;
+            esac
+            stage_universal "${path}"
+            found=$((found + 1))
+          }
+
+          mkdir -p target/universal/tauri target/universal/arm64
+          found=0
+          app_dir="target/universal-apple-darwin/release"
+          for path in "${app_dir}"/*; do
+            consider_app "${path}"
+          done
+          if [ "${found}" -lt 1 ] && [ -d "${app_dir}/bundle" ]; then
+            for path in $(find "${app_dir}/bundle" -type f); do
+              consider_app "${path}"
+            done
+          fi
+          if [ "${found}" -lt 1 ]; then
+            echo "universal build produced no Mach-O executable"
+            if [ -d target/universal-apple-darwin ]; then
+              find target/universal-apple-darwin -type f -print
+            fi
+            exit 1
+          fi
+          scan_release target/universal/tauri target/universal/tauri-scan.txt
+
+      - name: Smoke launch the arm64 slice
+        shell: bash
+        run: |
+          set -euo pipefail
+          machine="$(uname -m)"
+          echo "uname -m is ${machine}"
+          if [ "${machine}" != "arm64" ]; then
+            echo "smoke launch requires an arm64 runner"
+            exit 1
+          fi
+
+          kill_tree() {
+            parent="$1"
+            children="$(pgrep -P "${parent}" 2>/dev/null || true)"
+            if [ -n "${children}" ]; then
+              for child in ${children}; do
+                kill_tree "${child}"
+              done
+            fi
+            kill "${parent}" 2>/dev/null || true
+          }
+
+          launched=0
+          for path in target/universal/arm64/*; do
+            if [ ! -f "${path}" ]; then
+              continue
+            fi
+            if ! lipo -info "${path}" >/dev/null 2>&1; then
+              continue
+            fi
+            info="$(lipo -info "${path}")"
+            echo "${info}"
+            case "${info}" in
+              *x86_64*)
+                echo "refusing to launch a binary that still contains an x86_64 slice"
+                exit 1
+                ;;
+              *arm64*) ;;
+              *)
+                echo "thin slice is not arm64: ${info}"
+                exit 1
+                ;;
+            esac
+            chmod +x "${path}"
+            codesign --force --sign - "${path}"
+            codesign --verify --verbose=2 "${path}"
+            log="target/universal/arm64-smoke-${launched}.log"
+            "${path}" >"${log}" 2>&1 &
+            pid=$!
+            sleep 5
+            if kill -0 "${pid}" 2>/dev/null; then
+              echo "arm64 slice smoke launch is running: ${path}"
+              kill_tree "${pid}"
+              sleep 1
+              kill -9 "${pid}" 2>/dev/null || true
+              wait "${pid}" 2>/dev/null || true
+            else
+              set +e
+              wait "${pid}"
+              status=$?
+              set -e
+              echo "arm64 slice exited ${status}: ${path}"
+              cat "${log}"
+              if [ "${status}" -ne 0 ]; then
+                exit "${status}"
+              fi
+            fi
+            launched=$((launched + 1))
+          done
+          if [ "${launched}" -lt 1 ]; then
+            echo "no arm64 slice to launch"
+            exit 1
+          fi
+          echo "x86_64 slice is not executed"
