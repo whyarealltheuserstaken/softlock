@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Approved. Ticket breakdown approved 15 Nov 2026 (31 v1 tickets, 1 deferred). Gaps resolved during ticketing are in Implementation Decision 17. Amended 15 Nov 2026 with two Henry-approved v1 features: the battery and heat floor (Decision 10) and pausing background apps (Decision 18), summarized in Decision 19; ticket 35 added. On 16 Nov 2026 Henry decided v1 ships both pause modes, with gentle pause as the default |
+| **Status** | Approved. Ticket breakdown approved 15 Nov 2026 (31 v1 tickets, 1 deferred). Gaps resolved during ticketing are in Implementation Decision 17. Amended 15 Nov 2026 with two Henry-approved v1 features: the battery and heat floor (Decision 10) and pausing background apps (Decision 18), summarized in Decision 19; ticket 35 added. On 16 Nov 2026 Henry decided v1 ships both pause modes, with gentle pause as the default. The macOS phase 2 addendum of 16 Nov 2026 (`docs/platforms/macos.md`, tickets in `docs/tickets/macos/`) is planning only: it does not change Windows v1 behavior and it is not approved until Henry says so |
 | **Owner** | Henry |
 | **Date** | 15 November 2026 |
 | **Working name** | SoftLock. Pick a new name before public launch (see Further Notes) |
@@ -524,13 +524,7 @@ pub enum PauseMode { Efficiency, Suspend }                       // Efficiency i
 
 ### 16. Later platforms (abstraction now, implementation later)
 
-- **macOS 11+ (Apple Silicon and Intel), phase 2:**
-  - Root `LaunchDaemon` as the Service and a per-user `LaunchAgent` as the Lock Host.
-  - Input guard: a `CGEventTap` at the HID level, classifying events by source (`kCGEventSourceStateID` / source PID). Physical events are swallowed and synthetic ones passed.
-  - Overlay: a borderless window at shielding level with `sharingType = .none`, plus presentation options (disable force quit, process switching and session termination, hide the Dock and menu bar).
-  - Unlock: `LAContext` (Touch ID or password).
-  - Requires Accessibility and Input Monitoring permission, granted by the user.
-  - Known risks: Secure Input mode can starve event taps, and ScreenCaptureKit on newer macOS versions may ignore `sharingType`, which needs verifying. The Mac App Store is not a target, because event posting is blocked in the sandbox.
+- **macOS 11+ (Apple Silicon and Intel), phase 2.** The bullets that used to sit here (HID-level `CGEventTap`, `sharingType = .none`, shielding window level, `LAContext`) are the 15 Nov sketch. They are superseded by the addendum in [`docs/platforms/macos.md`](platforms/macos.md), written 16 Nov 2026 against commit `23b5a39bc92c2ee32f470256d78be27d030dc59f`. The addendum keeps these traits and the Broker nonce rule. It reopens input classification and capture exclusion, because Apple's current pages do not support "HID state means a physical key" or "sharing type none hides the window from capture." Tickets are in [`docs/tickets/macos/`](tickets/macos/README.md). This addendum adds no lock behavior and no GitHub issues. Henry has not approved it yet.
 - **Linux, phase 3:**
   - Root daemon plus a session client.
   - The leading design is an **evdev exclusive grab (`EVIOCGRAB`) of physical input devices**. Virtual `uinput` devices used by agents stay ungrabbed, and the daemon reads the grabbed devices for the unlock prompt. This works under both Wayland and X11.
@@ -643,6 +637,7 @@ Everything else (the Windows backend internals, overlay drawing, hook details) i
   - Seams 2 and 3 on `windows-2022` and `windows-2025` runners (Server SKUs with an interactive desktop. This must be confirmed in prototype P7).
   - Seam 4 on Linux.
   - MSI build, plus an install, uninstall and "nothing left behind" check on Windows.
+  - The macOS Universal 2 job (both slices, `lipo`, the release-binary scan on each slice, and a Tauri `universal-apple-darwin` build) is specified in the macOS addendum and in ticket m01. It is not in `.github/workflows/ci.yml` yet. Seam 1 on `macos-latest` stays as it is.
   - `cargo deny` for licenses (Apache-2.0-compatible only) and advisories.
 - GitHub-hosted runners are Windows Server, so client-only behavior (the Ctrl+Alt+Del screen layout, Windows Hello, Modern Standby, the lid) **can't be covered in CI**. It goes on the manual checklist.
 
