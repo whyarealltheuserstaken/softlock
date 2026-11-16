@@ -36,6 +36,57 @@ fn scanner_rejects_each_marker_on_its_own() {
 }
 
 #[test]
+fn extensionless_executable_fails_the_release_binary_check() {
+    let root = unique_dir("extensionless");
+    let app = root.join("softlock-app");
+    let pdb = root.join("softlock-app.pdb");
+    let import_lib = root.join("softlock_app_lib.lib");
+    let archive = root.join("libsoftlock_app_lib.a");
+    let odd_executable = root.join("wrapped.dat");
+    let notes = root.join("notes.txt");
+    fs::write(&app, padding(MARKER_STRING)).unwrap();
+    fs::write(&pdb, padding(MARKER_SYMBOL)).unwrap();
+    fs::write(&import_lib, padding(MARKER_STRING)).unwrap();
+    fs::write(&archive, padding(MARKER_SYMBOL)).unwrap();
+    fs::write(&odd_executable, padding(MARKER_STRING)).unwrap();
+    fs::write(&notes, padding(MARKER_STRING)).unwrap();
+    make_executable(&app);
+    make_executable(&odd_executable);
+
+    let hits = scan(&root, "");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.path.ends_with("softlock-app") && hit.string),
+        "an extensionless executable must fail the scan:\n{}",
+        format_hits(&hits)
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.path.ends_with(".pdb") && hit.symbol)
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.path.ends_with(".lib") && hit.string)
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.path.ends_with(".a") && hit.symbol)
+    );
+    #[cfg(unix)]
+    assert!(
+        hits.iter()
+            .any(|hit| hit.path.ends_with("wrapped.dat") && hit.string),
+        "a file with the executable bit must fail the scan:\n{}",
+        format_hits(&hits)
+    );
+    assert!(
+        hits.iter().all(|hit| !hit.path.ends_with("notes.txt")),
+        "a non-executable text file must not be scanned"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn contaminated_build_fails_the_release_binary_check() {
     let root = unique_dir("builds");
     let clean_dir = root.join("clean");
@@ -162,15 +213,41 @@ fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
+            // `build/` is build-script scratch. Every product crate is named
+            // with `-p` on the release build, so the artifacts under test are
+            // the package outputs in the release directory, not that scratch.
             if name == "build" || name == ".fingerprint" || name == "incremental" {
                 continue;
             }
             walk(&path, found);
             continue;
         }
-        if is_binary_name(&name) {
+        if is_release_artifact(&path, &name) {
             found.push(path);
         }
+    }
+}
+
+fn is_release_artifact(path: &Path, name: &str) -> bool {
+    is_binary_name(name) || is_extensionless(name) || is_executable(path)
+}
+
+fn is_extensionless(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('.') && !name.contains('.')
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -181,6 +258,9 @@ fn is_binary_name(name: &str) -> bool {
         || name.ends_with(".so")
         || name.ends_with(".dylib")
         || name.ends_with(".bin")
+        || name.ends_with(".pdb")
+        || name.ends_with(".lib")
+        || name.ends_with(".a")
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -204,6 +284,20 @@ fn format_hits(hits: &[Hit]) -> String {
         .map(|hit| format!("{} string={} symbol={}", hit.path, hit.string, hit.symbol))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn make_executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(permissions.mode() | 0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 fn unique_dir(label: &str) -> PathBuf {

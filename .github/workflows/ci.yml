@@ -133,8 +133,16 @@ jobs:
           toolchain: 1.100.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/softlock-app/package-lock.json
       - name: Windows target
         run: rustup target add x86_64-pc-windows-msvc
+      - name: Front end for the app binary
+        working-directory: crates/softlock-app
+        run: npm ci
       - name: Probe harness
         shell: bash
         run: |
@@ -142,8 +150,8 @@ jobs:
           mkdir -p target
           cargo test --locked -p softlock-seam3 --target x86_64-pc-windows-msvc -- --nocapture \
             2>&1 | tee target/seam3-probe.txt
-          grep -F "probe_window_receives_sendinput_key_and_capture_contains_marker" target/seam3-probe.txt
-          grep -F "registry_device_and_power_snapshots_diff" target/seam3-probe.txt
+          grep -F "probe_window_receives_sendinput_key_and_capture_contains_marker ... ok" target/seam3-probe.txt
+          grep -F "registry_device_and_power_snapshots_diff ... ok" target/seam3-probe.txt
       - name: Simulated-physical classifier
         shell: bash
         run: |
@@ -151,7 +159,7 @@ jobs:
           mkdir -p target
           cargo test --locked -p softlock-lockhost --features simulated-physical --target x86_64-pc-windows-msvc --lib -- --nocapture \
             2>&1 | tee target/seam3-classify.txt
-          grep -F "nonce_tagged_injected_event_is_simulated_physical" target/seam3-classify.txt
+          grep -F "nonce_tagged_injected_event_is_simulated_physical ... ok" target/seam3-classify.txt
       - name: Nonce survives SendInput into the hook
         shell: bash
         run: |
@@ -159,14 +167,15 @@ jobs:
           mkdir -p target
           cargo test --locked -p softlock-seam3 --features simulated-physical --target x86_64-pc-windows-msvc --test seam3 -- --nocapture hook_sees_nonce \
             2>&1 | tee target/seam3-hook.txt
-          grep -F "hook_sees_nonce_tagged_sendinput_as_simulated_physical" target/seam3-hook.txt
+          grep -F "hook_sees_nonce_tagged_sendinput_as_simulated_physical ... ok" target/seam3-hook.txt
       - name: Release build of the Windows target omits the test feature
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target
           cargo build --release --locked --target x86_64-pc-windows-msvc \
-            -p softlock-lockhost -p softlock-service -p softlock-broker -p softlock-windows
+            -p softlock-app -p softlock-lockhost -p softlock-service \
+            -p softlock-broker -p softlock-windows
           SOFTLOCK_RELEASE_SCAN_DIR="$PWD/target/x86_64-pc-windows-msvc/release" \
             cargo test --locked -p softlock-lockhost --test release_binary -- --nocapture product_release_binaries \
             2>&1 | tee target/windows-release-scan.txt

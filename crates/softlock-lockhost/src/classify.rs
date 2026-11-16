@@ -61,6 +61,8 @@ impl RunNonce {
         Ok(Self(value))
     }
 
+    /// Test helper. Production callers use [`Self::random`] so the nonce comes from the CSPRNG.
+    #[cfg(test)]
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
