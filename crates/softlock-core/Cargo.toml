@@ -28,6 +28,9 @@ name = "seam1"
 required-features = ["test-support"]
 
 [[test]]
+name = "ipc_zeroize"
+
+[[test]]
 name = "windows_dep"
 
 [[test]]

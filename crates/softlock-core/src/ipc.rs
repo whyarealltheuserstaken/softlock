@@ -118,10 +118,15 @@ pub enum IpcError {
 }
 
 pub fn message_json(id: u64, body: &impl Serialize) -> Result<String, IpcError> {
-    let mut value = serde_json::to_value(body).map_err(|_| IpcError::Malformed)?;
-    let Value::Object(fields) = std::mem::replace(&mut value, Value::Null) else {
-        zeroize_json(&mut value);
-        return Err(IpcError::Malformed);
+    let value = serde_json::to_value(body).map_err(|_| IpcError::Malformed)?;
+    // Match the serialized value itself. Replacing it with Null first drops the
+    // original on this path and leaves only the placeholder to wipe.
+    let fields = match value {
+        Value::Object(fields) => fields,
+        mut original => {
+            zeroize_json(&mut original);
+            return Err(IpcError::Malformed);
+        }
     };
     let mut object = Map::new();
     object.insert("v".to_string(), Value::from(IPC_VERSION));
@@ -208,7 +213,12 @@ fn decode_request_json(json: &str) -> Result<DecodedRequest, IpcError> {
     };
     object.remove("v");
     object.remove("id");
-    let kind = match serde_json::from_value(Value::Object(object)) {
+    // `from_value` consumes the object, so a failure drops a PIN still sitting
+    // in it. Deserialize from a reference and wipe that object on both paths.
+    let mut payload = Value::Object(object);
+    let parsed = RequestKind::deserialize(&payload);
+    zeroize_json(&mut payload);
+    let kind = match parsed {
         Ok(kind) => kind,
         Err(_) => return Err(IpcError::Malformed),
     };
