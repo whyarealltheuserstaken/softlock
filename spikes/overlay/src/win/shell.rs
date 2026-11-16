@@ -2,6 +2,7 @@
 //! to Explorer or a shell host.
 
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -10,14 +11,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PWSTR;
 
-use crate::shell::{ShellSurface, identify};
+use crate::shell::{ShellSurface, identify, surface_is_open};
 
 use super::input;
 
 pub fn visible_surfaces() -> Vec<ShellSurface> {
     let mut found = Vec::new();
     for hwnd in top_level_windows() {
-        if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+        let cloaked = visible && is_cloaked(hwnd);
+        if !surface_is_open(visible, cloaked) {
             continue;
         }
         let Some(exe) = process_path(hwnd) else {
@@ -60,6 +63,20 @@ unsafe extern "system" fn enum_windows(hwnd: HWND, data: LPARAM) -> windows::cor
         let list = &mut *(data.0 as *mut Vec<isize>);
         list.push(hwnd.0 as isize);
         windows::Win32::Foundation::TRUE
+    }
+}
+
+fn is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked = 0u32;
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+            size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0
     }
 }
 

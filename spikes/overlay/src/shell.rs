@@ -9,6 +9,13 @@ pub enum ShellSurface {
     Project,
 }
 
+/// A window is on screen only when Windows says it is visible and DWM has not
+/// cloaked it. The hidden Start menu reports visible while it is cloaked.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn surface_is_open(visible: bool, cloaked: bool) -> bool {
+    visible && !cloaked
+}
+
 /// A real shell host owns this window. The spike never posts a close message
 /// to one of these. It dismisses the surface with Escape instead.
 /// StartMenuExperienceHost is the Start menu even when its title is blank.
@@ -167,6 +174,14 @@ mod tests {
             identify("Chrome_WidgetWin_1", "Inbox", r"C:\chrome.exe"),
             None
         );
+    }
+
+    #[test]
+    fn a_cloaked_window_is_not_an_open_surface() {
+        assert!(surface_is_open(true, false));
+        assert!(!surface_is_open(true, true));
+        assert!(!surface_is_open(false, false));
+        assert!(!surface_is_open(false, true));
     }
 
     #[test]

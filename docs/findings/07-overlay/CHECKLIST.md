@@ -16,7 +16,9 @@ You can stop in the middle. The pink layer closes itself.
 
 Before the school PC, ask the person who manages that computer. That is school IT, not a teacher.
 
-You need permission to run an unsigned program. Windows SmartScreen may say "Windows protected your PC". Do not click through that until school IT says you may. After they say yes, the click is More info, then Run anyway.
+You need permission to run an unsigned program. Windows SmartScreen may say "Windows protected your PC". Do not click through that until school IT says you may. After they say yes, the click is More info, then Run anyway. Antivirus may flag the program because it is unsigned.
+
+Tell school IT what the toast switch does. `--suppress-toasts` writes two things for your Windows user, not for the whole computer: a RunOnce entry named `softlock-spike-overlay` under `HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce`, and the `ToastEnabled` setting under `HKCU\Software\Microsoft\Windows\CurrentVersion\PushNotifications`. It does not write a policy key.
 
 Do not install git, rustup, or Visual Studio on the school PC.
 
@@ -105,6 +107,15 @@ On the toast step, look for a banner. If a banner still appears, write `not supp
 
 If a step that was drawn above last time is gone, write `mitigated by` and the fix you think did it. If you are not sure which fix, write `mitigated by one of the four switches` and say what you saw.
 
+When that pass ends, put toasts back and confirm a banner appears before you go to the school PC:
+
+```powershell
+.\spike-overlay.exe restore-toasts
+.\spike-overlay.exe tour --only Toast --no-prompt --pause-secs 15 --timeout-secs 40
+```
+
+You should see a banner. If you do not, write that in the notes. Do not start the school PC pass until a banner shows, or until school IT says to skip toasts.
+
 ## 5. School PC (ThinkStation P7)
 
 School IT has already said yes, including the unsigned exe and SmartScreen. The two files are in a local folder, for example `C:\Users\<you>\softlock-test`. Open PowerShell there. Do not install Rust.
@@ -152,19 +163,32 @@ powershell -ExecutionPolicy Bypass -File .\open-surfaces.ps1 -PauseSecs 25 -Time
 
 Watch the toast step again. If a banner still appears, write `not suppressed until sign-out`. Do not sign out until the pink layer is gone.
 
-## 6. Put toasts back
+## 6. Final cleanup
 
-The toast setting is put back when the test exits. A crash, a kill, or a reboot also puts it back the next time you sign in, because the program writes a one-time startup entry before it changes the setting.
-
-After both passes, run this from the copied folder and confirm a banner appears again:
+Do this on the laptop and again on the school PC, from the copied folder. The laptop already confirmed a banner in section 4.2. On the school PC, the second command is how you confirm a banner appears again.
 
 ```powershell
 cd C:\Users\<you>\softlock-test
 .\spike-overlay.exe restore-toasts
 .\spike-overlay.exe tour --only Toast --no-prompt --pause-secs 15 --timeout-secs 40
+reg query HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce /v softlock-spike-overlay
+reg query HKCU\Software\softlock-spike-overlay
 ```
 
-You should see a banner. Photograph it if the earlier toast photos were missing. If no banner appears, write that in the notes and tell school IT. Do not keep trying.
+You should see a banner on the school PC. Photograph it if the earlier toast photos were missing. If no banner appears, write that in the notes and tell school IT. Do not keep trying.
+
+Both `reg query` commands should fail. The first should say it cannot find the value `softlock-spike-overlay`. The second should say it cannot find the key. If either one prints a value, run `.\spike-overlay.exe restore-toasts` again and repeat the two queries.
+
+Windows may add a notification-settings entry for `com.softlock.spike.overlay`. That entry is harmless. Leave it. It is not the RunOnce entry and it is not the sentinel key.
+
+Then delete the copied folder on both machines. Close PowerShell first if it is still inside that folder.
+
+```powershell
+cd $env:USERPROFILE
+Remove-Item -Recurse -Force .\softlock-test
+```
+
+Use the real folder name if you did not call it `softlock-test`.
 
 ## 7. If you get stuck
 

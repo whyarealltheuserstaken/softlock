@@ -22,7 +22,10 @@ use windows::Win32::Graphics::Gdi::{
     HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, ReleaseDC,
     SRCCOPY, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
+use windows::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    SetConsoleCtrlHandler,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::{
@@ -105,7 +108,7 @@ struct Cleanup;
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        finish();
+        cleanup_all();
     }
 }
 
@@ -496,13 +499,14 @@ fn cleanup_all() {
     });
 }
 
-fn finish() {
-    cleanup_all();
-}
-
 fn install_ctrl_c() {
     unsafe extern "system" fn handler(ctrl: u32) -> windows::core::BOOL {
-        if ctrl == CTRL_C_EVENT || ctrl == CTRL_BREAK_EVENT {
+        let closes = ctrl == CTRL_C_EVENT
+            || ctrl == CTRL_BREAK_EVENT
+            || ctrl == CTRL_CLOSE_EVENT
+            || ctrl == CTRL_LOGOFF_EVENT
+            || ctrl == CTRL_SHUTDOWN_EVENT;
+        if closes {
             cleanup_all();
             std::process::exit(0);
         }
@@ -537,7 +541,7 @@ fn run_tour(config: &Config) -> Result<(), String> {
         });
         let _ = std::io::Write::flush(&mut std::io::stdout());
         let before = shell::visible_surfaces();
-        let opened = match perform(step, build) {
+        let opened = match perform(step) {
             Ok(()) => true,
             Err(error) => {
                 eprintln!("This surface did not open: {error}");
@@ -556,7 +560,7 @@ fn run_tour(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn perform(step: &Step, _build: u32) -> Result<(), String> {
+fn perform(step: &Step) -> Result<(), String> {
     match step.action {
         Action::Chord(chord) => input::chord(chord),
         Action::Toast => toast::show(),

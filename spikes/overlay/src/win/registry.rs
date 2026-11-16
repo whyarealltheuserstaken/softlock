@@ -15,9 +15,8 @@ use windows::Win32::System::Registry::{
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::toast_plan::{
-    DISABLED_TOASTS, POLICY_SUBKEY, POLICY_VALUE, RUN_ONCE_SUBKEY, RUN_ONCE_VALUE, Restore,
-    SENTINEL_SUBKEY, TOAST_ENABLED_SUBKEY, TOAST_ENABLED_VALUE, restore_of, run_once_command,
-    suppression_blocked,
+    DISABLED_TOASTS, POLICY_SUBKEY, RUN_ONCE_SUBKEY, RUN_ONCE_VALUE, Restore, SENTINEL_SUBKEY,
+    TOAST_ENABLED_SUBKEY, TOAST_ENABLED_VALUE, restore_of, run_once_command, suppression_blocked,
 };
 use crate::win::wide;
 
@@ -63,16 +62,6 @@ fn restore_locked() -> Result<String, String> {
             TOAST_ENABLED_VALUE,
             restore_of(toast_present.then_some(toast_previous.unwrap_or(1))),
         )?;
-        // Older builds of this spike wrote the policy value. Put that back too,
-        // then stop. New runs do not write it.
-        if get_dword(SENTINEL_SUBKEY, "PolicyPresent")?.unwrap_or(0) == 1 {
-            let policy_previous = get_dword(SENTINEL_SUBKEY, "PolicyPrevious")?;
-            apply(
-                POLICY_SUBKEY,
-                POLICY_VALUE,
-                restore_of(Some(policy_previous.unwrap_or(0))),
-            )?;
-        }
         "toast settings restored"
     } else {
         "toast settings were already restored"
@@ -174,44 +163,35 @@ fn get_dword(subkey: &str, value: &str) -> Result<Option<u32>, String> {
 }
 
 fn set_dword(subkey: &str, value: &str, data: u32) -> Result<(), String> {
-    let subkey_w = wide(subkey);
-    let value_w = wide(value);
-    unsafe {
-        let mut key = Default::default();
-        let status = RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(subkey_w.as_ptr()),
-            None,
-            PCWSTR::null(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_ALL_ACCESS,
-            None,
-            &mut key,
-            None,
-        );
-        if status != ERROR_SUCCESS {
-            return Err(format!("could not open {subkey}: {status:?}"));
-        }
-        let status = RegSetKeyValueW(
-            key,
-            PCWSTR::null(),
-            PCWSTR(value_w.as_ptr()),
-            REG_DWORD.0,
-            Some((&data as *const u32).cast()),
-            size_of::<u32>() as u32,
-        );
-        let _ = RegCloseKey(key);
-        if status != ERROR_SUCCESS {
-            return Err(format!("could not write a toast value: {status:?}"));
-        }
-    }
-    Ok(())
+    set_value(
+        subkey,
+        value,
+        REG_DWORD.0,
+        (&data as *const u32).cast(),
+        size_of::<u32>() as u32,
+    )
 }
 
 fn set_sz(subkey: &str, value: &str, data: &str) -> Result<(), String> {
+    let data_w = wide(data);
+    set_value(
+        subkey,
+        value,
+        REG_SZ.0,
+        data_w.as_ptr().cast(),
+        (data_w.len() * 2) as u32,
+    )
+}
+
+fn set_value(
+    subkey: &str,
+    value: &str,
+    kind: u32,
+    data: *const u8,
+    bytes: u32,
+) -> Result<(), String> {
     let subkey_w = wide(subkey);
     let value_w = wide(value);
-    let data_w = wide(data);
     unsafe {
         let mut key = Default::default();
         let status = RegCreateKeyExW(
@@ -232,9 +212,9 @@ fn set_sz(subkey: &str, value: &str, data: &str) -> Result<(), String> {
             key,
             PCWSTR::null(),
             PCWSTR(value_w.as_ptr()),
-            REG_SZ.0,
-            Some(data_w.as_ptr().cast()),
-            (data_w.len() * 2) as u32,
+            kind,
+            Some(data.cast()),
+            bytes,
         );
         let _ = RegCloseKey(key);
         if status != ERROR_SUCCESS {

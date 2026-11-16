@@ -11,7 +11,9 @@ pub const TOAST_ENABLED_VALUE: &str = "ToastEnabled";
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const POLICY_SUBKEY: &str =
     r"Software\Policies\Microsoft\Windows\CurrentVersion\PushNotifications";
-#[cfg_attr(not(windows), allow(dead_code))]
+/// The policy value this spike must not write. Any existing value under the
+/// policy key is enough to refuse.
+#[allow(dead_code)]
 pub const POLICY_VALUE: &str = "NoToastApplicationNotification";
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const SENTINEL_SUBKEY: &str = r"Software\softlock-spike-overlay";

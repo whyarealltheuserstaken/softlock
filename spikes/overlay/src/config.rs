@@ -48,7 +48,6 @@ pub struct Config {
     /// The tour refuses to run elevated unless this is set.
     pub allow_admin: bool,
     pub fullscreen_secs: u64,
-    timeout_set: bool,
 }
 
 impl Config {
@@ -113,7 +112,6 @@ impl Config {
             index += 1;
         }
         let command = command.unwrap_or(Command::Run);
-        let timeout_set = timeout_secs.is_some();
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(match command {
             Command::Smoke => 8,
             _ => DEFAULT_TIMEOUT_SECS,
@@ -138,7 +136,6 @@ impl Config {
             shell_fixture,
             allow_admin,
             fullscreen_secs,
-            timeout_set,
         })
     }
 
@@ -165,17 +162,13 @@ impl Config {
         }
         Ok(())
     }
-
-    pub fn timeout_was_set(&self) -> bool {
-        self.timeout_set
-    }
 }
 
 /// An elevated tour is refused unless the operator passed `--allow-admin`.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn tour_allowed(elevated: bool, allow_admin: bool) -> Result<(), String> {
     if elevated && !allow_admin {
-        Err("this tour is running as admin. Start it by double-clicking the program. Pass --allow-admin only if school IT told you to.".into())
+        Err("this tour is running as admin. Close it and open a normal PowerShell. Do not choose Run as administrator. Pass --allow-admin only if school IT told you to.".into())
     } else {
         Ok(())
     }
