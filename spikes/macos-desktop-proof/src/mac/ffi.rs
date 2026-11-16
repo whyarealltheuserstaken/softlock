@@ -4,7 +4,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
 use crate::report::{
-    CaptureReport, TapBits, TapReport, WindowReport, capture_detail, capture_opened,
+    CaptureReport, TapBits, TapReport, WindowReport, active_tap, capture_detail, capture_opened,
     capture_unavailable, prompt_token, tap_from_bits,
 };
 
@@ -15,6 +15,7 @@ struct WindowOut {
     key_received: i32,
     post_location: [u8; 64],
     error: [u8; 768],
+    stage: [u8; 64],
 }
 
 #[repr(C)]
@@ -32,6 +33,19 @@ struct CaptureOut {
     opened: i32,
     width: i32,
     height: i32,
+    nonblack: i32,
+    marker: i32,
+    prompt: i32,
+    detail: [u8; 768],
+}
+
+#[repr(C)]
+struct ActiveOut {
+    created: i32,
+    deleted: i32,
+    listen_saw: i32,
+    accessibility_trusted: i32,
+    listen_preflight: i32,
     prompt: i32,
     detail: [u8; 768],
 }
@@ -46,11 +60,15 @@ struct SessionOut {
 }
 
 unsafe extern "C" {
+    fn macos_window_open(out: *mut WindowOut) -> i32;
+    fn macos_window_close() -> i32;
     fn macos_prove_window(out: *mut WindowOut) -> i32;
     fn macos_prove_tap(location: *const c_char, out: *mut TapOut) -> i32;
+    fn macos_prove_active_tap(out: *mut ActiveOut) -> i32;
     fn macos_prove_cg_window_list(out: *mut CaptureOut) -> i32;
     fn macos_prove_cg_display(out: *mut CaptureOut) -> i32;
     fn macos_prove_screen_capture_kit(out: *mut CaptureOut) -> i32;
+    fn macos_inspect_png(path: *const c_char, nonblack: *mut i32, marker: *mut i32) -> i32;
     fn macos_prompt_code() -> i32;
     fn macos_session_info(out: *mut SessionOut) -> i32;
 }
@@ -63,29 +81,91 @@ pub struct SessionInfo {
 pub fn prove_window() -> WindowReport {
     let mut out = zero_window();
     let rc = unsafe { macos_prove_window(&mut out) };
+    window_from_out(rc, &out)
+}
+
+pub fn window_open() -> WindowReport {
+    let mut out = zero_window();
+    let rc = unsafe { macos_window_open(&mut out) };
+    window_from_out(rc, &out)
+}
+
+pub fn window_close() {
+    unsafe { macos_window_close() };
+}
+
+fn window_from_out(rc: i32, out: &WindowOut) -> WindowReport {
     if rc != 0 {
         return WindowReport {
             ordered_front: false,
             key_window: false,
             key_received: false,
             post_location: String::new(),
+            stage: text(&out.stage),
             error: Some("NSWindow proof was not called".to_string()),
         };
     }
     let ordered_front = out.ordered_front != 0;
     let key_received = out.key_received != 0;
     let error = text(&out.error);
+    let stage = text(&out.stage);
     WindowReport {
         ordered_front,
         key_window: out.key_window != 0,
         key_received,
         post_location: text(&out.post_location),
+        stage: if stage.is_empty() {
+            "none".to_string()
+        } else {
+            stage
+        },
         error: if (ordered_front && key_received) || error.is_empty() {
             None
         } else {
             Some(error)
         },
     }
+}
+
+pub fn prove_active_tap() -> TapReport {
+    let mut out = zero_active();
+    let rc = unsafe { macos_prove_active_tap(&mut out) };
+    if rc != 0 {
+        return active_tap(
+            TapBits {
+                created: false,
+                callback_fired: false,
+                accessibility_trusted: None,
+                listen_preflight: None,
+                prompt: None,
+            },
+            None,
+            None,
+            "kCGEventTapOptionDefault was not called",
+        );
+    }
+    let deleted = match out.deleted {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    };
+    let listen_saw = match out.listen_saw {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    };
+    active_tap(
+        TapBits {
+            created: out.created != 0,
+            callback_fired: out.deleted == 1,
+            accessibility_trusted: flag(out.accessibility_trusted),
+            listen_preflight: flag(out.listen_preflight),
+            prompt: prompt_token(out.prompt),
+        },
+        deleted,
+        listen_saw,
+        &text(&out.detail),
+    )
 }
 
 pub fn prove_tap(location: &str, privilege: &str) -> TapReport {
@@ -123,6 +203,20 @@ pub fn prove_screen_capture_kit() -> CaptureReport {
     map_capture("ScreenCaptureKit", macos_prove_screen_capture_kit)
 }
 
+pub fn inspect_png(path: &std::path::Path) -> Option<(i32, i32)> {
+    let Ok(path) = CString::new(path.to_string_lossy().as_bytes()) else {
+        return None;
+    };
+    let mut nonblack = -1;
+    let mut marker = -1;
+    let rc = unsafe { macos_inspect_png(path.as_ptr(), &mut nonblack, &mut marker) };
+    if rc != 0 || nonblack < 0 || marker < 0 {
+        None
+    } else {
+        Some((nonblack, marker))
+    }
+}
+
 pub fn prompt_after_capture(detail: &str) -> String {
     capture_detail(detail, prompt_token(unsafe { macos_prompt_code() }))
 }
@@ -156,7 +250,13 @@ fn map_capture(api: &str, prove: unsafe extern "C" fn(*mut CaptureOut) -> i32) -
         return capture_unavailable(api, "probe was not called");
     }
     if out.opened != 0 {
-        return capture_opened(api, out.width, out.height);
+        if out.nonblack < 0 || out.marker < 0 {
+            let mut report = capture_opened(api, out.width, out.height, 0, 0);
+            report.nonblack_pixels = None;
+            report.marker_pixels = None;
+            return report;
+        }
+        return capture_opened(api, out.width, out.height, out.nonblack, out.marker);
     }
     let detail = text(&out.detail);
     let detail = if detail.is_empty() {
@@ -204,6 +304,7 @@ fn zero_window() -> WindowOut {
         key_received: 0,
         post_location: [0; 64],
         error: [0; 768],
+        stage: [0; 64],
     }
 }
 
@@ -223,6 +324,20 @@ fn zero_capture() -> CaptureOut {
         opened: 0,
         width: 0,
         height: 0,
+        nonblack: -1,
+        marker: -1,
+        prompt: 0,
+        detail: [0; 768],
+    }
+}
+
+fn zero_active() -> ActiveOut {
+    ActiveOut {
+        created: 0,
+        deleted: -1,
+        listen_saw: -1,
+        accessibility_trusted: -1,
+        listen_preflight: -1,
         prompt: 0,
         detail: [0; 768],
     }

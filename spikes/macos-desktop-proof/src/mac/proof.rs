@@ -20,6 +20,7 @@ use crate::report::{
     capture_unavailable, failure_reasons, job_window_plan, render, tap_process_miss,
     tap_sudo_failed, window_process_miss,
 };
+use crate::text::one_line;
 use crate::version::parse_sw_vers;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -34,6 +35,7 @@ pub fn dispatch(args: Args) -> i32 {
         Mode::TapOnly => run_tap(&args),
         Mode::WindowOnly => run_window(&args),
         Mode::CaptureOnly => run_capture(&args),
+        Mode::ActiveTap => run_active(&args),
         Mode::Orchestrator => run_orchestrator(&args),
     }
 }
@@ -63,25 +65,40 @@ fn run_orchestrator(args: &Args) -> i32 {
         }
     };
     eprintln!("macos desktop proof: window");
-    let window = child_window(&exe, &args.output_dir);
+    let desktop = child_desktop(&exe, &args.output_dir);
     eprintln!("macos desktop proof: event taps");
-    let session = child_tap(&exe, &args.output_dir, "kCGSessionEventTap", "user");
-    let hid_user = child_tap(&exe, &args.output_dir, "kCGHIDEventTap", "user");
-    let hid_root = root_hid_tap(&exe, &args.output_dir);
-    eprintln!("macos desktop proof: capture");
-    let mut captures = Vec::new();
-    for api in CAPTURE_APIS {
-        captures.push(child_capture(&exe, &args.output_dir, api));
-    }
+    let (session, session_crash) = child_tap(&exe, &args.output_dir, "kCGSessionEventTap", "user");
+    let (hid_user, hid_crash) = child_tap(&exe, &args.output_dir, "kCGHIDEventTap", "user");
+    let (hid_root, root_crash) = root_hid_tap(&exe, &args.output_dir);
+    eprintln!("macos desktop proof: active tap");
+    let (active, active_crash) = child_active(&exe, &args.output_dir);
     eprintln!("macos desktop proof: launchd");
     let jobs = launchd::exercise(&exe, &args.output_dir);
+    let mut crashes = Vec::new();
+    for crash in [
+        desktop.crash,
+        session_crash,
+        hid_crash,
+        root_crash,
+        active_crash,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        crashes.push(crash);
+    }
     let report = ProofReport {
         runner_image: args.runner_image.clone(),
         version,
-        window: Some(window),
-        taps: vec![session, hid_user, hid_root],
-        captures,
+        window: Some(desktop.window),
+        taps: vec![session, hid_user, hid_root, active],
+        captures: desktop.captures,
         jobs,
+        probe_crash: if crashes.is_empty() {
+            None
+        } else {
+            Some(crashes.join("; "))
+        },
     };
     let text = render(&report);
     println!("{text}");
@@ -137,14 +154,35 @@ fn run_job(args: &Args) -> i32 {
 }
 
 fn run_window(args: &Args) -> i32 {
-    eprintln!("stage=NSWindow");
-    let window = ffi::prove_window();
+    let window = ffi::window_open();
     let path = args.output_dir.join("window.json");
     if let Err(error) = write_json(&path, &window) {
         eprintln!("{error}");
+        ffi::window_close();
         return 1;
     }
+    for api in CAPTURE_APIS {
+        eprintln!("stage={api}");
+        let report = capture_api(api, &args.output_dir);
+        let path = args.output_dir.join(format!("capture-{api}.json"));
+        if let Err(error) = write_json(&path, &report) {
+            eprintln!("{error}");
+            ffi::window_close();
+            return 1;
+        }
+    }
+    ffi::window_close();
     0
+}
+
+fn capture_api(api: &str, output_dir: &Path) -> CaptureReport {
+    match api {
+        "CGWindowListCreateImage" => ffi::prove_cg_window_list(),
+        "CGDisplayCreateImage" => ffi::prove_cg_display(),
+        "screencapture" => prove_screencapture(output_dir),
+        "ScreenCaptureKit" => ffi::prove_screen_capture_kit(),
+        other => capture_unavailable(other, "unknown capture api"),
+    }
 }
 
 fn run_capture(args: &Args) -> i32 {
@@ -153,13 +191,7 @@ fn run_capture(args: &Args) -> i32 {
         return 2;
     };
     eprintln!("stage={api}");
-    let report = match api {
-        "CGWindowListCreateImage" => ffi::prove_cg_window_list(),
-        "CGDisplayCreateImage" => ffi::prove_cg_display(),
-        "screencapture" => prove_screencapture(&args.output_dir),
-        "ScreenCaptureKit" => ffi::prove_screen_capture_kit(),
-        other => capture_unavailable(other, "unknown capture api"),
-    };
+    let report = capture_api(api, &args.output_dir);
     let path = args.output_dir.join(format!("capture-{api}.json"));
     if let Err(error) = write_json(&path, &report) {
         eprintln!("{error}");
@@ -168,48 +200,121 @@ fn run_capture(args: &Args) -> i32 {
     0
 }
 
-fn child_window(exe: &Path, output_dir: &Path) -> WindowReport {
-    let path = output_dir.join("window.json");
-    let _ = fs::remove_file(&path);
-    let dir = path_arg(output_dir);
-    let outcome = run_limited(exe, &["--window-only", "--output-dir", &dir], 25);
-    if outcome.success
-        && let Some(window) = read_json::<WindowReport>(&path)
-    {
-        return window;
-    }
-    window_process_miss(outcome.code, &outcome.stderr)
+struct Desktop {
+    window: WindowReport,
+    captures: Vec<CaptureReport>,
+    crash: Option<String>,
 }
 
-fn child_tap(exe: &Path, output_dir: &Path, location: &str, privilege: &str) -> TapReport {
+fn child_desktop(exe: &Path, output_dir: &Path) -> Desktop {
+    let window_path = output_dir.join("window.json");
+    let _ = fs::remove_file(&window_path);
+    for api in CAPTURE_APIS {
+        let _ = fs::remove_file(output_dir.join(format!("capture-{api}.json")));
+    }
+    let dir = path_arg(output_dir);
+    let outcome = run_limited(exe, &["--window-only", "--output-dir", &dir], 70);
+    show_stderr(&outcome.stderr);
+    let window = read_json::<WindowReport>(&window_path)
+        .unwrap_or_else(|| window_process_miss(outcome.code, &outcome.stderr));
+    let mut captures = Vec::new();
+    for api in CAPTURE_APIS {
+        let path = output_dir.join(format!("capture-{api}.json"));
+        if let Some(report) = read_json::<CaptureReport>(&path) {
+            captures.push(report);
+        } else {
+            captures.push(capture_unavailable(
+                api,
+                &format!("process exited {}: {}", outcome.code, outcome.stderr),
+            ));
+        }
+    }
+    let crash = if outcome.success {
+        None
+    } else {
+        Some(format!(
+            "desktop probe process exited {}: {}",
+            outcome.code,
+            one_line(&outcome.stderr)
+        ))
+    };
+    Desktop {
+        window,
+        captures,
+        crash,
+    }
+}
+
+fn child_tap(
+    exe: &Path,
+    output_dir: &Path,
+    location: &str,
+    privilege: &str,
+) -> (TapReport, Option<String>) {
     let path = output_dir.join(format!("tap-{location}.json"));
     let _ = fs::remove_file(&path);
     let dir = path_arg(output_dir);
     let outcome = run_limited(exe, &["--tap-only", location, "--output-dir", &dir], 20);
+    show_stderr(&outcome.stderr);
     if outcome.success
         && let Some(mut tap) = read_json::<TapReport>(&path)
     {
         tap.location = location.to_string();
         tap.privilege = privilege.to_string();
-        return tap;
+        return (tap, None);
     }
-    tap_process_miss(location, privilege, outcome.code, &outcome.stderr)
+    (
+        tap_process_miss(location, privilege, outcome.code, &outcome.stderr),
+        Some(format!(
+            "{location} {privilege} process exited {}",
+            outcome.code
+        )),
+    )
 }
 
-fn child_capture(exe: &Path, output_dir: &Path, api: &str) -> CaptureReport {
-    let path = output_dir.join(format!("capture-{api}.json"));
+fn child_active(exe: &Path, output_dir: &Path) -> (TapReport, Option<String>) {
+    let path = output_dir.join("tap-active.json");
     let _ = fs::remove_file(&path);
     let dir = path_arg(output_dir);
-    let outcome = run_limited(exe, &["--capture-only", api, "--output-dir", &dir], 25);
+    let outcome = run_limited(exe, &["--active-tap", "--output-dir", &dir], 20);
+    show_stderr(&outcome.stderr);
     if outcome.success
-        && let Some(report) = read_json::<CaptureReport>(&path)
+        && let Some(tap) = read_json::<TapReport>(&path)
     {
-        return report;
+        return (tap, None);
     }
-    capture_unavailable(
-        api,
-        &format!("process exited {}: {}", outcome.code, outcome.stderr),
+    let mut tap = crate::report::active_tap(
+        crate::report::TapBits {
+            created: false,
+            callback_fired: false,
+            accessibility_trusted: None,
+            listen_preflight: None,
+            prompt: None,
+        },
+        None,
+        None,
+        "",
+    );
+    tap.error = Some(format!(
+        "kCGEventTapOptionDefault process exited {}: {}",
+        outcome.code,
+        one_line(&outcome.stderr)
+    ));
+    (
+        tap,
+        Some(format!("active tap process exited {}", outcome.code)),
     )
+}
+
+fn show_stderr(stderr: &str) {
+    if stderr.is_empty() {
+        return;
+    }
+    if stderr.ends_with('\n') {
+        eprint!("{stderr}");
+    } else {
+        eprintln!("{stderr}");
+    }
 }
 
 struct ChildOutcome {
@@ -302,10 +407,23 @@ fn run_tap(args: &Args) -> i32 {
     0
 }
 
-fn root_hid_tap(exe: &Path, output_dir: &Path) -> TapReport {
+fn run_active(args: &Args) -> i32 {
+    let tap = ffi::prove_active_tap();
+    let path = args.output_dir.join("tap-active.json");
+    if let Err(error) = write_json(&path, &tap) {
+        eprintln!("{error}");
+        return 1;
+    }
+    0
+}
+
+fn root_hid_tap(exe: &Path, output_dir: &Path) -> (TapReport, Option<String>) {
     let root_dir = output_dir.join("root-tap");
     if let Err(error) = fs::create_dir_all(&root_dir) {
-        return tap_sudo_failed("kCGHIDEventTap", &format!("output dir: {error}"));
+        return (
+            tap_sudo_failed("kCGHIDEventTap", &format!("output dir: {error}")),
+            None,
+        );
     }
     let destination = root_dir.join("tap-kCGHIDEventTap.json");
     let _ = fs::remove_file(&destination);
@@ -318,33 +436,44 @@ fn root_hid_tap(exe: &Path, output_dir: &Path) -> TapReport {
         .arg(&root_dir)
         .output();
     match output {
-        Err(error) => tap_sudo_failed("kCGHIDEventTap", &error.to_string()),
+        Err(error) => (tap_sudo_failed("kCGHIDEventTap", &error.to_string()), None),
         Ok(output) if !output.status.success() => {
             let detail = format!(
                 "{} {}",
                 String::from_utf8_lossy(&output.stderr),
                 String::from_utf8_lossy(&output.stdout)
             );
+            show_stderr(&detail);
             let code = output.status.code().unwrap_or(139);
             if output.status.code().is_none() || code == 139 || code == 134 || code == 126 {
-                tap_process_miss("kCGHIDEventTap", "root", code, &detail)
+                (
+                    tap_process_miss("kCGHIDEventTap", "root", code, &detail),
+                    Some(format!("kCGHIDEventTap root process exited {code}")),
+                )
             } else {
-                tap_sudo_failed("kCGHIDEventTap", &detail)
+                (tap_sudo_failed("kCGHIDEventTap", &detail), None)
             }
         }
-        Ok(_) => match fs::read_to_string(&destination) {
-            Ok(text) => match serde_json::from_str::<TapReport>(&text) {
-                Ok(mut tap) => {
-                    tap.location = "kCGHIDEventTap".to_string();
-                    tap.privilege = "root".to_string();
-                    tap
-                }
-                Err(error) => {
-                    tap_sudo_failed("kCGHIDEventTap", &format!("bad tap report: {error}"))
-                }
-            },
-            Err(error) => tap_sudo_failed("kCGHIDEventTap", &format!("no tap report: {error}")),
-        },
+        Ok(output) => {
+            show_stderr(&String::from_utf8_lossy(&output.stderr));
+            match fs::read_to_string(&destination) {
+                Ok(text) => match serde_json::from_str::<TapReport>(&text) {
+                    Ok(mut tap) => {
+                        tap.location = "kCGHIDEventTap".to_string();
+                        tap.privilege = "root".to_string();
+                        (tap, None)
+                    }
+                    Err(error) => (
+                        tap_sudo_failed("kCGHIDEventTap", &format!("bad tap report: {error}")),
+                        None,
+                    ),
+                },
+                Err(error) => (
+                    tap_sudo_failed("kCGHIDEventTap", &format!("no tap report: {error}")),
+                    None,
+                ),
+            }
+        }
     }
 }
 
@@ -368,9 +497,22 @@ fn prove_screencapture(dir: &Path) -> CaptureReport {
         Ok(_) => match fs::read(&path) {
             Err(error) => capture_unavailable("screencapture", &format!("no file: {error}")),
             Ok(bytes) => match png_size(&bytes) {
-                Some((width, height)) => {
-                    crate::report::capture_opened("screencapture", width, height)
-                }
+                Some((width, height)) => match ffi::inspect_png(&path) {
+                    Some((nonblack, marker)) => crate::report::capture_opened(
+                        "screencapture",
+                        width,
+                        height,
+                        nonblack,
+                        marker,
+                    ),
+                    None => {
+                        let mut report =
+                            crate::report::capture_opened("screencapture", width, height, 0, 0);
+                        report.nonblack_pixels = None;
+                        report.marker_pixels = None;
+                        report
+                    }
+                },
                 None => capture_unavailable("screencapture", "file is not a PNG"),
             },
         },

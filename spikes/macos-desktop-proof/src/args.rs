@@ -11,6 +11,7 @@ pub enum Mode {
     TapOnly,
     WindowOnly,
     CaptureOnly,
+    ActiveTap,
 }
 
 impl Mode {
@@ -45,6 +46,7 @@ where
     let mut tap_location = None;
     let mut window_only = false;
     let mut capture_api = None;
+    let mut active_tap = false;
     let mut tokens = tokens.into_iter();
     while let Some(token) = tokens.next() {
         match token.as_str() {
@@ -73,6 +75,7 @@ where
                 tap_location = Some(location);
             }
             "--window-only" => window_only = true,
+            "--active-tap" => active_tap = true,
             "--capture-only" => {
                 let api = tokens.next().ok_or("--capture-only needs a value")?;
                 if !CAPTURE_APIS.contains(&api.as_str()) {
@@ -88,6 +91,7 @@ where
         tap_location.is_some(),
         window_only,
         capture_api.is_some(),
+        active_tap,
     ]
     .into_iter()
     .filter(|selected| *selected)
@@ -103,6 +107,8 @@ where
         Mode::WindowOnly
     } else if capture_api.is_some() {
         Mode::CaptureOnly
+    } else if active_tap {
+        Mode::ActiveTap
     } else {
         Mode::Orchestrator
     };
@@ -179,6 +185,9 @@ mod tests {
         let capture = parse(tokens(&["--capture-only", "screencapture"])).unwrap();
         assert_eq!(capture.mode, Mode::CaptureOnly);
         assert_eq!(capture.capture_api.as_deref(), Some("screencapture"));
+        let active = parse(tokens(&["--active-tap"])).unwrap();
+        assert_eq!(active.mode, Mode::ActiveTap);
+        assert!(!active.mode.installs_daemon());
         assert!(parse(tokens(&["--capture-only", "camera"])).is_err());
         assert!(parse(tokens(&["--window-only", "--tap-only", "kCGHIDEventTap"])).is_err());
         assert!(parse(tokens(&["--elsewhere"])).is_err());

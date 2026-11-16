@@ -20,6 +20,7 @@ pub struct WindowReport {
     pub key_window: bool,
     pub key_received: bool,
     pub post_location: String,
+    pub stage: String,
     pub error: Option<String>,
 }
 
@@ -27,8 +28,12 @@ pub struct WindowReport {
 pub struct TapReport {
     pub location: String,
     pub privilege: String,
+    /// `listen-only` for the three required taps. `default` is the one active tap.
+    pub option: String,
     pub created: bool,
     pub callback_fired: bool,
+    pub key_deleted: Option<bool>,
+    pub listen_saw: Option<bool>,
     pub tcc: String,
     pub accessibility_trusted: Option<bool>,
     pub listen_preflight: Option<bool>,
@@ -42,6 +47,8 @@ pub struct CaptureReport {
     pub opened: bool,
     pub width: i32,
     pub height: i32,
+    pub nonblack_pixels: Option<i32>,
+    pub marker_pixels: Option<i32>,
     pub error: Option<String>,
 }
 
@@ -93,6 +100,8 @@ pub struct ProofReport {
     pub taps: Vec<TapReport>,
     pub captures: Vec<CaptureReport>,
     pub jobs: Vec<JobReport>,
+    /// Set when our own probe process crashes or times out. A capability miss stays None.
+    pub probe_crash: Option<String>,
 }
 
 pub struct TapBits {
@@ -155,8 +164,11 @@ pub fn tap_from_bits(location: &str, privilege: &str, bits: TapBits) -> TapRepor
     TapReport {
         location: location.to_string(),
         privilege: privilege.to_string(),
+        option: "listen-only".to_string(),
         created: bits.created,
         callback_fired: bits.callback_fired,
+        key_deleted: None,
+        listen_saw: None,
         tcc,
         accessibility_trusted: bits.accessibility_trusted,
         listen_preflight: bits.listen_preflight,
@@ -165,12 +177,38 @@ pub fn tap_from_bits(location: &str, privilege: &str, bits: TapBits) -> TapRepor
     }
 }
 
+pub fn active_tap(
+    bits: TapBits,
+    key_deleted: Option<bool>,
+    listen_saw: Option<bool>,
+    detail: &str,
+) -> TapReport {
+    let mut tap = tap_from_bits("kCGSessionEventTap", "user", bits);
+    tap.option = "default".to_string();
+    tap.key_deleted = key_deleted;
+    tap.listen_saw = listen_saw;
+    if tap.created {
+        let swallowed = key_deleted == Some(true) && listen_saw == Some(false);
+        tap.callback_fired = key_deleted == Some(true);
+        if !swallowed {
+            let why = if detail.is_empty() {
+                "kCGEventTapOptionDefault did not swallow keyCode 0".to_string()
+            } else {
+                one_line(detail)
+            };
+            tap.error = Some(why);
+        }
+    }
+    tap
+}
+
 pub fn window_process_miss(code: i32, stderr: &str) -> WindowReport {
     WindowReport {
         ordered_front: false,
         key_window: false,
         key_received: false,
         post_location: String::new(),
+        stage: last_stage(stderr),
         error: Some(format!(
             "NSWindow proof process exited {code}: {}",
             one_line(stderr)
@@ -178,12 +216,24 @@ pub fn window_process_miss(code: i32, stderr: &str) -> WindowReport {
     }
 }
 
+fn last_stage(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("stage="))
+        .unwrap_or("none")
+        .to_string()
+}
+
 pub fn tap_process_miss(location: &str, privilege: &str, code: i32, stderr: &str) -> TapReport {
     TapReport {
         location: location.to_string(),
         privilege: privilege.to_string(),
+        option: "listen-only".to_string(),
         created: false,
         callback_fired: false,
+        key_deleted: None,
+        listen_saw: None,
         tcc: "null".to_string(),
         accessibility_trusted: None,
         listen_preflight: None,
@@ -199,8 +249,11 @@ pub fn tap_sudo_failed(location: &str, detail: &str) -> TapReport {
     TapReport {
         location: location.to_string(),
         privilege: "root".to_string(),
+        option: "listen-only".to_string(),
         created: false,
         callback_fired: false,
+        key_deleted: None,
+        listen_saw: None,
         tcc: "null".to_string(),
         accessibility_trusted: None,
         listen_preflight: None,
@@ -212,12 +265,20 @@ pub fn tap_sudo_failed(location: &str, detail: &str) -> TapReport {
     }
 }
 
-pub fn capture_opened(api: &str, width: i32, height: i32) -> CaptureReport {
+pub fn capture_opened(
+    api: &str,
+    width: i32,
+    height: i32,
+    nonblack: i32,
+    marker: i32,
+) -> CaptureReport {
     CaptureReport {
         api: api.to_string(),
         opened: true,
         width,
         height,
+        nonblack_pixels: Some(nonblack),
+        marker_pixels: Some(marker),
         error: None,
     }
 }
@@ -228,6 +289,8 @@ pub fn capture_unavailable(api: &str, detail: &str) -> CaptureReport {
         opened: false,
         width: 0,
         height: 0,
+        nonblack_pixels: None,
+        marker_pixels: None,
         error: Some(format!("{api}: {}", one_line(detail))),
     }
 }
@@ -326,6 +389,17 @@ pub fn failure_reasons(report: &ProofReport) -> Vec<String> {
             Some(job) => reasons.extend(job_failures(job)),
         }
     }
+    match find_active(report) {
+        None => reasons.push("active kCGEventTapOptionDefault tap is missing".to_string()),
+        Some(tap) => {
+            if let Some(reason) = active_failure(tap) {
+                reasons.push(reason);
+            }
+        }
+    }
+    if let Some(crash) = report.probe_crash.as_deref() {
+        reasons.push(format!("probe crashed: {crash}"));
+    }
     reasons
 }
 
@@ -349,6 +423,7 @@ pub fn render(report: &ProofReport) -> String {
             "window-post-location={}",
             display_text(&window.post_location)
         ));
+        lines.push(format!("window-stage={}", display_text(&window.stage)));
         lines.push(format!(
             "window-error={}",
             window.error.as_deref().unwrap_or("none")
@@ -359,11 +434,15 @@ pub fn render(report: &ProofReport) -> String {
     for (location, privilege) in REQUIRED_TAPS {
         lines.push(tap_line(report, location, privilege));
     }
+    lines.push(active_line(report));
     for api in CAPTURE_APIS {
         lines.push(capture_line(report, api));
     }
     for kind in ["agent", "daemon"] {
         lines.extend(job_lines(report, kind));
+    }
+    if let Some(crash) = report.probe_crash.as_deref() {
+        lines.push(format!("probe-crash={crash}"));
     }
     let reasons = failure_reasons(report);
     if reasons.is_empty() {
@@ -394,7 +473,14 @@ fn version_failures(version: &VersionReport) -> Vec<String> {
     reasons
 }
 
+fn probe_crashed(error: Option<&str>) -> bool {
+    error.is_some_and(|text| text.contains("process exited") || text.contains("timed out"))
+}
+
 fn window_failure(window: &WindowReport) -> Option<String> {
+    if probe_crashed(window.error.as_deref()) {
+        return Some("window proof crashed in the probe".to_string());
+    }
     if window.ordered_front && window.key_received {
         return None;
     }
@@ -419,6 +505,9 @@ fn api_named(error: &str) -> bool {
 
 fn tap_failure(tap: &TapReport) -> Option<String> {
     let who = format!("{} {}", tap.location, tap.privilege);
+    if probe_crashed(tap.error.as_deref()) {
+        return Some(format!("{who} probe crashed"));
+    }
     match tap.tcc.as_str() {
         "created" if tap.created => None,
         "created" => Some(format!("{who} tcc=created but the tap was NULL")),
@@ -458,9 +547,15 @@ fn tap_failure(tap: &TapReport) -> Option<String> {
 }
 
 fn capture_failure(capture: &CaptureReport) -> Option<String> {
+    if probe_crashed(capture.error.as_deref()) {
+        return Some(format!("{} probe crashed", capture.api));
+    }
     if capture.opened {
         if capture.width <= 0 || capture.height <= 0 {
             return Some(format!("{} opened without a size", capture.api));
+        }
+        if capture.nonblack_pixels.is_none() || capture.marker_pixels.is_none() {
+            return Some(format!("{} opened without a pixel sample", capture.api));
         }
         return None;
     }
@@ -501,6 +596,13 @@ fn job_failures(job: &JobReport) -> Vec<String> {
     if job.loaded && job.graphic_session.is_none() {
         reasons.push(format!("{} loaded but wrote no marker", job.kind));
     }
+    if job
+        .window_error
+        .as_deref()
+        .is_some_and(|error| error.contains("proof started") || probe_crashed(Some(error)))
+    {
+        reasons.push(format!("{} window proof crashed", job.kind));
+    }
     if !job.unloaded {
         reasons.push(format!("{} was not unloaded", job.kind));
     }
@@ -523,14 +625,42 @@ fn tap_line(report: &ProofReport, location: &str, privilege: &str) -> String {
     )
 }
 
+fn active_failure(tap: &TapReport) -> Option<String> {
+    if probe_crashed(tap.error.as_deref()) {
+        return Some("active tap probe crashed".to_string());
+    }
+    if tap.option != "default" {
+        return Some("active tap is not kCGEventTapOptionDefault".to_string());
+    }
+    if !tap.created {
+        return tap_failure(tap);
+    }
+    let swallowed = tap.key_deleted == Some(true) && tap.listen_saw == Some(false);
+    if swallowed {
+        return None;
+    }
+    let named = tap
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("kCGEventTapOptionDefault"));
+    if named {
+        None
+    } else {
+        Some("active tap did not prove the posted key was swallowed".to_string())
+    }
+}
+
 fn capture_line(report: &ProofReport, api: &str) -> String {
     let Some(capture) = find_capture(report, api) else {
         return format!("capture-{api}=missing");
     };
     if capture.opened {
         format!(
-            "capture-{api}=opened width={} height={}",
-            capture.width, capture.height
+            "capture-{api}=opened width={} height={} nonblack={} marker={}",
+            capture.width,
+            capture.height,
+            pixel_flag(capture.nonblack_pixels),
+            pixel_flag(capture.marker_pixels)
         )
     } else {
         format!(
@@ -538,6 +668,34 @@ fn capture_line(report: &ProofReport, api: &str) -> String {
             capture.error.as_deref().unwrap_or("none")
         )
     }
+}
+
+fn pixel_flag(count: Option<i32>) -> String {
+    match count {
+        Some(count) if count > 0 => format!("true pixels={count}"),
+        Some(count) => format!("false pixels={count}"),
+        None => "unknown".to_string(),
+    }
+}
+
+fn active_line(report: &ProofReport) -> String {
+    let Some(tap) = find_active(report) else {
+        return "tap-active-kCGSessionEventTap-user=missing".to_string();
+    };
+    format!(
+        "tap-active-kCGSessionEventTap-user={} deleted={} listen-saw={} accessibility={} listen={} prompt={} error={}",
+        if tap.created {
+            "created"
+        } else {
+            tap.tcc.as_str()
+        },
+        flag(tap.key_deleted),
+        flag(tap.listen_saw),
+        flag(tap.accessibility_trusted),
+        flag(tap.listen_preflight),
+        tap.prompt_owner.as_deref().unwrap_or("none"),
+        tap.error.as_deref().unwrap_or("none")
+    )
 }
 
 fn job_lines(report: &ProofReport, kind: &str) -> Vec<String> {
@@ -576,10 +734,13 @@ fn job_lines(report: &ProofReport, kind: &str) -> Vec<String> {
 }
 
 fn find_tap<'a>(report: &'a ProofReport, location: &str, privilege: &str) -> Option<&'a TapReport> {
-    report
-        .taps
-        .iter()
-        .find(|tap| tap.location == location && tap.privilege == privilege)
+    report.taps.iter().find(|tap| {
+        tap.location == location && tap.privilege == privilege && tap.option != "default"
+    })
+}
+
+fn find_active(report: &ProofReport) -> Option<&TapReport> {
+    report.taps.iter().find(|tap| tap.option == "default")
 }
 
 fn find_capture<'a>(report: &'a ProofReport, api: &str) -> Option<&'a CaptureReport> {
@@ -623,6 +784,7 @@ fn passing_fixture() -> ProofReport {
             key_window: true,
             key_received: true,
             post_location: "kCGSessionEventTap".to_string(),
+            stage: "key-received-done".to_string(),
             error: None,
         }),
         taps: vec![
@@ -659,12 +821,25 @@ fn passing_fixture() -> ProofReport {
                     prompt: None,
                 },
             ),
+            active_tap(
+                TapBits {
+                    created: true,
+                    callback_fired: true,
+                    accessibility_trusted: Some(true),
+                    listen_preflight: Some(true),
+                    prompt: None,
+                },
+                Some(true),
+                Some(false),
+                "",
+            ),
         ],
         captures: CAPTURE_APIS
             .into_iter()
-            .map(|api| capture_opened(api, 1024, 768))
+            .map(|api| capture_opened(api, 1024, 768, 100, 40))
             .collect(),
         jobs: vec![agent_observation(true), daemon_observation()],
+        probe_crash: None,
     }
 }
 
@@ -822,11 +997,83 @@ mod tests {
                 .any(|reason| reason.contains("no API error"))
         );
 
-        report.window = Some(window_process_miss(139, "stage=NSWindow"));
-        assert!(failure_reasons(&report).is_empty());
+        report.window = Some(window_process_miss(139, "stage=order-front\n"));
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("crashed"))
+        );
+        assert!(render(&report).contains("window-stage=order-front"));
         report.taps[0] =
             tap_process_miss("kCGSessionEventTap", "user", 139, "stage=CGEventTapCreate");
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("probe crashed"))
+        );
+    }
+
+    #[test]
+    fn a_probe_crash_fails_and_an_active_miss_must_name_the_option() {
+        let mut report = passing_fixture();
+        report.probe_crash = Some("desktop probe process exited 139: stage=order-out".to_string());
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("probe crashed"))
+        );
+        assert!(render(&report).contains("result=fail"));
+
+        report.probe_crash = None;
+        {
+            let active = report
+                .taps
+                .iter_mut()
+                .find(|tap| tap.option == "default")
+                .unwrap();
+            active.key_deleted = Some(false);
+            active.listen_saw = Some(true);
+            active.error = Some(
+                "kCGEventTapOptionDefault returned NULL for keyCode 0 but the listen-only tap still observed it"
+                    .to_string(),
+            );
+        }
         assert!(failure_reasons(&report).is_empty());
+        assert!(render(&report).contains("deleted=false"));
+        assert!(render(&report).contains("listen-saw=true"));
+
+        report
+            .taps
+            .iter_mut()
+            .find(|tap| tap.option == "default")
+            .unwrap()
+            .error = Some("nope".to_string());
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("swallowed"))
+        );
+    }
+
+    #[test]
+    fn an_opened_image_without_pixels_fails_and_a_black_image_is_recorded() {
+        let mut report = passing_fixture();
+        report.captures[0].nonblack_pixels = None;
+        report.captures[0].marker_pixels = None;
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("pixel sample"))
+        );
+
+        report.captures[0] = capture_opened("CGWindowListCreateImage", 1024, 768, 0, 0);
+        assert!(failure_reasons(&report).is_empty());
+        let text = render(&report);
+        assert!(text.contains("nonblack=false pixels=0"));
+        assert!(text.contains("marker=false pixels=0"));
+        assert!(text.contains("tap-active-kCGSessionEventTap-user=created"));
+        assert!(text.contains("deleted=true"));
+        assert!(text.contains("listen-saw=false"));
     }
 
     #[test]

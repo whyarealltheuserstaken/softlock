@@ -1,8 +1,10 @@
-# m02: macos-latest can host taps, capture, and launchd; the window probe crashes
+# m02: macos-latest desktop proof
 
 Measured on 16 November 2026 UTC by the workspace-excluded probe `spikes/macos-desktop-proof`.
 
-The proof run is [macOS desktop proof run 43943606013](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43943606013), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43943606013/job/133567274223). The measured head is `525018cfe1330629f7e9f122f106ca2b760d69c9`. That commit printed `result=pass`. The window result inside that pass is a crash, recorded below. This probe did not lock the session, so it does not say the runner comes back after a lock (decision D8).
+The first proof run is [macOS desktop proof run 43943606013](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43943606013), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43943606013/job/133567274223), head `525018cfe1330629f7e9f122f106ca2b760d69c9`. That commit printed `result=pass`. The window line in that pass was a bug in the probe, not a runner capability miss: `macos_prove_window` built the window under ARC, left `releasedWhenClosed` at its default of YES, and then called `[window close]`. That is a double release and matches the SIGSEGV (exit 139). A crash in the probe now fails the job. This probe did not lock the session, so it does not say the runner comes back after a lock (decision D8).
+
+The m03 and m04 "stays on the runner" lines from that run are withdrawn. Listen-only taps do not prove the active tap m03 and m14 need, and `opened 1024x768` does not say whether the image has non-black pixels or the probe window's marker colour. Those decisions wait on the re-run.
 
 ## What the runner is
 
@@ -20,7 +22,7 @@ The screen the capture APIs opened is one 1024x768 display.
 
 ## What works
 
-Listen-only taps were created and their callbacks fired. No TCC prompt appeared.
+Listen-only taps were created and their callbacks fired. No TCC prompt appeared. `accessibility=true` on every tap means Accessibility was already granted for this runner. That says nothing about the TCC prompts on Henry's Mac (m10).
 
 ```
 tap-kCGSessionEventTap-user=created callback=true tcc=created accessibility=true listen=true prompt=none error=none
@@ -28,7 +30,7 @@ tap-kCGHIDEventTap-user=created callback=true tcc=created accessibility=true lis
 tap-kCGHIDEventTap-root=created callback=true tcc=created accessibility=true listen=true prompt=none error=none
 ```
 
-All four capture calls opened that 1024x768 display:
+All four capture calls returned a 1024x768 image. That only proves an image came back. The run did not record non-black pixels or the probe window's marker colour:
 
 ```
 capture-CGWindowListCreateImage=opened width=1024 height=768
@@ -61,9 +63,9 @@ job-daemon-window-error=no graphic session; NSWindow was not created
 
 The agent is in the Aqua session. The daemon is root and has no graphic session, so it did not create a window. A daemon that needs a window in the Aqua session has to start the agent through launchd.
 
-## What does not work
+## What that run did not prove
 
-The borderless window crashed. The child exited 139 (`SIGSEGV`) at the `NSWindow` stage, before it could report `CGEventPost`.
+The borderless window crashed inside the probe. The child exited 139 (`SIGSEGV`). The only stage line was `stage=NSWindow`, printed before the window call, so the log does not name `order-front`, `CGEventPost`, or `key-received`.
 
 ```
 window-ordered-front=false
@@ -72,16 +74,20 @@ window-post-location=none
 window-error=NSWindow proof process exited 139: stage=NSWindow
 ```
 
-The same crash happened in-process on the previous head (`7bb37642b23269dd992cb57d5723f5d73467b371`), which died with `Segmentation fault: 11` during the window step. The agent job wrote its marker first (`job-agent-window-error=NSWindow proof started`) and then died in the same call. The key was not delivered. This is a negative window result with a named API error, not a shown window.
+The same crash happened in-process on `7bb37642b23269dd992cb57d5723f5d73467b371` (`Segmentation fault: 11`). The agent job wrote `job-agent-window-error=NSWindow proof started` and then died in that call. Treating that as `result=pass` was wrong. The re-run has to record the window and the key after the double release is fixed.
+
+There was no active `kCGEventTapOptionDefault` tap. All three taps were listen-only. m03 and m14 need an active tap that deletes a posted key.
 
 ## Which later tickets stay on the runner
 
-- **m03** stays. `kCGSessionEventTap` and `kCGHIDEventTap` were live for the user, and the root HID tap was live too. Callbacks fired. There was no TCC denial and no prompt the job could not click.
-- **m04** stays for the single 1024x768 display. `CGWindowListCreateImage`, `CGDisplayCreateImage`, `screencapture`, and ScreenCaptureKit all opened. Pixel checks on that one virtual display can run here. A second monitor is not present on this runner.
+These decisions use only the log above. m03 and m04 are not decided yet.
+
+- **m03** does not stay on this evidence. The listen-only session and HID taps were created and their callbacks fired, with no TCC prompt. An active tap that swallows a posted key was not attempted. Whether m03 can stay depends on that re-run.
+- **m04** does not stay on this evidence. Each API returned 1024x768. The log does not say whether those images contain non-black pixels or the probe window's marker colour. One virtual display would still not prove a second monitor.
 - **m07** moves entirely to Henry's Intel Mac. The runner has no lid, no App Nap from a closed lid, and no real idle the way a laptop does.
 - **m08** keeps its chooser rows on the existing verify job. Those rows are a pure function and do not lock. The sheet (lock timing, the screensaver, FileVault, and the password after the screensaver) is Henry's Mac. This spike did not lock the runner.
 - **m11** stays on Henry's Intel Mac. This run is arm64. A Rosetta run is not the x86_64 slice test.
-- **m15** can keep load/unload and the socket protocol on the runner. The daemon has no graphic session, so launchd has to start the agent at login for a window. Installing the product agent and locking from a second process stay on Henry's Mac, along with any window work, because `NSWindow` crashes on this runner.
+- **m15** can keep load/unload and the socket protocol on the runner. The daemon has no graphic session, so launchd has to start the agent at login for a window. Installing the product agent and locking from a second process stay on Henry's Mac. Window work stays off the runner until a re-run shows the window and the key.
 
 ## Henry's Intel Mac
 
@@ -89,7 +95,8 @@ This section is only for Henry's machine: a 2020 Intel MacBook Pro (13-inch, Fou
 
 On that Mac:
 
-- Retry the borderless window and `CGEventPost`. The runner dies inside `NSWindow` before a key is posted.
+- The runner's `accessibility=true` does not describe the TCC prompts on this Mac (m10).
+- Window and `CGEventPost` on this Mac stay here until a runner re-run records them. The exit 139 line was a double release in the probe.
 - m07: lid, power assertions, and real idle.
 - m08: the lock sheet, the screensaver, and FileVault.
 - m11: the x86_64 slice.

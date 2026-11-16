@@ -13,6 +13,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -22,6 +23,7 @@ typedef struct {
     int key_received;
     char post_location[64];
     char error[768];
+    char stage[64];
 } WindowOut;
 
 typedef struct {
@@ -37,9 +39,21 @@ typedef struct {
     int opened;
     int width;
     int height;
+    int nonblack;
+    int marker;
     int prompt;
     char detail[768];
 } CaptureOut;
+
+typedef struct {
+    int created;
+    int deleted;
+    int listen_saw;
+    int accessibility_trusted;
+    int listen_preflight;
+    int prompt;
+    char detail[768];
+} ActiveOut;
 
 typedef struct {
     int uid;
@@ -50,6 +64,16 @@ typedef struct {
 } SessionOut;
 
 static const int kProbeKey = 0;
+@class ProbeWindow;
+static ProbeWindow *g_window = nil;
+
+static void stage_line(WindowOut *out, const char *name) {
+    if (out != NULL) {
+        snprintf(out->stage, sizeof out->stage, "%s", name);
+    }
+    fprintf(stderr, "stage=%s\n", name);
+    fflush(stderr);
+}
 
 static volatile int g_key_received = 0;
 
@@ -212,7 +236,7 @@ static void activate_app(void) {
     }
 }
 
-int macos_prove_window(WindowOut *out) {
+int macos_window_open(WindowOut *out) {
     if (out == NULL) {
         return 1;
     }
@@ -232,15 +256,21 @@ int macos_prove_window(WindowOut *out) {
                 snprintf(out->error, sizeof out->error, "NSWindow initWithContentRect returned nil");
                 return 0;
             }
+            // releasedWhenClosed defaults to YES. Under ARC, [window close] then
+            // releases the same object again when the local goes out of scope.
+            window.releasedWhenClosed = NO;
             window.opaque = YES;
             window.hasShadow = NO;
             window.level = NSNormalWindowLevel;
             window.backgroundColor = [NSColor colorWithSRGBRed:0.86 green:0.04 blue:0.63 alpha:1];
             ProbeView *view = [[ProbeView alloc] initWithFrame:NSMakeRect(0, 0, 320, 240)];
             window.contentView = view;
+            g_window = window;
+            stage_line(out, "order-front");
             [window orderFrontRegardless];
             [window makeKeyAndOrderFront:nil];
             pump(0.3);
+            stage_line(out, "order-front-done");
 
             BOOL on_screen = window.isVisible && window.screen != nil;
             BOOL unoccluded = (window.occlusionState & NSWindowOcclusionStateVisible) != 0;
@@ -260,6 +290,7 @@ int macos_prove_window(WindowOut *out) {
                                                                   }
                                                                   return event;
                                                                 }];
+            stage_line(out, "CGEventPost");
             CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
             if (source == NULL) {
                 snprintf(out->error, sizeof out->error, "CGEventSourceCreate returned NULL");
@@ -293,18 +324,40 @@ int macos_prove_window(WindowOut *out) {
                 }
                 CFRelease(source);
             }
+            stage_line(out, "CGEventPost-done");
+            stage_line(out, "key-received");
             out->key_received = g_key_received != 0 ? 1 : 0;
+            stage_line(out, "key-received-done");
             if (monitor != nil) {
                 [NSEvent removeMonitor:monitor];
             }
-            [window orderOut:nil];
-            [window close];
         } @catch (NSException *exception) {
             const char *name = exception.name.UTF8String != NULL ? exception.name.UTF8String : "NSException";
             snprintf(out->error, sizeof out->error, "NSApplication exception %s", name);
         }
     }
     return 0;
+}
+
+int macos_window_close(void) {
+    fprintf(stderr, "stage=order-out\n");
+    fflush(stderr);
+    @autoreleasepool {
+        if (g_window != nil) {
+            g_window.releasedWhenClosed = NO;
+            [g_window orderOut:nil];
+            g_window = nil;
+        }
+    }
+    fprintf(stderr, "stage=order-out-done\n");
+    fflush(stderr);
+    return 0;
+}
+
+int macos_prove_window(WindowOut *out) {
+    int rc = macos_window_open(out);
+    macos_window_close();
+    return rc;
 }
 
 static _Atomic int g_tap_fired = 0;
@@ -370,15 +423,74 @@ int macos_prove_tap(const char *location, TapOut *out) {
     return 0;
 }
 
+static void count_pixels(CGImageRef image, int *nonblack, int *marker) {
+    *nonblack = -1;
+    *marker = -1;
+    if (image == NULL) {
+        return;
+    }
+    size_t width = CGImageGetWidth(image);
+    size_t height = CGImageGetHeight(image);
+    if (width == 0 || height == 0 || width > 8192 || height > 8192) {
+        return;
+    }
+    size_t stride = width * 4;
+    void *bytes = calloc(height, stride);
+    if (bytes == NULL) {
+        return;
+    }
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(bytes, width, height, 8, stride, space,
+                                                 kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(space);
+    if (context == NULL) {
+        free(bytes);
+        return;
+    }
+    CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height), image);
+    CGContextRelease(context);
+    int dark = 0;
+    int pink = 0;
+    const uint8_t *pixels = bytes;
+    size_t count = width * height;
+    for (size_t index = 0; index < count; index++) {
+        uint8_t red = pixels[index * 4];
+        uint8_t green = pixels[index * 4 + 1];
+        uint8_t blue = pixels[index * 4 + 2];
+        uint8_t alpha = pixels[index * 4 + 3];
+        if (alpha == 0) {
+            continue;
+        }
+        if (alpha != 255) {
+            red = (uint8_t)((red * 255) / alpha);
+            green = (uint8_t)((green * 255) / alpha);
+            blue = (uint8_t)((blue * 255) / alpha);
+        }
+        if (red > 12 || green > 12 || blue > 12) {
+            dark++;
+        }
+        // Probe window is sRGB 0.86, 0.04, 0.63, about 219, 10, 161.
+        if (red >= 160 && green <= 80 && blue >= 90 && blue <= 230 && red > green + 40 && blue > green + 40) {
+            pink++;
+        }
+    }
+    free(bytes);
+    *nonblack = dark;
+    *marker = pink;
+}
+
 static void capture_from_image(CGImageRef image, CaptureOut *out, const char *null_detail) {
     if (image == NULL) {
         snprintf(out->detail, sizeof out->detail, "%s", null_detail);
         out->prompt = macos_prompt_code();
+        out->nonblack = -1;
+        out->marker = -1;
         return;
     }
     out->opened = 1;
     out->width = (int)CGImageGetWidth(image);
     out->height = (int)CGImageGetHeight(image);
+    count_pixels(image, &out->nonblack, &out->marker);
     CGImageRelease(image);
 }
 
@@ -420,6 +532,8 @@ typedef struct {
     int opened;
     int width;
     int height;
+    int nonblack;
+    int marker;
     int error_code;
     char domain[128];
     char detail[384];
@@ -446,17 +560,48 @@ int macos_prove_screen_capture_kit(CaptureOut *out) {
                 NSString *domain = error.domain != nil ? error.domain : @"unknown";
                 snprintf(g_sc.domain, sizeof g_sc.domain, "%s", domain.UTF8String != NULL ? domain.UTF8String : "");
                 g_sc.error_code = (int)error.code;
-            } else if (content.displays.count > 0) {
-                SCDisplay *display = content.displays.firstObject;
-                g_sc.opened = 1;
-                g_sc.width = (int)display.frame.size.width;
-                g_sc.height = (int)display.frame.size.height;
-            } else {
-                snprintf(g_sc.detail, sizeof g_sc.detail, "no displays");
+                atomic_store(&g_sc_done, 1);
+                return;
             }
+            if (content.displays.count == 0) {
+                snprintf(g_sc.detail, sizeof g_sc.detail, "no displays");
+                atomic_store(&g_sc_done, 1);
+                return;
+            }
+            SCDisplay *display = content.displays.firstObject;
+            if (@available(macOS 14.0, *)) {
+                SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+                SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
+                config.width = (size_t)display.frame.size.width;
+                config.height = (size_t)display.frame.size.height;
+                [SCScreenshotManager captureImageWithFilter:filter
+                                              configuration:config
+                                          completionHandler:^(CGImageRef image, NSError *shot_error) {
+                    if (atomic_load(&g_sc_gen) != generation) {
+                        return;
+                    }
+                    if (image != NULL) {
+                        g_sc.opened = 1;
+                        g_sc.width = (int)CGImageGetWidth(image);
+                        g_sc.height = (int)CGImageGetHeight(image);
+                        count_pixels(image, &g_sc.nonblack, &g_sc.marker);
+                    } else if (shot_error != nil) {
+                        NSString *domain = shot_error.domain != nil ? shot_error.domain : @"unknown";
+                        snprintf(g_sc.domain, sizeof g_sc.domain, "%s",
+                                 domain.UTF8String != NULL ? domain.UTF8String : "");
+                        g_sc.error_code = (int)shot_error.code;
+                        snprintf(g_sc.detail, sizeof g_sc.detail, "SCScreenshotManager");
+                    } else {
+                        snprintf(g_sc.detail, sizeof g_sc.detail, "SCScreenshotManager returned NULL");
+                    }
+                    atomic_store(&g_sc_done, 1);
+                }];
+                return;
+            }
+            snprintf(g_sc.detail, sizeof g_sc.detail, "SCScreenshotManager unavailable");
             atomic_store(&g_sc_done, 1);
         }];
-        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:8];
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:12];
         while (atomic_load(&g_sc_done) == 0 && [until timeIntervalSinceNow] > 0) {
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
         }
@@ -469,6 +614,8 @@ int macos_prove_screen_capture_kit(CaptureOut *out) {
             out->opened = 1;
             out->width = g_sc.width;
             out->height = g_sc.height;
+            out->nonblack = g_sc.nonblack;
+            out->marker = g_sc.marker;
             return 0;
         }
         if (g_sc.domain[0] != 0) {
@@ -502,4 +649,157 @@ int macos_session_info(SessionOut *out) {
         snprintf(out->error, sizeof out->error, "SessionGetInfo failed (%d)", (int)status);
     }
     return 0;
+}
+
+static _Atomic int g_active_deleted = 0;
+static _Atomic int g_listen_saw = 0;
+
+static CGEventRef active_delete_callback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *user) {
+    (void)proxy;
+    (void)user;
+    if (type == kCGEventKeyDown) {
+        int64_t key = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        if (key == kProbeKey) {
+            atomic_store(&g_active_deleted, 1);
+            return NULL;
+        }
+    }
+    return event;
+}
+
+static CGEventRef active_listen_callback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *user) {
+    (void)proxy;
+    (void)user;
+    if (type == kCGEventKeyDown) {
+        int64_t key = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        if (key == kProbeKey) {
+            atomic_store(&g_listen_saw, 1);
+        }
+    }
+    return event;
+}
+
+static void release_tap(CFMachPortRef port, CFRunLoopSourceRef source) {
+    if (port != NULL) {
+        CGEventTapEnable(port, false);
+        CFMachPortInvalidate(port);
+    }
+    if (source != NULL) {
+        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+        CFRelease(source);
+    }
+    if (port != NULL) {
+        CFRelease(port);
+    }
+}
+
+int macos_prove_active_tap(ActiveOut *out) {
+    if (out == NULL) {
+        return 1;
+    }
+    memset(out, 0, sizeof *out);
+    out->deleted = -1;
+    out->listen_saw = -1;
+    out->accessibility_trusted = -1;
+    out->listen_preflight = -1;
+    atomic_store(&g_active_deleted, 0);
+    atomic_store(&g_listen_saw, 0);
+    fprintf(stderr, "stage=active-listen\n");
+    fflush(stderr);
+    CGEventMask mask = CGEventMaskBit(kCGEventKeyDown);
+    CFMachPortRef listen = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+                                            kCGEventTapOptionListenOnly, mask, active_listen_callback, NULL);
+    fprintf(stderr, "stage=active-default\n");
+    fflush(stderr);
+    CFMachPortRef active = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+                                            kCGEventTapOptionDefault, mask, active_delete_callback, NULL);
+    out->accessibility_trusted = AXIsProcessTrusted() ? 1 : 0;
+    preflight_listen(&out->listen_preflight);
+    out->prompt = macos_prompt_code();
+    CFRunLoopSourceRef listen_source = NULL;
+    CFRunLoopSourceRef active_source = NULL;
+    if (listen != NULL) {
+        listen_source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, listen, 0);
+        if (listen_source != NULL) {
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), listen_source, kCFRunLoopCommonModes);
+        }
+        CGEventTapEnable(listen, true);
+    }
+    if (active == NULL) {
+        out->created = 0;
+        snprintf(out->detail, sizeof out->detail, "kCGEventTapOptionDefault returned NULL");
+        release_tap(listen, listen_source);
+        fprintf(stderr, "stage=active-done\n");
+        fflush(stderr);
+        return 0;
+    }
+    out->created = 1;
+    active_source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, active, 0);
+    if (active_source != NULL) {
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), active_source, kCFRunLoopCommonModes);
+    }
+    CGEventTapEnable(active, true);
+    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
+    if (source == NULL) {
+        snprintf(out->detail, sizeof out->detail, "kCGEventTapOptionDefault CGEventSourceCreate returned NULL");
+    } else {
+        char post_error[256];
+        post_error[0] = 0;
+        if (post_key(source, kCGHIDEventTap, post_error, sizeof post_error) != 0) {
+            snprintf(out->detail, sizeof out->detail, "kCGEventTapOptionDefault %s", post_error);
+        }
+        NSDate *hid_until = [NSDate dateWithTimeIntervalSinceNow:0.3];
+        while (atomic_load(&g_active_deleted) == 0 && [hid_until timeIntervalSinceNow] > 0) {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+        }
+        if (atomic_load(&g_active_deleted) == 0 && out->detail[0] == 0) {
+            post_error[0] = 0;
+            if (post_key(source, kCGSessionEventTap, post_error, sizeof post_error) != 0) {
+                snprintf(out->detail, sizeof out->detail, "kCGEventTapOptionDefault %s", post_error);
+            }
+        }
+        CFRelease(source);
+    }
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:0.6];
+    while ([until timeIntervalSinceNow] > 0
+           && (atomic_load(&g_active_deleted) == 0 || (listen != NULL && atomic_load(&g_listen_saw) == 0))) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+    }
+    out->deleted = atomic_load(&g_active_deleted) != 0 ? 1 : 0;
+    if (listen == NULL) {
+        out->listen_saw = -1;
+        snprintf(out->detail, sizeof out->detail,
+                 "kCGEventTapOptionDefault ran but the listen-only tap was NULL, so the delete was not compared");
+    } else {
+        out->listen_saw = atomic_load(&g_listen_saw) != 0 ? 1 : 0;
+        if (out->deleted == 1 && out->listen_saw == 1) {
+            snprintf(out->detail, sizeof out->detail,
+                     "kCGEventTapOptionDefault returned NULL for keyCode 0 but the listen-only tap still observed it");
+        } else if (out->deleted == 0 && out->detail[0] == 0) {
+            snprintf(out->detail, sizeof out->detail, "kCGEventTapOptionDefault did not delete keyCode 0");
+        }
+    }
+    release_tap(active, active_source);
+    release_tap(listen, listen_source);
+    fprintf(stderr, "stage=active-done\n");
+    fflush(stderr);
+    return 0;
+}
+
+int macos_inspect_png(const char *path, int *nonblack, int *marker) {
+    if (path == NULL || nonblack == NULL || marker == NULL) {
+        return 1;
+    }
+    *nonblack = -1;
+    *marker = -1;
+    @autoreleasepool {
+        NSString *file = [NSString stringWithUTF8String:path];
+        NSData *data = file != nil ? [NSData dataWithContentsOfFile:file] : nil;
+        NSBitmapImageRep *rep = data != nil ? [NSBitmapImageRep imageRepWithData:data] : nil;
+        if (rep == nil || rep.CGImage == NULL) {
+            return 1;
+        }
+        count_pixels(rep.CGImage, nonblack, marker);
+    }
+    return (*nonblack < 0 || *marker < 0) ? 1 : 0;
 }
