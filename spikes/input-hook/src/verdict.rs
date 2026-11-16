@@ -141,6 +141,10 @@ pub struct Sample {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     pub pass: bool,
+    /// The run finished and every check except silent hook removal held.
+    /// Removal is an operating-system outcome, so a negative answer is still
+    /// a completed measurement.
+    pub measured: bool,
     pub design: Design,
     pub fallback: Fallback,
     pub liveness_within_budget: bool,
@@ -184,7 +188,13 @@ impl Decision {
         }
         lines.push(format!(
             "result={}",
-            if self.pass { "pass" } else { "fail" }
+            if self.pass {
+                "pass"
+            } else if self.measured {
+                "measured"
+            } else {
+                "fail"
+            }
         ));
         lines.join("\n")
     }
@@ -324,8 +334,14 @@ pub fn judge(sample: &Sample) -> Decision {
     }
 
     let pass = reasons.is_empty();
+    let measured = !pass
+        && reasons.iter().all(|reason| {
+            reason.contains("did not get the hook removed")
+                || reason.contains("liveness reported the removed hook")
+        });
     Decision {
         pass,
+        measured,
         design,
         fallback,
         liveness_within_budget,
@@ -600,7 +616,17 @@ mod tests {
         still_installed.liveness_removed = false;
         let decision = judge(&still_installed);
         assert!(!decision.pass);
+        assert!(decision.measured);
+        assert!(
+            decision
+                .report(&still_installed)
+                .contains("result=measured")
+        );
         assert!(!decision.liveness_within_budget);
+
+        let mut late_only = passing_sample();
+        late_only.liveness_detect_ms = 501;
+        assert!(judge(&late_only).measured);
     }
 
     #[test]
