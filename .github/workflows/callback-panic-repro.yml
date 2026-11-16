@@ -1,9 +1,12 @@
 name: Callback panic repro
 
-# Manual only. CI gates the same test at 20 runs on each Windows image.
+# CI gates the same test at 20 runs on each Windows image.
 # This loop is 50 runs and writes the panic location when SOFTLOCK_PANIC_LOG is set.
+# workflow_dispatch works after this file is on the default branch. Until then,
+# a pull request runs the loop only when its body contains callback-panic-50-once.
 on:
   workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: read
@@ -14,6 +17,7 @@ concurrency:
 
 jobs:
   loop:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.body, 'callback-panic-50-once')
     name: callback panic x50 (${{ matrix.image }})
     runs-on: ${{ matrix.image }}
     timeout-minutes: 40
