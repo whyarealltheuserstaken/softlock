@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use zeroize::Zeroize;
 
 use crate::platform::{GuardHealth, OverlayHealth};
 use crate::state::{Fallback, LockSource, Secret, StateName};
@@ -12,7 +13,7 @@ pub const IPC_VERSION: u64 = 1;
 /// body is copied or parsed. 64 KiB is enough for config documents and status.
 pub const MAX_FRAME: usize = 64 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum RequestKind {
     Hello {
@@ -104,7 +105,7 @@ pub enum ResponseKind {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct DecodedRequest {
     pub id: u64,
     pub kind: RequestKind,
@@ -117,18 +118,22 @@ pub enum IpcError {
 }
 
 pub fn message_json(id: u64, body: &impl Serialize) -> Result<String, IpcError> {
-    let value = serde_json::to_value(body).map_err(|_| IpcError::Malformed)?;
-    let Some(fields) = value.as_object() else {
+    let mut value = serde_json::to_value(body).map_err(|_| IpcError::Malformed)?;
+    let Value::Object(fields) = std::mem::replace(&mut value, Value::Null) else {
+        zeroize_json(&mut value);
         return Err(IpcError::Malformed);
     };
     let mut object = Map::new();
     object.insert("v".to_string(), Value::from(IPC_VERSION));
     object.insert("id".to_string(), Value::from(id));
     for (key, field) in fields {
-        object.insert(key.clone(), field.clone());
+        object.insert(key, field);
     }
-    let json = serde_json::to_string(&Value::Object(object)).map_err(|_| IpcError::Malformed)?;
+    let json = serde_json::to_string(&object).map_err(|_| IpcError::Malformed)?;
+    zeroize_map(&mut object);
     if json.len() > MAX_FRAME {
+        let mut json = json;
+        json.zeroize();
         return Err(IpcError::Malformed);
     }
     Ok(json)
@@ -173,38 +178,79 @@ pub fn decode_request_frame(bytes: &[u8]) -> Result<DecodedRequest, IpcError> {
 }
 
 fn decode_request_json(json: &str) -> Result<DecodedRequest, IpcError> {
-    let value: Value = serde_json::from_str(json).map_err(|_| IpcError::Malformed)?;
-    let Some(object) = value.as_object() else {
+    let mut value: Value = match serde_json::from_str(json) {
+        Ok(value) => value,
+        Err(_) => return Err(IpcError::Malformed),
+    };
+    let Value::Object(object) = &mut value else {
+        zeroize_json(&mut value);
         return Err(IpcError::Malformed);
     };
-    let id = object
-        .get("id")
-        .and_then(Value::as_u64)
-        .ok_or(IpcError::Malformed)?;
-    let version = object
-        .get("v")
-        .and_then(Value::as_u64)
-        .ok_or(IpcError::Malformed)?;
+    let Some(id) = object.get("id").and_then(Value::as_u64) else {
+        zeroize_json(&mut value);
+        return Err(IpcError::Malformed);
+    };
+    let Some(version) = object.get("v").and_then(Value::as_u64) else {
+        zeroize_json(&mut value);
+        return Err(IpcError::Malformed);
+    };
     if version != IPC_VERSION {
+        zeroize_json(&mut value);
         return Err(IpcError::Unsupported { id });
     }
-    let mut body = object.clone();
-    body.remove("v");
-    body.remove("id");
-    let kind: RequestKind =
-        serde_json::from_value(Value::Object(body.clone())).map_err(|_| IpcError::Malformed)?;
-    if !same_fields(&body, &kind)? {
+    let keys: Vec<String> = object
+        .keys()
+        .filter(|key| *key != "v" && *key != "id")
+        .cloned()
+        .collect();
+    let Value::Object(mut object) = std::mem::replace(&mut value, Value::Null) else {
+        return Err(IpcError::Malformed);
+    };
+    object.remove("v");
+    object.remove("id");
+    let kind = match serde_json::from_value(Value::Object(object)) {
+        Ok(kind) => kind,
+        Err(_) => return Err(IpcError::Malformed),
+    };
+    if !same_fields(&keys, &kind)? {
         return Err(IpcError::Malformed);
     }
     Ok(DecodedRequest { id, kind })
 }
 
 /// Unit variants ignore unknown fields even with `deny_unknown_fields`.
-/// Compare the decoded message with the fields it actually owns.
-fn same_fields(body: &Map<String, Value>, kind: &RequestKind) -> Result<bool, IpcError> {
-    let canonical = serde_json::to_value(kind).map_err(|_| IpcError::Malformed)?;
-    let Some(canonical) = canonical.as_object() else {
-        return Err(IpcError::Malformed);
+/// Compare the decoded message with the fields it actually owns. The
+/// re-serialized value is wiped so a PIN in it does not outlive the check.
+fn same_fields(keys: &[String], kind: &RequestKind) -> Result<bool, IpcError> {
+    let mut canonical = serde_json::to_value(kind).map_err(|_| IpcError::Malformed)?;
+    let matches = match canonical.as_object() {
+        Some(object) => {
+            keys.len() == object.len() && keys.iter().all(|key| object.contains_key(key))
+        }
+        None => {
+            zeroize_json(&mut canonical);
+            return Err(IpcError::Malformed);
+        }
     };
-    Ok(body.len() == canonical.len() && body.keys().all(|key| canonical.contains_key(key)))
+    zeroize_json(&mut canonical);
+    Ok(matches)
+}
+
+fn zeroize_json(value: &mut Value) {
+    match value {
+        Value::String(text) => text.zeroize(),
+        Value::Array(items) => {
+            for item in items {
+                zeroize_json(item);
+            }
+        }
+        Value::Object(map) => zeroize_map(map),
+        _ => {}
+    }
+}
+
+fn zeroize_map(map: &mut Map<String, Value>) {
+    for value in map.values_mut() {
+        zeroize_json(value);
+    }
 }

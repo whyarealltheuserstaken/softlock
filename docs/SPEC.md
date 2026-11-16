@@ -400,7 +400,7 @@ After a fail-closed fall-back (or a hard lock) with `win_l` on, the takeover pol
   - The App disables editing while locked.
   - `PutConfig` returns `Locked` in any state except `Unlocked`, and also while the Windows lock is up (tracked through session notifications).
   - The file isn't re-read automatically after unlock. If it changed, the App offers "Apply changes made to the config file?"
-- **Sensitive fields** (anything in `[unlock]`, `[hardening]` or `[takeover]` that weakens protection) return `NeedsConfirmation`. They apply only after a Hello or password check in the App. **Turning any takeover setting on counts as weakening**, because it replaces the real Windows lock (section 17).
+- **Sensitive fields** return `NeedsConfirmation` and are not applied. A sensitive field is any top-level key `unlock`, `hardening`, or `takeover`, including dotted keys (`unlock.methods = []`), inline tables (`unlock = { methods = [] }`), and table headers with whitespace or a dotted suffix (`[ unlock ]`, `[unlock.pin]`). A document that does not parse also returns `NeedsConfirmation`, so an unreadable file cannot skip the check. These apply only after a Hello or password check in the App. **Turning any takeover setting on counts as weakening**, because it replaces the real Windows lock (section 17).
 - **Schema:** generated from the Rust types (`schemars`), published as JSON Schema, and used by the App UI and by agents. `schema_version` allows migrations.
 
 ```rust

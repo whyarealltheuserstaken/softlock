@@ -144,15 +144,13 @@ fn sample_requests() -> Vec<RequestKind> {
 }
 
 #[test]
-fn locked_leaves_only_on_a_verified_verdict_from_the_lock_host_or_its_broker() {
-    for kind in sample_requests() {
-        for role in [Role::App, Role::LockClient] {
+fn locked_leaves_only_on_a_verified_broker_verdict() {
+    for role in [Role::App, Role::LockClient] {
+        for kind in sample_requests() {
             let mut controller = locked_started();
-            controller.handle(Event::Public {
-                role,
-                kind: kind.clone(),
-            });
             let hard_lock = role == Role::App && matches!(kind, RequestKind::HardLock);
+            let label = format!("{role:?} {kind:?}");
+            controller.handle(Event::Public { role, kind });
             assert!(
                 if hard_lock {
                     matches!(
@@ -164,19 +162,20 @@ fn locked_leaves_only_on_a_verified_verdict_from_the_lock_host_or_its_broker() {
                 } else {
                     matches!(controller.state(), LockState::Locked { .. })
                 },
-                "{role:?} {kind:?} left the lock path for {:?}",
+                "{label} left the lock path for {:?}",
                 controller.state()
             );
             assert!(
                 !controller.returned_to_unlocked(),
-                "{role:?} {kind:?} reached Unlocked"
+                "{label} reached Unlocked"
             );
         }
     }
 
     let mut controller = locked_started();
-    let pin = Secret::new("1234");
-    let event = public(RequestKind::SetPin { pin: pin.clone() });
+    let event = public(RequestKind::SetPin {
+        pin: Secret::new("1234"),
+    });
     let rendered = format!("{event:?}");
     assert!(!rendered.contains("1234"));
     controller.handle(event);
@@ -1417,18 +1416,48 @@ fn os_lock_uses_the_console_session_and_its_result() {
 
 #[test]
 fn sensitive_config_needs_confirmation_and_is_not_applied() {
+    let cases = [
+        ("[unlock]\nmethods = []\n", vec!["unlock".to_string()]),
+        ("unlock.methods = []\n", vec!["unlock".to_string()]),
+        ("unlock = { methods = [] }\n", vec!["unlock".to_string()]),
+        ("[unlock.pin]\n", vec!["unlock".to_string()]),
+        ("[ unlock ]\n", vec!["unlock".to_string()]),
+        ("takeover.win_l = true\n", vec!["takeover".to_string()]),
+    ];
+    for (toml, fields) in cases {
+        let mut controller = started(FakePlatform::new());
+        let revision = controller.config_revision();
+        let before = controller.config_toml().to_string();
+        controller.handle(public(RequestKind::PutConfig {
+            toml: toml.to_string(),
+            base_revision: revision,
+        }));
+        assert_eq!(
+            controller.last_response(),
+            Some(&ResponseKind::NeedsConfirmation { fields }),
+            "{toml:?} was applied or named the wrong tables"
+        );
+        assert_eq!(controller.config_revision(), revision, "{toml:?}");
+        assert_eq!(controller.config_toml(), before, "{toml:?}");
+    }
+
     let mut controller = started(FakePlatform::new());
     let revision = controller.config_revision();
     let before = controller.config_toml().to_string();
     controller.handle(public(RequestKind::PutConfig {
-        toml: "[unlock]\nmethods = []\n".to_string(),
+        toml: "unlock = [\n".to_string(),
         base_revision: revision,
     }));
     assert_eq!(
         controller.last_response(),
         Some(&ResponseKind::NeedsConfirmation {
-            fields: vec!["unlock".to_string()],
-        })
+            fields: vec![
+                "unlock".to_string(),
+                "hardening".to_string(),
+                "takeover".to_string(),
+            ],
+        }),
+        "a document that does not parse must not be applied"
     );
     assert_eq!(controller.config_revision(), revision);
     assert_eq!(controller.config_toml(), before);
@@ -1627,12 +1656,77 @@ fn recovering_with_an_active_session_fails_closed() {
     assert!(!controller.returned_to_unlocked());
 }
 
-fn arb_request() -> impl Strategy<Value = RequestKind> {
+/// Request the property test can clone while it shrinks. The PIN and token
+/// stay plain strings until the step runs, so shrinking does not clone a `Secret`.
+#[derive(Clone, Debug)]
+enum GeneratedRequest {
+    Hello {
+        client_version: String,
+    },
+    GetStatus,
+    Lock {
+        source: LockSource,
+        note: Option<String>,
+    },
+    HardLock,
+    GetConfig,
+    ValidateConfig {
+        toml: String,
+    },
+    PutConfig {
+        toml: String,
+        base_revision: u64,
+    },
+    ConfirmSensitiveChange {
+        token: String,
+    },
+    SetPin {
+        pin: String,
+    },
+    ClearPin,
+    Subscribe,
+    CheckUpdate,
+    InstallUpdate {
+        version: String,
+    },
+}
+
+impl GeneratedRequest {
+    fn into_kind(self) -> RequestKind {
+        match self {
+            Self::Hello { client_version } => RequestKind::Hello { client_version },
+            Self::GetStatus => RequestKind::GetStatus,
+            Self::Lock { source, note } => RequestKind::Lock { source, note },
+            Self::HardLock => RequestKind::HardLock,
+            Self::GetConfig => RequestKind::GetConfig,
+            Self::ValidateConfig { toml } => RequestKind::ValidateConfig { toml },
+            Self::PutConfig {
+                toml,
+                base_revision,
+            } => RequestKind::PutConfig {
+                toml,
+                base_revision,
+            },
+            Self::ConfirmSensitiveChange { token } => RequestKind::ConfirmSensitiveChange {
+                token: Secret::new(token),
+            },
+            Self::SetPin { pin } => RequestKind::SetPin {
+                pin: Secret::new(pin),
+            },
+            Self::ClearPin => RequestKind::ClearPin,
+            Self::Subscribe => RequestKind::Subscribe,
+            Self::CheckUpdate => RequestKind::CheckUpdate,
+            Self::InstallUpdate { version } => RequestKind::InstallUpdate { version },
+        }
+    }
+}
+
+fn arb_request() -> impl Strategy<Value = GeneratedRequest> {
     prop_oneof![
         string_regex("[a-z0-9.]{1,8}")
             .unwrap()
-            .prop_map(|client_version| { RequestKind::Hello { client_version } }),
-        Just(RequestKind::GetStatus),
+            .prop_map(|client_version| { GeneratedRequest::Hello { client_version } }),
+        Just(GeneratedRequest::GetStatus),
         (
             prop_oneof![
                 Just(LockSource::Hotkey),
@@ -1642,36 +1736,32 @@ fn arb_request() -> impl Strategy<Value = RequestKind> {
             ],
             prop::option::of(string_regex("[a-z]{0,12}").unwrap()),
         )
-            .prop_map(|(source, note)| RequestKind::Lock { source, note }),
-        Just(RequestKind::HardLock),
-        Just(RequestKind::GetConfig),
+            .prop_map(|(source, note)| GeneratedRequest::Lock { source, note }),
+        Just(GeneratedRequest::HardLock),
+        Just(GeneratedRequest::GetConfig),
         string_regex("[a-z0-9]{0,16}")
             .unwrap()
-            .prop_map(|toml| { RequestKind::ValidateConfig { toml } }),
+            .prop_map(|toml| { GeneratedRequest::ValidateConfig { toml } }),
         (
             string_regex("[a-z0-9]{0,16}").unwrap(),
             any::<u8>().prop_map(u64::from),
         )
-            .prop_map(|(toml, base_revision)| RequestKind::PutConfig {
+            .prop_map(|(toml, base_revision)| GeneratedRequest::PutConfig {
                 toml,
                 base_revision,
             }),
-        string_regex("[a-z0-9]{0,8}").unwrap().prop_map(|token| {
-            RequestKind::ConfirmSensitiveChange {
-                token: Secret::new(token),
-            }
-        }),
+        string_regex("[a-z0-9]{0,8}")
+            .unwrap()
+            .prop_map(|token| { GeneratedRequest::ConfirmSensitiveChange { token } }),
         string_regex("[0-9]{4}")
             .unwrap()
-            .prop_map(|pin| RequestKind::SetPin {
-                pin: Secret::new(pin),
-            }),
-        Just(RequestKind::ClearPin),
-        Just(RequestKind::Subscribe),
-        Just(RequestKind::CheckUpdate),
+            .prop_map(|pin| GeneratedRequest::SetPin { pin }),
+        Just(GeneratedRequest::ClearPin),
+        Just(GeneratedRequest::Subscribe),
+        Just(GeneratedRequest::CheckUpdate),
         string_regex("[0-9.]{1,8}")
             .unwrap()
-            .prop_map(|version| { RequestKind::InstallUpdate { version } }),
+            .prop_map(|version| { GeneratedRequest::InstallUpdate { version } }),
     ]
 }
 
@@ -1692,7 +1782,10 @@ enum Start {
 
 #[derive(Clone, Debug)]
 enum Step {
-    Public { role: Role, kind: RequestKind },
+    Public {
+        role: Role,
+        request: GeneratedRequest,
+    },
     Session(SessionEvent),
     VerifiedBroker,
     VerifiedStale,
@@ -1795,7 +1888,7 @@ fn arb_step() -> impl Strategy<Value = Step> {
             ],
             arb_request(),
         )
-            .prop_map(|(role, kind)| Step::Public { role, kind }),
+            .prop_map(|(role, request)| Step::Public { role, request }),
         prop_oneof![
             Just(SessionEvent::OsLocked),
             Just(SessionEvent::OsUnlocked),
@@ -1836,7 +1929,7 @@ fn arb_start() -> impl Strategy<Value = Start> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(512))]
     #[test]
     fn adversarial_events_from_any_reachable_state_need_a_genuine_verified_verdict_to_unlock(
         start in arb_start(),
@@ -1848,8 +1941,11 @@ proptest! {
             let before = controller.state().clone();
             let mut genuine = false;
             match step {
-                Step::Public { role, kind } => {
-                    controller.handle(Event::Public { role, kind });
+                Step::Public { role, request } => {
+                    controller.handle(Event::Public {
+                        role,
+                        kind: request.into_kind(),
+                    });
                 }
                 Step::Session(notification) => {
                     controller.handle(Event::Session(notification));

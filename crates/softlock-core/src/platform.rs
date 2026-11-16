@@ -242,6 +242,9 @@ pub trait Power {
 }
 
 pub trait Credentials {
+    /// Account-password check. Next-ticket seam: the controller does not call
+    /// this. `SetPin` and `ConfirmSensitiveChange` stay `Unsupported` until
+    /// that ticket builds the Broker check. Stubs reject.
     fn verify_password(&self, user: &UserId, password: &Secret) -> Verdict;
 
     /// Forwards one submitted secret. Only [`Verdict::Verified`] may unlock.
@@ -324,8 +327,8 @@ pub trait PolicySettings {
     fn clear_policy(&mut self, setting: PolicySetting);
 }
 
-/// The platform surface from the spec, plus typed policy settings and the
-/// broker confirmation check. Fault injection is not part of this trait.
+/// The platform surface from the spec, plus typed policy settings. Fault
+/// injection is not part of this trait.
 pub trait Platform:
     InputGuard
     + Overlay
@@ -335,7 +338,6 @@ pub trait Platform:
     + Credentials
     + EncryptionStatus
     + PolicySettings
-    + ConfirmationCheck
 {
 }
 
@@ -348,13 +350,7 @@ impl<T> Platform for T where
         + Credentials
         + EncryptionStatus
         + PolicySettings
-        + ConfirmationCheck
 {
-}
-
-/// Hello or the account password, checked by the Broker the service launched.
-pub trait ConfirmationCheck {
-    fn confirm(&mut self, method: MethodId) -> Verdict;
 }
 
 pub trait EncryptionStatus {
@@ -489,12 +485,6 @@ impl Power for UnsupportedPlatform {
 
 impl Credentials for UnsupportedPlatform {
     fn verify_password(&self, _user: &UserId, _password: &Secret) -> Verdict {
-        Verdict::Rejected
-    }
-}
-
-impl ConfirmationCheck for UnsupportedPlatform {
-    fn confirm(&mut self, _method: MethodId) -> Verdict {
         Verdict::Rejected
     }
 }

@@ -1,5 +1,6 @@
 //! Lock state machine. Events go in, decisions come out. Nothing here calls an OS.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::config::{ConfigError, ConfigStore};
@@ -68,12 +69,12 @@ pub enum Event {
 pub struct LockController<P> {
     platform: P,
     state: LockState,
-    trace: Vec<LockState>,
+    trace: VecDeque<LockState>,
     #[cfg(feature = "test-support")]
     manual: bool,
     journal: Journal,
-    rejections: Vec<Rejection>,
-    failure_events: Vec<FailReason>,
+    rejections: VecDeque<Rejection>,
+    failure_events: VecDeque<FailReason>,
     failure_count: u32,
     backoff_until: Option<MonotonicInstant>,
     now: MonotonicInstant,
@@ -86,7 +87,7 @@ pub struct LockController<P> {
     config: ConfigStore,
     awake: Option<AwakeGuard>,
     last_response: Option<ResponseKind>,
-    notifications: Vec<Fallback>,
+    notifications: VecDeque<Fallback>,
 }
 
 impl<P: Platform> LockController<P> {
@@ -94,12 +95,12 @@ impl<P: Platform> LockController<P> {
         Self {
             platform,
             state: LockState::Unlocked,
-            trace: vec![LockState::Unlocked],
+            trace: VecDeque::from([LockState::Unlocked]),
             #[cfg(feature = "test-support")]
             manual: false,
             journal: Journal::empty(),
-            rejections: Vec::new(),
-            failure_events: Vec::new(),
+            rejections: VecDeque::new(),
+            failure_events: VecDeque::new(),
             failure_count: 0,
             backoff_until: None,
             now: MonotonicInstant::zero(),
@@ -112,7 +113,7 @@ impl<P: Platform> LockController<P> {
             config: ConfigStore::new(),
             awake: None,
             last_response: None,
-            notifications: Vec::new(),
+            notifications: VecDeque::new(),
         }
     }
 
@@ -156,7 +157,7 @@ impl<P: Platform> LockController<P> {
         &self.state
     }
 
-    pub fn visited(&self) -> &[LockState] {
+    pub fn visited(&self) -> &VecDeque<LockState> {
         &self.trace
     }
 
@@ -186,11 +187,11 @@ impl<P: Platform> LockController<P> {
         &mut self.platform
     }
 
-    pub fn rejection_log(&self) -> &[Rejection] {
+    pub fn rejection_log(&self) -> &VecDeque<Rejection> {
         &self.rejections
     }
 
-    pub fn failure_events(&self) -> &[FailReason] {
+    pub fn failure_events(&self) -> &VecDeque<FailReason> {
         &self.failure_events
     }
 
@@ -241,7 +242,7 @@ impl<P: Platform> LockController<P> {
         self.last_response.as_ref()
     }
 
-    pub fn notifications(&self) -> &[Fallback] {
+    pub fn notifications(&self) -> &VecDeque<Fallback> {
         &self.notifications
     }
 
@@ -358,7 +359,11 @@ impl<P: Platform> LockController<P> {
             self.reject("Verified");
             return;
         }
-        let genuine = self.broker_launched && self.broker_nonce.as_ref() == Some(&nonce);
+        let genuine = self.broker_launched
+            && self
+                .broker_nonce
+                .as_ref()
+                .is_some_and(|expected| expected.eq_ct(&nonce));
         if !genuine {
             self.reject("Verified");
             return;
@@ -657,7 +662,7 @@ impl<P: Platform> LockController<P> {
                 lock_source: self.state.source(),
                 guard: InputGuard::health(&self.platform),
                 overlay: Overlay::health(&self.platform),
-                last_fallback: self.notifications.last().copied(),
+                last_fallback: self.notifications.back().copied(),
             },
             RequestKind::Lock { source, .. } => {
                 self.start_lock(source);
@@ -713,10 +718,27 @@ impl<P: Platform> LockController<P> {
     }
 }
 
-fn sensitive_tables(toml: &str) -> Vec<String> {
-    ["unlock", "hardening", "takeover"]
+const SENSITIVE_TABLES: [&str; 3] = ["unlock", "hardening", "takeover"];
+
+/// Top-level `unlock`, `hardening`, and `takeover` keys. A document that does
+/// not parse fails closed: every sensitive name is reported so the write is
+/// not applied.
+fn sensitive_tables(document: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<toml::Value>(document) else {
+        return SENSITIVE_TABLES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+    };
+    let Some(table) = value.as_table() else {
+        return SENSITIVE_TABLES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+    };
+    SENSITIVE_TABLES
         .into_iter()
-        .filter(|name| toml.contains(&format!("[{name}]")))
+        .filter(|name| table.contains_key(*name))
         .map(str::to_string)
         .collect()
 }
@@ -739,9 +761,9 @@ fn request_name(kind: &RequestKind) -> &'static str {
     }
 }
 
-fn push_bounded<T>(items: &mut Vec<T>, item: T) {
+fn push_bounded<T>(items: &mut VecDeque<T>, item: T) {
     if items.len() == HISTORY_LIMIT {
-        items.remove(0);
+        items.pop_front();
     }
-    items.push(item);
+    items.push_back(item);
 }

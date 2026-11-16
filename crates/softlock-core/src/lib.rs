@@ -37,11 +37,11 @@ pub use name::{
     SERVICE_NAME, pipe_name, registry_key,
 };
 pub use platform::{
-    AwakeGuard, AwakeRequest, CapabilityReport, ConfirmationCheck, Credentials, DiskEncryption,
-    EncryptionStatus, GuardError, GuardHealth, HardenError, Hardening, HardeningConfig,
-    HardeningPlan, InputGuard, LockScreenLook, OsLockError, Overlay, OverlayError, OverlayHealth,
-    PassthroughTarget, PhysicalInputSink, PlannedChange, Platform, PolicySetting, PolicySettings,
-    Power, PowerCaps, PowerError, PromptView, SessionControl, SessionId, SessionInfo, Support,
+    AwakeGuard, AwakeRequest, CapabilityReport, Credentials, DiskEncryption, EncryptionStatus,
+    GuardError, GuardHealth, HardenError, Hardening, HardeningConfig, HardeningPlan, InputGuard,
+    LockScreenLook, OsLockError, Overlay, OverlayError, OverlayHealth, PassthroughTarget,
+    PhysicalInputSink, PlannedChange, Platform, PolicySetting, PolicySettings, Power, PowerCaps,
+    PowerError, PromptView, SessionControl, SessionId, SessionInfo, Support,
     UNSUPPORTED_PLATFORM_MESSAGE, UnsupportedPlatform, UserId, Verdict,
 };
 pub use state::{

@@ -7,11 +7,11 @@ use std::collections::BTreeMap;
 
 use crate::journal::{Journal, JournalEntry};
 use crate::platform::{
-    AwakeGuard, AwakeRequest, ConfirmationCheck, Credentials, DiskEncryption, EncryptionStatus,
-    GuardError, GuardHealth, HardenError, Hardening, HardeningPlan, InputGuard, LockScreenLook,
-    OsLockError, Overlay, OverlayError, OverlayHealth, PassthroughTarget, PhysicalInputSink,
-    PolicySetting, PolicySettings, Power, PowerCaps, PowerError, PromptView, SessionControl,
-    SessionId, UserId, Verdict,
+    AwakeGuard, AwakeRequest, Credentials, DiskEncryption, EncryptionStatus, GuardError,
+    GuardHealth, HardenError, Hardening, HardeningPlan, InputGuard, LockScreenLook, OsLockError,
+    Overlay, OverlayError, OverlayHealth, PassthroughTarget, PhysicalInputSink, PolicySetting,
+    PolicySettings, Power, PowerCaps, PowerError, PromptView, SessionControl, SessionId, UserId,
+    Verdict,
 };
 use crate::state::{ArmStep, MethodId, Secret, SessionEvent};
 
@@ -66,7 +66,6 @@ pub struct FakePlatform {
     os_lock_fails: bool,
     last_os_lock: Option<SessionId>,
     secret_verdict: Verdict,
-    confirmation: Verdict,
     revert_failed: bool,
     guard_armed: bool,
     overlay_shown: bool,
@@ -92,7 +91,6 @@ impl FakePlatform {
             os_lock_fails: false,
             last_os_lock: None,
             secret_verdict: Verdict::Rejected,
-            confirmation: Verdict::Rejected,
             revert_failed: false,
             guard_armed: false,
             overlay_shown: false,
@@ -148,10 +146,6 @@ impl FakePlatform {
 
     pub fn set_secret_verdict(&mut self, verdict: Verdict) {
         self.secret_verdict = verdict;
-    }
-
-    pub fn set_confirmation(&mut self, verdict: Verdict) {
-        self.confirmation = verdict;
     }
 
     pub fn fail_revert(&mut self, fail: bool) {
@@ -360,12 +354,6 @@ impl Power for FakePlatform {
             supported: true,
             modern_standby: false,
         }
-    }
-}
-
-impl ConfirmationCheck for FakePlatform {
-    fn confirm(&mut self, _method: MethodId) -> Verdict {
-        self.confirmation
     }
 }
 

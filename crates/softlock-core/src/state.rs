@@ -87,7 +87,9 @@ impl MethodId {
 }
 
 /// A secret the controller drops after the verdict. Debug output is redacted.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// There is no `Clone`: copying a secret multiplies bytes that then have to be
+/// wiped. Equality walks every byte, so it does not return on the first mismatch.
 pub struct Secret {
     bytes: Vec<u8>,
 }
@@ -109,6 +111,14 @@ impl Drop for Secret {
         self.bytes.zeroize();
     }
 }
+
+impl PartialEq for Secret {
+    fn eq(&self, other: &Self) -> bool {
+        constant_time_eq(&self.bytes, &other.bytes)
+    }
+}
+
+impl Eq for Secret {}
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -139,7 +149,7 @@ impl<'de> Deserialize<'de> for Secret {
 }
 
 /// One-time nonce for a Broker launch. It comes from the system CSPRNG.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct LaunchNonce([u8; 32]);
 
 impl LaunchNonce {
@@ -156,6 +166,33 @@ impl LaunchNonce {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Compares every byte. A derived `==` would return on the first mismatch.
+    pub fn eq_ct(&self, other: &Self) -> bool {
+        let mut diff = 0u8;
+        for (left, right) in self.0.iter().zip(other.0.iter()) {
+            diff |= left ^ right;
+        }
+        diff == 0
+    }
+}
+
+/// Equality that does not return early. Length is mixed in, then every
+/// overlapping byte, then the tail of the longer slice.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = u8::from(left.len() != right.len());
+    for (left_byte, right_byte) in left.iter().zip(right.iter()) {
+        diff |= left_byte ^ right_byte;
+    }
+    let longer = if left.len() > right.len() {
+        left
+    } else {
+        right
+    };
+    for byte in longer.iter().skip(left.len().min(right.len())) {
+        diff |= byte;
+    }
+    diff == 0
 }
 
 impl std::fmt::Debug for LaunchNonce {
