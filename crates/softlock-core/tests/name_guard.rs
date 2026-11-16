@@ -14,7 +14,6 @@ const STRING_RESOURCES: &str = "crates/softlock-app/src/strings/";
 const NAME_CONSTANT_LINES: &[&str] = &[
     "pub const PRODUCT_DISPLAY_NAME: &str = \"SoftLock\";",
     "pub const SERVICE_DISPLAY_NAME: &str = \"SoftLock Agent\";",
-    "pub const SERVICE_ID_PASCAL: &str = \"SoftLockAgent\";",
 ];
 
 /// The settings app's installed name and window title. Tauri cannot read the Rust constant.
