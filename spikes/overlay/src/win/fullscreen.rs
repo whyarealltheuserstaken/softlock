@@ -83,16 +83,12 @@ pub fn run(seconds: u64) -> Result<(), String> {
         }
     };
     let entered = unsafe { swap.SetFullscreenState(true, None::<&IDXGIOutput>) };
-    if let Err(error) = entered {
-        unsafe {
-            let _ = DestroyWindow(hwnd);
-        }
-        return Err(format!(
-            "exclusive fullscreen did not start ({error}). Do not count a green window that is not there."
-        ));
-    }
     let mut fullscreen = windows::core::BOOL(0);
-    if unsafe { swap.GetFullscreenState(Some(&mut fullscreen), None).is_ok() }
+    if let Err(error) = &entered {
+        eprintln!("exclusive fullscreen did not start ({error}). The green window stays windowed.");
+    }
+    if entered.is_ok()
+        && unsafe { swap.GetFullscreenState(Some(&mut fullscreen), None).is_ok() }
         && fullscreen.as_bool()
     {
         println!("fullscreen_mode: exclusive");

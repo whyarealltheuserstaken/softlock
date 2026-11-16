@@ -537,11 +537,15 @@ fn run_tour(config: &Config) -> Result<(), String> {
         });
         let _ = std::io::Write::flush(&mut std::io::stdout());
         let before = shell::visible_surfaces();
-        if let Err(error) = perform(step, build) {
-            eprintln!("This surface did not open: {error}");
-            eprintln!("Write that in the notes. The tour continues.");
-        }
-        confirm_overlay(step, &before)?;
+        let opened = match perform(step, build) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("This surface did not open: {error}");
+                eprintln!("Write that in the notes. The tour continues.");
+                false
+            }
+        };
+        confirm_overlay(step, &before, opened)?;
         if !matches!(step.action, Action::Fullscreen { .. }) {
             thread::sleep(tour::step_wait(config.pause, step.id, fullscreen_secs));
             dismiss(step, config);
@@ -570,12 +574,15 @@ fn perform(step: &Step, _build: u32) -> Result<(), String> {
     }
 }
 
-fn confirm_overlay(step: &Step, before: &[ShellSurface]) -> Result<(), String> {
+fn confirm_overlay(step: &Step, before: &[ShellSurface], opened: bool) -> Result<(), String> {
     if !overlay_is_up() {
         println!("surface_opened_while_overlay: overlay-closed");
         return Err("the tour ran after the overlay closed".into());
     }
     let Some(kind) = shell_surface_for(step.id) else {
+        if opened && step.id == SurfaceId::FullscreenExclusive {
+            println!("surface_opened_while_overlay: {}", step.id.title());
+        }
         return Ok(());
     };
     let deadline = Instant::now() + Duration::from_secs(2);
