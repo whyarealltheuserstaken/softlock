@@ -3,7 +3,7 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
-use crate::classify::fail_closed_end;
+use crate::classify::{disable_event_name, fail_closed_end};
 use crate::report::{
     CaptureReport, ClassifyReport, MarkerObservation, PostedObservation, SlowObservation, TapBits,
     TapReport, WindowReport, active_tap, capture_detail, capture_opened, capture_unavailable,
@@ -84,6 +84,7 @@ struct M03Out {
     disable_wait_ms: i64,
     dead_ms: i64,
     healthy_ms: i64,
+    disable_type: i64,
     key_reached_during: i32,
     key_reached_after: i32,
     dead_misses: i32,
@@ -424,14 +425,7 @@ pub fn prove_m03(exe: &std::path::Path, dir: &std::path::Path) -> ClassifyReport
     ClassifyReport {
         posts,
         slow: SlowObservation {
-            disable_event: {
-                let name = text(&out.disable_event);
-                if name.is_empty() {
-                    "none".to_string()
-                } else {
-                    name
-                }
-            },
+            disable_event: disable_event_name(out.disable_type).to_string(),
             sleep_ms: out.sleep_ms,
             disable_wait_ms: out.disable_wait_ms,
             key_reached_during: out.key_reached_during != 0,
@@ -444,8 +438,11 @@ pub fn prove_m03(exe: &std::path::Path, dir: &std::path::Path) -> ClassifyReport
             dead_misses: out.dead_misses.max(0) as u32,
             healthy_ms: out.healthy_ms,
             reenabled: out.reenabled != 0,
-            error: optional_text(&out.marker_error)
-                .or_else(|| if out.dead_ms == 0 { top } else { None }),
+            error: match optional_text(&out.marker_error) {
+                Some(error) => Some(error),
+                None if out.dead_ms == 0 => top,
+                None => None,
+            },
         },
         end_state: fail_closed_end().to_string(),
     }
@@ -475,6 +472,7 @@ fn zero_m03() -> M03Out {
         disable_wait_ms: 0,
         dead_ms: 0,
         healthy_ms: 0,
+        disable_type: 0,
         key_reached_during: 0,
         key_reached_after: 0,
         dead_misses: 0,

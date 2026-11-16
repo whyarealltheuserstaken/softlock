@@ -892,6 +892,7 @@ typedef struct {
     int64_t disable_wait_ms;
     int64_t dead_ms;
     int64_t healthy_ms;
+    int64_t disable_type;
     int key_reached_during;
     int key_reached_after;
     int dead_misses;
@@ -1368,6 +1369,7 @@ static void run_slow(const char *dir, M03Out *out) {
     int64_t entered = atomic_load(&g_slow_entered_ms);
     int64_t returned = atomic_load(&g_slow_returned_ms);
     int64_t disable_type = atomic_load(&g_disable_type);
+    out->disable_type = disable_type;
     snprintf(out->disable_event, sizeof out->disable_event, "%s", disable_name(disable_type));
     out->sleep_ms = (entered != 0 && returned != 0) ? (returned - entered) : 0;
     if (disable_type != 0 && entered != 0) {
