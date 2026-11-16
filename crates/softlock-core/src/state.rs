@@ -87,6 +87,7 @@ impl MethodId {
 }
 
 /// A secret the controller drops after the verdict. Debug output is redacted.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Secret {
     bytes: Vec<u8>,
 }
@@ -115,6 +116,54 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+impl Serialize for Secret {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let text = std::str::from_utf8(&self.bytes).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(text)
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut text = String::deserialize(deserializer)?;
+        let secret = Secret::new(text.as_bytes());
+        text.zeroize();
+        Ok(secret)
+    }
+}
+
+/// One-time nonce for a Broker launch. It comes from the system CSPRNG.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LaunchNonce([u8; 32]);
+
+impl LaunchNonce {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn generate() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes)?;
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for LaunchNonce {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LaunchNonce([redacted])")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateName {
     Unlocked,
@@ -130,12 +179,6 @@ pub enum StateName {
 pub enum Role {
     App,
     LockClient,
-    LockHost,
-    Broker,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VerdictChannel {
     LockHost,
     Broker,
 }
@@ -160,10 +203,12 @@ pub enum FailReason {
     ArmTimeout,
     RevertFailed,
     ServiceStop,
-    /// The Lock Host asked for a hard lock while the session was locked.
+    /// Hard lock while the session was already locked.
     HardLock,
     /// Recovery found a live session that still says it is locked.
     SessionActive,
+    /// Revert still failed after the owner signed back in.
+    Repair,
 }
 
 /// Why the machine fell back to the OS lock, and when.

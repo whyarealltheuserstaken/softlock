@@ -5,11 +5,6 @@ import product from "../src/strings/product-name.json" with { type: "json" };
 
 const origin = `http://${devServer.host}:${devServer.port}`;
 
-const LINUX_UA =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
-const MAC_UA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
-
 test("window title comes from the product name", async ({ page }) => {
   await page.goto("/");
   await expect(page).toHaveTitle(product.productName);
@@ -19,15 +14,18 @@ test("window title comes from the product name", async ({ page }) => {
 });
 
 test("macOS shows the unsupported platform message", async ({ browser }) => {
-  await expectUnsupported(browser, MAC_UA);
+  await expectUnsupported(browser);
 });
 
 test("Linux shows the unsupported platform message", async ({ browser }) => {
-  await expectUnsupported(browser, LINUX_UA);
+  await expectUnsupported(browser);
 });
 
-async function expectUnsupported(browser: Browser, userAgent: string) {
-  const context = await browser.newContext({ userAgent, baseURL: origin });
+async function expectUnsupported(browser: Browser) {
+  const context = await browser.newContext({ baseURL: origin });
+  await context.addInitScript((message) => {
+    window.__SOFTLOCK_PLATFORM_STATUS__ = { supported: false, message };
+  }, platform.unsupported);
   const page = await context.newPage();
   await page.goto("/");
   await expect(page.locator("main")).toHaveAttribute("data-platform-support", "unsupported");

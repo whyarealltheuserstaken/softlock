@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 use crate::journal::{Journal, JournalEntry};
 use crate::platform::{
     AwakeGuard, AwakeRequest, ConfirmationCheck, Credentials, DiskEncryption, EncryptionStatus,
-    GuardError, GuardHealth, HardenError, Hardening, HardeningConfig, HardeningPlan, InputGuard,
-    LockScreenLook, OsLockError, Overlay, OverlayError, OverlayHealth, PassthroughTarget,
-    PhysicalInputSink, PolicySetting, PolicySettings, Power, PowerCaps, PowerError, PromptView,
-    SessionControl, SessionId, SessionInfo, UserId, Verdict,
+    GuardError, GuardHealth, HardenError, Hardening, HardeningPlan, InputGuard, LockScreenLook,
+    OsLockError, Overlay, OverlayError, OverlayHealth, PassthroughTarget, PhysicalInputSink,
+    PolicySetting, PolicySettings, Power, PowerCaps, PowerError, PromptView, SessionControl,
+    SessionId, UserId, Verdict,
 };
 use crate::state::{ArmStep, MethodId, Secret, SessionEvent};
 
@@ -59,8 +59,12 @@ pub struct FakePlatform {
     settings: BTreeMap<PolicySetting, String>,
     apply_log: Vec<ApplyEvent>,
     fail_at: Option<ArmStep>,
-    /// A platform flag. It must not change the credential verdict.
+    /// A platform flag. Verification does not read it.
     accept_next: bool,
+    extras: BTreeMap<String, String>,
+    console: SessionId,
+    os_lock_fails: bool,
+    last_os_lock: Option<SessionId>,
     secret_verdict: Verdict,
     confirmation: Verdict,
     revert_failed: bool,
@@ -83,6 +87,10 @@ impl FakePlatform {
             apply_log: Vec::new(),
             fail_at: None,
             accept_next: false,
+            extras: BTreeMap::new(),
+            console: SessionId::from_raw(1),
+            os_lock_fails: false,
+            last_os_lock: None,
             secret_verdict: Verdict::Rejected,
             confirmation: Verdict::Rejected,
             revert_failed: false,
@@ -105,9 +113,37 @@ impl FakePlatform {
         self.fail_at = Some(step);
     }
 
-    /// Arms a flag that used to unlock on its own. The verifier ignores it.
+    /// Arms a flag that must not unlock on its own.
     pub fn accept_secrets(&mut self, accept: bool) {
         self.accept_next = accept;
+    }
+
+    pub fn secrets_flag(&self) -> bool {
+        self.accept_next
+    }
+
+    /// Instance id a backend journals itself. The controller does not know it.
+    pub const DEVICE_INSTANCE: &'static str = "HID\\TOUCH&COL01";
+
+    pub fn extra(&self, target: &str) -> Option<&str> {
+        self.extras.get(target).map(String::as_str)
+    }
+
+    pub fn set_console_session(&mut self, session: SessionId) {
+        self.console = session;
+    }
+
+    pub fn last_os_lock_session(&self) -> Option<SessionId> {
+        self.last_os_lock
+    }
+
+    pub fn fail_os_lock(&mut self, fail: bool) {
+        self.os_lock_fails = fail;
+    }
+
+    /// Changes settings without a durable journal. The order check must fail.
+    pub fn apply_settings_before_journal(&mut self, journal: &Journal, plan: &HardeningPlan) {
+        self.record_apply(journal, plan);
     }
 
     pub fn set_secret_verdict(&mut self, verdict: Verdict) {
@@ -132,6 +168,14 @@ impl FakePlatform {
 
     pub fn power_is_held(&self) -> bool {
         self.power_held
+    }
+
+    pub fn guard_is_armed(&self) -> bool {
+        self.guard_armed
+    }
+
+    pub fn overlay_is_shown(&self) -> bool {
+        self.overlay_shown
     }
 
     fn write_policy(&mut self, setting: PolicySetting, value: &str) {
@@ -230,7 +274,15 @@ impl Overlay for FakePlatform {
 }
 
 impl SessionControl for FakePlatform {
-    fn os_lock(&mut self, _session: SessionId) -> Result<(), OsLockError> {
+    fn console_session(&self) -> SessionId {
+        self.console
+    }
+
+    fn os_lock(&mut self, session: SessionId) -> Result<(), OsLockError> {
+        self.last_os_lock = Some(session);
+        if self.os_lock_fails {
+            return Err(OsLockError::Failed);
+        }
         self.os_locks = self.os_locks.saturating_add(1);
         Ok(())
     }
@@ -242,15 +294,28 @@ impl SessionControl for FakePlatform {
 }
 
 impl Hardening for FakePlatform {
-    fn plan(&self, _cfg: &HardeningConfig, _session: &SessionInfo) -> HardeningPlan {
-        crate::platform::standard_hardening_plan()
-    }
-
     fn apply(&mut self, plan: &HardeningPlan, journal: &mut Journal) -> Result<(), HardenError> {
         if self.fail_at == Some(ArmStep::Hardening) {
             return Err(HardenError::Failed);
         }
+        for change in &plan.changes {
+            let previous = PolicySetting::from_id(&change.target)
+                .and_then(|setting| PolicySettings::policy(self, setting));
+            journal.record(JournalEntry {
+                target: change.target.clone(),
+                previous,
+                new_value: change.new_value.clone(),
+            });
+        }
+        journal.record(JournalEntry {
+            target: Self::DEVICE_INSTANCE.to_string(),
+            previous: self.extras.get(Self::DEVICE_INSTANCE).cloned(),
+            new_value: "blocked".to_string(),
+        });
+        journal.flush();
         self.record_apply(journal, plan);
+        self.extras
+            .insert(Self::DEVICE_INSTANCE.to_string(), "blocked".to_string());
         Ok(())
     }
 
@@ -259,13 +324,21 @@ impl Hardening for FakePlatform {
             return Err(HardenError::Failed);
         }
         for entry in journal.entries() {
-            let Some(setting) = PolicySetting::from_id(&entry.target) else {
-                continue;
-            };
-            match &entry.previous {
-                Some(value) => self.write_policy(setting, value),
-                None => {
-                    self.settings.remove(&setting);
+            if let Some(setting) = PolicySetting::from_id(&entry.target) {
+                match &entry.previous {
+                    Some(value) => self.write_policy(setting, value),
+                    None => {
+                        self.settings.remove(&setting);
+                    }
+                }
+            } else {
+                match &entry.previous {
+                    Some(value) => {
+                        self.extras.insert(entry.target.clone(), value.clone());
+                    }
+                    None => {
+                        self.extras.remove(&entry.target);
+                    }
                 }
             }
         }
@@ -302,7 +375,6 @@ impl Credentials for FakePlatform {
     }
 
     fn verify_secret(&self, _method: &MethodId, _secret: &Secret) -> Verdict {
-        let _platform_flag = self.accept_next;
         self.secret_verdict
     }
 }

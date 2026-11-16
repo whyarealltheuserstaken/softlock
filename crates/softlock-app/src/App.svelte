@@ -1,14 +1,21 @@
 <script lang="ts">
-  import { createIpcBridge } from "./ipc/bridge";
-  import platform from "./strings/platform.json" with { type: "json" };
+  import { onMount } from "svelte";
+  import { createIpcBridge, loadPlatformStatus } from "./ipc/bridge";
 
   const bridge = createIpcBridge();
-  const platformMessage = bridge.supported ? null : platform.unsupported;
+  let supported = true;
+  let platformMessage: string | null = null;
+
+  onMount(async () => {
+    const status = await loadPlatformStatus(bridge.kind);
+    supported = status.supported;
+    platformMessage = status.supported ? null : status.message;
+  });
 </script>
 
 <main
   data-ipc-bridge={bridge.kind}
-  data-platform-support={bridge.supported ? "ready" : "unsupported"}
+  data-platform-support={supported ? "ready" : "unsupported"}
 >
   {#if platformMessage}
     <p class="platform-status" role="status">{platformMessage}</p>

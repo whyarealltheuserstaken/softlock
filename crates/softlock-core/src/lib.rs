@@ -28,7 +28,7 @@ pub use heartbeat::{
     lock_host_fails_closed_when_service_is_silent,
 };
 pub use ipc::{
-    DecodedRequest, IPC_VERSION, IpcError, MAX_FRAME, RequestKind, ResponseKind,
+    DecodedRequest, IPC_VERSION, IpcError, MAX_FRAME, RequestKind, ResponseKind, checked_body_len,
     decode_request_frame, encode_frame, message_json,
 };
 pub use journal::{Journal, JournalEntry};
@@ -45,6 +45,6 @@ pub use platform::{
     UNSUPPORTED_PLATFORM_MESSAGE, UnsupportedPlatform, UserId, Verdict,
 };
 pub use state::{
-    ArmStep, DisarmStep, FailReason, Fallback, HeartbeatReport, LockSource, LockState, MethodId,
-    PromptState, Role, Secret, SessionEvent, StateName, VerdictChannel,
+    ArmStep, DisarmStep, FailReason, Fallback, HeartbeatReport, LaunchNonce, LockSource, LockState,
+    MethodId, PromptState, Role, Secret, SessionEvent, StateName,
 };

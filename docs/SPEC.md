@@ -268,14 +268,15 @@ enum PromptState { Idle, Open { method: MethodId }, Passthrough { method: Method
 // Unlocking  --Done-->                          Unlocked
 // Unlocking  --RevertFailed-->                  OsLocked (after os_lock) + journal kept for retry
 // FailingClosed --OsLockConfirmed-->            OsLocked
-// OsLocked   --OsUnlocked-->                    Unlocked (journal reverted, user notified if after_fail)
+// OsLocked   --OsUnlocked, revert succeeds-->   Unlocked (journal reverted, user notified if after_fail)
+// OsLocked   --OsUnlocked, revert still failing--> OsLocked (guard and overlay disarmed, journal kept, Repair notice)
 // Recovering --SessionActiveAndJournalSaysLocked--> FailingClosed
 // Recovering --NoActiveLock-->                  Unlocked (journal reverted)
 // Any        --ServiceStopRequested while Locked--> FailingClosed, then stop
 ```
 
 Invariants (each one is a test):
-1. `Locked → Unlocking` happens only on a `Verified` verdict that arrived over the Lock Host's private channel, or from the Broker it launched. No public IPC verb produces it.
+1. `Locked → Unlocking` happens only on a `Verified` verdict from the Broker this service launched, checked against that launch's CSPRNG nonce, or on the credential verifier returning `Verified` for a `SubmitSecret`. The Lock Host does not verify and has no verdict that unlocks. No public IPC verb produces it.
 2. Every hardening change is in the persisted journal **before** it's applied.
 3. Any failure while `Arming` or `Locked` ends in `OsLocked`, never `Unlocked`.
 4. Config writes are rejected in every state except `Unlocked` with the session not OS-locked.
@@ -304,7 +305,7 @@ Invariants (each one is a test):
 | `Subscribe` | App | all | event stream: `StateChanged`, `ConfigChanged`, `FellBackToOsLock { reason, at }`, `UpdateAvailable` |
 | `CheckUpdate` / `InstallUpdate { version }` | App | Unlocked only | `UpToDate`, `Available { version, notes }`, or `Installing` |
 
-\* `HardLock` while Locked is only accepted from the Lock Host's private channel, for the hard-lock fall-back.
+\* `HardLock` while Locked is accepted only from the App. Every other role is rejected and logged. It fails closed with its own reason. While Unlocked, the App's `HardLock` calls the OS lock and the state stays Unlocked.
 
 **There is no `Unlock` request on the public pipe.** This is the lock-only agent framework: in a later release, the CLI and remote triggers will be thin `LockClient`s on top of `Lock`.
 

@@ -15,9 +15,9 @@ mod tests {
     use super::capability_report;
     use softlock_core::{
         AwakeRequest, CapabilityReport, Credentials, DiskEncryption, EncryptionStatus, GuardError,
-        HardenError, Hardening, HardeningConfig, InputGuard, LockScreenLook, OsLockError, Overlay,
+        HardenError, Hardening, HardeningPlan, InputGuard, LockScreenLook, OsLockError, Overlay,
         OverlayError, PhysicalInputSink, Power, PowerError, PromptView, Secret, SessionControl,
-        SessionId, SessionInfo, Support, UNSUPPORTED_PLATFORM_MESSAGE, UserId, Verdict,
+        SessionId, Support, UNSUPPORTED_PLATFORM_MESSAGE, UserId, Verdict,
     };
 
     use super::MacosBackend;
@@ -49,12 +49,7 @@ mod tests {
         );
         let _events = SessionControl::session_events(&backend);
 
-        let plan = Hardening::plan(
-            &backend,
-            &HardeningConfig,
-            &SessionInfo { id: SessionId(1) },
-        );
-        assert!(plan.changes.is_empty());
+        let plan = HardeningPlan::empty();
         let mut journal = softlock_core::Journal::empty();
         assert_eq!(
             Hardening::apply(&mut backend, &plan, &mut journal),

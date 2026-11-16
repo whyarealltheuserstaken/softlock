@@ -24,9 +24,9 @@ pub fn denied(
             }
         }
         RequestKind::HardLock => {
-            let app_may_lock = role == Role::App && matches!(state, LockState::Unlocked);
-            let host_may_fail = role == Role::LockHost && matches!(state, LockState::Locked { .. });
-            if app_may_lock || host_may_fail {
+            let app_unlocked = role == Role::App && matches!(state, LockState::Unlocked);
+            let app_locked = role == Role::App && matches!(state, LockState::Locked { .. });
+            if app_unlocked || app_locked {
                 None
             } else {
                 Some(ResponseKind::Unauthorized)
@@ -39,18 +39,24 @@ pub fn denied(
                 Some(ResponseKind::Unauthorized)
             }
         }
-        RequestKind::PutConfig { .. }
-        | RequestKind::ConfirmSensitiveChange { .. }
-        | RequestKind::SetPin { .. }
-        | RequestKind::ClearPin
-        | RequestKind::CheckUpdate
-        | RequestKind::InstallUpdate { .. } => {
+        RequestKind::PutConfig { .. } => {
             if role != Role::App {
                 Some(ResponseKind::Unauthorized)
             } else if writable {
                 None
             } else {
                 Some(ResponseKind::Locked)
+            }
+        }
+        RequestKind::ConfirmSensitiveChange { .. }
+        | RequestKind::SetPin { .. }
+        | RequestKind::ClearPin
+        | RequestKind::CheckUpdate
+        | RequestKind::InstallUpdate { .. } => {
+            if role == Role::App {
+                None
+            } else {
+                Some(ResponseKind::Unauthorized)
             }
         }
         RequestKind::Subscribe => {

@@ -84,13 +84,17 @@ fn dependency_names(manifest: &str) -> Vec<String> {
             }
             continue;
         }
-        if !in_deps {
-            continue;
-        }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
         let key = key.trim().trim_matches('"');
+        if let Some(name) = dotted_dependency_key(key) {
+            names.push(name);
+            continue;
+        }
+        if !in_deps {
+            continue;
+        }
         if key.is_empty()
             || matches!(
                 key,
@@ -106,12 +110,31 @@ fn dependency_names(manifest: &str) -> Vec<String> {
         {
             continue;
         }
-        names.push(key.to_string());
+        names.push(crate_name(key));
         if let Some(renamed) = renamed_package(value) {
             names.push(renamed);
         }
     }
     names
+}
+
+/// `dependencies.winreg = ...` outside a dependency table, and
+/// `windows.workspace = true` inside one, both name a crate.
+fn dotted_dependency_key(key: &str) -> Option<String> {
+    for prefix in ["dependencies.", "dev-dependencies.", "build-dependencies."] {
+        if let Some(rest) = key.strip_prefix(prefix) {
+            let name = crate_name(rest);
+            if name.is_empty() {
+                return None;
+            }
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn crate_name(key: &str) -> String {
+    key.split('.').next().unwrap_or(key).to_string()
 }
 
 fn renamed_package(value: &str) -> Option<String> {

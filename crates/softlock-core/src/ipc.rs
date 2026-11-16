@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::platform::{GuardHealth, OverlayHealth};
-use crate::state::{Fallback, LockSource, StateName};
+use crate::state::{Fallback, LockSource, Secret, StateName};
 
 pub const IPC_VERSION: u64 = 1;
 
@@ -34,11 +34,11 @@ pub enum RequestKind {
         base_revision: u64,
     },
     ConfirmSensitiveChange {
-        token: String,
+        token: Secret,
     },
     /// Canonical wire kind `SetPin`. A product rename must not change it.
     SetPin {
-        pin: String,
+        pin: Secret,
     },
     /// Canonical wire kind `ClearPin`. A product rename must not change it.
     ClearPin,
@@ -134,6 +134,21 @@ pub fn message_json(id: u64, body: &impl Serialize) -> Result<String, IpcError> 
     Ok(json)
 }
 
+/// The pipe reader calls this on the 4-byte length prefix before it allocates
+/// the body. A length above [`MAX_FRAME`] is rejected here, with no buffer yet.
+pub fn checked_body_len(prefix: &[u8]) -> Result<usize, IpcError> {
+    if prefix.len() < 4 {
+        return Err(IpcError::Malformed);
+    }
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&prefix[..4]);
+    let length = u32::from_le_bytes(bytes) as usize;
+    if length > MAX_FRAME {
+        return Err(IpcError::Malformed);
+    }
+    Ok(length)
+}
+
 pub fn encode_frame(json: &str) -> Result<Vec<u8>, IpcError> {
     if json.len() > MAX_FRAME {
         return Err(IpcError::Malformed);
@@ -149,12 +164,7 @@ pub fn decode_request_frame(bytes: &[u8]) -> Result<DecodedRequest, IpcError> {
     if bytes.len() < 4 {
         return Err(IpcError::Malformed);
     }
-    let mut prefix = [0u8; 4];
-    prefix.copy_from_slice(&bytes[..4]);
-    let length = u32::from_le_bytes(prefix) as usize;
-    if length > MAX_FRAME {
-        return Err(IpcError::Malformed);
-    }
+    let length = checked_body_len(bytes)?;
     if bytes.len() != 4 + length {
         return Err(IpcError::Malformed);
     }

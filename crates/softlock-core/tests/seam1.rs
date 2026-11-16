@@ -7,11 +7,12 @@ use proptest::prelude::*;
 use proptest::string::string_regex;
 use softlock_core::{
     ARM_STEP_TIMEOUT, ArmStep, Event, FailReason, FakePlatform, Fallback, GuardHealth,
-    HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BEFORE_FAILURE, Hardening, HardeningPlan, HeartbeatReport,
-    IpcError, Journal, JournalEntry, LockController, LockSource, LockState, MAX_FRAME, MethodId,
+    HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BEFORE_FAILURE, HardeningPlan, HeartbeatReport, IpcError,
+    Journal, JournalEntry, LaunchNonce, LockController, LockSource, LockState, MAX_FRAME, MethodId,
     OverlayHealth, PlannedChange, PolicySetting, PromptState, RequestKind, ResponseKind, Role,
-    SERVICE_SILENCE_LIMIT, Secret, SessionEvent, StateName, UNSUPPORTED_PLATFORM_MESSAGE,
-    UnsupportedPlatform, Verdict, VerdictChannel, journal_is_durable_before_apply,
+    SERVICE_SILENCE_LIMIT, Secret, SessionEvent, SessionId, StateName,
+    UNSUPPORTED_PLATFORM_MESSAGE, UnsupportedPlatform, Verdict, checked_body_len,
+    journal_is_durable_before_apply,
 };
 
 fn started(platform: FakePlatform) -> LockController<FakePlatform> {
@@ -77,25 +78,21 @@ fn put_config(revision: u64) -> RequestKind {
     }
 }
 
-fn verify(controller: &mut LockController<FakePlatform>, channel: VerdictChannel) {
-    if channel == VerdictChannel::Broker {
-        controller.handle(Event::RequestHello);
-    }
-    let nonce = match channel {
-        VerdictChannel::LockHost => controller.host_nonce(),
-        VerdictChannel::Broker => controller.broker_nonce().unwrap_or(0),
-    };
-    controller.handle(Event::Verified {
-        channel,
-        method: MethodId::os_password(),
-        nonce,
-    });
+fn verify(controller: &mut LockController<FakePlatform>) {
+    controller.handle(Event::RequestHello);
+    let nonce = controller.broker_nonce().expect("broker nonce");
+    controller.handle(Event::Verified { nonce });
+}
+
+fn counter_nonce(value: u8) -> LaunchNonce {
+    let mut bytes = [0u8; 32];
+    bytes[0] = value;
+    LaunchNonce::from_bytes(bytes)
 }
 
 fn public(kind: RequestKind) -> Event {
     Event::Public {
         role: Role::App,
-        id: 1,
         kind,
     }
 }
@@ -132,10 +129,10 @@ fn sample_requests() -> Vec<RequestKind> {
             base_revision: 1,
         },
         RequestKind::ConfirmSensitiveChange {
-            token: "token".to_string(),
+            token: Secret::new("token"),
         },
         RequestKind::SetPin {
-            pin: "1234".to_string(),
+            pin: Secret::new("1234"),
         },
         RequestKind::ClearPin,
         RequestKind::Subscribe,
@@ -153,12 +150,21 @@ fn locked_leaves_only_on_a_verified_verdict_from_the_lock_host_or_its_broker() {
             let mut controller = locked_started();
             controller.handle(Event::Public {
                 role,
-                id: 7,
                 kind: kind.clone(),
             });
+            let hard_lock = role == Role::App && matches!(kind, RequestKind::HardLock);
             assert!(
-                matches!(controller.state(), LockState::Locked { .. }),
-                "{role:?} {kind:?} left Locked for {:?}",
+                if hard_lock {
+                    matches!(
+                        controller.state(),
+                        LockState::FailingClosed {
+                            reason: FailReason::HardLock
+                        }
+                    )
+                } else {
+                    matches!(controller.state(), LockState::Locked { .. })
+                },
+                "{role:?} {kind:?} left the lock path for {:?}",
                 controller.state()
             );
             assert!(
@@ -169,54 +175,44 @@ fn locked_leaves_only_on_a_verified_verdict_from_the_lock_host_or_its_broker() {
     }
 
     let mut controller = locked_started();
-    controller.handle(public(RequestKind::SetPin {
-        pin: "1234".to_string(),
-    }));
-    let rendered = format!("{:?}", controller.rejection_log());
+    let pin = Secret::new("1234");
+    let event = public(RequestKind::SetPin { pin: pin.clone() });
+    let rendered = format!("{event:?}");
     assert!(!rendered.contains("1234"));
-    assert!(!controller.config_toml().contains("1234"));
+    controller.handle(event);
+    assert_redacted(&debug_output(&controller), "1234");
 
     let mut controller = locked_started();
     controller.handle(Event::Verified {
-        channel: VerdictChannel::Broker,
-        method: MethodId::windows_hello(),
-        nonce: 1,
+        nonce: counter_nonce(1),
     });
-    assert!(matches!(controller.state(), LockState::Locked { .. }));
     assert!(
-        controller
-            .rejection_log()
-            .iter()
-            .any(|rejection| rejection.event == "Verified")
+        matches!(controller.state(), LockState::Locked { .. }),
+        "a Lock Host style counter nonce must not unlock"
     );
-
-    let mut controller = locked_started();
-    let stale = controller.host_nonce().wrapping_add(1);
-    controller.handle(Event::Verified {
-        channel: VerdictChannel::LockHost,
-        method: MethodId::os_password(),
-        nonce: stale,
-    });
-    assert!(matches!(controller.state(), LockState::Locked { .. }));
+    assert!(
+        !controller
+            .visited()
+            .iter()
+            .any(|state| matches!(state, LockState::Unlocking { .. }))
+    );
 
     let mut controller = locked_started();
     controller.handle(Event::RequestHello);
     assert!(controller.broker_launched());
     let nonce = controller.broker_nonce().expect("broker nonce");
+    assert!(
+        !is_counter_nonce(&nonce),
+        "the broker nonce must come from a CSPRNG, not a counter"
+    );
     controller.handle(Event::Verified {
-        channel: VerdictChannel::Broker,
-        method: MethodId::windows_hello(),
-        nonce: nonce.wrapping_add(1),
+        nonce: counter_nonce(1),
     });
     assert!(
         matches!(controller.state(), LockState::Locked { .. }),
-        "a stale broker nonce must not unlock"
+        "a Lock Host verdict must not unlock"
     );
-    controller.handle(Event::Verified {
-        channel: VerdictChannel::Broker,
-        method: MethodId::windows_hello(),
-        nonce,
-    });
+    controller.handle(Event::Verified { nonce });
     assert!(
         controller
             .visited()
@@ -224,17 +220,29 @@ fn locked_leaves_only_on_a_verified_verdict_from_the_lock_host_or_its_broker() {
             .any(|state| matches!(state, LockState::Unlocking { .. }))
     );
     assert!(matches!(controller.state(), LockState::Unlocked));
+    assert!(controller.rejection_log().len() == 1);
+}
 
-    let mut controller = locked_started();
-    verify(&mut controller, VerdictChannel::LockHost);
-    assert!(
-        controller
-            .visited()
-            .iter()
-            .any(|state| matches!(state, LockState::Unlocking { .. }))
-    );
-    assert!(matches!(controller.state(), LockState::Unlocked));
-    assert!(controller.rejection_log().is_empty());
+fn is_counter_nonce(nonce: &LaunchNonce) -> bool {
+    let bytes = nonce.as_bytes();
+    bytes[1..].iter().all(|byte| *byte == 0)
+}
+
+fn debug_output(controller: &LockController<FakePlatform>) -> String {
+    format!(
+        "{:?} {:?} {:?} {:?} {:?} {:?} {}",
+        controller.rejection_log(),
+        controller.visited(),
+        controller.journal(),
+        controller.notifications(),
+        controller.last_response(),
+        controller.failure_events(),
+        controller.config_toml()
+    )
+}
+
+fn assert_redacted(text: &str, secret: &str) {
+    assert!(!text.contains(secret), "{text}");
 }
 
 #[test]
@@ -394,7 +402,6 @@ fn config_writes_are_rejected_outside_unlocked_with_the_session_not_os_locked() 
 
     unlocked.handle(Event::Public {
         role: Role::LockClient,
-        id: 3,
         kind: put_config(unlocked.config_revision()),
     });
     assert_eq!(unlocked.last_response(), Some(&ResponseKind::Unauthorized));
@@ -422,7 +429,7 @@ fn config_writes_are_rejected_outside_unlocked_with_the_session_not_os_locked() 
     reject_config(&mut locked);
 
     locked.drive_manually();
-    verify(&mut locked, VerdictChannel::LockHost);
+    verify(&mut locked);
     assert!(matches!(locked.state(), LockState::Unlocking { .. }));
     reject_config(&mut locked);
 
@@ -470,7 +477,7 @@ fn unlocked_leaves_the_journal_empty_and_restores_pre_lock_settings() {
     );
     assert!(!controller.journal().is_empty());
 
-    verify(&mut controller, VerdictChannel::LockHost);
+    verify(&mut controller);
     assert!(matches!(controller.state(), LockState::Unlocked));
     assert!(controller.journal().is_empty());
     assert_eq!(
@@ -520,9 +527,7 @@ fn unlocked_leaves_the_journal_empty_and_restores_pre_lock_settings() {
 fn unlisted_transition_is_rejected_and_logged() {
     let mut controller = started(FakePlatform::new());
     controller.handle(Event::Verified {
-        channel: VerdictChannel::LockHost,
-        method: MethodId::os_password(),
-        nonce: controller.host_nonce(),
+        nonce: counter_nonce(1),
     });
     assert!(matches!(controller.state(), LockState::Unlocked));
     assert!(
@@ -540,6 +545,16 @@ fn unlisted_transition_is_rejected_and_logged() {
             .rejection_log()
             .iter()
             .any(|rejection| rejection.event == "OsUnlocked")
+    );
+
+    let mut controller = started(FakePlatform::new());
+    controller.handle(Event::ServiceStopRequested);
+    assert!(matches!(controller.state(), LockState::Unlocked));
+    assert!(
+        controller
+            .rejection_log()
+            .iter()
+            .any(|rejection| rejection.event == "ServiceStopRequested")
     );
 }
 
@@ -626,7 +641,7 @@ fn backoff_attempts_one_through_four_have_no_delay_then_double_from_thirty_secon
     let leaked = format!("{:?}", controller.rejection_log());
     assert!(!leaked.contains("nope"));
 
-    verify(&mut controller, VerdictChannel::LockHost);
+    verify(&mut controller);
     assert!(matches!(controller.state(), LockState::Unlocked));
     assert_eq!(controller.failure_count(), 0);
     assert!(controller.journal().is_empty());
@@ -832,13 +847,13 @@ fn ipc_request_kinds_serialize_to_versioned_json_snapshots() {
         (
             "request-confirm-sensitive-change",
             RequestKind::ConfirmSensitiveChange {
-                token: "token".to_string(),
+                token: Secret::new("token"),
             },
         ),
         (
             "request-set-softlock-pin",
             RequestKind::SetPin {
-                pin: "1234".to_string(),
+                pin: Secret::new("1234"),
             },
         ),
         ("request-clear-softlock-pin", RequestKind::ClearPin),
@@ -1013,7 +1028,7 @@ fn apply_before_journal_flush_fails_the_order_check() {
             new_value: "1".to_string(),
         }],
     };
-    assert!(platform.apply(&plan, &mut journal).is_ok());
+    platform.apply_settings_before_journal(&journal, &plan);
     assert!(
         !journal_is_durable_before_apply(platform.apply_events()),
         "applying before the flush must fail the order check: {:?}",
@@ -1025,7 +1040,7 @@ fn apply_before_journal_flush_fails_the_order_check() {
 fn revert_failure_keeps_the_journal_and_does_not_unlock() {
     let mut unlocking = locked_started();
     unlocking.platform_mut().fail_revert(true);
-    verify(&mut unlocking, VerdictChannel::LockHost);
+    verify(&mut unlocking);
     assert!(matches!(
         unlocking.state(),
         LockState::FailingClosed {
@@ -1106,41 +1121,52 @@ fn flush_persists_failure_count_and_locked_flag_and_recovery_restores_backoff() 
 }
 
 #[test]
-fn sensitive_requests_return_ok_only_after_a_verified_broker_confirmation() {
+fn pin_and_confirmation_token_are_redacted_and_unsupported() {
+    let pin = "1234";
+    let token = "confirm-token";
+    let set_pin = Event::Public {
+        role: Role::App,
+        kind: RequestKind::SetPin {
+            pin: Secret::new(pin),
+        },
+    };
+    assert_redacted(&format!("{set_pin:?}"), pin);
     let mut controller = started(FakePlatform::new());
-    controller.handle(public(RequestKind::SetPin {
-        pin: "1234".to_string(),
-    }));
-    assert_eq!(
-        controller.last_response(),
-        Some(&ResponseKind::Unauthorized)
+    controller.handle(set_pin);
+    assert_eq!(controller.last_response(), Some(&ResponseKind::Unsupported));
+    assert!(
+        controller
+            .rejection_log()
+            .iter()
+            .any(|rejection| rejection.event == "SetPin")
     );
-    assert!(controller.broker_launched());
-    assert!(!controller.config_toml().contains("1234"));
-
-    controller
-        .platform_mut()
-        .set_confirmation(Verdict::Verified);
-    controller.handle(public(RequestKind::ConfirmSensitiveChange {
-        token: "token".to_string(),
-    }));
-    assert_eq!(controller.last_response(), Some(&ResponseKind::Ok));
-
-    controller
-        .platform_mut()
-        .set_confirmation(Verdict::Rejected);
-    controller.handle(public(RequestKind::SetPin {
-        pin: "9999".to_string(),
-    }));
-    assert_ne!(controller.last_response(), Some(&ResponseKind::Ok));
+    assert_redacted(&debug_output(&controller), pin);
+    let confirm = Event::Public {
+        role: Role::App,
+        kind: RequestKind::ConfirmSensitiveChange {
+            token: Secret::new(token),
+        },
+    };
+    assert_redacted(&format!("{confirm:?}"), token);
+    controller.handle(confirm);
+    assert_eq!(controller.last_response(), Some(&ResponseKind::Unsupported));
+    assert_redacted(&debug_output(&controller), token);
+    assert_redacted(&debug_output(&controller), pin);
     controller.handle(public(RequestKind::ClearPin));
-    assert_ne!(controller.last_response(), Some(&ResponseKind::Ok));
+    assert_eq!(controller.last_response(), Some(&ResponseKind::Unsupported));
+    controller.handle(public(RequestKind::CheckUpdate));
+    assert_eq!(controller.last_response(), Some(&ResponseKind::Unsupported));
+    controller.handle(public(RequestKind::InstallUpdate {
+        version: "0.2.0".to_string(),
+    }));
+    assert_eq!(controller.last_response(), Some(&ResponseKind::Unsupported));
 }
 
 #[test]
 fn submit_secret_without_a_verified_verdict_does_not_unlock() {
     let mut controller = locked_started();
     controller.platform_mut().accept_secrets(true);
+    assert!(controller.platform().secrets_flag());
     controller.platform_mut().fail_revert(true);
     controller.handle(Event::SubmitSecret {
         method: MethodId::os_password(),
@@ -1190,11 +1216,244 @@ fn service_stop_during_arming_fails_closed() {
 }
 
 #[test]
-fn hard_lock_from_the_lock_host_uses_its_own_failure_reason() {
+fn prompt_events_do_not_clear_the_backoff_deadline() {
+    let mut controller = locked_started();
+    for _ in 0..4 {
+        controller.handle(Event::SubmitSecret {
+            method: MethodId::os_password(),
+            secret: Secret::new("nope"),
+        });
+    }
+    assert!(!controller.backoff_delay().is_zero());
+    let count = controller.failure_count();
+    controller.handle(Event::PromptOpened {
+        method: MethodId::windows_hello(),
+    });
+    controller.handle(Event::PassthroughStarted {
+        method: MethodId::windows_hello(),
+    });
+    controller.handle(Event::VerificationStarted {
+        method: MethodId::os_password(),
+    });
+    assert!(!controller.backoff_delay().is_zero());
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::os_password(),
+        secret: Secret::new("nope"),
+    });
+    assert_eq!(controller.failure_count(), count);
+    assert!(
+        controller
+            .rejection_log()
+            .iter()
+            .any(|rejection| rejection.event == "SubmitSecret")
+    );
+    assert!(matches!(controller.state(), LockState::Locked { .. }));
+}
+
+#[test]
+fn note_failure_flushes_the_failure_count() {
+    let mut controller = locked_started();
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::os_password(),
+        secret: Secret::new("nope"),
+    });
+    assert_eq!(controller.journal().persisted().failures(), 1);
+    let before = controller.visited().len();
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::os_password(),
+        secret: Secret::new("again"),
+    });
+    assert!(controller.visited().len() > before);
+    assert_eq!(controller.journal().persisted().failures(), 2);
+}
+
+#[test]
+fn backend_instance_ids_stay_in_the_controller_journal() {
+    let mut controller = locked_started();
+    assert!(
+        controller
+            .journal()
+            .entries()
+            .iter()
+            .any(|entry| entry.target == FakePlatform::DEVICE_INSTANCE),
+        "backend journal writes were dropped: {:?}",
+        controller.journal().entries()
+    );
+    assert_eq!(
+        controller.platform().extra(FakePlatform::DEVICE_INSTANCE),
+        Some("blocked")
+    );
+    verify(&mut controller);
+    assert!(controller.journal().is_empty());
+    assert_eq!(
+        controller.platform().extra(FakePlatform::DEVICE_INSTANCE),
+        None
+    );
+}
+
+#[test]
+fn only_the_app_may_hard_lock_while_locked() {
+    for role in [Role::LockHost, Role::LockClient, Role::Broker] {
+        let mut controller = locked_started();
+        controller.handle(Event::Public {
+            role,
+            kind: RequestKind::HardLock,
+        });
+        assert_eq!(
+            controller.last_response(),
+            Some(&ResponseKind::Unauthorized)
+        );
+        assert!(
+            controller
+                .rejection_log()
+                .iter()
+                .any(|rejection| rejection.event == "HardLock"),
+            "{role:?} was not logged"
+        );
+        assert!(matches!(controller.state(), LockState::Locked { .. }));
+    }
+}
+
+#[test]
+fn each_overlay_health_field_fails_closed() {
+    let broken = [
+        OverlayHealth {
+            covered_monitors: 0,
+            capture_excluded: true,
+            topmost: true,
+        },
+        OverlayHealth {
+            covered_monitors: 1,
+            capture_excluded: false,
+            topmost: true,
+        },
+        OverlayHealth {
+            covered_monitors: 1,
+            capture_excluded: true,
+            topmost: false,
+        },
+    ];
+    for overlay in broken {
+        let mut controller = locked_started();
+        controller.handle(Event::Heartbeat(HeartbeatReport {
+            seq: 1,
+            guard: healthy_guard(),
+            overlay,
+        }));
+        assert_eq!(controller.failure_events(), &[FailReason::OverlayUnhealthy]);
+    }
+}
+
+#[test]
+fn revert_failure_on_os_lock_confirmation_keeps_the_original_reason() {
+    let mut controller = locked_started();
+    controller.platform_mut().fail_revert(true);
+    controller.handle(Event::HostExited);
+    controller.handle(Event::OsLockConfirmed);
+    assert!(matches!(
+        controller.state(),
+        LockState::OsLocked {
+            after_fail: Some(FailReason::HostExited)
+        }
+    ));
+    assert!(!controller.journal().is_empty());
+    assert!(controller.platform().guard_is_armed());
+}
+
+#[test]
+fn failed_revert_after_sign_in_disarms_and_asks_for_repair() {
+    let mut controller = locked_started();
+    controller.platform_mut().fail_revert(true);
+    controller.handle(Event::HostExited);
+    controller.handle(Event::OsLockConfirmed);
+    controller.handle(Event::Session(SessionEvent::OsUnlocked));
+    assert!(matches!(controller.state(), LockState::OsLocked { .. }));
+    assert!(!controller.journal().is_empty());
+    assert!(!controller.returned_to_unlocked());
+    assert!(!controller.platform().guard_is_armed());
+    assert!(!controller.platform().overlay_is_shown());
+    assert!(
+        controller
+            .notifications()
+            .iter()
+            .any(|notice| notice.reason == FailReason::Repair)
+    );
+}
+
+#[test]
+fn os_lock_uses_the_console_session_and_its_result() {
+    let mut platform = FakePlatform::new();
+    platform.set_console_session(SessionId::from_raw(7));
+    let mut controller = started(platform);
+    controller.handle(Event::LockRequested {
+        source: LockSource::Hotkey,
+    });
+    controller.handle(Event::HostExited);
+    assert_eq!(
+        controller.platform().last_os_lock_session(),
+        Some(SessionId::from_raw(7))
+    );
+
+    let mut platform = FakePlatform::new();
+    platform.fail_os_lock(true);
+    let mut controller = started(platform);
+    controller.handle(Event::LockRequested {
+        source: LockSource::Hotkey,
+    });
+    controller.handle(Event::HostExited);
+    assert!(
+        controller
+            .rejection_log()
+            .iter()
+            .any(|rejection| rejection.event == "OsLock")
+    );
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed {
+            reason: FailReason::HostExited
+        }
+    ));
+}
+
+#[test]
+fn sensitive_config_needs_confirmation_and_is_not_applied() {
+    let mut controller = started(FakePlatform::new());
+    let revision = controller.config_revision();
+    let before = controller.config_toml().to_string();
+    controller.handle(public(RequestKind::PutConfig {
+        toml: "[unlock]\nmethods = []\n".to_string(),
+        base_revision: revision,
+    }));
+    assert_eq!(
+        controller.last_response(),
+        Some(&ResponseKind::NeedsConfirmation {
+            fields: vec!["unlock".to_string()],
+        })
+    );
+    assert_eq!(controller.config_revision(), revision);
+    assert_eq!(controller.config_toml(), before);
+}
+
+#[test]
+fn failure_events_and_notifications_stay_within_the_ring() {
+    let mut controller = started(FakePlatform::new());
+    for _ in 0..80 {
+        controller.handle(Event::LockRequested {
+            source: LockSource::Hotkey,
+        });
+        controller.handle(Event::HostExited);
+        controller.handle(Event::OsLockConfirmed);
+        controller.handle(Event::Session(SessionEvent::OsUnlocked));
+    }
+    assert_eq!(controller.failure_events().len(), 64);
+    assert_eq!(controller.notifications().len(), 64);
+}
+
+#[test]
+fn hard_lock_from_the_app_while_locked_fails_closed() {
     let mut controller = locked_started();
     controller.handle(Event::Public {
-        role: Role::LockHost,
-        id: 1,
+        role: Role::App,
         kind: RequestKind::HardLock,
     });
     assert!(matches!(
@@ -1204,6 +1463,17 @@ fn hard_lock_from_the_lock_host_uses_its_own_failure_reason() {
         }
     ));
     assert!(!controller.returned_to_unlocked());
+}
+
+#[test]
+fn length_prefix_above_64_kib_is_rejected_before_allocation() {
+    let over = ((MAX_FRAME as u32) + 1).to_le_bytes();
+    assert_eq!(checked_body_len(&over), Err(IpcError::Malformed));
+    assert_eq!(
+        checked_body_len(&u32::MAX.to_le_bytes()),
+        Err(IpcError::Malformed)
+    );
+    assert_eq!(checked_body_len(&32u32.to_le_bytes()).expect("fits"), 32);
 }
 
 #[test]
@@ -1237,7 +1507,7 @@ fn pin_wire_kind_is_fixed() {
     let json = softlock_core::message_json(
         1,
         &RequestKind::SetPin {
-            pin: "1234".to_string(),
+            pin: Secret::new("1234"),
         },
     )
     .expect("json");
@@ -1253,9 +1523,7 @@ fn trace_and_rejections_stay_within_the_ring() {
     let mut controller = started(FakePlatform::new());
     for _ in 0..80 {
         controller.handle(Event::Verified {
-            channel: VerdictChannel::LockHost,
-            method: MethodId::os_password(),
-            nonce: 1,
+            nonce: counter_nonce(1),
         });
     }
     assert_eq!(controller.rejection_log().len(), 64);
@@ -1388,12 +1656,16 @@ fn arb_request() -> impl Strategy<Value = RequestKind> {
                 toml,
                 base_revision,
             }),
-        string_regex("[a-z0-9]{0,8}")
-            .unwrap()
-            .prop_map(|token| { RequestKind::ConfirmSensitiveChange { token } }),
+        string_regex("[a-z0-9]{0,8}").unwrap().prop_map(|token| {
+            RequestKind::ConfirmSensitiveChange {
+                token: Secret::new(token),
+            }
+        }),
         string_regex("[0-9]{4}")
             .unwrap()
-            .prop_map(|pin| RequestKind::SetPin { pin }),
+            .prop_map(|pin| RequestKind::SetPin {
+                pin: Secret::new(pin),
+            }),
         Just(RequestKind::ClearPin),
         Just(RequestKind::Subscribe),
         Just(RequestKind::CheckUpdate),
@@ -1422,9 +1694,10 @@ enum Start {
 enum Step {
     Public { role: Role, kind: RequestKind },
     Session(SessionEvent),
-    VerifiedFresh { channel: VerdictChannel },
-    VerifiedStale { channel: VerdictChannel },
-    VerifiedBrokerWithoutLaunch,
+    VerifiedBroker,
+    VerifiedStale,
+    VerifiedCounter,
+    PromptThenSubmit,
     SubmitSecret,
     HostExited,
     Advance,
@@ -1482,7 +1755,7 @@ fn reach(start: Start) -> LockController<FakePlatform> {
         Start::Unlocking => {
             let mut controller = locked_started();
             controller.drive_manually();
-            verify(&mut controller, VerdictChannel::LockHost);
+            verify(&mut controller);
             controller
         }
         Start::FailingClosed => {
@@ -1530,11 +1803,10 @@ fn arb_step() -> impl Strategy<Value = Step> {
             Just(SessionEvent::Logoff),
         ]
         .prop_map(Step::Session),
-        prop_oneof![Just(VerdictChannel::LockHost), Just(VerdictChannel::Broker)]
-            .prop_map(|channel| Step::VerifiedFresh { channel }),
-        prop_oneof![Just(VerdictChannel::LockHost), Just(VerdictChannel::Broker)]
-            .prop_map(|channel| Step::VerifiedStale { channel }),
-        Just(Step::VerifiedBrokerWithoutLaunch),
+        Just(Step::VerifiedBroker),
+        Just(Step::VerifiedStale),
+        Just(Step::VerifiedCounter),
+        Just(Step::PromptThenSubmit),
         Just(Step::SubmitSecret),
         Just(Step::HostExited),
         Just(Step::Advance),
@@ -1577,46 +1849,64 @@ proptest! {
             let mut genuine = false;
             match step {
                 Step::Public { role, kind } => {
-                    controller.handle(Event::Public { role, id: 1, kind });
+                    controller.handle(Event::Public { role, kind });
                 }
                 Step::Session(notification) => {
                     controller.handle(Event::Session(notification));
                 }
-                Step::VerifiedFresh { channel } => {
-                    genuine = matches!(before, LockState::Locked { .. });
-                    if channel == VerdictChannel::Broker {
-                        controller.handle(Event::RequestHello);
+                Step::VerifiedBroker => {
+                    controller.handle(Event::RequestHello);
+                    if let Some(nonce) = controller.broker_nonce() {
+                        genuine = matches!(before, LockState::Locked { .. });
+                        controller.handle(Event::Verified { nonce });
                     }
-                    let nonce = match channel {
-                        VerdictChannel::LockHost => controller.host_nonce(),
-                        VerdictChannel::Broker => controller.broker_nonce().unwrap_or(0),
-                    };
+                }
+                Step::VerifiedStale => {
+                    controller.handle(Event::RequestHello);
                     controller.handle(Event::Verified {
-                        channel,
-                        method: MethodId::windows_hello(),
-                        nonce,
+                        nonce: counter_nonce(9),
                     });
                 }
-                Step::VerifiedStale { channel } => {
-                    let nonce = controller.host_nonce().wrapping_add(9);
+                Step::VerifiedCounter => {
                     controller.handle(Event::Verified {
-                        channel,
-                        method: MethodId::os_password(),
-                        nonce,
-                    });
-                }
-                Step::VerifiedBrokerWithoutLaunch => {
-                    controller.handle(Event::Verified {
-                        channel: VerdictChannel::Broker,
-                        method: MethodId::windows_hello(),
-                        nonce: 1,
+                        nonce: counter_nonce(1),
                     });
                 }
                 Step::SubmitSecret => {
+                    let waiting = !controller.backoff_delay().is_zero();
+                    let count = controller.failure_count();
                     controller.handle(Event::SubmitSecret {
                         method: MethodId::os_password(),
                         secret: Secret::new("secret"),
                     });
+                    if waiting {
+                        prop_assert_eq!(controller.failure_count(), count);
+                    }
+                }
+                Step::PromptThenSubmit => {
+                    let waiting = !controller.backoff_delay().is_zero();
+                    let count = controller.failure_count();
+                    controller.handle(Event::PromptOpened {
+                        method: MethodId::windows_hello(),
+                    });
+                    controller.handle(Event::PassthroughStarted {
+                        method: MethodId::windows_hello(),
+                    });
+                    controller.handle(Event::VerificationStarted {
+                        method: MethodId::os_password(),
+                    });
+                    controller.handle(Event::SubmitSecret {
+                        method: MethodId::os_password(),
+                        secret: Secret::new("secret"),
+                    });
+                    if waiting {
+                        prop_assert_eq!(
+                            controller.failure_count(),
+                            count,
+                            "a prompt event must not clear the backoff deadline"
+                        );
+                        prop_assert!(!controller.backoff_delay().is_zero());
+                    }
                 }
                 Step::HostExited => controller.handle(Event::HostExited),
                 Step::Advance => {

@@ -29,6 +29,15 @@ fn core_windows_only_dependency_fails_the_build() {
     check_manifest("[target.'cfg(windows)'.dependencies]\nserde = \"1\"\n")
         .expect("a portable crate under a windows cfg is not windows-only");
 
+    let dotted_key =
+        check_manifest("[target.'cfg(windows)'.dependencies]\nwindows.workspace = true\n")
+            .unwrap_err();
+    assert!(dotted_key.contains("windows"), "{dotted_key}");
+
+    let inline =
+        check_manifest("[target.'cfg(windows)']\ndependencies.winreg = \"0.52\"\n").unwrap_err();
+    assert!(inline.contains("winreg"), "{inline}");
+
     let renamed =
         check_manifest("[dependencies]\nserde = { package = \"windows\", version = \"1\" }\n")
             .unwrap_err();

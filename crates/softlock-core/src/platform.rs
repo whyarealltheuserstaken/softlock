@@ -79,6 +79,14 @@ impl PromptView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionId(pub u32);
 
+impl SessionId {
+    pub const UNKNOWN: Self = Self(u32::MAX);
+
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionInfo {
     pub id: SessionId,
@@ -217,12 +225,13 @@ pub trait Overlay {
 }
 
 pub trait SessionControl {
+    /// The active console session (`WTSGetActiveConsoleSessionId` on Windows).
+    fn console_session(&self) -> SessionId;
     fn os_lock(&mut self, session: SessionId) -> Result<(), OsLockError>;
     fn session_events(&self) -> Receiver<SessionEvent>;
 }
 
 pub trait Hardening {
-    fn plan(&self, cfg: &HardeningConfig, session: &SessionInfo) -> HardeningPlan;
     fn apply(&mut self, plan: &HardeningPlan, journal: &mut Journal) -> Result<(), HardenError>;
     fn revert(&mut self, journal: &Journal) -> Result<(), HardenError>;
 }
@@ -441,6 +450,10 @@ impl Overlay for UnsupportedPlatform {
 }
 
 impl SessionControl for UnsupportedPlatform {
+    fn console_session(&self) -> SessionId {
+        SessionId::UNKNOWN
+    }
+
     fn os_lock(&mut self, _session: SessionId) -> Result<(), OsLockError> {
         Err(OsLockError::Unsupported)
     }
@@ -452,10 +465,6 @@ impl SessionControl for UnsupportedPlatform {
 }
 
 impl Hardening for UnsupportedPlatform {
-    fn plan(&self, _cfg: &HardeningConfig, _session: &SessionInfo) -> HardeningPlan {
-        HardeningPlan::empty()
-    }
-
     fn apply(&mut self, _plan: &HardeningPlan, _journal: &mut Journal) -> Result<(), HardenError> {
         Err(HardenError::Unsupported)
     }
