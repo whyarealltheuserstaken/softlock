@@ -138,19 +138,154 @@ pub struct Sample {
     pub timeout_ms: u64,
 }
 
+/// Why a sample failed a check. The variant, not the text, decides the result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reason {
+    SystemIntegrity {
+        got: u32,
+    },
+    MediumIntegrity {
+        got: u32,
+    },
+    ElevatedIntegrity {
+        got: u32,
+    },
+    Session {
+        system: u32,
+        console: u32,
+    },
+    NotSystemUser,
+    NotDefaultDesktop,
+    MediumControl {
+        system: u32,
+        medium: u32,
+        window: u32,
+    },
+    SystemMissedElevated {
+        seen: u32,
+    },
+    MissingInjectedFlag {
+        seen: u32,
+    },
+    MediumSawElevated {
+        seen: u32,
+    },
+    HighHookMissed {
+        seen: u32,
+    },
+    WindowMissed {
+        received: u32,
+    },
+    LoadTooSmall {
+        sent: u32,
+    },
+    LoadDropped {
+        seen: u32,
+        sent: u32,
+    },
+    DeadAfterLoad,
+    MarkerNotSeenBefore,
+    SlowNeverRan,
+    /// The slow callback ran and the hook was still installed afterwards.
+    HookNotRemoved,
+    /// The hook was removed, and the marker check reported it after the budget.
+    LivenessLate {
+        detect_ms: u64,
+    },
+    FallbackNeeded,
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SystemIntegrity { got } => {
+                write!(f, "system hook integrity is {got}, want {IL_SYSTEM}")
+            }
+            Self::MediumIntegrity { got } => {
+                write!(f, "medium hook integrity is {got}, want {IL_MEDIUM}")
+            }
+            Self::ElevatedIntegrity { got } => {
+                write!(f, "elevated probe integrity is {got}, want {IL_HIGH}")
+            }
+            Self::Session { system, console } => {
+                write!(
+                    f,
+                    "system hook session is {system}, console session is {console}"
+                )
+            }
+            Self::NotSystemUser => write!(f, "system hook is not running as SYSTEM"),
+            Self::NotDefaultDesktop => write!(f, "system hook is not on winsta0\\default"),
+            Self::MediumControl {
+                system,
+                medium,
+                window,
+            } => write!(
+                f,
+                "medium-foreground control saw system {system} medium {medium} window {window}, want {VISIBILITY_KEYS}"
+            ),
+            Self::SystemMissedElevated { seen } => write!(
+                f,
+                "system hook saw {seen} of {VISIBILITY_KEYS} keys delivered to the elevated window"
+            ),
+            Self::MissingInjectedFlag { seen } => {
+                write!(
+                    f,
+                    "system hook saw {seen} injected flags of {VISIBILITY_KEYS}"
+                )
+            }
+            Self::MediumSawElevated { seen } => {
+                write!(
+                    f,
+                    "medium hook saw {seen} keys destined for the elevated window"
+                )
+            }
+            Self::HighHookMissed { seen } => write!(
+                f,
+                "high-integrity hook saw {seen} of {VISIBILITY_KEYS} elevated-window keys"
+            ),
+            Self::WindowMissed { received } => write!(
+                f,
+                "elevated window received {received} of {VISIBILITY_KEYS} keys the system hook passed on"
+            ),
+            Self::LoadTooSmall { sent } => {
+                write!(
+                    f,
+                    "load sent {sent} events, which is below tens of thousands"
+                )
+            }
+            Self::LoadDropped { seen, sent } => {
+                write!(f, "load hook saw {seen} of {sent} injected events")
+            }
+            Self::DeadAfterLoad => write!(f, "hook was not alive after the load burst"),
+            Self::MarkerNotSeenBefore => {
+                write!(f, "liveness marker was not seen before the slow callback")
+            }
+            Self::SlowNeverRan => write!(f, "slow callback never ran"),
+            Self::HookNotRemoved => write!(f, "slow callback did not get the hook removed"),
+            Self::LivenessLate { detect_ms } => write!(
+                f,
+                "liveness reported the removed hook in {detect_ms} ms, budget is {LIVENESS_BUDGET_MS}"
+            ),
+            Self::FallbackNeeded => write!(
+                f,
+                "system hook missed elevated-window input and the elevated linked-token hook saw it"
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     pub pass: bool,
-    /// The run finished and every check except silent hook removal held.
-    /// Removal is an operating-system outcome, so a negative answer is still
-    /// a completed measurement.
+    /// Every other check held, and the only miss is that the hook was never removed.
+    /// A removal that the marker check reported after the budget is a failure.
     pub measured: bool,
     pub design: Design,
     pub fallback: Fallback,
     pub liveness_within_budget: bool,
     pub passed_through: bool,
     pub injected_flag: bool,
-    pub reasons: Vec<String>,
+    pub reasons: Vec<Reason>,
 }
 
 impl Decision {
@@ -198,6 +333,11 @@ impl Decision {
         ));
         lines.join("\n")
     }
+
+    /// `0` when the sample passed or the only miss is that removal never happened.
+    pub fn exit_code(&self) -> i32 {
+        if self.pass || self.measured { 0 } else { 1 }
+    }
 }
 
 pub fn judge(sample: &Sample) -> Decision {
@@ -209,106 +349,97 @@ pub fn judge(sample: &Sample) -> Decision {
     let high_saw_elevated = sample.elevated_hook_seen == VISIBILITY_KEYS;
 
     if sample.system_il != IL_SYSTEM {
-        reasons.push(format!(
-            "system hook integrity is {}, want {IL_SYSTEM}",
-            sample.system_il
-        ));
+        reasons.push(Reason::SystemIntegrity {
+            got: sample.system_il,
+        });
     }
     if sample.medium_il != IL_MEDIUM {
-        reasons.push(format!(
-            "medium hook integrity is {}, want {IL_MEDIUM}",
-            sample.medium_il
-        ));
+        reasons.push(Reason::MediumIntegrity {
+            got: sample.medium_il,
+        });
     }
     if sample.elevated_il != IL_HIGH {
-        reasons.push(format!(
-            "elevated probe integrity is {}, want {IL_HIGH}",
-            sample.elevated_il
-        ));
+        reasons.push(Reason::ElevatedIntegrity {
+            got: sample.elevated_il,
+        });
     }
     if sample.system_session == 0 || sample.system_session != sample.console_session {
-        reasons.push(format!(
-            "system hook session is {}, console session is {}",
-            sample.system_session, sample.console_session
-        ));
+        reasons.push(Reason::Session {
+            system: sample.system_session,
+            console: sample.console_session,
+        });
     }
     if !sample.system_user_is_system {
-        reasons.push("system hook is not running as SYSTEM".to_string());
+        reasons.push(Reason::NotSystemUser);
     }
     if !sample.system_on_default_desktop {
-        reasons.push("system hook is not on winsta0\\default".to_string());
+        reasons.push(Reason::NotDefaultDesktop);
     }
     if sample.control_medium_seen != VISIBILITY_KEYS
         || sample.control_system_seen != VISIBILITY_KEYS
         || sample.control_window != VISIBILITY_KEYS
     {
-        reasons.push(format!(
-            "medium-foreground control saw system {} medium {} window {}, want {VISIBILITY_KEYS}",
-            sample.control_system_seen, sample.control_medium_seen, sample.control_window
-        ));
+        reasons.push(Reason::MediumControl {
+            system: sample.control_system_seen,
+            medium: sample.control_medium_seen,
+            window: sample.control_window,
+        });
     }
     if !system_saw_elevated {
-        reasons.push(format!(
-            "system hook saw {} of {VISIBILITY_KEYS} keys delivered to the elevated window",
-            sample.elevated_system_seen
-        ));
+        reasons.push(Reason::SystemMissedElevated {
+            seen: sample.elevated_system_seen,
+        });
     }
     if system_saw_elevated && !injected_flag {
-        reasons.push(format!(
-            "system hook saw {} injected flags of {VISIBILITY_KEYS}",
-            sample.elevated_system_injected
-        ));
+        reasons.push(Reason::MissingInjectedFlag {
+            seen: sample.elevated_system_injected,
+        });
     }
     if !medium_missed_elevated {
-        reasons.push(format!(
-            "medium hook saw {} keys destined for the elevated window",
-            sample.elevated_medium_seen
-        ));
+        reasons.push(Reason::MediumSawElevated {
+            seen: sample.elevated_medium_seen,
+        });
     }
     if !high_saw_elevated {
-        reasons.push(format!(
-            "high-integrity hook saw {} of {VISIBILITY_KEYS} elevated-window keys",
-            sample.elevated_hook_seen
-        ));
+        reasons.push(Reason::HighHookMissed {
+            seen: sample.elevated_hook_seen,
+        });
     }
     if system_saw_elevated && sample.elevated_window != VISIBILITY_KEYS {
-        reasons.push(format!(
-            "elevated window received {} of {VISIBILITY_KEYS} keys the system hook passed on",
-            sample.elevated_window
-        ));
+        reasons.push(Reason::WindowMissed {
+            received: sample.elevated_window,
+        });
     }
     if sample.load_sent < 20_000 {
-        reasons.push(format!(
-            "load sent {} events, which is below tens of thousands",
-            sample.load_sent
-        ));
+        reasons.push(Reason::LoadTooSmall {
+            sent: sample.load_sent,
+        });
     }
     if sample.load_seen != sample.load_sent {
-        reasons.push(format!(
-            "load hook saw {} of {} injected events",
-            sample.load_seen, sample.load_sent
-        ));
+        reasons.push(Reason::LoadDropped {
+            seen: sample.load_seen,
+            sent: sample.load_sent,
+        });
     }
     if !sample.hook_alive_after_load {
-        reasons.push("hook was not alive after the load burst".to_string());
+        reasons.push(Reason::DeadAfterLoad);
     }
     if !sample.liveness_healthy_before {
-        reasons.push("liveness marker was not seen before the slow callback".to_string());
+        reasons.push(Reason::MarkerNotSeenBefore);
     }
     if !sample.slow_entered {
-        reasons.push("slow callback never ran".to_string());
+        reasons.push(Reason::SlowNeverRan);
     }
     let liveness_within_budget = sample.liveness_healthy_before
         && sample.slow_entered
         && sample.liveness_removed
         && sample.liveness_detect_ms <= LIVENESS_BUDGET_MS;
     if !sample.liveness_removed {
-        reasons.push("slow callback did not get the hook removed".to_string());
+        reasons.push(Reason::HookNotRemoved);
     } else if sample.liveness_detect_ms > LIVENESS_BUDGET_MS {
-        reasons.push(format!(
-            "liveness reported the removed hook in {} ms, budget is {LIVENESS_BUDGET_MS}",
-            sample.liveness_detect_ms
-        ));
+        reasons.push(Reason::LivenessLate {
+            detect_ms: sample.liveness_detect_ms,
+        });
     }
 
     let design = if system_saw_elevated && medium_missed_elevated && passed_through {
@@ -327,18 +458,15 @@ pub fn judge(sample: &Sample) -> Decision {
         Fallback::Unresolved
     };
     if design == Design::Reject && fallback == Fallback::Needed {
-        reasons.push(
-            "system hook missed elevated-window input and the elevated linked-token hook saw it"
-                .to_string(),
-        );
+        reasons.push(Reason::FallbackNeeded);
     }
 
     let pass = reasons.is_empty();
+    // Only "the hook was never removed". A late report of a real removal fails.
     let measured = !pass
-        && reasons.iter().all(|reason| {
-            reason.contains("did not get the hook removed")
-                || reason.contains("liveness reported the removed hook")
-        });
+        && reasons
+            .iter()
+            .all(|reason| matches!(reason, Reason::HookNotRemoved));
     Decision {
         pass,
         measured,
@@ -580,7 +708,7 @@ mod tests {
             decision
                 .reasons
                 .iter()
-                .any(|reason| reason.contains("medium-foreground control"))
+                .any(|reason| matches!(reason, Reason::MediumControl { .. }))
         );
     }
 
@@ -602,31 +730,50 @@ mod tests {
 
     #[test]
     fn liveness_budget_is_500_ms_and_requires_removal() {
-        let mut late = passing_sample();
-        late.liveness_detect_ms = 501;
-        let decision = judge(&late);
-        assert!(!decision.pass);
-        assert!(!decision.liveness_within_budget);
-
         let mut on_budget = passing_sample();
         on_budget.liveness_detect_ms = 500;
         assert!(judge(&on_budget).pass);
 
-        let mut still_installed = passing_sample();
-        still_installed.liveness_removed = false;
-        let decision = judge(&still_installed);
-        assert!(!decision.pass);
-        assert!(decision.measured);
-        assert!(
-            decision
-                .report(&still_installed)
-                .contains("result=measured")
-        );
-        assert!(!decision.liveness_within_budget);
-
         let mut late_only = passing_sample();
         late_only.liveness_detect_ms = 501;
-        assert!(judge(&late_only).measured);
+        let decision = judge(&late_only);
+        assert!(!decision.pass);
+        assert!(!decision.measured);
+        assert!(!decision.liveness_within_budget);
+        assert_eq!(decision.exit_code(), 1);
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| matches!(reason, Reason::LivenessLate { detect_ms: 501 }))
+        );
+        assert!(decision.report(&late_only).contains("result=fail"));
+    }
+
+    #[test]
+    fn removal_never_happened_is_measured_and_exits_zero() {
+        let mut sample = passing_sample();
+        sample.liveness_removed = false;
+        let decision = judge(&sample);
+        assert!(!decision.pass);
+        assert!(decision.measured);
+        assert_eq!(decision.exit_code(), 0);
+        assert!(!decision.liveness_within_budget);
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .all(|reason| matches!(reason, Reason::HookNotRemoved))
+        );
+        assert!(decision.report(&sample).contains("result=measured"));
+        assert!(!decision.report(&sample).contains("result=fail"));
+
+        let mut also_dropped = sample;
+        also_dropped.load_seen = 0;
+        let decision = judge(&also_dropped);
+        assert!(!decision.measured);
+        assert_eq!(decision.exit_code(), 1);
+        assert!(decision.report(&also_dropped).contains("result=fail"));
     }
 
     #[test]

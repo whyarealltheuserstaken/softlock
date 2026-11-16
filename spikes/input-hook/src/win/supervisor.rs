@@ -184,11 +184,7 @@ fn run_proof(args: &Args) -> Result<i32, String> {
     if !decision.pass {
         print_logs(&args.output_dir);
     }
-    Ok(if decision.pass || decision.measured {
-        0
-    } else {
-        1
-    })
+    Ok(decision.exit_code())
 }
 
 struct PhaseCounts {

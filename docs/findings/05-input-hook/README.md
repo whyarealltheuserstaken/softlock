@@ -1,24 +1,26 @@
-# 05: SYSTEM in the interactive session sees elevated input; a slow hook is not removed
+# 05: SYSTEM in the interactive session sees elevated input
 
 Measured on 16 November 2026 UTC by the workspace-excluded probe `spikes/input-hook`.
 
-The numbers below are from [Input hook proof run 43894384199](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43894384199), commit `2109601155baa8cfe20398d82afbe1fb7a0b5246`.
+The `result=measured` lines below are from [Input hook proof run 43895906522](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43895906522), commit `3c42fba03facfff2c946a4ba7cd03720f655444e`. That is the run that printed them. The earlier run [43894384199](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43894384199) printed `result=fail` for the same operating-system outcome, because the harness still treated "the hook was not removed" as a job failure.
 
-- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43894384199/job/133393843759)
-- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43894384199/job/133393843730)
+- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43895906522/job/133399283309)
+- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43895906522/job/133399283803)
 
 ## Decision
 
-Confirm the SYSTEM-in-session Lock Host for low-level keyboard input. On both runner images a `WH_KEYBOARD_LL` hook running as `SYSTEM` on the interactive desktop saw every `SendInput` key delivered to an elevated window, and a medium-integrity hook saw none of them. The elevated linked-token fall-back is not needed for that. These runners have no linked token (`0x80070520`), and the console user's own token is already high integrity.
+Confirm the SYSTEM-in-session Lock Host for low-level keyboard input. On both runner images a `WH_KEYBOARD_LL` hook running as `SYSTEM` on the interactive desktop saw every `SendInput` key delivered to an elevated window, and a medium-integrity hook saw none of them.
 
-Reject silent removal as something these images will do. A callback that sleeps past `LowLevelHooksTimeout` does not get the hook uninstalled. Windows Server 2022 does not even stop waiting on the callback. Windows Server 2025 stops waiting at about 600 ms and still delivers the next event to the same hook, including after 11 such timeouts. The no-op-marker check therefore cannot report a removal within 500 ms, because there is no removal to report.
+`fallback-needed=false` is what these Server runner images showed. The console user's token is already high integrity (`elevation-type=1`, integrity 12288) and there is no linked token (`0x80070520`), so the token is unsplit. That does not say what a client Windows logon with UAC's split token does. Ticket [06](https://github.com/whyarealltheuserstaken/softlock/issues/6) has to re-check the elevated linked token there.
+
+Silent removal was not shown. Windows Server 2022 never timed the callback out, so its removal result is inconclusive. Windows Server 2025 did time `SendInput` out, eleven times, and the same SYSTEM hook was still installed afterwards. No non-SYSTEM hook was put on the slow path, so that cannot be separated from "this setup never triggers removal".
 
 This is a keyboard `SendInput` proof (F13 for visibility and load, F24 for the marker). The hook callback does no I/O. Mouse input is the same integrity rule and is left to the Lock Host work.
 
 Dependents:
 
-- [06](https://github.com/whyarealltheuserstaken/softlock/issues/6) still has to try physical input on real hardware. This spike only injected keys.
-- [12](https://github.com/whyarealltheuserstaken/softlock/issues/12) can install the Lock Host hook as SYSTEM in the session. It should not treat "the callback was slow, so Windows removed the hook" as the liveness signal on these operating systems. The marker check is still the right shape for a hook that is gone; these images do not make it gone.
+- [06](https://github.com/whyarealltheuserstaken/softlock/issues/6) still has to try physical input on real hardware. This spike only injected keys. It also has the two open questions below: a non-SYSTEM slow-hook control, and a client Windows logon whose token is split by UAC.
+- [12](https://github.com/whyarealltheuserstaken/softlock/issues/12) can install the Lock Host hook as SYSTEM in the session. Liveness has to be a self-check: a periodic no-op marker with a deadline. It must not assume that Windows removes a hook whose callback is slow. The marker check is how the Lock Host notices that its own hook has gone; these images did not make it go.
 - [13](https://github.com/whyarealltheuserstaken/softlock/issues/13) is how the service launches that SYSTEM-in-session process. The launch used here is the one ticket 02 left open: duplicate the service token, set its session to the console session, and `CreateProcessAsUser` onto `winsta0\default`.
 
 ## What both images showed
@@ -53,40 +55,42 @@ The control line is the medium window in front: the system hook, the medium hook
 
 ## Removal
 
-The system hook then sleeps in the callback, longer than the 300 ms default, while the supervisor injects F24 markers from outside that process. A same-process `SendInput` does not trip the timeout; an earlier run blocked for the whole sleep (1,814 ms on windows-2022 with an 1,800 ms sleep).
+The system hook then sleeps in the callback, longer than the 300 ms default, while the supervisor injects F24 markers from outside that process. A same-process `SendInput` does not trip the timeout; an earlier run blocked for the whole sleep (1,814 ms on windows-2022 with an 1,800 ms sleep). Only the SYSTEM hook was armed. The medium and elevated hooks were not, so there is no control that shows whether a non-SYSTEM hook on the same desktop would be removed.
 
-### windows-2022
+### windows-2022 is inconclusive
 
-Windows Server 2022 Datacenter, 21H2, build 20348. The callback slept 900 ms. `SendInput` waited for it to return. That is not a timeout, so the probe did not keep going.
+Windows Server 2022 Datacenter, 21H2, build 20348. The callback slept 900 ms. `SendInput` waited for it to return (`timed-out=false`, `slow-strikes=0`). The timeout path never ran, so this image does not say whether a slow hook is removed.
 
 ```
 slow-sleep-ms=900
-slow-strike index=1 blocked-ms=910 timed-out=false
+slow-strike index=1 blocked-ms=903 timed-out=false
 slow-strikes=0 entered=1 returned=1 probe-seen=true
 hook-removed=false
-liveness-detect-ms=914
+liveness-detect-ms=906
+result=measured
 ```
 
-### windows-2025
+### windows-2025 timed out and the hook stayed
 
-Windows Server 2025 Datacenter, 24H2, build 26100. Each of 11 markers returned in about 600 ms, before the 900 ms sleep ended. After the 11th callback had returned, the hook was disarmed and one more marker was injected. The hook saw it. `liveness-detect-ms=314` is how long that last check took, not a detection of removal.
+Windows Server 2025 Datacenter, 24H2, build 26100. Each of 11 markers returned in about 600 ms, before the 900 ms sleep ended. After the 11th callback had returned, the hook was disarmed and one more marker was injected. The hook saw it. `liveness-detect-ms=333` is how long that last check took, not a detection of removal. The hook was not removed on this SYSTEM-in-session setup. Without a non-SYSTEM slow hook, ticket 06 still has to tell "Windows does not remove hooks here" from "this setup never triggers removal".
 
 ```
 slow-sleep-ms=900
-slow-strike index=1 blocked-ms=603 timed-out=true
-slow-strike index=2 blocked-ms=601 timed-out=true
-slow-strike index=3 blocked-ms=599 timed-out=true
-slow-strike index=4 blocked-ms=602 timed-out=true
-slow-strike index=5 blocked-ms=601 timed-out=true
-slow-strike index=6 blocked-ms=601 timed-out=true
+slow-strike index=1 blocked-ms=600 timed-out=true
+slow-strike index=2 blocked-ms=611 timed-out=true
+slow-strike index=3 blocked-ms=600 timed-out=true
+slow-strike index=4 blocked-ms=615 timed-out=true
+slow-strike index=5 blocked-ms=602 timed-out=true
+slow-strike index=6 blocked-ms=602 timed-out=true
 slow-strike index=7 blocked-ms=601 timed-out=true
-slow-strike index=8 blocked-ms=602 timed-out=true
-slow-strike index=9 blocked-ms=602 timed-out=true
-slow-strike index=10 blocked-ms=600 timed-out=true
-slow-strike index=11 blocked-ms=600 timed-out=true
+slow-strike index=8 blocked-ms=614 timed-out=true
+slow-strike index=9 blocked-ms=611 timed-out=true
+slow-strike index=10 blocked-ms=610 timed-out=true
+slow-strike index=11 blocked-ms=601 timed-out=true
 slow-strikes=11 entered=11 returned=11 probe-seen=true
 hook-removed=false
-liveness-detect-ms=314
+liveness-detect-ms=333
+result=measured
 ```
 
-The job log prints `result=measured` when visibility, the injected flag, pass-through, and the load all held and the only miss is this removal result. `result=pass` would mean the hook was removed and the marker check reported that within 500 ms. That did not happen on either image.
+`result=measured` means every other check held and the only miss is that the hook was never removed. A hook that was removed, but whose marker check reported it after 500 ms, is `result=fail` and the process exits non-zero. `result=pass` would mean the hook was removed and the marker check reported that within 500 ms. Neither image did that.
