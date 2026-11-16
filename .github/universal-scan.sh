@@ -38,18 +38,18 @@ require_minos() {
     exit 1
   fi
   minos_count="$(printf '%s\n' "${lines}" | grep -c 'minos 11.0' || true)"
-  fat=0
+  universal_binary=0
   if lipo -info "${bin}" >/dev/null 2>&1; then
     archs="$(lipo -archs "${bin}")"
     case "${archs}" in
       *x86_64*)
         case "${archs}" in
-          *arm64*) fat=1 ;;
+          *arm64*) universal_binary=1 ;;
         esac
         ;;
     esac
   fi
-  if [ "${fat}" -eq 1 ] && [ "${minos_count}" -lt 2 ]; then
+  if [ "${universal_binary}" -eq 1 ] && [ "${minos_count}" -lt 2 ]; then
     echo "fat binary needs at least two minos 11.0 lines, found ${minos_count}"
     exit 1
   fi
