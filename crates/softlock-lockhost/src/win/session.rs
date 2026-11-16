@@ -327,6 +327,10 @@ pub(crate) struct Shared {
     pub hook_poisoned: AtomicBool,
     #[cfg(feature = "simulated-physical")]
     pub panic_in_callback: AtomicBool,
+    /// Panic only on F13. The liveness marker and stray mouse input stay
+    /// quiet, so a service test can fire `emergency()` after the host is ready.
+    #[cfg(feature = "simulated-physical")]
+    pub panic_callback_on_f13: AtomicBool,
     pub failing_closed: AtomicBool,
     pub heartbeat_missed: AtomicBool,
     pub emergency_ran: AtomicBool,
@@ -383,6 +387,8 @@ impl Shared {
             hook_poisoned: AtomicBool::new(false),
             #[cfg(feature = "simulated-physical")]
             panic_in_callback: AtomicBool::new(false),
+            #[cfg(feature = "simulated-physical")]
+            panic_callback_on_f13: AtomicBool::new(false),
             failing_closed: AtomicBool::new(false),
             heartbeat_missed: AtomicBool::new(false),
             emergency_ran: AtomicBool::new(false),
@@ -461,7 +467,7 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
     // `emergency()` and drops the hooks.
     #[cfg(feature = "simulated-physical")]
     if std::env::var("SOFTLOCK_PANIC").ok().as_deref() == Some("callback") {
-        shared.panic_in_callback.store(true, Ordering::Release);
+        shared.panic_callback_on_f13.store(true, Ordering::Release);
     }
     if ready.send(Ok(elapsed)).is_err() {
         shutdown(&shared);

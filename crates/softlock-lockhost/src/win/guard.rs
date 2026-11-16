@@ -350,6 +350,14 @@ unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             }
             return LRESULT(1);
         }
+        #[cfg(feature = "simulated-physical")]
+        if shared
+            .panic_callback_on_f13
+            .load(std::sync::atomic::Ordering::Acquire)
+            && vk == 0x7C
+        {
+            panic!("lock host hook callback");
+        }
         let injected = info.flags.contains(LLKHF_INJECTED);
         if !blocks(injected, extra) {
             return CallNextHookEx(None, code, wparam, lparam);
