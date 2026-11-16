@@ -23,7 +23,7 @@ A ticket whose tests are CI and whose checklist line is his Mac is labeled with 
 | [m05](m05-physical-input-intel.md) | Kit: physical vs posted input on the Intel Mac | m03 | Henry's Intel Mac |
 | [m06](m06-overlay-intel.md) | Kit: overlay level, Spaces, full-screen, every display | m04 | Henry's Intel Mac |
 | [m07](m07-keep-awake-intel.md) | Kit: power assertions, App Nap, lid if there is one | m02 | Henry's Intel Mac |
-| [m08](m08-fail-closed-intel.md) | Kit: real lock primitive and FileVault status | m02, D5 | Henry's Intel Mac |
+| [m08](m08-fail-closed-intel.md) | Kit: the two D5 lock paths, the fallback test, and FileVault status | m02 for the sheet; the CI rows wait on nothing | Henry's Intel Mac, and CI for the chooser |
 | [m09](m09-password-sheet-intel.md) | Kit: `LAContext` password sheet above the overlay | m05 | Henry's Intel Mac |
 | [m10](m10-tcc-prompts-intel.md) | Kit: Accessibility and Input Monitoring, no MDM | m05, D3 | Henry's Intel Mac |
 | [m11](m11-x86-slice-intel.md) | Run the x86_64 slice natively | m01, m02 | Henry's Intel Mac |
@@ -31,7 +31,7 @@ A ticket whose tests are CI and whose checklist line is his Mac is labeled with 
 | [m14](m14-lock-host.md) | Lock Host: block physical input, pass posted input, dev PIN | m01, m03, m04, m05, m06, m10, m11 | CI only and Henry's Intel Mac |
 | [m15](m15-service.md) | Service: LaunchDaemon, LaunchAgent, socket, Broker nonce | m14, m02 | CI only and Henry's Intel Mac |
 | [m16](m16-app-tracer.md) | App hotkey and status, first macOS tracer bullet | m15, m07 | Henry's Intel Mac |
-| [m17](m17-fail-closed.md) | Fail closed wired to the primitive m08 picked | m08, m15 | Henry's Intel Mac |
+| [m17](m17-fail-closed.md) | Fail closed on `SACLockScreenImmediate`, then the documented path | m08, m15 | CI and Henry's Intel Mac |
 | [m18](m18-password-unlock.md) | Unlock with the Mac password through the Broker | m09, m15 | Henry's Intel Mac |
 | [m19](m19-touch-id-unlock.md) | Unlock with Touch ID through the same Broker | m12, m18 | Apple Silicon only |
 
@@ -87,4 +87,4 @@ m15 --> m18
 m18 --> m19
 ```
 
-D3 blocks m10. D5 blocks the private-API candidate inside m08. D1, D2, D4, D6, and D7 do not block a spike. D6 blocks any ticket that would claim capture exclusion beyond what m04 and m06 measured. D2 blocks a signing ticket, and this set does not contain one.
+D3 blocks m10. D5 is decided: `SACLockScreenImmediate` via `dlopen`, and the documented screen-saver path when that symbol is missing or the call fails. It does not block m08. D1, D2, D4, D6, and D7 do not block a spike. The Intel Mac details in D1 are still open. D6 blocks any ticket that would claim capture exclusion beyond what m04 and m06 measured. D2 blocks a signing ticket, and this set does not contain one.

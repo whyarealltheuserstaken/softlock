@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Planning only. Not approved. Henry has not signed this, and the tickets are not GitHub issues. No product code comes with it. |
+| **Status** | Planning only. Not approved as a set, and the tickets are not GitHub issues. The lead accepted D1, D2, D3, D4, D6, and D7 on 16 November 2026. Decision D5 is recorded in section 4. The Intel Mac details in D1 are still open. No product code comes with it. |
 | **Date** | 16 November 2026 |
 | **Read against** | `23b5a39bc92c2ee32f470256d78be27d030dc59f` on `main` |
 | **Supersedes** | The macOS bullets that used to live in SPEC.md Implementation Decision 16, and the short phase-2 note that used to be this file |
@@ -132,17 +132,23 @@ Lid close is forced sleep on the QA1340 page. Phase 2 does not offer lid-close t
 
 Fail closed still means the real lock, within about a second, and agents pause until the owner signs in. The Windows primitive does not exist here.
 
-**Spike m08.** Three candidates, in the order the spike tries them. The first one that shows the real lock screen within a second, and that the spike can see fail, is the one ticket m17 wires up. The others are written down as misses.
+**Decision D5, Henry, 16 November 2026.** The lock call is `SACLockScreenImmediate` in the private `login.framework`. The binary resolves it with `dlopen` and `dlsym`. It does not link `login.framework`. There is no Apple documentation page for this symbol. It is private SPI. A missing symbol does not crash. A call that returns failure does not crash. Either one takes the documented lock path: start the screen saver and require the account password to leave it. That path is what the public pages give us. It is the weaker path. It depends on the password-after-screensaver setting, and a bystander must not be able to click or type through it back to the desktop. The login window is not this fallback.
 
-1. `SACLockScreenImmediate` in the private `login.framework`, resolved with `dlopen` and `dlsym`, not linked. There is no Apple documentation page for this symbol. It is private SPI. Decision D5 says whether the spike is even allowed to try it. A removed symbol is a failed lock, not a crash.
-2. The login window, as distinct from the lock screen. The spike records the API or tool it used. The old `CGSession -suspend` path is not assumed to exist.
-3. Start the screen saver and require the account password to leave it. This is the weakest candidate. It depends on the password-after-screensaver setting, and the spike has to show a bystander cannot click through it back to the desktop.
+**Spike m08.** On Henry's Intel Mac, time both paths. The private call has to show the real lock screen within about a second. The documented path is timed the same way, including whether a click or a key reached the desktop without the account password. Forcing a missing symbol on his OS may be impossible. When it is, the sheet says so, and the CI rows below are the proof of that branch.
 
 **Verified.** Apple's [FileVault deployment introduction](https://support.apple.com/guide/deployment/intro-to-filevault-dep82064ec40/web) says that after FileVault is on, the user's credentials are required during boot. On Apple silicon and on a Mac with the T2 chip, key handling stays in the Secure Enclave. A forced power-off or reboot is the accepted denial of service, and it lands at that prompt when FileVault is on. That is the same story as BitLocker on Windows.
 
 **Verified from the `fdesetup(8)` manual page** (read from [this mirror](https://keith.github.io/xcode-man-pages/fdesetup.8.html)): `fdesetup` reports whether FileVault is on or off, and some status commands can be run from a non-root session. `fdesetup status` indicates On or Off. `fdesetup isactive` returns `true` or `false`.
 
 **Spike m08.** Run `fdesetup status` and `fdesetup isactive` as the console user, not root, and record the output. The wizard's disk-encryption check uses whichever of those works without an admin password. An Intel Mac without a T2 chip does not prove the Secure Enclave path. GitHub runners are not rebooted into the FileVault prompt, so the pre-boot screen is Henry's checklist line if his disk has FileVault on, and it is unproven if it does not.
+
+**Test, tickets m08 and m17, runs in CI.** The chooser is a pure function of two results: whether `dlsym` returned the symbol, and whether that call succeeded. It lives with the macOS `SessionControl` work and the workspace test calls it. The test does not call the live symbol, so the job does not lock the runner. The existing verify job (`cargo test --workspace` on `ubuntu-latest`, `windows-latest`, and `macos-latest` in `.github/workflows/ci.yml`) runs these three rows:
+
+1. Symbol missing. The documented path is the one requested.
+2. Symbol present, call failed. The documented path is the one requested.
+3. Call succeeded. The documented path is not requested.
+
+A row that skips the documented path, or that takes it after a successful private call, fails the job. m08 lands the function and the test with the probe. m17 keeps the same test green when the service and the lock host call the chooser. Henry's Mac remains the proof that either path shows a lock screen.
 
 ## 5. Unlock, against the lock core
 
@@ -208,5 +214,6 @@ Simulated physical input on a runner is the nonce in `kCGEventSourceUserData`, a
 - That `CGShieldingWindowLevel()` is the overlay level.
 - That an assertion keeps a Mac awake with the lid shut.
 - That `SACLockScreenImmediate` is a public API.
+- That a missing symbol or a failed call leaves the session unlocked. Both take the documented screen-saver path.
 - That Touch ID can be tested on an Intel Mac that has no sensor, or on a GitHub runner.
 - That a Rosetta run of the x86_64 slice replaces Henry's Mac.

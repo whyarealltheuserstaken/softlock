@@ -18,7 +18,7 @@ If m02 found a daemon cannot start a GUI process in the Aqua session, launchd st
 - [ ] No public message sequence reaches Unlocked from Locked. A nonce with one flipped byte stays locked (CI, seam 1 already covers the state machine; this ticket covers the socket)
 - [ ] The dev PIN is checked by the service. The lock host has no verdict that unlocks (CI)
 - [ ] On his Mac, the dev install script loads both jobs, a second process can lock, and unloading the script's jobs removes them (checklist)
-- [ ] Killing the daemon while locked ends in the real lock primitive m08 picked, or this checklist line waits if m17 has not landed and is recorded as blocked on m17 rather than faked
+- [ ] Killing the daemon while locked ends in the lock D5 named (`SACLockScreenImmediate`, or the documented screen-saver path if that call is missing or fails), or this checklist line waits if m17 has not landed and is recorded as blocked on m17 rather than faked
 - [ ] Release binaries, both slices, still pass the m01 scan
 
 The kill line is shared with m17. If m17 has not landed, this ticket's install checklist does not invent a lock primitive. It stops at "jobs load, a second process locks, the dev PIN unlocks."
