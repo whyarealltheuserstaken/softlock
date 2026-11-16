@@ -5,7 +5,13 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F13, VK_F24};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AllowSetForegroundWindow, GetForegroundWindow, HWND_TOPMOST, LSFW_UNLOCK,
+    LockSetForegroundWindow, SW_HIDE, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    SetForegroundWindow, SetWindowPos, ShowWindow,
+};
 
 use crate::guard;
 use crate::protocol::{self, Command, Hello, ROLE_ELEVATED, ROLE_MEDIUM, ROLE_SYSTEM, Reply};
@@ -202,6 +208,12 @@ fn visibility_phase(
     };
     for attempt in 1..=3 {
         reset_all(peers)?;
+        let other = if target == ROLE_MEDIUM {
+            ROLE_ELEVATED
+        } else {
+            ROLE_MEDIUM
+        };
+        hide_window(peers[other].hello.hwnd);
         let foreground = ask(
             peers.get_mut(target).ok_or("probe missing")?,
             &Command::Foreground,
@@ -209,11 +221,20 @@ fn visibility_phase(
         let Reply::Foreground { ok, rect, error } = foreground else {
             return Err("probe did not answer foreground".to_string());
         };
+        let mut ok = ok;
         if !ok {
             say(&format!(
                 "foreground attempt {attempt} target={target} error={}",
                 error.unwrap_or_else(|| "unknown".to_string())
             ));
+            ok = force_foreground(peers[target].hello.hwnd);
+            if ok {
+                say(&format!(
+                    "foreground attempt {attempt} target={target} taken by supervisor"
+                ));
+            }
+        }
+        if !ok {
             continue;
         }
         if let Some(rect) = rect {
@@ -318,19 +339,49 @@ fn liveness_phase(peers: &mut HashMap<String, Peer>, timeout_ms: u64) -> Result<
             error,
         });
     }
-    // The marker has to come from this process. Injecting it from the hook
-    // process blocks inside the callback and Windows does not remove the hook.
-    let t_send = Instant::now();
-    let sender = thread::spawn(|| {
+    // One slow callback is passed on. The hook comes out on a later timeout,
+    // so repeat the marker until that happens, then probe after the callback
+    // has returned and can no longer hide a still-installed hook.
+    let mut strikes = 0u32;
+    let mut blocked_ms = 0u64;
+    let mut removal = Instant::now();
+    let mut entered = 0u32;
+    for index in 1..=11 {
         let started = Instant::now();
-        let result = input::send_key_pairs(VK_F24, EXTRA_MARKER, 1);
-        (started.elapsed().as_millis() as u64, result)
-    });
-    let removal = t_send + Duration::from_millis(timeout_ms);
-    while Instant::now() < removal {
-        thread::sleep(Duration::from_millis(20));
+        let sent = input::send_key_pairs(VK_F24, EXTRA_MARKER, 1);
+        blocked_ms = started.elapsed().as_millis() as u64;
+        if let Err(failure) = sent {
+            say(&format!("slow-marker index={index} error={failure}"));
+        }
+        let timed_out = blocked_ms + 150 < sleep_ms;
+        say(&format!(
+            "slow-strike index={index} blocked-ms={blocked_ms} timed-out={timed_out}"
+        ));
+        if timed_out {
+            strikes += 1;
+            removal = Instant::now();
+        }
+        let wait_deadline = Instant::now() + Duration::from_millis(sleep_ms.saturating_add(1_500));
+        while Instant::now() < wait_deadline {
+            entered = counts_of(peers, ROLE_SYSTEM)?.slow_entered;
+            let returned = counts_of(peers, ROLE_SYSTEM)?.slow_returned;
+            if returned >= index {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !timed_out {
+            break;
+        }
     }
-    thread::sleep(Duration::from_millis(50));
+    let returned = counts_of(peers, ROLE_SYSTEM)?.slow_returned;
+    let disarm = ask(
+        peers.get_mut(ROLE_SYSTEM).ok_or("system hook missing")?,
+        &Command::Disarm,
+    )?;
+    if !matches!(disarm, Reply::Disarm) {
+        return Err("system hook did not disarm".to_string());
+    }
     let before = counts_of(peers, ROLE_SYSTEM)?.marker_seen;
     let _ = input::send_key_pairs(VK_F24, EXTRA_MARKER, 1);
     let mut saw = counts_of(peers, ROLE_SYSTEM)?.marker_seen > before;
@@ -340,37 +391,49 @@ fn liveness_phase(peers: &mut HashMap<String, Peer>, timeout_ms: u64) -> Result<
         saw = counts_of(peers, ROLE_SYSTEM)?.marker_seen > before;
     }
     let detect_ms = removal.elapsed().as_millis() as u64;
-    let return_deadline = Instant::now() + Duration::from_millis(sleep_ms.saturating_add(2_000));
-    let mut entered = false;
-    let mut returned = false;
-    while Instant::now() < return_deadline {
-        let counts = counts_of(peers, ROLE_SYSTEM)?;
-        entered = counts.slow_entered;
-        returned = counts.slow_returned;
-        if returned {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    thread::sleep(Duration::from_millis(300));
-    let before_confirm = counts_of(peers, ROLE_SYSTEM)?.marker_seen;
-    let _ = input::send_key_pairs(VK_F24, EXTRA_MARKER, 1);
-    thread::sleep(Duration::from_millis(250));
-    let still_dead = counts_of(peers, ROLE_SYSTEM)?.marker_seen == before_confirm;
-    let (blocked_ms, marker_result) = sender
-        .join()
-        .unwrap_or((0, Err("sender thread panicked".to_string())));
-    if let Err(failure) = &marker_result {
-        say(&format!("slow-marker error={failure}"));
-    }
+    say(&format!(
+        "slow-strikes={strikes} entered={entered} returned={returned} probe-seen={saw}"
+    ));
     Ok(Liveness {
         healthy_before: true,
-        entered,
+        entered: entered > 0,
         detect_ms,
-        removed: entered && !saw && still_dead && returned,
+        removed: strikes >= 11 && returned >= 11 && !saw,
         blocked_ms,
         error: None,
     })
+}
+
+fn hide_window(hwnd: u64) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(HWND(hwnd as *mut core::ffi::c_void), SW_HIDE);
+    }
+}
+
+fn force_foreground(hwnd: u64) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    let window = HWND(hwnd as *mut core::ffi::c_void);
+    unsafe {
+        let _ = AllowSetForegroundWindow(0xFFFF_FFFF);
+        let _ = LockSetForegroundWindow(LSFW_UNLOCK);
+        let _ = ShowWindow(window, SW_SHOW);
+        let _ = SetWindowPos(
+            window,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+        let _ = SetForegroundWindow(window);
+        GetForegroundWindow() == window
+    }
 }
 
 struct HookCounts {
@@ -379,8 +442,8 @@ struct HookCounts {
     load_seen: u64,
     marker_seen: u64,
     window_keys: u64,
-    slow_entered: bool,
-    slow_returned: bool,
+    slow_entered: u32,
+    slow_returned: u32,
 }
 
 fn counts_of(peers: &mut HashMap<String, Peer>, role: &str) -> Result<HookCounts, String> {

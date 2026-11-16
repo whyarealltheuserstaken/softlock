@@ -22,6 +22,7 @@ pub struct Hello {
     pub desktop: String,
     pub timeout_ms: u64,
     pub timeout_raw: String,
+    pub hwnd: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +38,8 @@ pub enum Command {
     Slow { timeout_ms: u64 },
     #[serde(rename = "quit")]
     Quit,
+    #[serde(rename = "disarm")]
+    Disarm,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,8 +68,8 @@ pub enum Reply {
         load_seen: u64,
         marker_seen: u64,
         window_keys: u64,
-        slow_entered: bool,
-        slow_returned: bool,
+        slow_entered: u32,
+        slow_returned: u32,
     },
     /// The system hook armed the removal probe. The supervisor injects the
     /// marker from outside that process; a same-process `SendInput` does not
@@ -80,6 +83,8 @@ pub enum Reply {
     },
     #[serde(rename = "bye")]
     Bye,
+    #[serde(rename = "disarm")]
+    Disarm,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -145,8 +150,8 @@ mod tests {
             load_seen: 40_000,
             marker_seen: 1,
             window_keys: 20,
-            slow_entered: false,
-            slow_returned: false,
+            slow_entered: 0,
+            slow_returned: 0,
         };
         let mut bytes = Vec::new();
         write_msg(&mut bytes, &reply).unwrap();
@@ -166,6 +171,7 @@ mod tests {
             desktop: "Default".to_string(),
             timeout_ms: 300,
             timeout_raw: "absent".to_string(),
+            hwnd: 0,
         };
         let mut bytes = Vec::new();
         write_msg(&mut bytes, &hello).unwrap();

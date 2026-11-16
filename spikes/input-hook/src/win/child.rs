@@ -43,6 +43,7 @@ enum UiCmd {
 
 struct HookSession {
     thread_id: u32,
+    hwnd: u64,
     commands: Sender<UiCmd>,
     join: JoinHandle<()>,
 }
@@ -103,6 +104,7 @@ fn run_role(args: &Args, role: &str, log_path: &std::path::Path) -> Result<(), S
             desktop: id.desktop,
             timeout_ms: id.timeout_ms,
             timeout_raw: id.timeout_raw,
+            hwnd: hook.hwnd,
         },
     )?;
     let result = command_loop(role, &hook, &mut reader, &mut writer, log_path);
@@ -175,6 +177,10 @@ fn command_loop(
                 protocol::write_msg(writer, &Reply::Bye)?;
                 return Ok(());
             }
+            Command::Disarm => {
+                callback::disarm();
+                protocol::write_msg(writer, &Reply::Disarm)?;
+            }
         }
     }
 }
@@ -217,7 +223,9 @@ fn arm_slow(timeout_ms: u64) -> Reply {
             error: Some("marker was not seen before the slow callback".to_string()),
         };
     }
-    let sleep_ms = timeout_ms.saturating_add(1_500).min(8_000);
+    // Just past the timeout, so the gap between the timeout and the callback
+    // returning stays inside the 500 ms liveness budget.
+    let sleep_ms = timeout_ms.saturating_add(400).min(1_500);
     callback::SLOW_RETURNED.store(0, Ordering::Relaxed);
     callback::SLOW_ENTERED.store(0, Ordering::Relaxed);
     callback::SLOW_MS.store(sleep_ms as u32, Ordering::Relaxed);
@@ -256,8 +264,9 @@ fn start_hook(
     let log_path = log_path.to_path_buf();
     let join = thread::spawn(move || hook_main(with_window, role, log_path, cmd_rx, ready_tx));
     match ready_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(thread_id)) => Ok(HookSession {
+        Ok(Ok((thread_id, hwnd))) => Ok(HookSession {
             thread_id,
+            hwnd,
             commands: cmd_tx,
             join,
         }),
@@ -274,7 +283,7 @@ fn hook_main(
     role: String,
     log_path: std::path::PathBuf,
     commands: Receiver<UiCmd>,
-    ready: Sender<Result<u32, String>>,
+    ready: Sender<Result<(u32, u64), String>>,
 ) {
     let raised = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
     if let Err(error) = raised {
@@ -317,6 +326,7 @@ fn hook_main(
         let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
     }
     let thread_id = unsafe { GetCurrentThreadId() };
+    let hwnd_bits = hwnd.as_ref().map(|window| window.0 as u64).unwrap_or(0);
     log_line(
         &log_path,
         &format!(
@@ -324,7 +334,7 @@ fn hook_main(
             hwnd.is_some()
         ),
     );
-    let _ = ready.send(Ok(thread_id));
+    let _ = ready.send(Ok((thread_id, hwnd_bits)));
     loop {
         let status = unsafe { GetMessageW(&mut message, None, 0, 0) };
         if status.0 == 0 || status.0 == -1 {

@@ -31,11 +31,15 @@ pub fn reset_counts() {
     WINDOW_KEYS.store(0, Ordering::Relaxed);
 }
 
-pub fn slow_state() -> (bool, bool) {
+pub fn slow_state() -> (u32, u32) {
     (
-        SLOW_ENTERED.load(Ordering::Relaxed) == 1,
-        SLOW_RETURNED.load(Ordering::Relaxed) == 1,
+        SLOW_ENTERED.load(Ordering::Relaxed),
+        SLOW_RETURNED.load(Ordering::Relaxed),
     )
+}
+
+pub fn disarm() {
+    SLOW_ARM.store(false, Ordering::Release);
 }
 
 pub fn counts() -> (u64, u64, u64, u64, u64) {
@@ -68,10 +72,11 @@ pub unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: L
         }
         match action {
             HookAction::Slow { sleep_ms } => {
-                SLOW_ARM.store(false, Ordering::Release);
-                SLOW_ENTERED.store(1, Ordering::Release);
+                // Stay armed so each injected marker is another timeout.
+                // Windows removes the hook on a repeated timeout, not the first.
+                SLOW_ENTERED.fetch_add(1, Ordering::Release);
                 Sleep(sleep_ms);
-                SLOW_RETURNED.store(1, Ordering::Release);
+                SLOW_RETURNED.fetch_add(1, Ordering::Release);
                 LRESULT(1)
             }
             HookAction::Swallow { count_marker } => {
