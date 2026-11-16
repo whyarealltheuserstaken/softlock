@@ -17,6 +17,8 @@ fn main() {
         "ApplicationServices",
         "CoreFoundation",
         "CoreGraphics",
+        "CoreMedia",
+        "CoreVideo",
         "Foundation",
         "ScreenCaptureKit",
         "Security",

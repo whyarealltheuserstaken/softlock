@@ -12,11 +12,23 @@ pub const CAPTURE_APIS: [&str; 4] = [
     "ScreenCaptureKit",
 ];
 
-/// Sharing types m04 measures. `default` is the value AppKit leaves unset.
-pub const SHARING_TYPES: [&str; 2] = ["default", "none"];
+/// Sharing phases. `default` is the value AppKit leaves unset. `baseline` is the same capture with the windows ordered out.
+pub const SHARING_PHASES: [&str; 3] = ["default", "none", "baseline"];
+
+/// The four m02 paths plus one `SCStream` frame of the whole display.
+pub const SHARING_APIS: [&str; 5] = [
+    "CGWindowListCreateImage",
+    "CGDisplayCreateImage",
+    "screencapture",
+    "ScreenCaptureKit",
+    "SCStream",
+];
 
 /// What `macos_prove_screen_capture_kit` calls: one whole-display image and an empty exclude list.
 pub const SCREEN_CAPTURE_ENTRY: &str = "SCScreenshotManager excludingWindows empty";
+
+/// One `SCStream` frame of the display, with no windows excluded.
+pub const SCSTREAM_ENTRY: &str = "SCStream excludingWindows empty";
 
 pub const REQUIRED_TAPS: [(&str, &str); 3] = [
     ("kCGSessionEventTap", "user"),

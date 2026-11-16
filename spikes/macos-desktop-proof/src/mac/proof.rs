@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::args::{Args, Mode};
 use crate::guard::service_install_allowed;
-use crate::labels::{CAPTURE_APIS, SCREEN_CAPTURE_ENTRY};
+use crate::labels::{CAPTURE_APIS, SCREEN_CAPTURE_ENTRY, SHARING_APIS};
 use crate::mac::{ffi, launchd};
 use crate::png::png_size;
 use crate::report::{
@@ -201,17 +201,41 @@ fn capture_api(api: &str, output_dir: &Path) -> CaptureReport {
         "CGDisplayCreateImage" => ffi::prove_cg_display(),
         "screencapture" => prove_screencapture(output_dir),
         "ScreenCaptureKit" => ffi::prove_screen_capture_kit(),
+        "SCStream" => ffi::prove_sc_stream(),
         other => capture_unavailable(other, "unknown capture api"),
     }
 }
 
+fn stage(name: &str) {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    eprintln!("stage={name} t={millis}");
+    let _ = io::stderr().flush();
+}
+
 fn run_sharing(args: &Args) -> i32 {
-    eprintln!("stage=sharing-window");
+    stage("sharing-window");
     let mut window = ffi::sharing_open();
     let mut samples = capture_sharing("default", &args.output_dir);
-    eprintln!("stage=sharing-none");
+    stage("sharing-none");
     window.sharing_none = ffi::sharing_set_none();
+    stage("sharing-control");
+    if !ffi::sharing_control_open() {
+        window.error = Some("NSWindow control window was not created".to_string());
+    }
+    let presence = ffi::sharing_presence();
+    window.visible_after_none = presence.visible;
+    window.occlusion_after_none = presence.occlusion;
+    window.listed_on_screen = presence.listed;
+    if !presence.detail.is_empty() && window.error.is_none() {
+        window.error = Some(presence.detail);
+    }
     samples.extend(capture_sharing("none", &args.output_dir));
+    stage("sharing-baseline");
+    ffi::sharing_order_out();
+    samples.extend(capture_sharing("baseline", &args.output_dir));
     ffi::sharing_close();
     let report = SharingReport { window, samples };
     let path = args.output_dir.join("sharing.json");
@@ -224,8 +248,8 @@ fn run_sharing(args: &Args) -> i32 {
 
 fn capture_sharing(sharing: &str, output_dir: &Path) -> Vec<crate::report::SharingSample> {
     let mut samples = Vec::new();
-    for api in CAPTURE_APIS {
-        eprintln!("stage=sharing-{sharing}-{api}");
+    for api in SHARING_APIS {
+        stage(&format!("sharing-{sharing}-{api}"));
         let report = capture_api(api, output_dir);
         samples.push(sharing_sample(sharing, &report));
     }
@@ -236,7 +260,7 @@ fn child_sharing(exe: &Path, output_dir: &Path) -> (SharingReport, Option<String
     let path = output_dir.join("sharing.json");
     let _ = fs::remove_file(&path);
     let dir = path_arg(output_dir);
-    let outcome = run_limited(exe, &["--sharing-only", "--output-dir", &dir], 90);
+    let outcome = run_limited(exe, &["--sharing-only", "--output-dir", &dir], 220);
     show_stderr(&outcome.stderr);
     if let Some(report) = read_json::<SharingReport>(&path) {
         let crash = if outcome.success {
@@ -260,6 +284,10 @@ fn child_sharing(exe: &Path, output_dir: &Path) -> (SharingReport, Option<String
                 shielding_called: false,
                 sharing_default: String::new(),
                 sharing_none: String::new(),
+                window_area: 0,
+                visible_after_none: false,
+                occlusion_after_none: false,
+                listed_on_screen: false,
                 display_image_api: String::new(),
                 screen_capture_entry: SCREEN_CAPTURE_ENTRY.to_string(),
                 error: Some(format!(
@@ -647,13 +675,17 @@ fn prove_screencapture(dir: &Path) -> CaptureReport {
             Err(error) => capture_unavailable("screencapture", &format!("no file: {error}")),
             Ok(bytes) => match png_size(&bytes) {
                 Some((width, height)) => match ffi::inspect_png(&path) {
-                    Some((nonblack, marker)) => crate::report::capture_opened(
-                        "screencapture",
-                        width,
-                        height,
-                        nonblack,
-                        marker,
-                    ),
+                    Some((nonblack, marker, control)) => {
+                        let mut report = crate::report::capture_opened(
+                            "screencapture",
+                            width,
+                            height,
+                            nonblack,
+                            marker,
+                        );
+                        report.control_pixels = Some(control);
+                        report
+                    }
                     None => {
                         let mut report =
                             crate::report::capture_opened("screencapture", width, height, 0, 0);

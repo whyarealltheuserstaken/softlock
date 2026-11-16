@@ -7,7 +7,8 @@ use crate::classify::{
     fail_closed_end, healthy_callback_within_one_heartbeat, state_name,
 };
 use crate::labels::{
-    AGENT_LABEL, CAPTURE_APIS, DAEMON_LABEL, REQUIRED_TAPS, SCREEN_CAPTURE_ENTRY, SHARING_TYPES,
+    AGENT_LABEL, CAPTURE_APIS, DAEMON_LABEL, REQUIRED_TAPS, SCREEN_CAPTURE_ENTRY, SCSTREAM_ENTRY,
+    SHARING_APIS, SHARING_PHASES,
 };
 use crate::launchctl::PrintState;
 use crate::text::one_line;
@@ -57,6 +58,9 @@ pub struct CaptureReport {
     pub height: i32,
     pub nonblack_pixels: Option<i32>,
     pub marker_pixels: Option<i32>,
+    /// Pixels of the green control window. The m02 lines do not print this.
+    #[serde(default)]
+    pub control_pixels: Option<i32>,
     pub error: Option<String>,
 }
 
@@ -111,7 +115,13 @@ pub struct SharingWindowReport {
     pub shielding_called: bool,
     pub sharing_default: String,
     pub sharing_none: String,
-    /// Symbol the display-image capture actually resolved on this OS.
+    /// Width times height of the marker window, in pixels.
+    pub window_area: i32,
+    /// After `sharingType` is `.none`: still visible, unoccluded, and listed on screen.
+    pub visible_after_none: bool,
+    pub occlusion_after_none: bool,
+    pub listed_on_screen: bool,
+    /// Both display-image symbols this probe called, comma-separated.
     pub display_image_api: String,
     /// ScreenCaptureKit entry point the harness called, with its filter.
     pub screen_capture_entry: String,
@@ -127,6 +137,9 @@ pub struct SharingSample {
     pub width: i32,
     pub height: i32,
     pub marker_pixels: Option<i32>,
+    /// Pixels of the second window. Required on the `.none` captures.
+    #[serde(default)]
+    pub control_pixels: Option<i32>,
     pub error: Option<String>,
 }
 
@@ -377,6 +390,7 @@ pub fn capture_opened(
         height,
         nonblack_pixels: Some(nonblack),
         marker_pixels: Some(marker),
+        control_pixels: None,
         error: None,
     }
 }
@@ -389,6 +403,7 @@ pub fn capture_unavailable(api: &str, detail: &str) -> CaptureReport {
         height: 0,
         nonblack_pixels: None,
         marker_pixels: None,
+        control_pixels: None,
         error: Some(format!("{api}: {}", one_line(detail))),
     }
 }
@@ -506,16 +521,22 @@ pub fn failure_reasons(report: &ProofReport) -> Vec<String> {
     reasons
 }
 
-/// A path m14 may claim: the marker is in the default capture and absent when sharing is `.none`.
-/// Zero on both is a miss (the window was not in the image), not a claim.
-pub fn m14_may_claim(sample_default: &SharingSample, sample_none: &SharingSample) -> bool {
-    sample_default.sharing == "default"
-        && sample_none.sharing == "none"
-        && sample_default.api == sample_none.api
-        && sample_default.opened
-        && sample_none.opened
-        && sample_default.marker_pixels.is_some_and(|count| count > 0)
-        && sample_none.marker_pixels == Some(0)
+/// The marker window left the image when `.none` matches the ordered-out baseline
+/// and the default capture still holds the window area on top of that baseline.
+pub fn window_removed(
+    default_count: i32,
+    none_count: i32,
+    baseline_count: i32,
+    window_area: i32,
+) -> bool {
+    window_area > 0
+        && default_count >= baseline_count.saturating_add(window_area)
+        && none_count == baseline_count
+}
+
+/// This runner does not by itself let m14 claim a path. m06 has to agree.
+pub fn m14_may_claim(_sample_default: &SharingSample, _sample_none: &SharingSample) -> bool {
+    false
 }
 
 pub fn sharing_sample(sharing: &str, capture: &CaptureReport) -> SharingSample {
@@ -526,6 +547,7 @@ pub fn sharing_sample(sharing: &str, capture: &CaptureReport) -> SharingSample {
         width: capture.width,
         height: capture.height,
         marker_pixels: capture.marker_pixels,
+        control_pixels: capture.control_pixels,
         error: capture.error.clone(),
     }
 }
@@ -568,8 +590,19 @@ fn sharing_failures(sharing: Option<&SharingReport>) -> Vec<String> {
             display_text(&window.sharing_none)
         ));
     }
-    if window.display_image_api.is_empty() {
-        reasons.push("display-image API was not named".to_string());
+    if !window.display_image_api.contains("CGWindowListCreateImage")
+        || !window.display_image_api.contains("CGDisplayCreateImage")
+    {
+        reasons.push(format!(
+            "display-image API is {}",
+            display_text(&window.display_image_api)
+        ));
+    }
+    if !window.visible_after_none || !window.occlusion_after_none || !window.listed_on_screen {
+        reasons.push(
+            "sharing window was not on screen after sharing none (visible, occlusion, or window list)"
+                .to_string(),
+        );
     }
     if window.screen_capture_entry != SCREEN_CAPTURE_ENTRY {
         reasons.push("ScreenCaptureKit entry was not named".to_string());
@@ -579,8 +612,8 @@ fn sharing_failures(sharing: Option<&SharingReport>) -> Vec<String> {
     } else if !window.ordered_front {
         reasons.push("sharing window was not ordered front".to_string());
     }
-    for sharing_type in SHARING_TYPES {
-        for api in CAPTURE_APIS {
+    for sharing_type in SHARING_PHASES {
+        for api in SHARING_APIS {
             match sharing
                 .samples
                 .iter()
@@ -595,7 +628,45 @@ fn sharing_failures(sharing: Option<&SharingReport>) -> Vec<String> {
             }
         }
     }
+    for api in SHARING_APIS {
+        if let Some(reason) = sharing_removed_failure(sharing, api) {
+            reasons.push(reason);
+        }
+    }
     reasons
+}
+
+fn sharing_removed_failure(sharing: &SharingReport, api: &str) -> Option<String> {
+    let default = find_sharing(sharing, "default", api)?;
+    let none = find_sharing(sharing, "none", api)?;
+    let baseline = find_sharing(sharing, "baseline", api)?;
+    if !default.opened || !none.opened || !baseline.opened {
+        return None;
+    }
+    let (Some(default_count), Some(none_count), Some(baseline_count)) = (
+        default.marker_pixels,
+        none.marker_pixels,
+        baseline.marker_pixels,
+    ) else {
+        return None;
+    };
+    if !window_removed(
+        default_count,
+        none_count,
+        baseline_count,
+        sharing.window.window_area,
+    ) {
+        return Some(format!(
+            "sharing {api} .none count {none_count} is not the baseline {baseline_count} under a default of {default_count}"
+        ));
+    }
+    let control = none.control_pixels.unwrap_or(0);
+    if control < sharing.window.window_area {
+        return Some(format!(
+            "sharing {api} control window was absent from the .none capture (pixels={control})"
+        ));
+    }
+    None
 }
 
 fn sharing_sample_failure(sample: &SharingSample) -> Option<String> {
@@ -1033,13 +1104,40 @@ fn sharing_lines(sharing: Option<&SharingReport>) -> Vec<String> {
             "display-image-api={}",
             display_text(&window.display_image_api)
         ),
+        format!(
+            "sharing-presence=visible={} occlusion={} listed={} area={}",
+            window.visible_after_none,
+            window.occlusion_after_none,
+            window.listed_on_screen,
+            window.window_area
+        ),
     ];
-    for sharing_type in SHARING_TYPES {
-        for api in CAPTURE_APIS {
+    for sharing_type in SHARING_PHASES {
+        for api in SHARING_APIS {
             lines.push(sharing_sample_line(sharing, sharing_type, api));
         }
     }
-    for api in CAPTURE_APIS {
+    for api in SHARING_APIS {
+        let removed = match (
+            find_sharing(sharing, "default", api),
+            find_sharing(sharing, "none", api),
+            find_sharing(sharing, "baseline", api),
+        ) {
+            (Some(sample_default), Some(sample_none), Some(baseline))
+                if sample_default.opened
+                    && sample_none.opened
+                    && baseline.opened
+                    && window_removed(
+                        sample_default.marker_pixels.unwrap_or(-1),
+                        sample_none.marker_pixels.unwrap_or(-1),
+                        baseline.marker_pixels.unwrap_or(-1),
+                        window.window_area,
+                    ) =>
+            {
+                "true"
+            }
+            _ => "false",
+        };
         let claim = match (
             find_sharing(sharing, "default", api),
             find_sharing(sharing, "none", api),
@@ -1051,7 +1149,7 @@ fn sharing_lines(sharing: Option<&SharingReport>) -> Vec<String> {
             }
             _ => "do-not-claim",
         };
-        lines.push(format!("sharing-m14-{api}={claim}"));
+        lines.push(format!("sharing-m14-{api}={claim} removed={removed}"));
     }
     lines
 }
@@ -1062,6 +1160,8 @@ fn sharing_sample_line(sharing: &SharingReport, sharing_type: &str, api: &str) -
     };
     let entry = if api == "ScreenCaptureKit" {
         format!(" entry={}", sharing.window.screen_capture_entry)
+    } else if api == "SCStream" {
+        format!(" entry={SCSTREAM_ENTRY}")
     } else {
         String::new()
     };
@@ -1070,8 +1170,12 @@ fn sharing_sample_line(sharing: &SharingReport, sharing_type: &str, api: &str) -
             .marker_pixels
             .map(|count| count.to_string())
             .unwrap_or_else(|| "unknown".to_string());
+        let control = sample
+            .control_pixels
+            .map(|count| format!(" control pixels={count}"))
+            .unwrap_or_default();
         format!(
-            "sharing-{sharing_type}-{api}=marker pixels={count} width={} height={height}{entry}",
+            "sharing-{sharing_type}-{api}=marker pixels={count}{control} width={} height={height}{entry}",
             sample.width,
             height = sample.height
         )
@@ -1286,7 +1390,7 @@ fn passing_fixture() -> ProofReport {
             .collect(),
         jobs: vec![agent_observation(true), daemon_observation()],
         classify: Some(passing_classify()),
-        sharing: Some(measured_sharing(80, 80)),
+        sharing: Some(measured_sharing()),
         probe_crash: None,
     }
 }
@@ -1336,14 +1440,13 @@ fn passing_classify() -> ClassifyReport {
 }
 
 #[cfg(test)]
-fn measured_sharing(default_marker: i32, none_marker: i32) -> SharingReport {
+fn measured_sharing() -> SharingReport {
     let mut samples = Vec::new();
-    for sharing in SHARING_TYPES {
-        for api in CAPTURE_APIS {
-            let marker = if sharing == "none" {
-                none_marker
-            } else {
-                default_marker
+    for sharing in SHARING_PHASES {
+        for api in SHARING_APIS {
+            let marker = match sharing {
+                "default" => 76834,
+                _ => 34,
             };
             samples.push(SharingSample {
                 sharing: sharing.to_string(),
@@ -1352,6 +1455,7 @@ fn measured_sharing(default_marker: i32, none_marker: i32) -> SharingReport {
                 width: 1024,
                 height: 768,
                 marker_pixels: Some(marker),
+                control_pixels: (sharing == "none").then_some(76800),
                 error: None,
             });
         }
@@ -1365,7 +1469,11 @@ fn measured_sharing(default_marker: i32, none_marker: i32) -> SharingReport {
             shielding_called: false,
             sharing_default: "NSWindowSharingReadOnly".to_string(),
             sharing_none: "NSWindowSharingNone".to_string(),
-            display_image_api: "CGWindowListCreateImage".to_string(),
+            window_area: 76800,
+            visible_after_none: true,
+            occlusion_after_none: true,
+            listed_on_screen: true,
+            display_image_api: "CGWindowListCreateImage,CGDisplayCreateImage".to_string(),
             screen_capture_entry: SCREEN_CAPTURE_ENTRY.to_string(),
             error: None,
         },
@@ -1458,13 +1566,15 @@ mod tests {
         assert!(text.contains("healthy-within-heartbeat=true"));
         assert!(text.contains("fail-closed=Locked"));
         assert!(text.contains("result=pass"));
-        assert!(text.contains("display-image-api=CGWindowListCreateImage"));
-        assert!(text.contains("sharing-default-screencapture=marker pixels=80"));
-        assert!(text.contains("sharing-none-screencapture=marker pixels=80"));
+        assert!(text.contains("display-image-api=CGWindowListCreateImage,CGDisplayCreateImage"));
+        assert!(text.contains("sharing-default-screencapture=marker pixels=76834"));
+        assert!(text.contains("sharing-none-screencapture=marker pixels=34"));
+        assert!(text.contains("sharing-baseline-screencapture=marker pixels=34"));
         assert!(text.contains(
-            "sharing-none-ScreenCaptureKit=marker pixels=80 width=1024 height=768 entry=SCScreenshotManager excludingWindows empty"
+            "sharing-none-ScreenCaptureKit=marker pixels=34 control pixels=76800 width=1024 height=768 entry=SCScreenshotManager excludingWindows empty"
         ));
-        assert!(text.contains("sharing-m14-ScreenCaptureKit=do-not-claim"));
+        assert!(text.contains("sharing-m14-ScreenCaptureKit=do-not-claim removed=true"));
+        assert!(text.contains("sharing-m14-SCStream=do-not-claim removed=true"));
         assert!(text.contains("ignoresMouseEvents=true"));
         assert!(text.contains("shielding=false"));
         assert!(!text.contains("Serial"));
@@ -1879,72 +1989,78 @@ mod tests {
     }
 
     #[test]
-    fn sharing_none_omits_the_marker_only_when_the_default_capture_shows_it() {
-        let shown = measured_sharing(40, 0);
-        let hidden = shown
-            .samples
-            .iter()
-            .find(|sample| sample.sharing == "none" && sample.api == "screencapture")
-            .unwrap();
-        let visible = shown
+    fn counts_76834_34_34_remove_the_window_and_stay_unclaimed() {
+        assert!(window_removed(76834, 34, 34, 76800));
+        assert!(!window_removed(76834, 76834, 34, 76800));
+        assert!(!window_removed(34, 34, 34, 76800));
+        let sharing = measured_sharing();
+        let default = sharing
             .samples
             .iter()
             .find(|sample| sample.sharing == "default" && sample.api == "screencapture")
             .unwrap();
-        assert!(m14_may_claim(visible, hidden));
-
-        let still_there = measured_sharing(40, 12);
-        let none = still_there
+        let none = sharing
             .samples
             .iter()
-            .find(|sample| sample.sharing == "none" && sample.api == "ScreenCaptureKit")
-            .unwrap();
-        let default = still_there
-            .samples
-            .iter()
-            .find(|sample| sample.sharing == "default" && sample.api == "ScreenCaptureKit")
+            .find(|sample| sample.sharing == "none" && sample.api == "screencapture")
             .unwrap();
         assert!(!m14_may_claim(default, none));
-
-        let both_zero = measured_sharing(0, 0);
-        let none = both_zero
-            .samples
-            .iter()
-            .find(|sample| sample.sharing == "none" && sample.api == "CGDisplayCreateImage")
-            .unwrap();
-        let default = both_zero
-            .samples
-            .iter()
-            .find(|sample| sample.sharing == "default" && sample.api == "CGDisplayCreateImage")
-            .unwrap();
-        assert!(!m14_may_claim(default, none));
-
         let mut report = passing_fixture();
-        report.sharing = Some(shown);
+        report.sharing = Some(sharing);
         assert!(failure_reasons(&report).is_empty());
         let text = render(&report);
-        assert!(text.contains("sharing-none-screencapture=marker pixels=0"));
-        assert!(text.contains("sharing-m14-screencapture=claim"));
-        assert!(text.contains("sharing-m14-CGWindowListCreateImage=claim"));
+        assert!(text.contains("sharing-default-CGWindowListCreateImage=marker pixels=76834"));
+        assert!(text.contains("sharing-none-CGWindowListCreateImage=marker pixels=34"));
+        assert!(text.contains("sharing-baseline-CGWindowListCreateImage=marker pixels=34"));
+        assert!(text.contains("sharing-m14-screencapture=do-not-claim removed=true"));
+        assert!(text.contains("sharing-m14-SCStream=do-not-claim removed=true"));
         assert!(text.contains("result=pass"));
     }
 
     #[test]
-    fn a_nonzero_marker_under_sharing_none_is_recorded_and_not_claimed() {
+    fn a_missing_baseline_or_a_hidden_control_fails() {
+        let mut sharing = measured_sharing();
+        let sample = sharing
+            .samples
+            .iter_mut()
+            .find(|sample| sample.sharing == "none" && sample.api == "screencapture")
+            .unwrap();
+        sample.marker_pixels = Some(76834);
         let mut report = passing_fixture();
-        report.sharing = Some(measured_sharing(90, 90));
-        assert!(failure_reasons(&report).is_empty());
-        let text = render(&report);
-        assert!(text.contains("sharing-none-CGWindowListCreateImage=marker pixels=90"));
-        assert!(text.contains("sharing-m14-CGWindowListCreateImage=do-not-claim"));
-        assert!(text.contains("sharing-m14-CGDisplayCreateImage=do-not-claim"));
-        assert!(text.contains("sharing-m14-screencapture=do-not-claim"));
-        assert!(text.contains("sharing-m14-ScreenCaptureKit=do-not-claim"));
+        report.sharing = Some(sharing);
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("is not the baseline"))
+        );
+
+        let mut sharing = measured_sharing();
+        let sample = sharing
+            .samples
+            .iter_mut()
+            .find(|sample| sample.sharing == "none" && sample.api == "SCStream")
+            .unwrap();
+        sample.control_pixels = Some(0);
+        report.sharing = Some(sharing);
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("control window was absent"))
+        );
+
+        let mut sharing = measured_sharing();
+        sharing.window.listed_on_screen = false;
+        report.sharing = Some(sharing);
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("not on screen after sharing none"))
+        );
     }
 
     #[test]
     fn screen_capture_kit_unavailable_is_named_and_not_a_claim() {
-        let mut sharing = measured_sharing(10, 10);
+        let mut sharing = measured_sharing();
         for sample in &mut sharing.samples {
             if sample.api == "ScreenCaptureKit" {
                 sample.opened = false;
@@ -1975,7 +2091,7 @@ mod tests {
                 .any(|reason| reason.contains("sharing measurement is missing"))
         );
 
-        let mut sharing = measured_sharing(10, 0);
+        let mut sharing = measured_sharing();
         sharing.window.shielding_called = true;
         report.sharing = Some(sharing);
         assert!(
@@ -1984,7 +2100,7 @@ mod tests {
                 .any(|reason| reason.contains("CGShieldingWindowLevel"))
         );
 
-        let mut sharing = measured_sharing(10, 0);
+        let mut sharing = measured_sharing();
         let sample = sharing
             .samples
             .iter_mut()

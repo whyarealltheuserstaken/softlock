@@ -5,6 +5,8 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
+#import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 
 #include <Security/AuthSession.h>
@@ -18,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -48,6 +51,7 @@ typedef struct {
     int height;
     int nonblack;
     int marker;
+    int control;
     int prompt;
     char detail[768];
 } CaptureOut;
@@ -75,13 +79,20 @@ static const int kProbeKey = 0;
 @class ProbeWindow;
 static ProbeWindow *g_window = nil;
 static NSWindow *g_sharing = nil;
+static NSWindow *g_control = nil;
+
+static void stage_named(const char *name) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    fprintf(stderr, "stage=%s t=%lld.%03d\n", name, (long long)tv.tv_sec, (int)(tv.tv_usec / 1000));
+    fflush(stderr);
+}
 
 static void stage_line(WindowOut *out, const char *name) {
     if (out != NULL) {
         snprintf(out->stage, sizeof out->stage, "%s", name);
     }
-    fprintf(stderr, "stage=%s\n", name);
-    fflush(stderr);
+    stage_named(name);
 }
 
 static volatile int g_key_received = 0;
@@ -380,12 +391,20 @@ typedef struct {
     int ordered_front;
     int ignores_mouse_events;
     int shielding_called;
+    int window_area;
     char level[64];
     char collection[128];
     char sharing_default[64];
-    char display_image_api[64];
+    char display_image_api[128];
     char error[768];
 } SharingWindowOut;
+
+typedef struct {
+    int visible;
+    int occlusion;
+    int listed;
+    char detail[256];
+} SharingPresenceOut;
 
 static const char *sharing_name(NSWindowSharingType type) {
     switch (type) {
@@ -427,7 +446,7 @@ int macos_sharing_open(SharingWindowOut *out) {
             activate_app();
             NSScreen *screen = [NSScreen mainScreen];
             NSRect frame_rect = screen != nil ? screen.frame : NSMakeRect(0, 0, 800, 600);
-            NSRect frame = NSMakeRect(NSMidX(frame_rect) - 160, NSMidY(frame_rect) - 120, 320, 240);
+            NSRect frame = NSMakeRect(NSMidX(frame_rect) - 328, NSMidY(frame_rect) - 120, 320, 240);
             NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
                                                             styleMask:NSWindowStyleMaskBorderless
                                                               backing:NSBackingStoreBuffered
@@ -458,10 +477,17 @@ int macos_sharing_open(SharingWindowOut *out) {
             sharing_collection(window, out->collection, sizeof out->collection);
             out->ignores_mouse_events = window.ignoresMouseEvents ? 1 : 0;
             snprintf(out->sharing_default, sizeof out->sharing_default, "%s", sharing_name(window.sharingType));
+            out->window_area = 320 * 240;
+            out->display_image_api[0] = 0;
             if (dlsym(RTLD_DEFAULT, "CGWindowListCreateImage") != NULL) {
-                snprintf(out->display_image_api, sizeof out->display_image_api, "CGWindowListCreateImage");
-            } else {
-                snprintf(out->display_image_api, sizeof out->display_image_api, "unavailable");
+                strncat(out->display_image_api, "CGWindowListCreateImage", sizeof out->display_image_api - 1);
+            }
+            if (dlsym(RTLD_DEFAULT, "CGDisplayCreateImage") != NULL) {
+                if (out->display_image_api[0] != 0) {
+                    strncat(out->display_image_api, ",", sizeof out->display_image_api - strlen(out->display_image_api) - 1);
+                }
+                strncat(out->display_image_api, "CGDisplayCreateImage",
+                        sizeof out->display_image_api - strlen(out->display_image_api) - 1);
             }
             BOOL on_screen = window.isVisible && window.screen != nil;
             BOOL unoccluded = (window.occlusionState & NSWindowOcclusionStateVisible) != 0;
@@ -495,14 +521,111 @@ int macos_sharing_set_none(char *buf, size_t len) {
     return 0;
 }
 
+static NSWindow *make_color_window(NSRect frame, NSColor *color) {
+    NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+                                                    styleMask:NSWindowStyleMaskBorderless
+                                                      backing:NSBackingStoreBuffered
+                                                        defer:NO];
+    if (window == nil) {
+        return nil;
+    }
+    window.releasedWhenClosed = NO;
+    window.opaque = YES;
+    window.hasShadow = NO;
+    window.level = NSScreenSaverWindowLevel;
+    window.collectionBehavior =
+        NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
+    window.ignoresMouseEvents = YES;
+    window.backgroundColor = color;
+    ProbeView *view = [[ProbeView alloc] initWithFrame:NSMakeRect(0, 0, frame.size.width, frame.size.height)];
+    window.contentView = view;
+    return window;
+}
+
+int macos_sharing_control_open(void) {
+    @autoreleasepool {
+        if (g_control != nil) {
+            return 0;
+        }
+        NSScreen *screen = [NSScreen mainScreen];
+        NSRect frame_rect = screen != nil ? screen.frame : NSMakeRect(0, 0, 1024, 768);
+        NSRect frame = NSMakeRect(NSMidX(frame_rect) + 8, NSMidY(frame_rect) - 120, 320, 240);
+        NSWindow *window = make_color_window(frame, [NSColor colorWithSRGBRed:0.05 green:0.82 blue:0.08 alpha:1]);
+        if (window == nil) {
+            return 1;
+        }
+        g_control = window;
+        [window orderFrontRegardless];
+        pump(0.3);
+    }
+    return 0;
+}
+
+int macos_sharing_presence(SharingPresenceOut *out) {
+    if (out == NULL) {
+        return 1;
+    }
+    memset(out, 0, sizeof *out);
+    @autoreleasepool {
+        if (g_sharing == nil) {
+            snprintf(out->detail, sizeof out->detail, "NSWindow sharing window is nil");
+            return 0;
+        }
+        pump(0.2);
+        out->visible = g_sharing.isVisible ? 1 : 0;
+        out->occlusion = (g_sharing.occlusionState & NSWindowOcclusionStateVisible) != 0 ? 1 : 0;
+        CGWindowID wanted = (CGWindowID)g_sharing.windowNumber;
+        CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID);
+        if (list == NULL) {
+            snprintf(out->detail, sizeof out->detail, "CGWindowListCopyWindowInfo returned NULL");
+            return 0;
+        }
+        CFIndex count = CFArrayGetCount(list);
+        for (CFIndex index = 0; index < count; index++) {
+            CFDictionaryRef info = CFArrayGetValueAtIndex(list, index);
+            CFNumberRef number = CFDictionaryGetValue(info, kCGWindowNumber);
+            int value = 0;
+            if (number != NULL && CFNumberGetValue(number, kCFNumberIntType, &value) && (CGWindowID)value == wanted) {
+                out->listed = 1;
+                break;
+            }
+        }
+        CFRelease(list);
+        if (out->visible == 0 || out->occlusion == 0 || out->listed == 0) {
+            snprintf(out->detail, sizeof out->detail,
+                     "NSWindow visible=%d occlusion=%d CGWindowListCopyWindowInfo listed=%d number=%d",
+                     out->visible, out->occlusion, out->listed, (int)wanted);
+        }
+    }
+    return 0;
+}
+
+int macos_sharing_order_out(void) {
+    stage_named("sharing-order-out");
+    @autoreleasepool {
+        if (g_sharing != nil) {
+            [g_sharing orderOut:nil];
+        }
+        if (g_control != nil) {
+            [g_control orderOut:nil];
+        }
+        pump(0.3);
+    }
+    return 0;
+}
+
 int macos_sharing_close(void) {
-    fprintf(stderr, "stage=sharing-order-out\n");
-    fflush(stderr);
+    stage_named("sharing-close");
     @autoreleasepool {
         if (g_sharing != nil) {
             g_sharing.releasedWhenClosed = NO;
             [g_sharing orderOut:nil];
             g_sharing = nil;
+        }
+        if (g_control != nil) {
+            g_control.releasedWhenClosed = NO;
+            [g_control orderOut:nil];
+            g_control = nil;
         }
     }
     return 0;
@@ -596,9 +719,12 @@ int macos_prove_tap(const char *location, TapOut *out) {
     return 0;
 }
 
+static int g_pixel_control = -1;
+
 static void count_pixels(CGImageRef image, int *nonblack, int *marker) {
     *nonblack = -1;
     *marker = -1;
+    g_pixel_control = -1;
     if (image == NULL) {
         return;
     }
@@ -624,6 +750,7 @@ static void count_pixels(CGImageRef image, int *nonblack, int *marker) {
     CGContextRelease(context);
     int dark = 0;
     int pink = 0;
+    int green_window = 0;
     const uint8_t *pixels = bytes;
     size_t count = width * height;
     for (size_t index = 0; index < count; index++) {
@@ -646,10 +773,15 @@ static void count_pixels(CGImageRef image, int *nonblack, int *marker) {
         if (red >= 160 && green <= 80 && blue >= 90 && blue <= 230 && red > green + 40 && blue > green + 40) {
             pink++;
         }
+        // Control window is sRGB 0.05, 0.82, 0.08, about 13, 209, 20.
+        if (green >= 160 && red <= 80 && blue <= 80 && green > red + 40 && green > blue + 40) {
+            green_window++;
+        }
     }
     free(bytes);
     *nonblack = dark;
     *marker = pink;
+    g_pixel_control = green_window;
 }
 
 static void capture_from_image(CGImageRef image, CaptureOut *out, const char *null_detail) {
@@ -658,12 +790,14 @@ static void capture_from_image(CGImageRef image, CaptureOut *out, const char *nu
         out->prompt = macos_prompt_code();
         out->nonblack = -1;
         out->marker = -1;
+        out->control = -1;
         return;
     }
     out->opened = 1;
     out->width = (int)CGImageGetWidth(image);
     out->height = (int)CGImageGetHeight(image);
     count_pixels(image, &out->nonblack, &out->marker);
+    out->control = g_pixel_control;
     CGImageRelease(image);
 }
 
@@ -707,12 +841,16 @@ typedef struct {
     int height;
     int nonblack;
     int marker;
+    int control;
     int error_code;
     char domain[128];
     char detail[384];
 } ScResult;
 
+@class StreamSink;
 static ScResult g_sc;
+static SCStream *g_live_stream = nil;
+static StreamSink *g_stream_sink = nil;
 static _Atomic int g_sc_done = 0;
 static _Atomic int g_sc_gen = 0;
 
@@ -758,6 +896,7 @@ int macos_prove_screen_capture_kit(CaptureOut *out) {
                         g_sc.width = (int)CGImageGetWidth(image);
                         g_sc.height = (int)CGImageGetHeight(image);
                         count_pixels(image, &g_sc.nonblack, &g_sc.marker);
+                        g_sc.control = g_pixel_control;
                     } else if (shot_error != nil) {
                         NSString *domain = shot_error.domain != nil ? shot_error.domain : @"unknown";
                         snprintf(g_sc.domain, sizeof g_sc.domain, "%s",
@@ -789,6 +928,7 @@ int macos_prove_screen_capture_kit(CaptureOut *out) {
             out->height = g_sc.height;
             out->nonblack = g_sc.nonblack;
             out->marker = g_sc.marker;
+            out->control = g_sc.control;
             return 0;
         }
         if (g_sc.domain[0] != 0) {
@@ -797,6 +937,163 @@ int macos_prove_screen_capture_kit(CaptureOut *out) {
             snprintf(out->detail, sizeof out->detail, "%s", g_sc.detail);
         } else {
             snprintf(out->detail, sizeof out->detail, "returned NULL");
+        }
+        out->prompt = macos_prompt_code();
+        return 0;
+    }
+    snprintf(out->detail, sizeof out->detail, "unavailable");
+    return 0;
+}
+
+@interface StreamSink : NSObject <SCStreamOutput>
+@end
+
+@implementation StreamSink
+- (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
+    (void)stream;
+    if (type != SCStreamOutputTypeScreen || atomic_load(&g_sc_done) != 0) {
+        return;
+    }
+    CVImageBufferRef buffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (buffer == NULL) {
+        snprintf(g_sc.detail, sizeof g_sc.detail, "CMSampleBufferGetImageBuffer returned NULL");
+        atomic_store(&g_sc_done, 1);
+        return;
+    }
+    CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+    size_t width = CVPixelBufferGetWidth(buffer);
+    size_t height = CVPixelBufferGetHeight(buffer);
+    size_t stride = CVPixelBufferGetBytesPerRow(buffer);
+    uint8_t *base = CVPixelBufferGetBaseAddress(buffer);
+    OSType format = CVPixelBufferGetPixelFormatType(buffer);
+    if (base == NULL || format != kCVPixelFormatType_32BGRA || width == 0 || height == 0 || width > 8192 || height > 8192) {
+        snprintf(g_sc.detail, sizeof g_sc.detail, "SCStream pixel format %u", (unsigned)format);
+        CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+        atomic_store(&g_sc_done, 1);
+        return;
+    }
+    int dark = 0;
+    int pink = 0;
+    int green_window = 0;
+    for (size_t y = 0; y < height; y++) {
+        uint8_t *row = base + y * stride;
+        for (size_t x = 0; x < width; x++) {
+            uint8_t blue = row[x * 4];
+            uint8_t green = row[x * 4 + 1];
+            uint8_t red = row[x * 4 + 2];
+            uint8_t alpha = row[x * 4 + 3];
+            if (alpha == 0) {
+                continue;
+            }
+            if (red > 12 || green > 12 || blue > 12) {
+                dark++;
+            }
+            if (red >= 160 && green <= 80 && blue >= 90 && blue <= 230 && red > green + 40 && blue > green + 40) {
+                pink++;
+            }
+            if (green >= 160 && red <= 80 && blue <= 80 && green > red + 40 && green > blue + 40) {
+                green_window++;
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+    g_sc.opened = 1;
+    g_sc.width = (int)width;
+    g_sc.height = (int)height;
+    g_sc.nonblack = dark;
+    g_sc.marker = pink;
+    g_sc.control = green_window;
+    atomic_store(&g_sc_done, 1);
+}
+@end
+
+int macos_prove_sc_stream(CaptureOut *out) {
+    if (out == NULL) {
+        return 1;
+    }
+    memset(out, 0, sizeof *out);
+    out->control = -1;
+    if (@available(macOS 12.3, *)) {
+        memset(&g_sc, 0, sizeof g_sc);
+        g_sc.control = -1;
+        atomic_store(&g_sc_done, 0);
+        int generation = atomic_fetch_add(&g_sc_gen, 1) + 1;
+        [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *error) {
+            if (atomic_load(&g_sc_gen) != generation) {
+                return;
+            }
+            if (error != nil || content.displays.count == 0) {
+                if (error != nil) {
+                    NSString *domain = error.domain != nil ? error.domain : @"unknown";
+                    snprintf(g_sc.domain, sizeof g_sc.domain, "%s", domain.UTF8String != NULL ? domain.UTF8String : "");
+                    g_sc.error_code = (int)error.code;
+                } else {
+                    snprintf(g_sc.detail, sizeof g_sc.detail, "no displays");
+                }
+                atomic_store(&g_sc_done, 1);
+                return;
+            }
+            SCDisplay *display = content.displays.firstObject;
+            SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+            SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
+            config.width = (size_t)display.frame.size.width;
+            config.height = (size_t)display.frame.size.height;
+            config.pixelFormat = kCVPixelFormatType_32BGRA;
+            config.minimumFrameInterval = CMTimeMake(1, 2);
+            config.queueDepth = 1;
+            g_stream_sink = [[StreamSink alloc] init];
+            g_live_stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:nil];
+            NSError *add_error = nil;
+            BOOL added = [g_live_stream addStreamOutput:g_stream_sink type:SCStreamOutputTypeScreen sampleHandlerQueue:dispatch_get_main_queue() error:&add_error];
+            if (!added || add_error != nil) {
+                NSString *domain = add_error.domain != nil ? add_error.domain : @"SCStream";
+                snprintf(g_sc.domain, sizeof g_sc.domain, "%s", domain.UTF8String != NULL ? domain.UTF8String : "");
+                g_sc.error_code = add_error != nil ? (int)add_error.code : -1;
+                snprintf(g_sc.detail, sizeof g_sc.detail, "addStreamOutput");
+                atomic_store(&g_sc_done, 1);
+                return;
+            }
+            [g_live_stream startCaptureWithCompletionHandler:^(NSError *start_error) {
+                if (start_error != nil && atomic_load(&g_sc_done) == 0) {
+                    NSString *domain = start_error.domain != nil ? start_error.domain : @"SCStream";
+                    snprintf(g_sc.domain, sizeof g_sc.domain, "%s", domain.UTF8String != NULL ? domain.UTF8String : "");
+                    g_sc.error_code = (int)start_error.code;
+                    snprintf(g_sc.detail, sizeof g_sc.detail, "startCapture");
+                    atomic_store(&g_sc_done, 1);
+                }
+            }];
+        }];
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:12];
+        while (atomic_load(&g_sc_done) == 0 && [until timeIntervalSinceNow] > 0) {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+        }
+        if (g_live_stream != nil) {
+            [g_live_stream stopCaptureWithCompletionHandler:^(NSError *stop_error) {
+                (void)stop_error;
+            }];
+            g_live_stream = nil;
+            g_stream_sink = nil;
+        }
+        if (atomic_load(&g_sc_done) == 0) {
+            snprintf(out->detail, sizeof out->detail, "SCStream timed out");
+            out->prompt = macos_prompt_code();
+            return 0;
+        }
+        if (g_sc.opened) {
+            out->opened = 1;
+            out->width = g_sc.width;
+            out->height = g_sc.height;
+            out->nonblack = g_sc.nonblack;
+            out->marker = g_sc.marker;
+            out->control = g_sc.control;
+            return 0;
+        }
+        if (g_sc.domain[0] != 0) {
+            snprintf(out->detail, sizeof out->detail, "NSError %s %d %s", g_sc.domain, g_sc.error_code, g_sc.detail);
+        } else if (g_sc.detail[0] != 0) {
+            snprintf(out->detail, sizeof out->detail, "%s", g_sc.detail);
+        } else {
+            snprintf(out->detail, sizeof out->detail, "SCStream returned NULL");
         }
         out->prompt = macos_prompt_code();
         return 0;
@@ -987,12 +1284,13 @@ int macos_prove_active_tap(ActiveOut *out) {
     return 0;
 }
 
-int macos_inspect_png(const char *path, int *nonblack, int *marker) {
-    if (path == NULL || nonblack == NULL || marker == NULL) {
+int macos_inspect_png(const char *path, int *nonblack, int *marker, int *control) {
+    if (path == NULL || nonblack == NULL || marker == NULL || control == NULL) {
         return 1;
     }
     *nonblack = -1;
     *marker = -1;
+    *control = -1;
     @autoreleasepool {
         NSString *file = [NSString stringWithUTF8String:path];
         NSData *data = file != nil ? [NSData dataWithContentsOfFile:file] : nil;
@@ -1001,8 +1299,9 @@ int macos_inspect_png(const char *path, int *nonblack, int *marker) {
             return 1;
         }
         count_pixels(rep.CGImage, nonblack, marker);
+        *control = g_pixel_control;
     }
-    return (*nonblack < 0 || *marker < 0) ? 1 : 0;
+    return (*nonblack < 0 || *marker < 0 || *control < 0) ? 1 : 0;
 }
 
 static const int kSlowKey = 1;
