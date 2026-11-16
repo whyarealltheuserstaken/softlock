@@ -17,6 +17,7 @@ pub enum Mode {
     ClassifyTarget,
     ClassifyPost,
     Smoke,
+    SharingOnly,
 }
 
 impl Mode {
@@ -57,6 +58,7 @@ where
     let mut classify_target = false;
     let mut post_source = None;
     let mut smoke = false;
+    let mut sharing_only = false;
     let mut tokens = tokens.into_iter();
     while let Some(token) = tokens.next() {
         match token.as_str() {
@@ -96,6 +98,7 @@ where
                 }
                 post_source = Some(source);
             }
+            "--sharing-only" => sharing_only = true,
             "--capture-only" => {
                 let api = tokens.next().ok_or("--capture-only needs a value")?;
                 if !CAPTURE_APIS.contains(&api.as_str()) {
@@ -116,12 +119,15 @@ where
         classify_target,
         post_source.is_some(),
         smoke,
+        sharing_only,
     ]
     .into_iter()
     .filter(|selected| *selected)
     .count();
     if selected > 1 {
-        return Err("job, tap, window, capture, and classify are different processes".to_string());
+        return Err(
+            "job, tap, window, capture, classify, and sharing are different processes".to_string(),
+        );
     }
     let mode = if job_kind.is_some() {
         Mode::Job
@@ -141,6 +147,8 @@ where
         Mode::ClassifyPost
     } else if smoke {
         Mode::Smoke
+    } else if sharing_only {
+        Mode::SharingOnly
     } else {
         Mode::Orchestrator
     };
@@ -225,6 +233,10 @@ mod tests {
         assert_eq!(smoke.mode, Mode::Smoke);
         assert!(!smoke.mode.installs_daemon());
         assert!(parse(tokens(&["--smoke", "--window-only"])).is_err());
+        let sharing = parse(tokens(&["--sharing-only"])).unwrap();
+        assert_eq!(sharing.mode, Mode::SharingOnly);
+        assert!(!sharing.mode.installs_daemon());
+        assert!(parse(tokens(&["--sharing-only", "--window-only"])).is_err());
         assert!(parse(tokens(&["--capture-only", "camera"])).is_err());
         assert!(parse(tokens(&["--window-only", "--tap-only", "kCGHIDEventTap"])).is_err());
         let m03 = parse(tokens(&["--m03"])).unwrap();

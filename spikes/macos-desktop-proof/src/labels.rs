@@ -12,6 +12,12 @@ pub const CAPTURE_APIS: [&str; 4] = [
     "ScreenCaptureKit",
 ];
 
+/// Sharing types m04 measures. `default` is the value AppKit leaves unset.
+pub const SHARING_TYPES: [&str; 2] = ["default", "none"];
+
+/// What `macos_prove_screen_capture_kit` calls: one whole-display image and an empty exclude list.
+pub const SCREEN_CAPTURE_ENTRY: &str = "SCScreenshotManager excludingWindows empty";
+
 pub const REQUIRED_TAPS: [(&str, &str); 3] = [
     ("kCGSessionEventTap", "user"),
     ("kCGHIDEventTap", "user"),

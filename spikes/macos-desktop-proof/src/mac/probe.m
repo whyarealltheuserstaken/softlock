@@ -74,6 +74,7 @@ typedef struct {
 static const int kProbeKey = 0;
 @class ProbeWindow;
 static ProbeWindow *g_window = nil;
+static NSWindow *g_sharing = nil;
 
 static void stage_line(WindowOut *out, const char *name) {
     if (out != NULL) {
@@ -370,6 +371,138 @@ int macos_window_open(WindowOut *out) {
         } @catch (NSException *exception) {
             const char *name = exception.name.UTF8String != NULL ? exception.name.UTF8String : "NSException";
             snprintf(out->error, sizeof out->error, "NSApplication exception %s", name);
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    int ordered_front;
+    int ignores_mouse_events;
+    int shielding_called;
+    char level[64];
+    char collection[128];
+    char sharing_default[64];
+    char display_image_api[64];
+    char error[768];
+} SharingWindowOut;
+
+static const char *sharing_name(NSWindowSharingType type) {
+    switch (type) {
+    case NSWindowSharingNone:
+        return "NSWindowSharingNone";
+    case NSWindowSharingReadOnly:
+        return "NSWindowSharingReadOnly";
+    case NSWindowSharingReadWrite:
+        return "NSWindowSharingReadWrite";
+    default:
+        return "other";
+    }
+}
+
+static void sharing_collection(NSWindow *window, char *buf, size_t len) {
+    NSWindowCollectionBehavior bits = window.collectionBehavior;
+    buf[0] = 0;
+    if ((bits & NSWindowCollectionBehaviorCanJoinAllSpaces) != 0) {
+        strncat(buf, "canJoinAllSpaces", len - strlen(buf) - 1);
+    }
+    if ((bits & NSWindowCollectionBehaviorFullScreenAuxiliary) != 0) {
+        if (buf[0] != 0) {
+            strncat(buf, ",", len - strlen(buf) - 1);
+        }
+        strncat(buf, "fullScreenAuxiliary", len - strlen(buf) - 1);
+    }
+}
+
+// Borderless marker window at NSScreenSaverWindowLevel. sharingType is left at
+// AppKit's default. This function does not call CGShieldingWindowLevel().
+int macos_sharing_open(SharingWindowOut *out) {
+    if (out == NULL) {
+        return 1;
+    }
+    memset(out, 0, sizeof *out);
+    out->shielding_called = 0;
+    @autoreleasepool {
+        @try {
+            activate_app();
+            NSScreen *screen = [NSScreen mainScreen];
+            NSRect frame_rect = screen != nil ? screen.frame : NSMakeRect(0, 0, 800, 600);
+            NSRect frame = NSMakeRect(NSMidX(frame_rect) - 160, NSMidY(frame_rect) - 120, 320, 240);
+            NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+                                                            styleMask:NSWindowStyleMaskBorderless
+                                                              backing:NSBackingStoreBuffered
+                                                                defer:NO];
+            if (window == nil) {
+                snprintf(out->error, sizeof out->error, "NSWindow initWithContentRect returned nil");
+                return 0;
+            }
+            window.releasedWhenClosed = NO;
+            window.opaque = YES;
+            window.hasShadow = NO;
+            window.level = NSScreenSaverWindowLevel;
+            window.collectionBehavior =
+                NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
+            window.ignoresMouseEvents = YES;
+            window.backgroundColor = [NSColor colorWithSRGBRed:0.86 green:0.04 blue:0.63 alpha:1];
+            ProbeView *view = [[ProbeView alloc] initWithFrame:NSMakeRect(0, 0, 320, 240)];
+            view.wantsLayer = NO;
+            window.contentView = view;
+            g_sharing = window;
+            [window orderFrontRegardless];
+            pump(0.4);
+            if (window.level == NSScreenSaverWindowLevel) {
+                snprintf(out->level, sizeof out->level, "screenSaver");
+            } else {
+                snprintf(out->level, sizeof out->level, "level-%d", (int)window.level);
+            }
+            sharing_collection(window, out->collection, sizeof out->collection);
+            out->ignores_mouse_events = window.ignoresMouseEvents ? 1 : 0;
+            snprintf(out->sharing_default, sizeof out->sharing_default, "%s", sharing_name(window.sharingType));
+            if (dlsym(RTLD_DEFAULT, "CGWindowListCreateImage") != NULL) {
+                snprintf(out->display_image_api, sizeof out->display_image_api, "CGWindowListCreateImage");
+            } else {
+                snprintf(out->display_image_api, sizeof out->display_image_api, "unavailable");
+            }
+            BOOL on_screen = window.isVisible && window.screen != nil;
+            BOOL unoccluded = (window.occlusionState & NSWindowOcclusionStateVisible) != 0;
+            out->ordered_front = (on_screen && unoccluded) ? 1 : 0;
+            if (out->ordered_front == 0) {
+                snprintf(out->error, sizeof out->error,
+                         "NSWindow orderFrontRegardless did not leave the screenSaver window visible");
+            }
+        } @catch (NSException *exception) {
+            const char *name = exception.name.UTF8String != NULL ? exception.name.UTF8String : "NSException";
+            snprintf(out->error, sizeof out->error, "NSWindow exception %s", name);
+        }
+    }
+    return 0;
+}
+
+int macos_sharing_set_none(char *buf, size_t len) {
+    if (buf == NULL || len == 0) {
+        return 1;
+    }
+    buf[0] = 0;
+    @autoreleasepool {
+        if (g_sharing == nil) {
+            snprintf(buf, len, "missing");
+            return 0;
+        }
+        g_sharing.sharingType = NSWindowSharingNone;
+        pump(0.4);
+        snprintf(buf, len, "%s", sharing_name(g_sharing.sharingType));
+    }
+    return 0;
+}
+
+int macos_sharing_close(void) {
+    fprintf(stderr, "stage=sharing-order-out\n");
+    fflush(stderr);
+    @autoreleasepool {
+        if (g_sharing != nil) {
+            g_sharing.releasedWhenClosed = NO;
+            [g_sharing orderOut:nil];
+            g_sharing = nil;
         }
     }
     return 0;

@@ -4,10 +4,11 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
 use crate::classify::{disable_event_name, fail_closed_end};
+use crate::labels::SCREEN_CAPTURE_ENTRY;
 use crate::report::{
-    CaptureReport, ClassifyReport, MarkerObservation, PostedObservation, SlowObservation, TapBits,
-    TapReport, WindowReport, active_tap, capture_detail, capture_opened, capture_unavailable,
-    prompt_token, tap_from_bits,
+    CaptureReport, ClassifyReport, MarkerObservation, PostedObservation, SharingWindowReport,
+    SlowObservation, TapBits, TapReport, WindowReport, active_tap, capture_detail, capture_opened,
+    capture_unavailable, prompt_token, tap_from_bits,
 };
 
 #[repr(C)]
@@ -97,8 +98,23 @@ struct M03Out {
     error: [u8; 512],
 }
 
+#[repr(C)]
+struct SharingWindowOut {
+    ordered_front: i32,
+    ignores_mouse_events: i32,
+    shielding_called: i32,
+    level: [u8; 64],
+    collection: [u8; 128],
+    sharing_default: [u8; 64],
+    display_image_api: [u8; 64],
+    error: [u8; 768],
+}
+
 unsafe extern "C" {
     fn macos_window_open(out: *mut WindowOut) -> i32;
+    fn macos_sharing_open(out: *mut SharingWindowOut) -> i32;
+    fn macos_sharing_set_none(buf: *mut c_char, len: usize) -> i32;
+    fn macos_sharing_close() -> i32;
     fn macos_window_close() -> i32;
     fn macos_prove_window(out: *mut WindowOut) -> i32;
     fn macos_prove_tap(location: *const c_char, out: *mut TapOut) -> i32;
@@ -133,6 +149,52 @@ pub fn window_open() -> WindowReport {
 
 pub fn window_close() {
     unsafe { macos_window_close() };
+}
+
+pub fn sharing_open() -> SharingWindowReport {
+    let mut out = SharingWindowOut {
+        ordered_front: 0,
+        ignores_mouse_events: 0,
+        shielding_called: 0,
+        level: [0; 64],
+        collection: [0; 128],
+        sharing_default: [0; 64],
+        display_image_api: [0; 64],
+        error: [0; 768],
+    };
+    let rc = unsafe { macos_sharing_open(&mut out) };
+    let error = text(&out.error);
+    SharingWindowReport {
+        ordered_front: out.ordered_front != 0,
+        level: text(&out.level),
+        collection: text(&out.collection),
+        ignores_mouse_events: out.ignores_mouse_events != 0,
+        shielding_called: out.shielding_called != 0,
+        sharing_default: text(&out.sharing_default),
+        sharing_none: String::new(),
+        display_image_api: text(&out.display_image_api),
+        screen_capture_entry: SCREEN_CAPTURE_ENTRY.to_string(),
+        error: if rc != 0 {
+            Some("NSWindow sharing probe was not called".to_string())
+        } else if error.is_empty() {
+            None
+        } else {
+            Some(error)
+        },
+    }
+}
+
+pub fn sharing_set_none() -> String {
+    let mut buf = [0u8; 64];
+    let rc = unsafe { macos_sharing_set_none(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    text(&buf)
+}
+
+pub fn sharing_close() {
+    unsafe { macos_sharing_close() };
 }
 
 fn window_from_out(rc: i32, out: &WindowOut) -> WindowReport {

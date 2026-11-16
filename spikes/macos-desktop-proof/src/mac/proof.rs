@@ -12,13 +12,14 @@ use serde::Serialize;
 
 use crate::args::{Args, Mode};
 use crate::guard::service_install_allowed;
-use crate::labels::CAPTURE_APIS;
+use crate::labels::{CAPTURE_APIS, SCREEN_CAPTURE_ENTRY};
 use crate::mac::{ffi, launchd};
 use crate::png::png_size;
 use crate::report::{
-    CaptureReport, ClassifyReport, JobMarker, ProofReport, TapReport, VersionReport, WindowPlan,
-    WindowReport, capture_unavailable, failure_reasons, job_window_plan, render, tap_process_miss,
-    tap_sudo_failed, window_process_miss,
+    CaptureReport, ClassifyReport, JobMarker, ProofReport, SharingReport, SharingWindowReport,
+    TapReport, VersionReport, WindowPlan, WindowReport, capture_unavailable, failure_reasons,
+    job_window_plan, render, sharing_sample, tap_process_miss, tap_sudo_failed,
+    window_process_miss,
 };
 use crate::text::one_line;
 use crate::version::parse_sw_vers;
@@ -46,6 +47,7 @@ pub fn dispatch(args: Args) -> i32 {
             ffi::classify_post(source, &args.output_dir)
         }
         Mode::Smoke => crate::smoke::run(&args),
+        Mode::SharingOnly => run_sharing(&args),
         Mode::Orchestrator => run_orchestrator(&args),
     }
 }
@@ -84,11 +86,14 @@ fn run_orchestrator(args: &Args) -> i32 {
     let (active, active_crash) = child_active(&exe, &args.output_dir);
     eprintln!("macos desktop proof: posted events, tap disable, marker");
     let (classify, classify_crash) = child_m03(&exe, &args.output_dir);
+    eprintln!("macos desktop proof: sharingType");
+    let (sharing, sharing_crash) = child_sharing(&exe, &args.output_dir);
     eprintln!("macos desktop proof: launchd");
     let jobs = launchd::exercise(&exe, &args.output_dir);
     let mut crashes = Vec::new();
     for crash in [
         desktop.crash,
+        sharing_crash,
         session_crash,
         hid_crash,
         root_crash,
@@ -108,6 +113,7 @@ fn run_orchestrator(args: &Args) -> i32 {
         captures: desktop.captures,
         jobs,
         classify: Some(classify),
+        sharing: Some(sharing),
         probe_crash: if crashes.is_empty() {
             None
         } else {
@@ -197,6 +203,75 @@ fn capture_api(api: &str, output_dir: &Path) -> CaptureReport {
         "ScreenCaptureKit" => ffi::prove_screen_capture_kit(),
         other => capture_unavailable(other, "unknown capture api"),
     }
+}
+
+fn run_sharing(args: &Args) -> i32 {
+    eprintln!("stage=sharing-window");
+    let mut window = ffi::sharing_open();
+    let mut samples = capture_sharing("default", &args.output_dir);
+    eprintln!("stage=sharing-none");
+    window.sharing_none = ffi::sharing_set_none();
+    samples.extend(capture_sharing("none", &args.output_dir));
+    ffi::sharing_close();
+    let report = SharingReport { window, samples };
+    let path = args.output_dir.join("sharing.json");
+    if let Err(error) = write_json(&path, &report) {
+        eprintln!("{error}");
+        return 1;
+    }
+    0
+}
+
+fn capture_sharing(sharing: &str, output_dir: &Path) -> Vec<crate::report::SharingSample> {
+    let mut samples = Vec::new();
+    for api in CAPTURE_APIS {
+        eprintln!("stage=sharing-{sharing}-{api}");
+        let report = capture_api(api, output_dir);
+        samples.push(sharing_sample(sharing, &report));
+    }
+    samples
+}
+
+fn child_sharing(exe: &Path, output_dir: &Path) -> (SharingReport, Option<String>) {
+    let path = output_dir.join("sharing.json");
+    let _ = fs::remove_file(&path);
+    let dir = path_arg(output_dir);
+    let outcome = run_limited(exe, &["--sharing-only", "--output-dir", &dir], 90);
+    show_stderr(&outcome.stderr);
+    if let Some(report) = read_json::<SharingReport>(&path) {
+        let crash = if outcome.success {
+            None
+        } else {
+            Some(format!(
+                "sharing probe process exited {}: {}",
+                outcome.code,
+                one_line(&outcome.stderr)
+            ))
+        };
+        return (report, crash);
+    }
+    (
+        SharingReport {
+            window: SharingWindowReport {
+                ordered_front: false,
+                level: String::new(),
+                collection: String::new(),
+                ignores_mouse_events: false,
+                shielding_called: false,
+                sharing_default: String::new(),
+                sharing_none: String::new(),
+                display_image_api: String::new(),
+                screen_capture_entry: SCREEN_CAPTURE_ENTRY.to_string(),
+                error: Some(format!(
+                    "NSWindow sharing probe process exited {}: {}",
+                    outcome.code,
+                    one_line(&outcome.stderr)
+                )),
+            },
+            samples: Vec::new(),
+        },
+        Some(format!("sharing probe process exited {}", outcome.code)),
+    )
 }
 
 fn run_capture(args: &Args) -> i32 {
