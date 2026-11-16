@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::classify::{
+    self, POST_SOURCES, dead_callback_reported_in_time, draft_name, expected_state_id,
+    fail_closed_end, failure_ends_unlocked, healthy_callback_within_one_heartbeat, state_name,
+};
 use crate::labels::{AGENT_LABEL, CAPTURE_APIS, DAEMON_LABEL, REQUIRED_TAPS};
 use crate::launchctl::PrintState;
 use crate::text::one_line;
@@ -95,6 +99,48 @@ pub struct JobReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PostedObservation {
+    pub source: String,
+    pub poster: String,
+    pub poster_pid: i64,
+    pub state_id: i64,
+    pub source_pid: i64,
+    pub fields_read: bool,
+    pub tap_saw: bool,
+    pub window_received: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SlowObservation {
+    pub disable_event: String,
+    pub sleep_ms: i64,
+    pub disable_wait_ms: i64,
+    pub key_reached_during: bool,
+    pub key_reached_after: bool,
+    pub reenabled: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MarkerObservation {
+    pub dead_ms: i64,
+    pub dead_misses: u32,
+    pub healthy_ms: i64,
+    pub reenabled: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClassifyReport {
+    pub posts: Vec<PostedObservation>,
+    pub slow: SlowObservation,
+    pub marker: MarkerObservation,
+    /// Always `Locked` when a measurement is a guard failure. Never `Unlocked`.
+    pub end_state: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProofReport {
     pub runner_image: String,
     pub version: VersionReport,
@@ -102,6 +148,7 @@ pub struct ProofReport {
     pub taps: Vec<TapReport>,
     pub captures: Vec<CaptureReport>,
     pub jobs: Vec<JobReport>,
+    pub classify: Option<ClassifyReport>,
     /// Set when our own probe process crashes or times out. A capability miss stays None.
     pub probe_crash: Option<String>,
 }
@@ -407,6 +454,10 @@ pub fn failure_reasons(report: &ProofReport) -> Vec<String> {
     if let Some(crash) = report.probe_crash.as_deref() {
         reasons.push(format!("probe crashed: {crash}"));
     }
+    match report.classify.as_ref() {
+        None => reasons.push("m03 classify proof is missing".to_string()),
+        Some(classify) => reasons.extend(classify_failures(classify)),
+    }
     reasons
 }
 
@@ -451,6 +502,7 @@ pub fn render(report: &ProofReport) -> String {
     if let Some(crash) = report.probe_crash.as_deref() {
         lines.push(format!("probe-crash={crash}"));
     }
+    lines.extend(classify_lines(report));
     let reasons = failure_reasons(report);
     if reasons.is_empty() {
         lines.push("result=pass".to_string());
@@ -461,6 +513,129 @@ pub fn render(report: &ProofReport) -> String {
         }
     }
     lines.join("\n")
+}
+
+fn classify_failures(classify: &ClassifyReport) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if failure_ends_unlocked(&classify.end_state) || classify.end_state != fail_closed_end() {
+        reasons.push(format!(
+            "m03 failure ended {}; fail-closed ends Locked",
+            display_text(&classify.end_state)
+        ));
+    }
+    for source in POST_SOURCES {
+        match classify
+            .posts
+            .iter()
+            .find(|post| post.source == source && post.poster == "second-process")
+        {
+            None => reasons.push(format!(
+                "m03 post {source} from a second process is missing"
+            )),
+            Some(post) => {
+                if probe_crashed(post.error.as_deref()) {
+                    reasons.push(format!("m03 post {source} crashed in the probe"));
+                } else if !post.fields_read {
+                    reasons.push(format!(
+                        "m03 post {source} did not record a state id and source pid"
+                    ));
+                }
+            }
+        }
+    }
+    if classify.slow.reenabled || classify.marker.reenabled {
+        reasons.push("m03 re-enabled the tap and that is not success".to_string());
+    }
+    if probe_crashed(classify.slow.error.as_deref()) {
+        reasons.push("m03 slow callback crashed in the probe".to_string());
+    } else if classify.slow.sleep_ms <= 0 {
+        let error = classify.slow.error.as_deref().unwrap_or("");
+        if !error.contains("CGEventTapCreate") {
+            reasons.push("m03 slow callback did not run".to_string());
+        }
+    }
+    let known = matches!(
+        classify.slow.disable_event.as_str(),
+        "kCGEventTapDisabledByTimeout" | "kCGEventTapDisabledByUserInput" | "none"
+    );
+    if !known {
+        reasons.push(format!(
+            "m03 disable event {} is not a timeout, user input, or none",
+            classify.slow.disable_event
+        ));
+    }
+    if probe_crashed(classify.marker.error.as_deref()) {
+        reasons.push("m03 marker check crashed in the probe".to_string());
+    } else if !marker_bounds_met(&classify.marker) {
+        let error = classify.marker.error.as_deref().unwrap_or("");
+        if !error.contains("CGEventTapCreate") {
+            reasons.push(format!(
+                "m03 marker dead-ms={} healthy-ms={} is outside the heartbeat bound",
+                classify.marker.dead_ms, classify.marker.healthy_ms
+            ));
+        }
+    }
+    reasons
+}
+
+fn marker_bounds_met(marker: &MarkerObservation) -> bool {
+    marker.dead_ms >= 0
+        && marker.healthy_ms >= 0
+        && dead_callback_reported_in_time(marker.dead_misses, marker.dead_ms as u64)
+        && healthy_callback_within_one_heartbeat(marker.healthy_ms as u64)
+}
+
+fn classify_lines(report: &ProofReport) -> Vec<String> {
+    let Some(classify) = report.classify.as_ref() else {
+        return vec!["m03=missing".to_string()];
+    };
+    let mut lines = Vec::new();
+    for post in &classify.posts {
+        let class = classify::classify(post.state_id, post.source_pid);
+        let matches = expected_state_id(&post.source) == Some(post.state_id);
+        lines.push(format!(
+            "post source={} poster={} poster-pid={} state-id={} state-name={} state-matches={} source-pid={} tap-saw={} window-received={} draft={} error={}",
+            post.source,
+            post.poster,
+            post.poster_pid,
+            post.state_id,
+            state_name(post.state_id),
+            matches,
+            post.source_pid,
+            post.tap_saw,
+            post.window_received,
+            draft_name(class),
+            post.error.as_deref().unwrap_or("none"),
+        ));
+    }
+    lines.push(format!(
+        "slow disable-event={} sleep-ms={} disable-wait-ms={} key-reached-during={} key-reached-after={} reenabled={} error={}",
+        classify.slow.disable_event,
+        classify.slow.sleep_ms,
+        classify.slow.disable_wait_ms,
+        classify.slow.key_reached_during,
+        classify.slow.key_reached_after,
+        classify.slow.reenabled,
+        classify.slow.error.as_deref().unwrap_or("none"),
+    ));
+    let dead = classify.marker.dead_ms >= 0
+        && dead_callback_reported_in_time(
+            classify.marker.dead_misses,
+            classify.marker.dead_ms as u64,
+        );
+    let healthy = healthy_callback_within_one_heartbeat(classify.marker.healthy_ms.max(0) as u64);
+    lines.push(format!(
+        "marker dead-ms={} dead-misses={} healthy-ms={} dead-within-1s={} healthy-within-heartbeat={} reenabled={} error={}",
+        classify.marker.dead_ms,
+        classify.marker.dead_misses,
+        classify.marker.healthy_ms,
+        dead,
+        healthy,
+        classify.marker.reenabled,
+        classify.marker.error.as_deref().unwrap_or("none"),
+    ));
+    lines.push(format!("fail-closed={}", classify.end_state));
+    lines
 }
 
 fn version_failures(version: &VersionReport) -> Vec<String> {
@@ -853,7 +1028,50 @@ fn passing_fixture() -> ProofReport {
             .map(|api| capture_opened(api, 1024, 768, 100, 40))
             .collect(),
         jobs: vec![agent_observation(true), daemon_observation()],
+        classify: Some(passing_classify()),
         probe_crash: None,
+    }
+}
+
+#[cfg(test)]
+fn passing_classify() -> ClassifyReport {
+    let posts = [
+        ("kCGEventSourceStatePrivate", -1),
+        ("kCGEventSourceStateCombinedSessionState", 0),
+        ("kCGEventSourceStateHIDSystemState", 1),
+    ]
+    .into_iter()
+    .map(|(source, state_id)| PostedObservation {
+        source: source.to_string(),
+        poster: "second-process".to_string(),
+        poster_pid: 4242,
+        state_id,
+        source_pid: 4242,
+        fields_read: true,
+        tap_saw: true,
+        window_received: true,
+        error: None,
+    })
+    .collect();
+    ClassifyReport {
+        posts,
+        slow: SlowObservation {
+            disable_event: "none".to_string(),
+            sleep_ms: 2000,
+            disable_wait_ms: 2000,
+            key_reached_during: false,
+            key_reached_after: true,
+            reenabled: false,
+            error: None,
+        },
+        marker: MarkerObservation {
+            dead_ms: 750,
+            dead_misses: 3,
+            healthy_ms: 20,
+            reenabled: false,
+            error: None,
+        },
+        end_state: fail_closed_end().to_string(),
     }
 }
 
@@ -934,11 +1152,44 @@ mod tests {
         assert!(
             text.contains("job-daemon-window-error=no graphic session; NSWindow was not created")
         );
+        assert!(text.contains("state-id=-1"));
+        assert!(text.contains("source-pid=4242"));
+        assert!(text.contains("window-received=true"));
+        assert!(text.contains("disable-event=none"));
+        assert!(text.contains("dead-within-1s=true"));
+        assert!(text.contains("healthy-within-heartbeat=true"));
+        assert!(text.contains("fail-closed=Locked"));
         assert!(text.contains("result=pass"));
         assert!(!text.contains("Serial"));
         let back: ProofReport =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).expect("json");
         assert_eq!(report, back);
+    }
+
+    #[test]
+    fn a_reenabled_tap_or_an_unlocked_end_fails_closed() {
+        let mut unlocked = passing_fixture();
+        unlocked.classify.as_mut().unwrap().end_state = "Unlocked".to_string();
+        assert!(
+            failure_reasons(&unlocked)
+                .iter()
+                .any(|reason| reason.contains("Locked"))
+        );
+        let mut reenabled = passing_fixture();
+        reenabled.classify.as_mut().unwrap().slow.reenabled = true;
+        assert!(
+            failure_reasons(&reenabled)
+                .iter()
+                .any(|reason| reason.contains("re-enabled"))
+        );
+        let mut early = passing_fixture();
+        early.classify.as_mut().unwrap().marker.dead_misses = 1;
+        early.classify.as_mut().unwrap().marker.dead_ms = 100;
+        assert!(
+            failure_reasons(&early)
+                .iter()
+                .any(|reason| reason.contains("heartbeat"))
+        );
     }
 
     #[test]

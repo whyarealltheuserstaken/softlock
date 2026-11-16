@@ -3,9 +3,11 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
+use crate::classify::fail_closed_end;
 use crate::report::{
-    CaptureReport, TapBits, TapReport, WindowReport, active_tap, capture_detail, capture_opened,
-    capture_unavailable, prompt_token, tap_from_bits,
+    CaptureReport, ClassifyReport, MarkerObservation, PostedObservation, SlowObservation, TapBits,
+    TapReport, WindowReport, active_tap, capture_detail, capture_opened, capture_unavailable,
+    prompt_token, tap_from_bits,
 };
 
 #[repr(C)]
@@ -60,6 +62,38 @@ struct SessionOut {
     error: [u8; 256],
 }
 
+#[repr(C)]
+struct PostRow {
+    state_id: i64,
+    source_pid: i64,
+    poster_pid: i64,
+    window_received: i32,
+    tap_saw: i32,
+    same_process: i32,
+    fields_read: i32,
+    source: [u8; 64],
+    error: [u8; 256],
+}
+
+#[repr(C)]
+struct M03Out {
+    posts: [PostRow; 6],
+    post_count: i32,
+    pad: i32,
+    sleep_ms: i64,
+    disable_wait_ms: i64,
+    dead_ms: i64,
+    healthy_ms: i64,
+    key_reached_during: i32,
+    key_reached_after: i32,
+    dead_misses: i32,
+    reenabled: i32,
+    disable_event: [u8; 64],
+    slow_error: [u8; 256],
+    marker_error: [u8; 256],
+    error: [u8; 512],
+}
+
 unsafe extern "C" {
     fn macos_window_open(out: *mut WindowOut) -> i32;
     fn macos_window_close() -> i32;
@@ -72,6 +106,9 @@ unsafe extern "C" {
     fn macos_inspect_png(path: *const c_char, nonblack: *mut i32, marker: *mut i32) -> i32;
     fn macos_prompt_code() -> i32;
     fn macos_session_info(out: *mut SessionOut) -> i32;
+    fn macos_classify_post(source: *const c_char, dir: *const c_char) -> i32;
+    fn macos_classify_target(dir: *const c_char) -> i32;
+    fn macos_prove_m03(exe: *const c_char, dir: *const c_char, out: *mut M03Out) -> i32;
 }
 
 pub struct SessionInfo {
@@ -336,6 +373,116 @@ fn zero_capture() -> CaptureOut {
         marker: -1,
         prompt: 0,
         detail: [0; 768],
+    }
+}
+
+pub fn classify_post(source: &str, dir: &std::path::Path) -> i32 {
+    let source = CString::new(source).unwrap_or_else(|_| CString::new("").unwrap());
+    let dir = CString::new(dir.to_string_lossy().as_bytes())
+        .unwrap_or_else(|_| CString::new("").unwrap());
+    unsafe { macos_classify_post(source.as_ptr(), dir.as_ptr()) }
+}
+
+pub fn classify_target(dir: &std::path::Path) -> i32 {
+    let dir = CString::new(dir.to_string_lossy().as_bytes())
+        .unwrap_or_else(|_| CString::new("").unwrap());
+    unsafe { macos_classify_target(dir.as_ptr()) }
+}
+
+pub fn prove_m03(exe: &std::path::Path, dir: &std::path::Path) -> ClassifyReport {
+    let exe = CString::new(exe.to_string_lossy().as_bytes())
+        .unwrap_or_else(|_| CString::new("").unwrap());
+    let dir = CString::new(dir.to_string_lossy().as_bytes())
+        .unwrap_or_else(|_| CString::new("").unwrap());
+    let mut out = zero_m03();
+    let _rc = unsafe { macos_prove_m03(exe.as_ptr(), dir.as_ptr(), &mut out) };
+    let mut posts = Vec::new();
+    let count = out.post_count.clamp(0, 6) as usize;
+    for row in out.posts.iter().take(count) {
+        let error = optional_text(&row.error);
+        posts.push(PostedObservation {
+            source: text(&row.source),
+            poster: if row.same_process == 0 {
+                "second-process".to_string()
+            } else {
+                "same-process".to_string()
+            },
+            poster_pid: row.poster_pid,
+            state_id: row.state_id,
+            source_pid: row.source_pid,
+            fields_read: row.fields_read != 0,
+            tap_saw: row.tap_saw != 0,
+            window_received: row.window_received != 0,
+            error,
+        });
+    }
+    let mut slow_error = optional_text(&out.slow_error);
+    let top = optional_text(&out.error);
+    if slow_error.is_none() && out.sleep_ms == 0 {
+        slow_error = top.clone();
+    }
+    ClassifyReport {
+        posts,
+        slow: SlowObservation {
+            disable_event: {
+                let name = text(&out.disable_event);
+                if name.is_empty() {
+                    "none".to_string()
+                } else {
+                    name
+                }
+            },
+            sleep_ms: out.sleep_ms,
+            disable_wait_ms: out.disable_wait_ms,
+            key_reached_during: out.key_reached_during != 0,
+            key_reached_after: out.key_reached_after != 0,
+            reenabled: out.reenabled != 0,
+            error: slow_error,
+        },
+        marker: MarkerObservation {
+            dead_ms: out.dead_ms,
+            dead_misses: out.dead_misses.max(0) as u32,
+            healthy_ms: out.healthy_ms,
+            reenabled: out.reenabled != 0,
+            error: optional_text(&out.marker_error)
+                .or_else(|| if out.dead_ms == 0 { top } else { None }),
+        },
+        end_state: fail_closed_end().to_string(),
+    }
+}
+
+fn optional_text(buf: &[u8]) -> Option<String> {
+    let text = text(buf);
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn zero_m03() -> M03Out {
+    M03Out {
+        posts: std::array::from_fn(|_| PostRow {
+            state_id: 0,
+            source_pid: 0,
+            poster_pid: 0,
+            window_received: 0,
+            tap_saw: 0,
+            same_process: 0,
+            fields_read: 0,
+            source: [0; 64],
+            error: [0; 256],
+        }),
+        post_count: 0,
+        pad: 0,
+        sleep_ms: 0,
+        disable_wait_ms: 0,
+        dead_ms: 0,
+        healthy_ms: 0,
+        key_reached_during: 0,
+        key_reached_after: 0,
+        dead_misses: 0,
+        reenabled: 0,
+        disable_event: [0; 64],
+        slow_error: [0; 256],
+        marker_error: [0; 256],
+        error: [0; 512],
     }
 }
 

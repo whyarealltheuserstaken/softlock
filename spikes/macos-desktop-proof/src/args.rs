@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::classify::POST_SOURCES;
 use crate::labels::CAPTURE_APIS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,6 +13,9 @@ pub enum Mode {
     WindowOnly,
     CaptureOnly,
     ActiveTap,
+    M03,
+    ClassifyTarget,
+    ClassifyPost,
 }
 
 impl Mode {
@@ -29,6 +33,7 @@ pub struct Args {
     pub job_kind: Option<String>,
     pub tap_location: Option<String>,
     pub capture_api: Option<String>,
+    pub post_source: Option<String>,
 }
 
 pub fn parse_env() -> Result<Args, String> {
@@ -47,6 +52,9 @@ where
     let mut window_only = false;
     let mut capture_api = None;
     let mut active_tap = false;
+    let mut m03 = false;
+    let mut classify_target = false;
+    let mut post_source = None;
     let mut tokens = tokens.into_iter();
     while let Some(token) = tokens.next() {
         match token.as_str() {
@@ -76,6 +84,15 @@ where
             }
             "--window-only" => window_only = true,
             "--active-tap" => active_tap = true,
+            "--m03" => m03 = true,
+            "--classify-target" => classify_target = true,
+            "--classify-post" => {
+                let source = tokens.next().ok_or("--classify-post needs a value")?;
+                if !POST_SOURCES.contains(&source.as_str()) {
+                    return Err(format!("unknown event source {source}"));
+                }
+                post_source = Some(source);
+            }
             "--capture-only" => {
                 let api = tokens.next().ok_or("--capture-only needs a value")?;
                 if !CAPTURE_APIS.contains(&api.as_str()) {
@@ -92,12 +109,15 @@ where
         window_only,
         capture_api.is_some(),
         active_tap,
+        m03,
+        classify_target,
+        post_source.is_some(),
     ]
     .into_iter()
     .filter(|selected| *selected)
     .count();
     if selected > 1 {
-        return Err("job, tap, window, and capture are different processes".to_string());
+        return Err("job, tap, window, capture, and classify are different processes".to_string());
     }
     let mode = if job_kind.is_some() {
         Mode::Job
@@ -109,6 +129,12 @@ where
         Mode::CaptureOnly
     } else if active_tap {
         Mode::ActiveTap
+    } else if m03 {
+        Mode::M03
+    } else if classify_target {
+        Mode::ClassifyTarget
+    } else if post_source.is_some() {
+        Mode::ClassifyPost
     } else {
         Mode::Orchestrator
     };
@@ -120,6 +146,7 @@ where
         job_kind,
         tap_location,
         capture_api,
+        post_source,
     })
 }
 
@@ -190,6 +217,18 @@ mod tests {
         assert!(!active.mode.installs_daemon());
         assert!(parse(tokens(&["--capture-only", "camera"])).is_err());
         assert!(parse(tokens(&["--window-only", "--tap-only", "kCGHIDEventTap"])).is_err());
+        let m03 = parse(tokens(&["--m03"])).unwrap();
+        assert_eq!(m03.mode, Mode::M03);
+        assert!(!m03.mode.installs_daemon());
+        let post = parse(tokens(&[
+            "--classify-post",
+            "kCGEventSourceStateHIDSystemState",
+        ]))
+        .unwrap();
+        assert_eq!(post.mode, Mode::ClassifyPost);
+        assert!(!post.mode.installs_daemon());
+        assert!(parse(tokens(&["--classify-post", "hardware"])).is_err());
+        assert!(parse(tokens(&["--m03", "--classify-target"])).is_err());
         assert!(parse(tokens(&["--elsewhere"])).is_err());
         assert!(parse(tokens(&["--output-dir"])).is_err());
     }

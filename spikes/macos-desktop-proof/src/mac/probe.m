@@ -10,12 +10,19 @@
 #include <Security/AuthSession.h>
 #include <ctype.h>
 #include <dlfcn.h>
+#include <pthread.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+extern char **environ;
 
 typedef struct {
     int ordered_front;
@@ -859,4 +866,657 @@ int macos_inspect_png(const char *path, int *nonblack, int *marker) {
         count_pixels(rep.CGImage, nonblack, marker);
     }
     return (*nonblack < 0 || *marker < 0) ? 1 : 0;
+}
+
+static const int kSlowKey = 1;
+static const int kMarkerKey = 105;
+static const int kSlowSleepMs = 2000;
+
+typedef struct {
+    int64_t state_id;
+    int64_t source_pid;
+    int64_t poster_pid;
+    int window_received;
+    int tap_saw;
+    int same_process;
+    int fields_read;
+    char source[64];
+    char error[256];
+} PostRow;
+
+typedef struct {
+    PostRow posts[6];
+    int post_count;
+    int pad;
+    int64_t sleep_ms;
+    int64_t disable_wait_ms;
+    int64_t dead_ms;
+    int64_t healthy_ms;
+    int key_reached_during;
+    int key_reached_after;
+    int dead_misses;
+    int reenabled;
+    char disable_event[64];
+    char slow_error[256];
+    char marker_error[256];
+    char error[512];
+} M03Out;
+
+static _Atomic int g_count_post = 0;
+static _Atomic int g_count_slow = 0;
+static _Atomic int64_t g_last_post_ms = 0;
+static _Atomic int64_t g_last_slow_ms = 0;
+static _Atomic int64_t g_tap_state = 0;
+static _Atomic int64_t g_tap_pid = 0;
+static _Atomic int g_tap_saw = 0;
+static _Atomic int64_t g_slow_entered_ms = 0;
+static _Atomic int64_t g_slow_returned_ms = 0;
+static _Atomic int64_t g_disable_type = 0;
+static _Atomic int64_t g_disable_ms = 0;
+static _Atomic int g_marker_seen = 0;
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void write_text(const char *path, const char *text) {
+    FILE *file = fopen(path, "w");
+    if (file == NULL) {
+        return;
+    }
+    fputs(text, file);
+    fclose(file);
+}
+
+static int state_from_name(const char *name, CGEventSourceStateID *state) {
+    if (strcmp(name, "kCGEventSourceStatePrivate") == 0) {
+        *state = kCGEventSourceStatePrivate;
+        return 0;
+    }
+    if (strcmp(name, "kCGEventSourceStateCombinedSessionState") == 0) {
+        *state = kCGEventSourceStateCombinedSessionState;
+        return 0;
+    }
+    if (strcmp(name, "kCGEventSourceStateHIDSystemState") == 0) {
+        *state = kCGEventSourceStateHIDSystemState;
+        return 0;
+    }
+    return -1;
+}
+
+static void join_path(char *out, size_t cap, const char *dir, const char *name) {
+    snprintf(out, cap, "%s/%s", dir, name);
+}
+
+static void write_target_state(const char *dir) {
+    char body[256];
+    snprintf(body, sizeof body, "ready=1\ncount0=%d\ncount1=%d\nlast0=%lld\nlast1=%lld\n",
+             atomic_load(&g_count_post), atomic_load(&g_count_slow),
+             (long long)atomic_load(&g_last_post_ms), (long long)atomic_load(&g_last_slow_ms));
+    char path[1024];
+    join_path(path, sizeof path, dir, "target-state.txt");
+    write_text(path, body);
+}
+
+static int read_int_line(const char *text, const char *key, long long *out) {
+    const char *found = strstr(text, key);
+    if (found == NULL) {
+        return -1;
+    }
+    return sscanf(found + strlen(key), "%lld", out) == 1 ? 0 : -1;
+}
+
+static int read_target_state(const char *dir, int *count0, int *count1, int64_t *last0, int64_t *last1) {
+    char path[1024];
+    join_path(path, sizeof path, dir, "target-state.txt");
+    FILE *file = fopen(path, "r");
+    if (file == NULL) {
+        return -1;
+    }
+    char text[512];
+    size_t n = fread(text, 1, sizeof text - 1, file);
+    fclose(file);
+    text[n] = 0;
+    long long ready = 0;
+    long long c0 = 0;
+    long long c1 = 0;
+    long long l0 = 0;
+    long long l1 = 0;
+    if (read_int_line(text, "ready=", &ready) != 0 || ready != 1) {
+        return -1;
+    }
+    read_int_line(text, "count0=", &c0);
+    read_int_line(text, "count1=", &c1);
+    read_int_line(text, "last0=", &l0);
+    read_int_line(text, "last1=", &l1);
+    *count0 = (int)c0;
+    *count1 = (int)c1;
+    *last0 = (int64_t)l0;
+    *last1 = (int64_t)l1;
+    return 0;
+}
+
+static CGEventRef field_callback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *user) {
+    (void)proxy;
+    (void)user;
+    if (type == kCGEventKeyDown && event != NULL) {
+        int64_t key = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        if (key == kProbeKey) {
+            atomic_store(&g_tap_state, CGEventGetIntegerValueField(event, kCGEventSourceStateID));
+            atomic_store(&g_tap_pid, CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID));
+            atomic_store(&g_tap_saw, 1);
+        }
+    }
+    return event;
+}
+
+static CGEventRef slow_callback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *user) {
+    (void)proxy;
+    (void)user;
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        atomic_store(&g_disable_type, (int64_t)type);
+        atomic_store(&g_disable_ms, now_ms());
+        // A disabled tap is not re-enabled. Returning NULL does not turn it back on.
+        return NULL;
+    }
+    if (type == kCGEventKeyDown && event != NULL) {
+        int64_t key = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        if (key == kSlowKey && atomic_load(&g_slow_entered_ms) == 0) {
+            atomic_store(&g_slow_entered_ms, now_ms());
+            usleep((useconds_t)kSlowSleepMs * 1000);
+            atomic_store(&g_slow_returned_ms, now_ms());
+        }
+    }
+    return event;
+}
+
+static CGEventRef marker_callback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *user) {
+    (void)proxy;
+    (void)user;
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        return NULL;
+    }
+    if (type == kCGEventKeyDown && event != NULL) {
+        int64_t key = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        if (key == kMarkerKey) {
+            atomic_store(&g_marker_seen, 1);
+        }
+    }
+    return event;
+}
+
+static int post_key_code(CGEventSourceRef source, CGKeyCode key, CGEventTapLocation location, int64_t *state_id,
+                         int64_t *source_pid, char *error, size_t cap) {
+    CGEventRef down = CGEventCreateKeyboardEvent(source, key, true);
+    CGEventRef up = CGEventCreateKeyboardEvent(source, key, false);
+    if (down == NULL || up == NULL) {
+        snprintf(error, cap, "CGEventCreateKeyboardEvent returned NULL");
+        if (down != NULL) {
+            CFRelease(down);
+        }
+        if (up != NULL) {
+            CFRelease(up);
+        }
+        return -1;
+    }
+    *state_id = CGEventGetIntegerValueField(down, kCGEventSourceStateID);
+    *source_pid = CGEventGetIntegerValueField(down, kCGEventSourceUnixProcessID);
+    CGEventPost(location, down);
+    CGEventPost(location, up);
+    CFRelease(down);
+    CFRelease(up);
+    return 0;
+}
+
+static int post_named(const char *name, const char *dir, CGKeyCode key, char *error, size_t cap) {
+    CGEventSourceStateID state;
+    if (state_from_name(name, &state) != 0) {
+        snprintf(error, cap, "unknown CGEventSourceStateID %s", name);
+        return -1;
+    }
+    CGEventSourceRef source = CGEventSourceCreate(state);
+    if (source == NULL) {
+        snprintf(error, cap, "CGEventSourceCreate returned NULL");
+        return -1;
+    }
+    int64_t state_id = 0;
+    int64_t source_pid = 0;
+    int rc = post_key_code(source, key, kCGSessionEventTap, &state_id, &source_pid, error, cap);
+    CFRelease(source);
+    if (rc != 0) {
+        return rc;
+    }
+    char body[256];
+    snprintf(body, sizeof body, "ok=1\nstate_id=%lld\nsource_pid=%lld\nposter_pid=%d\n",
+             (long long)state_id, (long long)source_pid, (int)getpid());
+    char path[1024];
+    join_path(path, sizeof path, dir, "last-post.txt");
+    write_text(path, body);
+    return 0;
+}
+
+int macos_classify_post(const char *source, const char *dir) {
+    if (source == NULL || dir == NULL) {
+        return 2;
+    }
+    char error[256];
+    error[0] = 0;
+    fprintf(stderr, "stage=classify-post\n");
+    fflush(stderr);
+    if (post_named(source, dir, (CGKeyCode)kProbeKey, error, sizeof error) != 0) {
+        char body[512];
+        snprintf(body, sizeof body, "ok=0\nstate_id=0\nsource_pid=0\nposter_pid=%d\nerror=%s\n",
+                 (int)getpid(), error);
+        char path[1024];
+        join_path(path, sizeof path, dir, "last-post.txt");
+        write_text(path, body);
+        fprintf(stderr, "stage=classify-post-done\n");
+        return 1;
+    }
+    fprintf(stderr, "stage=classify-post-done\n");
+    return 0;
+}
+
+static BOOL open_target(char *error_out, size_t cap) {
+    activate_app();
+    NSScreen *screen = [NSScreen mainScreen];
+    NSRect frame_rect = screen != nil ? screen.visibleFrame : NSMakeRect(0, 0, 800, 600);
+    NSRect frame = NSMakeRect(NSMidX(frame_rect) - 160, NSMidY(frame_rect) - 120, 320, 240);
+    ProbeWindow *window = [[ProbeWindow alloc] initWithContentRect:frame
+                                                          styleMask:NSWindowStyleMaskBorderless
+                                                            backing:NSBackingStoreBuffered
+                                                              defer:NO];
+    if (window == nil) {
+        snprintf(error_out, cap, "NSWindow initWithContentRect returned nil");
+        return NO;
+    }
+    window.releasedWhenClosed = NO;
+    window.opaque = YES;
+    window.level = NSNormalWindowLevel;
+    window.backgroundColor = [NSColor colorWithSRGBRed:0.1 green:0.4 blue:0.8 alpha:1];
+    ProbeView *view = [[ProbeView alloc] initWithFrame:NSMakeRect(0, 0, 320, 240)];
+    window.contentView = view;
+    g_window = window;
+    [window orderFrontRegardless];
+    [window makeKeyAndOrderFront:nil];
+    return wait_until_key(window);
+}
+
+int macos_classify_target(const char *dir) {
+    if (dir == NULL) {
+        return 2;
+    }
+    fprintf(stderr, "stage=classify-target\n");
+    fflush(stderr);
+    @autoreleasepool {
+        char ignored[64];
+        if (!open_target(ignored, sizeof ignored)) {
+            fprintf(stderr, "stage=classify-target-not-key\n");
+        }
+        id monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                                            handler:^NSEvent *(NSEvent *event) {
+                                                              int code = (int)event.keyCode;
+                                                              int64_t stamp = now_ms();
+                                                              if (code == kProbeKey) {
+                                                                  atomic_fetch_add(&g_count_post, 1);
+                                                                  atomic_store(&g_last_post_ms, stamp);
+                                                              }
+                                                              if (code == kSlowKey) {
+                                                                  atomic_fetch_add(&g_count_slow, 1);
+                                                                  atomic_store(&g_last_slow_ms, stamp);
+                                                              }
+                                                              return event;
+                                                            }];
+        char stop[1024];
+        join_path(stop, sizeof stop, dir, "target.stop");
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:40];
+        while ([until timeIntervalSinceNow] > 0) {
+            write_target_state(dir);
+            if (access(stop, F_OK) == 0) {
+                break;
+            }
+            pump(0.05);
+        }
+        if (monitor != nil) {
+            [NSEvent removeMonitor:monitor];
+        }
+        if (g_window != nil) {
+            g_window.releasedWhenClosed = NO;
+            [g_window orderOut:nil];
+            g_window = nil;
+        }
+    }
+    fprintf(stderr, "stage=classify-target-done\n");
+    return 0;
+}
+
+static int spawn_child(const char *exe, char *const argv[], pid_t *pid) {
+    int rc = posix_spawn(pid, exe, NULL, NULL, argv, environ);
+    return rc;
+}
+
+static void fill_post(PostRow *row, const char *source, int same_process, int tap_saw, int64_t tap_state,
+                      int64_t tap_pid, int before, int after, const char *dir) {
+    memset(row, 0, sizeof *row);
+    snprintf(row->source, sizeof row->source, "%s", source);
+    row->same_process = same_process;
+    row->tap_saw = tap_saw;
+    row->window_received = after > before ? 1 : 0;
+    char path[1024];
+    join_path(path, sizeof path, dir, "last-post.txt");
+    FILE *file = fopen(path, "r");
+    char text[512];
+    text[0] = 0;
+    if (file != NULL) {
+        size_t n = fread(text, 1, sizeof text - 1, file);
+        fclose(file);
+        text[n] = 0;
+    }
+    long long ok = 0;
+    long long state_id = 0;
+    long long source_pid = 0;
+    long long poster_pid = 0;
+    read_int_line(text, "ok=", &ok);
+    read_int_line(text, "state_id=", &state_id);
+    read_int_line(text, "source_pid=", &source_pid);
+    read_int_line(text, "poster_pid=", &poster_pid);
+    if (tap_saw) {
+        row->state_id = tap_state;
+        row->source_pid = tap_pid;
+        row->fields_read = 1;
+    } else if (ok == 1) {
+        row->state_id = (int64_t)state_id;
+        row->source_pid = (int64_t)source_pid;
+        row->fields_read = 1;
+        snprintf(row->error, sizeof row->error, "tap did not see the key; fields are from the poster");
+    } else {
+        const char *err = strstr(text, "error=");
+        snprintf(row->error, sizeof row->error, "%s", err != NULL ? err + 6 : "CGEventPost wrote no fields");
+        char *newline = strchr(row->error, '\n');
+        if (newline != NULL) {
+            *newline = 0;
+        }
+    }
+    row->poster_pid = (int64_t)poster_pid;
+}
+
+static void one_post(const char *exe, const char *dir, const char *source, int same_process, M03Out *out) {
+    if (out->post_count >= 6) {
+        return;
+    }
+    atomic_store(&g_tap_saw, 0);
+    int before = 0;
+    int ignored = 0;
+    int64_t last0 = 0;
+    int64_t last1 = 0;
+    read_target_state(dir, &before, &ignored, &last0, &last1);
+    char last[1024];
+    join_path(last, sizeof last, dir, "last-post.txt");
+    unlink(last);
+    char error[256];
+    error[0] = 0;
+    if (same_process) {
+        post_named(source, dir, (CGKeyCode)kProbeKey, error, sizeof error);
+    } else {
+        char *argv[] = {(char *)exe, "--classify-post", (char *)source, "--output-dir", (char *)dir, NULL};
+        pid_t pid = 0;
+        if (spawn_child(exe, argv, &pid) != 0) {
+            snprintf(error, sizeof error, "posix_spawn of CGEventPost failed");
+        } else {
+            int status = 0;
+            waitpid(pid, &status, 0);
+        }
+    }
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:0.6];
+    while (atomic_load(&g_tap_saw) == 0 && [until timeIntervalSinceNow] > 0) {
+        pump(0.05);
+    }
+    pump(0.15);
+    int after = before;
+    read_target_state(dir, &after, &ignored, &last0, &last1);
+    PostRow *row = &out->posts[out->post_count];
+    fill_post(row, source, same_process, atomic_load(&g_tap_saw), atomic_load(&g_tap_state), atomic_load(&g_tap_pid),
+              before, after, dir);
+    if (row->error[0] == 0 && error[0] != 0) {
+        snprintf(row->error, sizeof row->error, "%s", error);
+    }
+    out->post_count += 1;
+}
+
+struct SlowPoster {
+    char dir[1024];
+};
+
+static void *slow_poster(void *arg) {
+    struct SlowPoster *poster = arg;
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:5];
+    while (atomic_load(&g_slow_entered_ms) == 0 && [until timeIntervalSinceNow] > 0) {
+        usleep(5000);
+    }
+    usleep(200000);
+    char error[256];
+    post_named("kCGEventSourceStateCombinedSessionState", poster->dir, (CGKeyCode)kSlowKey, error, sizeof error);
+    return NULL;
+}
+
+static void *slow_starter(void *arg) {
+    struct SlowPoster *poster = arg;
+    usleep(100000);
+    char error[256];
+    post_named("kCGEventSourceStateCombinedSessionState", poster->dir, (CGKeyCode)kSlowKey, error, sizeof error);
+    return NULL;
+}
+
+static const char *disable_name(int64_t type) {
+    uint32_t value = (uint32_t)type;
+    if (value == 0xFFFFFFFE) {
+        return "kCGEventTapDisabledByTimeout";
+    }
+    if (value == 0xFFFFFFFF) {
+        return "kCGEventTapDisabledByUserInput";
+    }
+    return "none";
+}
+
+static void run_slow(const char *dir, M03Out *out) {
+    fprintf(stderr, "stage=slow-callback\n");
+    fflush(stderr);
+    atomic_store(&g_slow_entered_ms, 0);
+    atomic_store(&g_slow_returned_ms, 0);
+    atomic_store(&g_disable_type, 0);
+    atomic_store(&g_disable_ms, 0);
+    CGEventMask mask = CGEventMaskBit(kCGEventKeyDown);
+    CFMachPortRef port = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask,
+                                          slow_callback, NULL);
+    if (port == NULL) {
+        snprintf(out->slow_error, sizeof out->slow_error, "CGEventTapCreate returned NULL");
+        snprintf(out->disable_event, sizeof out->disable_event, "none");
+        return;
+    }
+    CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0);
+    CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+    CGEventTapEnable(port, true);
+    int before = 0;
+    int count0 = 0;
+    int64_t last0 = 0;
+    int64_t last1 = 0;
+    read_target_state(dir, &count0, &before, &last0, &last1);
+    struct SlowPoster poster;
+    snprintf(poster.dir, sizeof poster.dir, "%s", dir);
+    pthread_t starter;
+    pthread_t during;
+    pthread_create(&starter, NULL, slow_starter, &poster);
+    pthread_create(&during, NULL, slow_poster, &poster);
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:8];
+    int64_t after_return_budget = 0;
+    while ([until timeIntervalSinceNow] > 0) {
+        int64_t returned = atomic_load(&g_slow_returned_ms);
+        if (returned != 0 && after_return_budget == 0) {
+            after_return_budget = now_ms() + 1500;
+        }
+        pump(0.05);
+        if (returned != 0 && (atomic_load(&g_disable_type) != 0 || now_ms() >= after_return_budget)) {
+            break;
+        }
+    }
+    pthread_join(starter, NULL);
+    pthread_join(during, NULL);
+    int after = before;
+    read_target_state(dir, &count0, &after, &last0, &last1);
+    int64_t entered = atomic_load(&g_slow_entered_ms);
+    int64_t returned = atomic_load(&g_slow_returned_ms);
+    int64_t disable_type = atomic_load(&g_disable_type);
+    snprintf(out->disable_event, sizeof out->disable_event, "%s", disable_name(disable_type));
+    out->sleep_ms = (entered != 0 && returned != 0) ? (returned - entered) : 0;
+    if (disable_type != 0 && entered != 0) {
+        out->disable_wait_ms = atomic_load(&g_disable_ms) - entered;
+    } else if (entered != 0) {
+        out->disable_wait_ms = now_ms() - entered;
+    }
+    out->key_reached_during =
+        (after > before && last1 >= entered && returned != 0 && last1 <= returned) ? 1 : 0;
+    out->key_reached_after = (after > before && returned != 0 && last1 > returned) ? 1 : 0;
+    if (entered == 0) {
+        snprintf(out->slow_error, sizeof out->slow_error, "CGEventPost slow key never entered the callback");
+    }
+    CGEventTapEnable(port, false);
+    CFRunLoopRemoveSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+    CFRelease(source);
+    CFRelease(port);
+    fprintf(stderr, "stage=slow-callback-done\n");
+    fflush(stderr);
+}
+
+static int post_marker(char *error, size_t cap) {
+    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStatePrivate);
+    if (source == NULL) {
+        snprintf(error, cap, "CGEventSourceCreate returned NULL");
+        return -1;
+    }
+    int64_t state_id = 0;
+    int64_t source_pid = 0;
+    int rc = post_key_code(source, (CGKeyCode)kMarkerKey, kCGSessionEventTap, &state_id, &source_pid, error, cap);
+    CFRelease(source);
+    return rc;
+}
+
+static void run_marker(M03Out *out) {
+    fprintf(stderr, "stage=marker\n");
+    fflush(stderr);
+    atomic_store(&g_marker_seen, 0);
+    CGEventMask mask = CGEventMaskBit(kCGEventKeyDown);
+    CFMachPortRef port = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly, mask,
+                                          marker_callback, NULL);
+    if (port == NULL) {
+        snprintf(out->marker_error, sizeof out->marker_error, "CGEventTapCreate returned NULL");
+        return;
+    }
+    // The source stays off the run loop, so this callback never runs.
+    int64_t start = now_ms();
+    int misses = 0;
+    while (misses < 3) {
+        char error[256];
+        error[0] = 0;
+        if (post_marker(error, sizeof error) != 0 && out->marker_error[0] == 0) {
+            snprintf(out->marker_error, sizeof out->marker_error, "%s", error);
+        }
+        usleep(250000);
+        if (atomic_load(&g_marker_seen) != 0) {
+            break;
+        }
+        misses += 1;
+    }
+    out->dead_ms = now_ms() - start;
+    out->dead_misses = misses;
+    atomic_store(&g_marker_seen, 0);
+    CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0);
+    CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+    CGEventTapEnable(port, true);
+    int64_t healthy_start = now_ms();
+    char error[256];
+    error[0] = 0;
+    if (post_marker(error, sizeof error) != 0 && out->marker_error[0] == 0) {
+        snprintf(out->marker_error, sizeof out->marker_error, "%s", error);
+    }
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:0.25];
+    while (atomic_load(&g_marker_seen) == 0 && [until timeIntervalSinceNow] > 0) {
+        pump(0.01);
+    }
+    out->healthy_ms = now_ms() - healthy_start;
+    if (atomic_load(&g_marker_seen) == 0 && out->marker_error[0] == 0) {
+        snprintf(out->marker_error, sizeof out->marker_error,
+                 "marker callback did not see the no-op within one heartbeat");
+    }
+    CGEventTapEnable(port, false);
+    CFRunLoopRemoveSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+    CFRelease(source);
+    CFRelease(port);
+    fprintf(stderr, "stage=marker-done\n");
+    fflush(stderr);
+}
+
+int macos_prove_m03(const char *exe, const char *dir, M03Out *out) {
+    if (exe == NULL || dir == NULL || out == NULL) {
+        return 2;
+    }
+    memset(out, 0, sizeof *out);
+    snprintf(out->disable_event, sizeof out->disable_event, "none");
+    out->reenabled = 0;
+    char stop[1024];
+    join_path(stop, sizeof stop, dir, "target.stop");
+    unlink(stop);
+    char *argv[] = {(char *)exe, "--classify-target", "--output-dir", (char *)dir, NULL};
+    pid_t target = 0;
+    if (spawn_child(exe, argv, &target) != 0) {
+        snprintf(out->error, sizeof out->error, "posix_spawn of the target window failed");
+        return 0;
+    }
+    int ready = 0;
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:5];
+    while ([until timeIntervalSinceNow] > 0) {
+        int c0 = 0;
+        int c1 = 0;
+        int64_t l0 = 0;
+        int64_t l1 = 0;
+        if (read_target_state(dir, &c0, &c1, &l0, &l1) == 0) {
+            ready = 1;
+            break;
+        }
+        pump(0.05);
+    }
+    if (!ready) {
+        snprintf(out->error, sizeof out->error, "NSWindow target did not become ready");
+    }
+    CGEventMask mask = CGEventMaskBit(kCGEventKeyDown);
+    CFMachPortRef listen = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
+                                            mask, field_callback, NULL);
+    CFRunLoopSourceRef listen_source = NULL;
+    if (listen == NULL) {
+        snprintf(out->error, sizeof out->error, "CGEventTapCreate returned NULL");
+    } else {
+        listen_source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, listen, 0);
+        CFRunLoopAddSource(CFRunLoopGetMain(), listen_source, kCFRunLoopCommonModes);
+        CGEventTapEnable(listen, true);
+        const char *sources[3] = {
+            "kCGEventSourceStatePrivate",
+            "kCGEventSourceStateCombinedSessionState",
+            "kCGEventSourceStateHIDSystemState",
+        };
+        for (int index = 0; index < 3; index++) {
+            one_post(exe, dir, sources[index], 0, out);
+            one_post(exe, dir, sources[index], 1, out);
+        }
+        CGEventTapEnable(listen, false);
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), listen_source, kCFRunLoopCommonModes);
+        CFRelease(listen_source);
+        CFRelease(listen);
+    }
+    run_slow(dir, out);
+    run_marker(out);
+    write_text(stop, "stop\n");
+    kill(target, SIGTERM);
+    waitpid(target, NULL, 0);
+    return 0;
 }

@@ -1,6 +1,7 @@
 //! Throwaway macOS desktop probe. Not linked into product binaries.
 
 mod args;
+mod classify;
 mod guard;
 mod labels;
 mod launchctl;
