@@ -1,7 +1,7 @@
 //! Orchestrator, timer child, overlay child, and heartbeat child.
 
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, ErrorKind, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,21 +10,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::args::{Args, Mode};
+use crate::args::{APP_NAP_SAMPLE_MS, Args, Mode};
 use crate::mac::ffi::{self, HeldAssertions};
 use crate::report::{
     AssertionReport, CaffeinateReport, DISPLAY_ASSERTION, HardwareRow, KIT_ID, KitReport,
-    SYSTEM_ASSERTION, TimerReport, failure_reasons, hardware_only_list, hardware_row,
-    keep_awake_claim, laptop_lid_row, lid_external_row, pmset_shows, power_key_row, render,
-    runner_hardware_row, slowed_sentence,
+    SYSTEM_ASSERTION, TimerReport, expected_ticks, failure_reasons, hardware_only_list,
+    hardware_row, keep_awake_claim, laptop_lid_row, lid_external_row, pmset_shows, power_key_row,
+    render, runner_hardware_row, slowed_sentence,
 };
-use crate::scrub::{contains_serial, scrub};
+use crate::scrub::{contains_serial, filter_pmset};
 use crate::version::parse_sw_vers;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_stop(_signal: i32) {
     STOP.store(true, Ordering::Relaxed);
+}
+
+fn stop_requested() -> bool {
+    STOP.load(Ordering::Relaxed)
 }
 
 pub fn dispatch(args: Args) -> i32 {
@@ -50,6 +54,7 @@ fn run_orchestrator(args: &Args) -> i32 {
     for name in [
         "timer-down.json",
         "timer-up.json",
+        "timer-app-nap.json",
         "overlay.json",
         "heartbeat.txt",
         "lid-on-power-heartbeat.txt",
@@ -64,42 +69,44 @@ fn run_orchestrator(args: &Args) -> i32 {
     let display_count = ffi::display_count();
     let names = ffi::assertion_names();
     let mut held = HeldAssertions::create();
-    let pmset_held = pmset_assertions();
+    let pid = std::process::id();
+    let pmset_held = filtered_pmset(pid, &held.reason);
     let shows_reason = pmset_shows(&pmset_held, &held.reason);
     let shows_system = pmset_shows(&pmset_held, SYSTEM_ASSERTION);
     let shows_display = pmset_shows(&pmset_held, DISPLAY_ASSERTION);
-    let caffeinate = caffeinate_control();
-    let timer = match sample_timers(args) {
-        Ok(timer) => timer,
-        Err(error) => TimerReport {
-            interval_ms: args.interval_ms,
-            duration_ms: args.sample_ms,
-            overlay_down_count: None,
-            overlay_up_count: None,
-            overlay_ordered_front: false,
-            overlay_display_count: display_count,
-            slowed: false,
-            sentence: error.clone(),
-            error: Some(error),
-        },
+    let caffeinate = caffeinate_control(pid);
+    let mut interrupted = stop_requested();
+    let timer = if interrupted {
+        empty_timer(args, "interrupted before the timer sample")
+    } else {
+        match sample_timers(args) {
+            Ok(timer) => timer,
+            Err(error) => empty_timer(args, &error),
+        }
     };
+    interrupted = interrupted || stop_requested();
+    let (lid_on_power, lid_external, power_key) = if interrupted {
+        skipped_hardware("interrupted", held.is_held())
+    } else {
+        hardware_rows(args, held.is_held())
+    };
+    interrupted = interrupted || stop_requested();
     held.release();
-    let pmset_after = pmset_assertions();
+    let pmset_after = filtered_pmset(pid, &held.reason);
     let after_shows = pmset_shows(&pmset_after, &held.reason);
     let assertions = AssertionReport {
         names_compiled: names,
         reason: held.reason.clone(),
         created: held.created,
         released: held.released,
-        pmset_while_held: scrub(&pmset_held),
-        pmset_after_release: scrub(&pmset_after),
+        pmset_while_held: pmset_held.clone(),
+        pmset_after_release: pmset_after.clone(),
         pmset_shows_reason: shows_reason,
         pmset_shows_system: shows_system,
         pmset_shows_display: shows_display,
         pmset_after_shows_reason: after_shows,
         error: held.error.clone(),
     };
-    let (lid_on_power, lid_external, power_key) = hardware_rows(args);
     let reversible = held.released && !after_shows;
     let serial_collected = contains_serial(&pmset_held)
         || contains_serial(&pmset_after)
@@ -110,7 +117,7 @@ fn run_orchestrator(args: &Args) -> i32 {
         version,
         display_count,
         keep_awake_claim: keep_awake_claim(
-            assertions.created && assertions.released,
+            assertions.created && assertions.released && !interrupted,
             &lid_on_power,
         ),
         assertions,
@@ -123,6 +130,7 @@ fn run_orchestrator(args: &Args) -> i32 {
         serial_collected,
         locked_session: false,
         reversible,
+        interrupted,
         probe_crash: None,
     };
     let text = render(&report);
@@ -133,39 +141,134 @@ fn run_orchestrator(args: &Args) -> i32 {
         eprintln!("{error}");
         return 1;
     }
-    if failure_reasons(&report).is_empty() {
-        0
-    } else {
+    if interrupted || !failure_reasons(&report).is_empty() {
         1
+    } else {
+        0
     }
+}
+
+fn empty_timer(args: &Args, error: &str) -> TimerReport {
+    TimerReport {
+        interval_ms: args.interval_ms,
+        duration_ms: args.sample_ms,
+        overlay_down_count: None,
+        overlay_up_count: None,
+        overlay_ordered_front: false,
+        overlay_opaque: true,
+        overlay_display_count: 0,
+        occlusion_visible_down: None,
+        occlusion_visible_up: None,
+        expected_ticks: expected_ticks(args.sample_ms, args.interval_ms),
+        app_nap_ms: if args.mode == Mode::Kit {
+            APP_NAP_SAMPLE_MS
+        } else {
+            0
+        },
+        app_nap_count: None,
+        app_nap_occlusion_visible: None,
+        app_nap_ran: false,
+        slowed: false,
+        sentence: error.to_string(),
+        error: Some(error.to_string()),
+    }
+}
+
+fn skipped_hardware(status: &str, held: bool) -> (HardwareRow, HardwareRow, HardwareRow) {
+    (
+        hardware_row(
+            status.to_string(),
+            None,
+            None,
+            held,
+            "skipped because the kit was interrupted",
+        ),
+        hardware_row(
+            status.to_string(),
+            None,
+            None,
+            held,
+            "skipped because the kit was interrupted",
+        ),
+        hardware_row(
+            status.to_string(),
+            None,
+            None,
+            held,
+            "skipped because the kit was interrupted",
+        ),
+    )
 }
 
 fn sample_timers(args: &Args) -> Result<TimerReport, String> {
     let exe = current_exe()?;
-    let down = run_child_timer(&exe, args)?;
-    let (up, overlay_front, overlay_displays) = run_child_timer_with_overlay(&exe, args)?;
-    let (slowed, sentence) = match (down, up) {
-        (Some(down), Some(up)) => slowed_sentence(down, up),
+    let down = run_child_timer(&exe, args, "timer-down.json")?;
+    if stop_requested() {
+        return Err("interrupted".to_string());
+    }
+    let (up, overlay) = run_child_timer_with_overlay(&exe, args, "timer-up.json", args.sample_ms)?;
+    if stop_requested() {
+        return Err("interrupted".to_string());
+    }
+    let (slowed, sentence) = match (down.ticks, up.ticks) {
+        (Some(down_n), Some(up_n)) => slowed_sentence(down_n, up_n),
         _ => (
             false,
             "Timer counts are incomplete, so slowing is not claimed.".to_string(),
         ),
     };
+    let mut app_nap_count = None;
+    let mut app_nap_occlusion = None;
+    let mut app_nap_ran = false;
+    if args.mode == Mode::Kit && !stop_requested() {
+        println!(
+            "STEP hands-off App Nap: overlay covers the timer for {APP_NAP_SAMPLE_MS} ms. Do not touch the Mac. Check the App Nap column in Activity Monitor for the timer process. Escape works only if Terminal has Accessibility permission."
+        );
+        let _ = io::stdout().flush();
+        let nap =
+            run_child_timer_with_overlay(&exe, args, "timer-app-nap.json", APP_NAP_SAMPLE_MS)?;
+        app_nap_count = nap.0.ticks;
+        app_nap_occlusion = nap.0.occlusion_visible;
+        app_nap_ran = true;
+    }
     Ok(TimerReport {
         interval_ms: args.interval_ms,
         duration_ms: args.sample_ms,
-        overlay_down_count: down,
-        overlay_up_count: up,
-        overlay_ordered_front: overlay_front,
-        overlay_display_count: overlay_displays,
+        overlay_down_count: down.ticks,
+        overlay_up_count: up.ticks,
+        overlay_ordered_front: overlay.ordered_front,
+        overlay_opaque: overlay.opaque,
+        overlay_display_count: overlay.display_count,
+        occlusion_visible_down: down.occlusion_visible,
+        occlusion_visible_up: up.occlusion_visible,
+        expected_ticks: expected_ticks(args.sample_ms, args.interval_ms),
+        app_nap_ms: if args.mode == Mode::Kit {
+            APP_NAP_SAMPLE_MS
+        } else {
+            0
+        },
+        app_nap_count,
+        app_nap_occlusion_visible: app_nap_occlusion,
+        app_nap_ran,
         slowed,
         sentence,
         error: None,
     })
 }
 
-fn run_child_timer(exe: &Path, args: &Args) -> Result<Option<u64>, String> {
-    let path = args.output_dir.join("timer-down.json");
+struct CountFile {
+    ticks: Option<u64>,
+    occlusion_visible: Option<bool>,
+}
+
+struct OverlayState {
+    ordered_front: bool,
+    opaque: bool,
+    display_count: i32,
+}
+
+fn run_child_timer(exe: &Path, args: &Args, count_file: &str) -> Result<CountFile, String> {
+    let path = args.output_dir.join(count_file);
     let out = args.output_dir.to_str().unwrap_or(".").to_string();
     let sample = args.sample_ms.to_string();
     let interval = args.interval_ms.to_string();
@@ -181,12 +284,12 @@ fn run_child_timer(exe: &Path, args: &Args) -> Result<Option<u64>, String> {
             "--interval-ms",
             &interval,
             "--count-file",
-            "timer-down.json",
+            count_file,
         ],
     )?;
-    let status = child.wait().map_err(|error| error.to_string())?;
+    let status = wait_child(&mut child)?;
     if !status.success() {
-        return Err(format!("timer overlay-down exited {status}"));
+        return Err(format!("timer {count_file} exited {status}"));
     }
     read_count(&path)
 }
@@ -194,11 +297,13 @@ fn run_child_timer(exe: &Path, args: &Args) -> Result<Option<u64>, String> {
 fn run_child_timer_with_overlay(
     exe: &Path,
     args: &Args,
-) -> Result<(Option<u64>, bool, i32), String> {
+    count_file: &str,
+    sample_ms: u64,
+) -> Result<(CountFile, OverlayState), String> {
     let overlay_json = args.output_dir.join("overlay.json");
-    let timer_json = args.output_dir.join("timer-up.json");
+    let timer_json = args.output_dir.join(count_file);
     let out = args.output_dir.to_str().unwrap_or(".").to_string();
-    let sample = args.sample_ms.to_string();
+    let sample = sample_ms.to_string();
     let interval = args.interval_ms.to_string();
     let mut overlay = spawn_role(
         exe,
@@ -224,18 +329,19 @@ fn run_child_timer_with_overlay(
             "--interval-ms",
             &interval,
             "--count-file",
-            "timer-up.json",
+            count_file,
         ],
     )?;
-    let timer_status = timer.wait().map_err(|error| error.to_string())?;
+    let timer_status = wait_child(&mut timer)?;
     let _ = overlay.kill();
     let _ = overlay.wait();
     if !timer_status.success() {
-        return Err(format!("timer overlay-up exited {timer_status}"));
+        return Err(format!(
+            "timer {count_file} overlay-up exited {timer_status}"
+        ));
     }
     let count = read_count(&timer_json)?;
-    let (front, displays) = read_overlay(&overlay_json);
-    Ok((count, front, displays))
+    Ok((count, read_overlay(&overlay_json)))
 }
 
 fn spawn_role(exe: &Path, extra: &[&str]) -> Result<Child, String> {
@@ -245,6 +351,22 @@ fn spawn_role(exe: &Path, extra: &[&str]) -> Result<Child, String> {
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| error.to_string())
+}
+
+fn wait_child(child: &mut Child) -> Result<std::process::ExitStatus, String> {
+    loop {
+        match child.wait() {
+            Ok(status) => return Ok(status),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {
+                if stop_requested() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("interrupted".to_string());
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
 }
 
 fn run_timer(args: &Args) -> i32 {
@@ -261,9 +383,13 @@ fn run_timer(args: &Args) -> i32 {
     let limit = Duration::from_millis(args.sample_ms);
     let step = Duration::from_millis(args.interval_ms.max(1));
     let mut ticks = 0_u64;
-    while started.elapsed() < limit && !STOP.load(Ordering::Relaxed) {
+    let mut occlusion_visible = true;
+    while started.elapsed() < limit && !stop_requested() {
         match ffi::TimerWindow::tick() {
-            Ok(value) => ticks = value,
+            Ok((value, visible)) => {
+                ticks = value;
+                occlusion_visible = visible;
+            }
             Err(error) => {
                 eprintln!("{error}");
                 return 1;
@@ -273,11 +399,17 @@ fn run_timer(args: &Args) -> i32 {
     }
     let name = args.count_file.as_deref().unwrap_or("timer-down.json");
     let path = args.output_dir.join(name);
-    if let Err(error) = write_json(&path, &TickFile { ticks }) {
+    if let Err(error) = write_json(
+        &path,
+        &TickFile {
+            ticks,
+            occlusion_visible,
+        },
+    ) {
         eprintln!("{error}");
         return 1;
     }
-    0
+    if stop_requested() { 1 } else { 0 }
 }
 
 fn run_overlay(args: &Args) -> i32 {
@@ -286,6 +418,7 @@ fn run_overlay(args: &Args) -> i32 {
     let path = args.output_dir.join("overlay.json");
     let marker = OverlayFile {
         ordered_front: overlay.ordered_front,
+        opaque: overlay.opaque,
         display_count: overlay.display_count,
         error: overlay.error.clone(),
     };
@@ -298,22 +431,23 @@ fn run_overlay(args: &Args) -> i32 {
     }
     let started = Instant::now();
     let limit = Duration::from_millis(args.sample_ms + 500);
-    while started.elapsed() < limit && !STOP.load(Ordering::Relaxed) {
+    while started.elapsed() < limit && !stop_requested() {
         ffi::Overlay::pump(50);
         if ffi::Overlay::escape_seen() {
             break;
         }
     }
-    0
+    if stop_requested() { 1 } else { 0 }
 }
 
 fn run_heartbeat(args: &Args) -> i32 {
     install_stop_handler();
+    let parent = unsafe { libc::getppid() };
     let name = args.count_file.as_deref().unwrap_or("heartbeat.txt");
     let path = args.output_dir.join(name);
     let started = Instant::now();
     let limit = Duration::from_millis(args.sample_ms.max(30_000));
-    while started.elapsed() < limit && !STOP.load(Ordering::Relaxed) {
+    while started.elapsed() < limit && !stop_requested() && parent_alive(parent) {
         let now = wall_ms();
         if let Err(error) = append_line(&path, &now.to_string()) {
             eprintln!("{error}");
@@ -324,13 +458,23 @@ fn run_heartbeat(args: &Args) -> i32 {
     0
 }
 
-fn hardware_rows(args: &Args) -> (HardwareRow, HardwareRow, HardwareRow) {
+fn parent_alive(parent: libc::pid_t) -> bool {
+    if parent <= 1 {
+        return false;
+    }
+    unsafe { libc::getppid() == parent }
+}
+
+fn hardware_rows(args: &Args, held: bool) -> (HardwareRow, HardwareRow, HardwareRow) {
     if args.mode == Mode::Runner {
         return (
-            runner_hardware_row("lid close on power"),
-            runner_hardware_row("lid close with an external display"),
-            runner_hardware_row("power key"),
+            runner_hardware_row("lid close on power", held),
+            runner_hardware_row("lid close with an external display", held),
+            runner_hardware_row("power key", held),
         );
+    }
+    if stop_requested() {
+        return skipped_hardware("interrupted", held);
     }
     let lid = record_lid(
         args,
@@ -340,12 +484,17 @@ fn hardware_rows(args: &Args) -> (HardwareRow, HardwareRow, HardwareRow) {
             "STEP lid-closed-on-power",
             "Leave the Mac on power. Unplug the external display if one is attached and you can do that safely.",
             "Stay next to the machine. Close the lid. After about 20 seconds, open it.",
-            "This kit does not change the lid-close action and does not lock the session.",
+            "Both idle assertions are still held. This kit does not change the lid-close action and does not lock the session.",
             "Type slept, awake, or skip. Do not type no-lid.",
         ],
         laptop_lid_row,
         900_000,
+        held,
     );
+    if stop_requested() {
+        let rest = skipped_hardware("interrupted", held);
+        return (lid, rest.1, rest.2);
+    }
     let external = record_lid(
         args,
         "lid-external",
@@ -354,20 +503,28 @@ fn hardware_rows(args: &Args) -> (HardwareRow, HardwareRow, HardwareRow) {
             "STEP lid-closed-with-external-display",
             "If you use an external display, plug it in and wait until it shows the desktop.",
             "Close the lid, wait about 20 seconds, then open it. Clamshell may stay awake; that is the measurement.",
+            "Both idle assertions are still held.",
             "Type slept, awake, no-external-display, or skip.",
         ],
         lid_external_row,
         900_000,
+        held,
     );
+    if stop_requested() {
+        let rest = skipped_hardware("interrupted", held);
+        return (lid, external, rest.2);
+    }
     let power = record_choice(
         args.power_key.as_deref(),
         &[
             "STEP power-key",
             "Tap the power key once. Do not hold it. Holding it can force a shutdown.",
+            "Both idle assertions are still held. They are released after this row.",
             "Type slept, restart-panel, nothing, or skip.",
         ],
         power_key_row,
         "power key tap",
+        held,
     );
     (lid, external, power)
 }
@@ -379,15 +536,25 @@ fn record_lid(
     steps: &[&str],
     parse: fn(&str) -> Result<String, String>,
     wait_ms: u64,
+    held: bool,
 ) -> HardwareRow {
     for step in steps {
         println!("{step}");
     }
     let _ = io::stdout().flush();
+    if stop_requested() {
+        return hardware_row(
+            "interrupted".to_string(),
+            None,
+            None,
+            held,
+            "interrupted before the lid row",
+        );
+    }
     let exe = match current_exe() {
         Ok(exe) => exe,
         Err(error) => {
-            return hardware_row("error".to_string(), None, None, &error);
+            return hardware_row("error".to_string(), None, None, held, &error);
         }
     };
     let beat_name = format!("{stamp}-heartbeat.txt");
@@ -414,15 +581,25 @@ fn record_lid(
         let _ = child.kill();
         let _ = child.wait();
     }
+    if choice == "interrupted" || stop_requested() {
+        return hardware_row(
+            "interrupted".to_string(),
+            None,
+            heartbeat_gap(&beat),
+            held,
+            "operator interrupted",
+        );
+    }
     let gap = heartbeat_gap(&beat);
     match parse(&choice) {
         Ok(outcome) => hardware_row(
             "recorded".to_string(),
             Some(outcome),
             gap,
+            held,
             "operator row plus heartbeat gap if the process paused",
         ),
-        Err(error) => hardware_row("error".to_string(), None, gap, &error),
+        Err(error) => hardware_row("error".to_string(), None, gap, held, &error),
     }
 }
 
@@ -431,39 +608,71 @@ fn record_choice(
     steps: &[&str],
     parse: fn(&str) -> Result<String, String>,
     note: &str,
+    held: bool,
 ) -> HardwareRow {
     for step in steps {
         println!("{step}");
     }
     let _ = io::stdout().flush();
+    if stop_requested() {
+        return hardware_row(
+            "interrupted".to_string(),
+            None,
+            None,
+            held,
+            "interrupted before the prompt",
+        );
+    }
     let choice = match preset {
         Some(value) => value.to_string(),
         None => read_choice(&["slept", "restart-panel", "nothing", "skip"]),
     };
+    if choice == "interrupted" || stop_requested() {
+        return hardware_row(
+            "interrupted".to_string(),
+            None,
+            None,
+            held,
+            "operator interrupted",
+        );
+    }
     match parse(&choice) {
-        Ok(outcome) => hardware_row("recorded".to_string(), Some(outcome), None, note),
-        Err(error) => hardware_row("error".to_string(), None, None, &error),
+        Ok(outcome) => hardware_row("recorded".to_string(), Some(outcome), None, held, note),
+        Err(error) => hardware_row("error".to_string(), None, None, held, &error),
     }
 }
 
 fn read_choice(allowed: &[&str]) -> String {
+    if stop_requested() {
+        return "interrupted".to_string();
+    }
     if !stdin_is_terminal() {
         return "needs-terminal".to_string();
     }
     print!("> ");
     let _ = io::stdout().flush();
     let mut line = String::new();
-    match io::stdin().lock().read_line(&mut line) {
-        Ok(0) => "skip".to_string(),
-        Ok(_) => {
-            let value = line.trim();
-            if allowed.contains(&value) {
-                value.to_string()
-            } else {
-                "skip".to_string()
-            }
+    loop {
+        if stop_requested() {
+            return "interrupted".to_string();
         }
-        Err(_) => "skip".to_string(),
+        match io::stdin().lock().read_line(&mut line) {
+            Ok(0) => return "skip".to_string(),
+            Ok(_) => {
+                let value = line.trim();
+                if allowed.contains(&value) {
+                    return value.to_string();
+                }
+                return "skip".to_string();
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {
+                if stop_requested() {
+                    return "interrupted".to_string();
+                }
+                line.clear();
+            }
+            Err(_) => return "skip".to_string(),
+        }
     }
 }
 
@@ -489,7 +698,7 @@ fn heartbeat_gap(path: &Path) -> Option<u64> {
     Some(gap)
 }
 
-fn caffeinate_control() -> CaffeinateReport {
+fn caffeinate_control(pid: u32) -> CaffeinateReport {
     let present = Command::new("which")
         .arg("caffeinate")
         .output()
@@ -504,17 +713,16 @@ fn caffeinate_control() -> CaffeinateReport {
         };
     }
     let child = Command::new("caffeinate")
-        .arg("-i")
+        .args(["-i", "-t", "5", "-w", &pid.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
     match child {
         Ok(mut child) => {
             thread::sleep(Duration::from_millis(400));
-            let excerpt = pmset_assertions();
-            let showed = excerpt.to_ascii_lowercase().contains("caffeinate");
-            let _ = child.kill();
-            let _ = child.wait();
+            let raw = pmset_raw();
+            let showed = raw.to_ascii_lowercase().contains("caffeinate");
+            let _ = wait_child(&mut child);
             CaffeinateReport {
                 present: true,
                 ran: true,
@@ -531,7 +739,7 @@ fn caffeinate_control() -> CaffeinateReport {
     }
 }
 
-fn pmset_assertions() -> String {
+fn pmset_raw() -> String {
     match Command::new("pmset").args(["-g", "assertions"]).output() {
         Ok(output) => {
             let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -539,10 +747,14 @@ fn pmset_assertions() -> String {
                 text.push('\n');
                 text.push_str(&String::from_utf8_lossy(&output.stderr));
             }
-            scrub(&text)
+            text
         }
         Err(error) => format!("pmset failed: {error}"),
     }
+}
+
+fn filtered_pmset(pid: u32, reason: &str) -> String {
+    filter_pmset(&pmset_raw(), pid, reason)
 }
 
 fn read_version() -> crate::report::VersionReport {
@@ -564,20 +776,35 @@ fn current_exe() -> Result<std::path::PathBuf, String> {
     std::env::current_exe().map_err(|error| error.to_string())
 }
 
-fn read_count(path: &Path) -> Result<Option<u64>, String> {
+fn read_count(path: &Path) -> Result<CountFile, String> {
     let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
     let file: TickFile = serde_json::from_str(&text).map_err(|error| error.to_string())?;
-    Ok(Some(file.ticks))
+    Ok(CountFile {
+        ticks: Some(file.ticks),
+        occlusion_visible: Some(file.occlusion_visible),
+    })
 }
 
-fn read_overlay(path: &Path) -> (bool, i32) {
+fn read_overlay(path: &Path) -> OverlayState {
     let Ok(text) = fs::read_to_string(path) else {
-        return (false, 0);
+        return OverlayState {
+            ordered_front: false,
+            opaque: false,
+            display_count: 0,
+        };
     };
     let Ok(file) = serde_json::from_str::<OverlayFile>(&text) else {
-        return (false, 0);
+        return OverlayState {
+            ordered_front: false,
+            opaque: false,
+            display_count: 0,
+        };
     };
-    (file.ordered_front, file.display_count)
+    OverlayState {
+        ordered_front: file.ordered_front,
+        opaque: file.opaque,
+        display_count: file.display_count,
+    }
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
@@ -606,20 +833,25 @@ fn wall_ms() -> u64 {
 
 fn install_stop_handler() {
     unsafe {
-        let handler = handle_stop as *const () as libc::sighandler_t;
-        libc::signal(libc::SIGTERM, handler);
-        libc::signal(libc::SIGINT, handler);
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handle_stop as usize;
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
     }
 }
 
 #[derive(Serialize, serde::Deserialize)]
 struct TickFile {
     ticks: u64,
+    occlusion_visible: bool,
 }
 
 #[derive(Serialize, serde::Deserialize)]
 struct OverlayFile {
     ordered_front: bool,
+    opaque: bool,
     display_count: i32,
     error: Option<String>,
 }

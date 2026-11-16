@@ -15,23 +15,25 @@ Copied from [Henry's sheet](../../tickets/macos/henry-sheet.md). Fill the rows a
 | External displays | Unknown. Still open. The kit still has the lid-closed-with-external-display row. |
 | Second keyboard | Unknown. Still open |
 
-Do not paste a hardware serial number.
+Do not paste a hardware serial number. Do not paste a full `pmset -g assertions` dump.
 
 | Row | Result |
 |---|---|
 | `sw_vers` / `uname -m` | |
 | Assertion names that compiled | |
-| `pmset` shows reason string | |
+| Filtered `pmset` shows reason string | |
 | Timer count, overlay down | |
 | Timer count, overlay up | |
+| Timer occlusion visible down / up | |
 | Covered process slowed? | |
-| Lid closed on power | slept / awake (not "no lid") |
-| Lid closed with an external display | slept / awake / no-external-display |
-| Power key tap | slept / restart-panel / nothing |
-| Assertions released | |
+| Hands-off App Nap (300 s, Activity Monitor column) | |
+| Lid closed on power (`assertion-held`) | slept / awake (not "no lid") |
+| Lid closed with an external display (`assertion-held`) | slept / awake / no-external-display |
+| Power key tap (`assertion-held`) | slept / restart-panel / nothing |
+| Assertions released after those rows | |
 | Keep-awake claim for m16 | idle sleep only, pending these rows |
 
-`pmset -g assertions` excerpt while held:
+Filtered `pmset` excerpt while held (summary counts and this probe's pid/reason only):
 
 ```
 ```

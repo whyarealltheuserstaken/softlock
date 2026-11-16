@@ -103,6 +103,7 @@ fn macos_keep_awake_workflow_runs_the_runner_slice_and_pins_actions() {
     assert!(text.contains(".github/workflows/macos-keep-awake.yml"));
     assert!(text.contains("contents: read"));
     assert!(text.contains("--runner"));
+    assert!(text.contains("--locked"));
     assert!(text.contains("IOPMAssertionCreateWithName") || text.contains("keep-awake"));
     assert!(!text.contains("sudo"));
     assert!(!text.contains("launchctl"));

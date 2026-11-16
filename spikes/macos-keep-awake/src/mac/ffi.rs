@@ -27,12 +27,14 @@ struct AssertOut {
 struct WindowOut {
     ordered_front: i32,
     display_count: i32,
+    opaque: i32,
     error: [u8; 256],
 }
 
 #[repr(C)]
 struct TimerOut {
     ticks: u64,
+    occlusion_visible: i32,
     error: [u8; 256],
 }
 
@@ -107,6 +109,10 @@ impl HeldAssertions {
         }
     }
 
+    pub fn is_held(&self) -> bool {
+        self.created && !self.released && (self.system_id != 0 || self.display_id != 0)
+    }
+
     pub fn release(&mut self) {
         if self.system_id == 0 && self.display_id == 0 {
             self.released = true;
@@ -130,6 +136,7 @@ impl Drop for HeldAssertions {
 pub struct Overlay {
     pub ordered_front: bool,
     pub display_count: i32,
+    pub opaque: bool,
     pub error: Option<String>,
 }
 
@@ -138,6 +145,7 @@ impl Overlay {
         let mut out = WindowOut {
             ordered_front: 0,
             display_count: 0,
+            opaque: 0,
             error: [0; 256],
         };
         unsafe {
@@ -146,6 +154,7 @@ impl Overlay {
         Overlay {
             ordered_front: out.ordered_front != 0,
             display_count: out.display_count,
+            opaque: out.opaque != 0,
             error: optional_text(&out.error),
         }
     }
@@ -183,6 +192,7 @@ impl TimerWindow {
         let mut out = WindowOut {
             ordered_front: 0,
             display_count: 0,
+            opaque: 0,
             error: [0; 256],
         };
         unsafe {
@@ -194,9 +204,10 @@ impl TimerWindow {
         }
     }
 
-    pub fn tick() -> Result<u64, String> {
+    pub fn tick() -> Result<(u64, bool), String> {
         let mut out = TimerOut {
             ticks: 0,
+            occlusion_visible: 0,
             error: [0; 256],
         };
         let rc = unsafe { m07_timer_tick(&mut out) };
@@ -205,7 +216,7 @@ impl TimerWindow {
                 optional_text(&out.error).unwrap_or_else(|| "timer tick failed".to_string())
             );
         }
-        Ok(out.ticks)
+        Ok((out.ticks, out.occlusion_visible != 0))
     }
 
     pub fn close() {

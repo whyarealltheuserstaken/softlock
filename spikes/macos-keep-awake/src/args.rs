@@ -6,6 +6,7 @@ pub const REASON_PREFIX: &str = "m07-keep-awake-probe";
 pub const DEFAULT_INTERVAL_MS: u64 = 50;
 pub const RUNNER_SAMPLE_MS: u64 = 8_000;
 pub const KIT_SAMPLE_MS: u64 = 60_000;
+pub const APP_NAP_SAMPLE_MS: u64 = 300_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -186,6 +187,7 @@ mod tests {
         assert_eq!(kit.mode, Mode::Kit);
         assert!(kit.mode.holds_assertions());
         assert_eq!(kit.sample_ms, KIT_SAMPLE_MS);
+        assert_eq!(APP_NAP_SAMPLE_MS, 300_000);
 
         let timer = parse(tokens(&["--role", "timer"])).unwrap();
         assert_eq!(timer.mode, Mode::Timer);

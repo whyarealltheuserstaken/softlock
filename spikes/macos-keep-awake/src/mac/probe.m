@@ -31,11 +31,13 @@ typedef struct {
 typedef struct {
     int ordered_front;
     int display_count;
+    int opaque;
     char error[256];
 } WindowOut;
 
 typedef struct {
     uint64_t ticks;
+    int occlusion_visible;
     char error[256];
 } TimerOut;
 
@@ -198,11 +200,12 @@ int m07_overlay_open(WindowOut *out) {
                                                                   backing:NSBackingStoreBuffered
                                                                     defer:NO];
             window.releasedWhenClosed = NO;
-            window.opaque = NO;
+            window.opaque = YES;
+            window.alphaValue = 1.0;
             window.hasShadow = NO;
             window.ignoresMouseEvents = YES;
             window.level = NSStatusWindowLevel;
-            window.backgroundColor = [[NSColor blackColor] colorWithAlphaComponent:0.35];
+            window.backgroundColor = [NSColor blackColor];
             window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                         NSWindowCollectionBehaviorFullScreenAuxiliary;
             [window orderFrontRegardless];
@@ -217,6 +220,7 @@ int m07_overlay_open(WindowOut *out) {
             }
         }
         out->ordered_front = front ? 1 : 0;
+        out->opaque = 1;
         if (!front) {
             snprintf(out->error, sizeof out->error, "overlay windows were not visible");
         }
@@ -306,6 +310,8 @@ int m07_timer_tick(TimerOut *out) {
         out->ticks = g_ticks;
         g_timer_label.stringValue = [NSString stringWithFormat:@"%llu", (unsigned long long)g_ticks];
         pump(0.01);
+        BOOL visible = g_timer != nil && (g_timer.occlusionState & NSWindowOcclusionStateVisible) != 0;
+        out->occlusion_visible = visible ? 1 : 0;
     }
     return 0;
 }

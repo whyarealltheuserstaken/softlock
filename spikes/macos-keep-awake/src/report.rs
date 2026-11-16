@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
-use crate::args::REASON_PREFIX;
-use crate::scrub::{contains_serial, scrub};
+use crate::args::{APP_NAP_SAMPLE_MS, DEFAULT_INTERVAL_MS, REASON_PREFIX, RUNNER_SAMPLE_MS};
+use crate::scrub::{contains_serial, filter_pmset, scrub};
 use crate::text::one_line;
 
 pub const KIT_ID: &str = "m07-keep-awake";
@@ -60,7 +60,15 @@ pub struct TimerReport {
     pub overlay_down_count: Option<u64>,
     pub overlay_up_count: Option<u64>,
     pub overlay_ordered_front: bool,
+    pub overlay_opaque: bool,
     pub overlay_display_count: i32,
+    pub occlusion_visible_down: Option<bool>,
+    pub occlusion_visible_up: Option<bool>,
+    pub expected_ticks: u64,
+    pub app_nap_ms: u64,
+    pub app_nap_count: Option<u64>,
+    pub app_nap_occlusion_visible: Option<bool>,
+    pub app_nap_ran: bool,
     pub slowed: bool,
     pub sentence: String,
     pub error: Option<String>,
@@ -71,6 +79,7 @@ pub struct HardwareRow {
     pub status: String,
     pub outcome: Option<String>,
     pub heartbeat_gap_ms: Option<u64>,
+    pub assertion_held: bool,
     pub note: String,
 }
 
@@ -91,6 +100,7 @@ pub struct KitReport {
     pub serial_collected: bool,
     pub locked_session: bool,
     pub reversible: bool,
+    pub interrupted: bool,
     pub probe_crash: Option<String>,
 }
 
@@ -130,11 +140,12 @@ pub fn power_key_row(outcome: &str) -> Result<String, String> {
     }
 }
 
-pub fn runner_hardware_row(subject: &str) -> HardwareRow {
+pub fn runner_hardware_row(subject: &str, assertion_held: bool) -> HardwareRow {
     HardwareRow {
         status: "not-run-on-runner".to_string(),
         outcome: None,
         heartbeat_gap_ms: None,
+        assertion_held,
         note: format!(
             "{subject} needs Henry's Intel Mac. The GitHub runner has no lid and no power key."
         ),
@@ -145,14 +156,21 @@ pub fn hardware_row(
     status: String,
     outcome: Option<String>,
     gap: Option<u64>,
+    assertion_held: bool,
     note: &str,
 ) -> HardwareRow {
     HardwareRow {
         status,
         outcome,
         heartbeat_gap_ms: gap,
+        assertion_held,
         note: note.to_string(),
     }
+}
+
+pub fn expected_ticks(sample_ms: u64, interval_ms: u64) -> u64 {
+    let step = interval_ms.saturating_add(10).max(1);
+    sample_ms / step
 }
 
 pub fn pmset_shows(excerpt: &str, needle: &str) -> bool {
@@ -210,19 +228,20 @@ pub fn hardware_only_list() -> Vec<String> {
 pub fn instructions(kit: bool) -> &'static str {
     if kit {
         "step=1 Stay at the Mac. This kit does not lock it and does not swallow the keyboard.\n\
-         step=2 It holds IOPMAssertionCreateWithName idle-system and idle-display assertions, then releases them.\n\
-         step=3 A timer process ticks. The same sample runs with the overlay down, then covering that window. Escape ends the overlay early. The overlay ignores the mouse and does not become key.\n\
-         step=4 Lid closed on power, no external display if you can unplug it. Stay next to the machine. After about 20 seconds, open the lid. Type slept, awake, or skip. \"no lid\" is not a row on this laptop.\n\
-         step=5 If you use an external display, plug it in, wait until it shows the desktop, close the lid, wait, open the lid. Type slept, awake, no-external-display, or skip.\n\
-         step=6 Tap the power key once. Do not hold it. Type slept, restart-panel, nothing, or skip.\n\
-         step=7 Assertions are already released. Nothing is left armed. Paste the JSON onto the sheet."
+         step=2 It holds both IOPMAssertionCreateWithName idle-system and idle-display assertions through the lid and power-key steps (QA1340). They are released afterwards.\n\
+         step=3 A timer process ticks. The same sample runs with the overlay down, then covering that window. The overlay is fully opaque, ignores the mouse, and does not become key. Escape ends it early only if Terminal has Accessibility permission; otherwise it closes by itself after about 60 s.\n\
+         step=4 Hands-off App Nap: the overlay covers the timer for 300 s (--sample-ms 300000). Do not touch the Mac. Check the App Nap column in Activity Monitor for the timer process.\n\
+         step=5 Lid closed on power, no external display if you can unplug it. Stay next to the machine. After about 20 seconds, open the lid. Type slept, awake, or skip. \"no lid\" is not a row on this laptop. Both assertions stay held.\n\
+         step=6 If you use an external display, plug it in, wait until it shows the desktop, close the lid, wait, open the lid. Type slept, awake, no-external-display, or skip. Both assertions stay held.\n\
+         step=7 Tap the power key once. Do not hold it. Type slept, restart-panel, nothing, or skip. Both assertions are still held for this row (assertion-held=true). They are released after this step. Nothing is left armed. Paste the filtered JSON onto the sheet."
     } else {
         "step=1 Runner proof only. No lid, no power key, no real idle App Nap.\n\
-         step=2 Create idle-system and idle-display assertions with IOPMAssertionCreateWithName.\n\
-         step=3 Confirm the reason string in pmset -g assertions, then release them.\n\
-         step=4 If caffeinate exists, run it as a control and kill it.\n\
-         step=5 Timer counts with the overlay down and covering that window, same duration.\n\
-         step=6 Hardware rows stay not-run-on-runner."
+         step=2 Create idle-system and idle-display assertions with IOPMAssertionCreateWithName and keep them held.\n\
+         step=3 Confirm the probe reason in a filtered pmset excerpt (summary counts plus this pid/reason only).\n\
+         step=4 If caffeinate exists, run it as caffeinate -i -t 5 -w <kit pid>.\n\
+         step=5 Timer counts with the overlay down and covering that window, same duration. Overlay is fully opaque. Record timer occlusion.\n\
+         step=6 Hardware rows stay not-run-on-runner while both assertions are still held (assertion-held=true).\n\
+         step=7 Release both assertions after those rows."
     }
 }
 
@@ -233,6 +252,9 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
     }
     if report.locked_session {
         reasons.push("the kit must not lock the session".to_string());
+    }
+    if report.interrupted {
+        reasons.push("the kit was interrupted".to_string());
     }
     if report.mode == "runner" && report.version.uname_m != "arm64" {
         reasons.push(format!(
@@ -283,6 +305,18 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
         || contains_serial(&report.version.hw_model)
     {
         reasons.push("serial text reached the report".to_string());
+    }
+    if pmset_leaks_other_owners(&report.assertions.pmset_while_held)
+        || pmset_leaks_other_owners(&report.assertions.pmset_after_release)
+    {
+        reasons.push("pmset excerpt named another process, path, or device".to_string());
+    }
+    if report.mode == "kit"
+        && (report.lid_on_power.status == "recorded" || report.power_key.status == "recorded")
+        && (!report.lid_on_power.assertion_held || !report.power_key.assertion_held)
+    {
+        reasons
+            .push("idle assertions were not held through the lid and power-key rows".to_string());
     }
     if report.lid_on_power.status == "no-lid"
         || report.lid_on_power.outcome.as_deref() == Some("no-lid")
@@ -351,6 +385,18 @@ pub fn render(report: &KitReport) -> String {
         report.assertions.released
     ));
     out.push_str(&format!(
+        "lid-on-power-assertion-held={}\n",
+        report.lid_on_power.assertion_held
+    ));
+    out.push_str(&format!(
+        "lid-external-assertion-held={}\n",
+        report.lid_external.assertion_held
+    ));
+    out.push_str(&format!(
+        "power-key-assertion-held={}\n",
+        report.power_key.assertion_held
+    ));
+    out.push_str(&format!(
         "pmset-shows-reason={}\n",
         report.assertions.pmset_shows_reason
     ));
@@ -370,7 +416,11 @@ pub fn render(report: &KitReport) -> String {
         out.push_str(&format!("assertion-error={}\n", one_line(error)));
     }
     out.push_str("pmset-while-held-begin\n");
-    out.push_str(&scrub(&report.assertions.pmset_while_held));
+    out.push_str(&scrub(&filter_pmset(
+        &report.assertions.pmset_while_held,
+        pid_from_reason(&report.assertions.reason),
+        &report.assertions.reason,
+    )));
     out.push('\n');
     out.push_str("pmset-while-held-end\n");
     out.push_str(&format!(
@@ -399,6 +449,25 @@ pub fn render(report: &KitReport) -> String {
         "overlay-ordered-front={}\n",
         report.timer.overlay_ordered_front
     ));
+    out.push_str(&format!("overlay-opaque={}\n", report.timer.overlay_opaque));
+    out.push_str(&format!(
+        "timer-expected-ticks={}\n",
+        report.timer.expected_ticks
+    ));
+    out.push_str(&format!(
+        "timer-occlusion-visible-down={}\n",
+        fmt_flag(report.timer.occlusion_visible_down)
+    ));
+    out.push_str(&format!(
+        "timer-occlusion-visible-up={}\n",
+        fmt_flag(report.timer.occlusion_visible_up)
+    ));
+    out.push_str(&format!("app-nap-ran={}\n", report.timer.app_nap_ran));
+    out.push_str(&format!("app-nap-ms={}\n", report.timer.app_nap_ms));
+    out.push_str(&format!(
+        "app-nap-count={}\n",
+        fmt_count(report.timer.app_nap_count)
+    ));
     out.push_str(&format!(
         "lid-on-power={}\n",
         row_token(&report.lid_on_power)
@@ -419,6 +488,7 @@ pub fn render(report: &KitReport) -> String {
     out.push_str(&format!("serial-collected={}\n", report.serial_collected));
     out.push_str(&format!("locked-session={}\n", report.locked_session));
     out.push_str(&format!("reversible={}\n", report.reversible));
+    out.push_str(&format!("interrupted={}\n", report.interrupted));
     if let Some(crash) = &report.probe_crash {
         out.push_str(&format!("probe-crash={}\n", one_line(crash)));
     }
@@ -441,6 +511,38 @@ fn fmt_count(count: Option<u64>) -> String {
     }
 }
 
+fn fmt_flag(value: Option<bool>) -> String {
+    match value {
+        Some(true) => "true".to_string(),
+        Some(false) => "false".to_string(),
+        None => "missing".to_string(),
+    }
+}
+
+fn pid_from_reason(reason: &str) -> u32 {
+    reason
+        .rsplit('-')
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn pmset_leaks_other_owners(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "windowserver",
+        "addonsd",
+        "virtual usb",
+        "listed by owning",
+        "kernel assertions",
+        "com.apple.",
+        "/users/",
+        ".app/",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 fn row_token(row: &HardwareRow) -> String {
     row.outcome.clone().unwrap_or_else(|| row.status.clone())
 }
@@ -461,7 +563,7 @@ fn passing_runner_fixture() -> KitReport {
         created: true,
         released: true,
         pmset_while_held: format!(
-            "   {SYSTEM_ASSERTION}    1\n   pid 1({REASON_PREFIX}-1): PreventUserIdleSystemSleep\n   {DISPLAY_ASSERTION}    1\n"
+            "{SYSTEM_ASSERTION} 1\n{DISPLAY_ASSERTION} 1\npid 1({REASON_PREFIX}-1): {SYSTEM_ASSERTION} named: \"{REASON_PREFIX}-1\""
         ),
         pmset_after_release: "No assertions.\n".to_string(),
         pmset_shows_reason: true,
@@ -470,7 +572,7 @@ fn passing_runner_fixture() -> KitReport {
         pmset_after_shows_reason: false,
         error: None,
     };
-    let lid = runner_hardware_row("lid close");
+    let lid = runner_hardware_row("lid close", true);
     KitReport {
         kit: KIT_ID.to_string(),
         mode: "runner".to_string(),
@@ -491,23 +593,32 @@ fn passing_runner_fixture() -> KitReport {
             error: None,
         },
         timer: TimerReport {
-            interval_ms: 50,
-            duration_ms: 8000,
+            interval_ms: DEFAULT_INTERVAL_MS,
+            duration_ms: RUNNER_SAMPLE_MS,
             overlay_down_count: Some(down),
             overlay_up_count: Some(up),
             overlay_ordered_front: true,
+            overlay_opaque: true,
             overlay_display_count: 1,
+            occlusion_visible_down: Some(true),
+            occlusion_visible_up: Some(false),
+            expected_ticks: expected_ticks(RUNNER_SAMPLE_MS, DEFAULT_INTERVAL_MS),
+            app_nap_ms: APP_NAP_SAMPLE_MS,
+            app_nap_count: None,
+            app_nap_occlusion_visible: None,
+            app_nap_ran: false,
             slowed,
             sentence,
             error: None,
         },
         lid_on_power: lid.clone(),
-        lid_external: runner_hardware_row("lid close with an external display"),
-        power_key: runner_hardware_row("power key"),
+        lid_external: runner_hardware_row("lid close with an external display", true),
+        power_key: runner_hardware_row("power key", true),
         hardware_only: hardware_only_list(),
         serial_collected: false,
         locked_session: false,
         reversible: true,
+        interrupted: false,
         probe_crash: None,
     }
 }
@@ -546,7 +657,7 @@ mod tests {
 
     #[test]
     fn keep_awake_names_m16_and_idle_sleep_only() {
-        let lid = runner_hardware_row("lid");
+        let lid = runner_hardware_row("lid", true);
         let claim = keep_awake_claim(true, &lid);
         assert!(claim.contains("m16"));
         assert!(claim.contains("idle sleep"));
@@ -555,6 +666,7 @@ mod tests {
             "recorded".to_string(),
             Some("slept".to_string()),
             Some(8000),
+            true,
             "lid",
         );
         let claim = keep_awake_claim(true, &slept);
@@ -575,7 +687,16 @@ mod tests {
         assert!(!text.contains("no lid"));
         assert!(!contains_serial(&text));
         assert!(text.contains("step=1"));
+        assert!(text.contains("step=7"));
         assert!(text.contains("IOPMAssertionCreateWithName"));
+        assert!(text.contains("overlay-opaque=true"));
+        assert_eq!(
+            report.timer.expected_ticks,
+            expected_ticks(RUNNER_SAMPLE_MS, DEFAULT_INTERVAL_MS)
+        );
+        assert_eq!(report.timer.expected_ticks, 133);
+        assert!(text.contains("lid-on-power-assertion-held=true"));
+        assert!(!text.contains("WindowServer"));
         let json = serde_json::to_string(&report).expect("json");
         assert!(json.contains(KIT_ID));
         assert!(!contains_serial(&json));
@@ -617,5 +738,19 @@ mod tests {
         );
         report.mode = "kit".to_string();
         assert!(failure_reasons(&report).is_empty());
+    }
+
+    #[test]
+    fn a_foreign_pmset_line_fails_the_job() {
+        let mut report = passing_runner_fixture();
+        report
+            .assertions
+            .pmset_while_held
+            .push_str("\npid 161(WindowServer): UserIsActive\n");
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("another process"))
+        );
     }
 }
