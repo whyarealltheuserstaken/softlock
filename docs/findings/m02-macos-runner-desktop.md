@@ -2,7 +2,7 @@
 
 Measured on 16 November 2026 UTC by the workspace-excluded probe `spikes/macos-desktop-proof`.
 
-The proof run is [macOS desktop proof run 43959914537](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43959914537), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43959914537/job/133624232691). The measured head is `6fd8fc5afa65736600b496b8626eac5cb815177e`. The job printed `result=pass`. This probe did not lock the session, so it does not say the runner comes back after a lock (decision D8).
+The proof run is [macOS desktop proof run 43962299968](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43962299968), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43962299968/job/133632617392). The measured head is `6ebe140b2aed4078e8922f87050770abf8a23383`. The job printed `result=pass`. This probe did not lock the session, so it does not say the runner comes back after a lock (decision D8).
 
 An earlier head, `525018cfe1330629f7e9f122f106ca2b760d69c9`, printed `result=pass` with `window-error=NSWindow proof process exited 139`. That exit was a double release in the probe, not a runner capability. A later head blamed `CGEventPost` for missing the window. This run is after the activation change: the proof process waits until the app is active and the window is key, using `activateIgnoringOtherApps` and `NSRunningApplication activateWithOptions`. A crash in the probe still fails the job.
 
@@ -73,10 +73,10 @@ tap-active-kCGSessionEventTap-user=created control=true deleted=true listen-saw=
 
 ## Capture pixels
 
-Each API returned a 1024x768 image. Every image had non-black pixels and the probe window's marker colour. This is the positive capture only: the window was on screen, and capture exclusion was not tested. ScreenCaptureKit's non-black count is 158684. The other three are 158731. The marker count is 76836 for `CGWindowListCreateImage` and 76834 for the other three. This is one virtual display.
+Each API returned a 1024x768 image. Every image had non-black pixels and the probe window's marker colour. This is the positive capture only: the window was on screen, and capture exclusion was not tested. `CGWindowListCreateImage` counted 159580 non-black pixels and 76840 marker pixels. `CGDisplayCreateImage` and `screencapture` counted 158731 non-black and 76834 marker. ScreenCaptureKit counted 158684 non-black and 76834 marker. This is one virtual display.
 
 ```
-capture-CGWindowListCreateImage=opened width=1024 height=768 nonblack=true pixels=158731 marker=true pixels=76836
+capture-CGWindowListCreateImage=opened width=1024 height=768 nonblack=true pixels=159580 marker=true pixels=76840
 capture-CGDisplayCreateImage=opened width=1024 height=768 nonblack=true pixels=158731 marker=true pixels=76834
 capture-screencapture=opened width=1024 height=768 nonblack=true pixels=158731 marker=true pixels=76834
 capture-ScreenCaptureKit=opened width=1024 height=768 nonblack=true pixels=158684 marker=true pixels=76834
