@@ -18,12 +18,12 @@ Install these before the reviewer asks you to run the check:
 
 ## Get this exact copy
 
-Do not use `main`. Check out the commit the reviewer named:
+Do not use `main`. Check out this program commit. A commit cannot contain its own id, so copy this command from the latest copy of this file:
 
 ```
 git clone https://github.com/whyarealltheuserstaken/softlock.git
 cd softlock
-git checkout REPLACE_WITH_PROGRAM_COMMIT
+git checkout 81d8366560b3532d23e4a33a2b9e660096a042a4
 ```
 
 `git status` should say `HEAD detached at` that commit.
