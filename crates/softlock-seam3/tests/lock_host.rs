@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use softlock_lockhost::{
     DevConfig, DevLock, OVERLAY_MARKER, RunNonce, clear_run_nonce, current_session_id,
-    disconnect_session, last_mouse_hook_sample, set_run_nonce,
+    disconnect_session, set_run_nonce,
 };
 use softlock_seam3::{
     Probe, Rgb, capture_marker, capture_near, cursor_position, keyboard_focus, send_left_click,
@@ -136,9 +136,7 @@ fn injected_keys_and_clicks_reach_the_probe_while_locked() {
     assert_eq!(
         probe.clicks().len(),
         clicks,
-        "simulated-physical click reached the probe while locked; hook={:?} nonce={:#x}",
-        last_mouse_hook_sample(),
-        nonce.extra()
+        "simulated-physical click reached the probe while locked"
     );
 }
 
@@ -239,9 +237,7 @@ fn simulated_physical_mouse_does_not_move_the_cursor() {
     assert_eq!(
         cursor_position().expect("cursor"),
         parked,
-        "simulated-physical mouse movement moved the cursor; hook={:?} nonce={:#x}",
-        last_mouse_hook_sample(),
-        nonce.extra()
+        "simulated-physical mouse movement moved the cursor"
     );
 }
 

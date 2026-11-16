@@ -29,6 +29,5 @@ pub use classify::{RunNonce, clear_run_nonce, set_run_nonce};
 pub use dev_marker::dev_launch_marker_bytes;
 #[cfg(all(feature = "dev-launch", windows))]
 pub use win::{
-    DevConfig, DevError, DevLock, MouseHookSample, OVERLAY_MARKER, current_session_id,
-    disconnect_session, last_mouse_hook_sample,
+    DevConfig, DevError, DevLock, OVERLAY_MARKER, current_session_id, disconnect_session,
 };

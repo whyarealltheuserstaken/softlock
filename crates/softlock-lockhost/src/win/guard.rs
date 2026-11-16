@@ -299,7 +299,6 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             .last_event
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         let message = wparam.0 as u32;
-        note_mouse_sample(shared, info);
         let injected = info.flags & LLMHF_INJECTED != 0;
         let extra = mouse_extra(info, injected);
         if !blocks(injected, extra) {
@@ -311,9 +310,6 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             }
             return forwarded;
         }
-        shared
-            .mouse_blocked
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
         note_physical(shared);
         // The cursor has already moved by the time this hook runs. Ask the
         // window thread to put it back. The callback itself does not call
@@ -362,109 +358,26 @@ fn blocks(injected: bool, extra_info: u64) -> bool {
     )
 }
 
-/// `dwExtraInfo` from a mouse hook. The keyboard struct is naturally aligned
-/// and its extra field arrives intact. The mouse struct is not: an 8-aligned
-/// view and a 4-packed view put the extra field on different offsets, and a
-/// 32-bit copy keeps only the low half. Return the value the classifier
-/// treats as blocked.
+/// `dwExtraInfo` from a mouse hook.
+///
+/// `WH_KEYBOARD_LL` delivers all 64 bits. `WH_MOUSE_LL` delivers the low 32
+/// and zeroes the high half. A value equal to the low half of this run's
+/// nonce is that nonce. Zero is never a nonce, so an untagged injected event
+/// still passes.
 fn mouse_extra(info: &MSLLHOOKSTRUCT, injected: bool) -> u64 {
-    let aligned = info.dwExtraInfo as u64;
-    if blocks(injected, aligned) {
-        return aligned;
+    let reported = info.dwExtraInfo as u64;
+    if blocks(injected, reported) {
+        return reported;
     }
     #[cfg(feature = "simulated-physical")]
     {
         let nonce = crate::classify::current_run_nonce();
-        if nonce != 0 && mouse_bytes_carry_nonce(info, nonce) {
+        let low = nonce & 0xFFFF_FFFF;
+        if injected && low != 0 && reported == low {
             return nonce;
         }
     }
-    let packed = unsafe {
-        let raw = (info as *const MSLLHOOKSTRUCT).cast::<u8>();
-        std::ptr::read_unaligned(raw.add(20).cast::<u64>())
-    };
-    if packed != aligned && blocks(injected, packed) {
-        packed
-    } else {
-        aligned
-    }
-}
-
-#[cfg(feature = "simulated-physical")]
-fn mouse_bytes_carry_nonce(info: &MSLLHOOKSTRUCT, nonce: u64) -> bool {
-    let mut raw = [0u8; 32];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            (info as *const MSLLHOOKSTRUCT).cast::<u8>(),
-            raw.as_mut_ptr(),
-            raw.len(),
-        );
-    }
-    let needle = nonce.to_le_bytes();
-    (0..=24).any(|start| raw[start..start + 8] == needle)
-}
-
-fn note_mouse_sample(shared: &Shared, info: &MSLLHOOKSTRUCT) {
-    shared
-        .mouse_seen
-        .fetch_add(1, std::sync::atomic::Ordering::Release);
-    shared
-        .mouse_flags
-        .store(info.flags, std::sync::atomic::Ordering::Release);
-    shared.mouse_extra.store(
-        info.dwExtraInfo as u64,
-        std::sync::atomic::Ordering::Release,
-    );
-    let mut raw = [0u8; 32];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            (info as *const MSLLHOOKSTRUCT).cast::<u8>(),
-            raw.as_mut_ptr(),
-            raw.len(),
-        );
-    }
-    let (chunks, _) = raw.as_chunks::<8>();
-    for (word, chunk) in shared.mouse_words.iter().zip(chunks) {
-        word.store(
-            u64::from_le_bytes(*chunk),
-            std::sync::atomic::Ordering::Release,
-        );
-    }
-}
-
-/// Last mouse event the hook observed. Zero when no session is armed.
-pub fn last_mouse_hook_sample() -> MouseHookSample {
-    let Some(shared) = session_ptr() else {
-        return MouseHookSample::default();
-    };
-    MouseHookSample {
-        seen: shared.mouse_seen.load(std::sync::atomic::Ordering::Acquire),
-        blocked: shared
-            .mouse_blocked
-            .load(std::sync::atomic::Ordering::Acquire),
-        flags: shared
-            .mouse_flags
-            .load(std::sync::atomic::Ordering::Acquire),
-        extra: shared
-            .mouse_extra
-            .load(std::sync::atomic::Ordering::Acquire),
-        words: [
-            shared.mouse_words[0].load(std::sync::atomic::Ordering::Acquire),
-            shared.mouse_words[1].load(std::sync::atomic::Ordering::Acquire),
-            shared.mouse_words[2].load(std::sync::atomic::Ordering::Acquire),
-            shared.mouse_words[3].load(std::sync::atomic::Ordering::Acquire),
-        ],
-    }
-}
-
-/// Bytes the mouse hook copied out of `MSLLHOOKSTRUCT`, plus the counters.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MouseHookSample {
-    pub seen: u64,
-    pub blocked: u64,
-    pub flags: u32,
-    pub extra: u64,
-    pub words: [u64; 4],
+    reported
 }
 
 fn note_allowed_cursor(shared: &Shared, x: i32, y: i32) {
