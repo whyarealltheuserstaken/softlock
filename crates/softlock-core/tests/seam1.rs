@@ -1363,6 +1363,79 @@ fn prompt_events_do_not_clear_the_backoff_deadline() {
 }
 
 #[test]
+fn failing_closed_counts_wrong_secrets_and_applies_backoff() {
+    let mut controller = locked_started();
+    controller.handle(Event::HostExited);
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed {
+            reason: FailReason::HostExited
+        }
+    ));
+
+    for attempt in 1..=3 {
+        controller.handle(Event::SubmitSecret {
+            method: MethodId::softlock_pin(),
+            secret: Secret::new("nope"),
+        });
+        assert_eq!(controller.failure_count(), attempt);
+        assert_eq!(controller.backoff_delay(), Duration::ZERO);
+        assert_eq!(controller.journal().failures(), attempt);
+        assert!(matches!(
+            controller.state(),
+            LockState::FailingClosed {
+                reason: FailReason::HostExited
+            }
+        ));
+    }
+
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::softlock_pin(),
+        secret: Secret::new("nope"),
+    });
+    assert_eq!(controller.failure_count(), 4);
+    assert_eq!(controller.backoff_delay(), Duration::from_secs(30));
+    assert_eq!(controller.journal().failures(), 4);
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed {
+            reason: FailReason::HostExited
+        }
+    ));
+
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::softlock_pin(),
+        secret: Secret::new("nope"),
+    });
+    assert_eq!(
+        controller.failure_count(),
+        4,
+        "the 5th attempt is held for the delay"
+    );
+    assert!(
+        controller
+            .rejection_log()
+            .iter()
+            .any(|rejection| rejection.event == "SubmitSecret")
+    );
+
+    controller.handle(Event::AdvanceTime(Duration::from_secs(30)));
+    assert_eq!(controller.backoff_delay(), Duration::ZERO);
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed {
+            reason: FailReason::HostExited
+        }
+    ));
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::softlock_pin(),
+        secret: Secret::new("nope"),
+    });
+    assert_eq!(controller.failure_count(), 5);
+    assert_eq!(controller.backoff_delay(), Duration::from_secs(60));
+}
+
+#[test]
 fn note_failure_flushes_the_failure_count() {
     let mut controller = locked_started();
     controller.handle(Event::SubmitSecret {

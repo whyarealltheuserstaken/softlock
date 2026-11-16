@@ -170,6 +170,12 @@ fn sleep_until(total: Duration, shared: &Shared) -> bool {
         if shared.stop.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
+        if shared
+            .panic_liveness
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            panic!("lock host liveness thread");
+        }
         thread::sleep(Duration::from_millis(10));
     }
     !shared.stop.load(std::sync::atomic::Ordering::Acquire)
@@ -249,6 +255,9 @@ fn hook_thread(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<u32, (
             if status.0 == 0 || status.0 == -1 {
                 break;
             }
+            if keep.panic_hook.load(std::sync::atomic::Ordering::Acquire) {
+                panic!("lock host hook thread");
+            }
         }
     }));
     if panicked.is_err() {
@@ -262,6 +271,11 @@ fn hook_thread(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<u32, (
     }
 }
 
+/// A panic inside this callback, or inside `mouse_proc`, aborts the process.
+/// Both are `extern "system"`, so unwinding out of them is an abort. The
+/// hooks die with the process and input is not left trapped. No OS lock is
+/// attempted. A flag set from a panic hook would not help: abort stops the
+/// other threads before the liveness thread can read it.
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         if code < 0 {

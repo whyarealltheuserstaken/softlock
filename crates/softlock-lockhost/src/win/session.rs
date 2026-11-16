@@ -146,6 +146,7 @@ impl DevLock {
 
     /// Makes `lock_or_disconnect` return `decide(false, false)` without
     /// calling `LockWorkStation` or `WTSDisconnectSession`.
+    #[cfg(feature = "simulated-physical")]
     pub fn stub_os_lock_unavailable(&self) {
         self.shared.os_lock_stub.store(1, Ordering::Release);
     }
@@ -171,12 +172,14 @@ impl DevLock {
         self.shared.fail.store(true, Ordering::Release);
     }
 
+    #[cfg(feature = "simulated-physical")]
     pub fn ignore_liveness_marker(&self) {
         self.shared
             .ignore_liveness_marker
             .store(true, Ordering::Release);
     }
 
+    #[cfg(feature = "simulated-physical")]
     pub fn hold_heartbeats(&self) {
         self.shared.hold_heartbeats.store(true, Ordering::Release);
     }
@@ -185,8 +188,32 @@ impl DevLock {
         self.shared.heartbeat_missed.load(Ordering::Acquire)
     }
 
+    #[cfg(feature = "simulated-physical")]
     pub fn panic_window_thread(&self) {
         self.shared.panic_window.store(true, Ordering::Release);
+    }
+
+    /// Wakes the hook thread so its loop panics. The callback itself is not
+    /// this path: a panic there aborts the process.
+    #[cfg(feature = "simulated-physical")]
+    pub fn panic_hook_thread(&self) {
+        self.shared.panic_hook.store(true, Ordering::Release);
+        let thread_id = self.shared.hook_thread_id.load(Ordering::Acquire);
+        if thread_id != 0 {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                    thread_id,
+                    0,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "simulated-physical")]
+    pub fn panic_liveness_thread(&self) {
+        self.shared.panic_liveness.store(true, Ordering::Release);
     }
 }
 
@@ -245,6 +272,8 @@ pub(crate) struct Shared {
     pub ignore_liveness_marker: AtomicBool,
     pub hold_heartbeats: AtomicBool,
     pub panic_window: AtomicBool,
+    pub panic_hook: AtomicBool,
+    pub panic_liveness: AtomicBool,
     pub failing_closed: AtomicBool,
     pub heartbeat_missed: AtomicBool,
     pub emergency_ran: AtomicBool,
@@ -290,6 +319,8 @@ impl Shared {
             ignore_liveness_marker: AtomicBool::new(false),
             hold_heartbeats: AtomicBool::new(false),
             panic_window: AtomicBool::new(false),
+            panic_hook: AtomicBool::new(false),
+            panic_liveness: AtomicBool::new(false),
             failing_closed: AtomicBool::new(false),
             heartbeat_missed: AtomicBool::new(false),
             emergency_ran: AtomicBool::new(false),
@@ -706,7 +737,8 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
         return;
     }
     // Wrong PIN, or a PIN the controller will not accept. `verify_secret`
-    // stays `Rejected`, so a `Locked` controller records the failure.
+    // stays `Rejected`, so a `Locked` or `FailingClosed` controller records
+    // the failure and starts backoff.
     controller.handle(Event::SubmitSecret {
         method: MethodId::softlock_pin(),
         secret,

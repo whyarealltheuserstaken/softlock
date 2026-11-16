@@ -365,6 +365,24 @@ fn wts_disconnect_on_an_unused_session_fails() {
     );
 }
 
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo) + Send + Sync + 'static>;
+
+struct RestoreHook(Option<PanicHook>);
+
+impl Drop for RestoreHook {
+    fn drop(&mut self) {
+        if let Some(hook) = self.0.take() {
+            std::panic::set_hook(hook);
+        }
+    }
+}
+
+fn quiet_hook() -> RestoreHook {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    RestoreHook(Some(previous))
+}
+
 fn wake(lock: &DevLock, extra: u64) {
     send_virtual_key(VK_F13, extra).expect("wake");
     assert!(
@@ -576,19 +594,140 @@ fn a_window_thread_panic_tries_the_os_lock_then_drops_the_hooks() {
     let lock = arm("unused", None);
     lock.stub_os_lock_unavailable();
     // The panic is caught. A quiet hook keeps the test line as `... ok`.
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    let _quiet = quiet_hook();
     lock.panic_window_thread();
-    let finished = wait_for(Duration::from_secs(3), || {
-        !lock.is_locked() && lock.overlay_windows().is_empty() && lock.os_lock_attempts() >= 1
-    });
-    std::panic::set_hook(previous);
     assert!(
-        finished,
+        wait_for(Duration::from_secs(3), || {
+            !lock.is_locked() && lock.overlay_windows().is_empty() && lock.os_lock_attempts() >= 1
+        }),
         "a window-thread panic left the guard up or skipped the OS lock"
     );
     send_virtual_key(VK_F14, extra).expect("after panic");
     probe
         .wait_for_key(VK_F14, Duration::from_secs(3))
         .expect("input stayed blocked after the window thread panicked");
+}
+
+fn enter_failing_closed(lock: &DevLock) {
+    lock.stub_os_lock_unavailable();
+    lock.signal_guard_down();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            lock.os_lock_error() && lock.is_locked()
+        }),
+        "the guard-down did not fail closed"
+    );
+}
+
+fn five_wrong_pins(lock: &DevLock, extra: u64) {
+    wake(lock, extra);
+    for _ in 0..5 {
+        submit_pin(lock, WRONG, extra);
+        assert!(
+            wait_for(Duration::from_secs(20), || {
+                lock.pin_chars() == 0 && lock.is_locked()
+            }),
+            "a wrong pin released the guard"
+        );
+    }
+}
+
+#[test]
+fn failing_closed_wrong_pins_then_a_correct_pin_during_backoff_stays_locked() {
+    let _guard = gate();
+    let nonce = Nonce::install();
+    let extra = nonce.extra();
+    let lock = arm(spec_hash(), None);
+    enter_failing_closed(&lock);
+    five_wrong_pins(&lock, extra);
+    submit_pin(&lock, CORRECT, extra);
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            lock.pin_chars() == 0 && lock.is_locked()
+        }),
+        "a correct pin during failing-closed backoff released the guard"
+    );
+    thread::sleep(Duration::from_millis(400));
+    assert!(
+        lock.is_locked(),
+        "the guard released before failing-closed backoff expired"
+    );
+    assert!(
+        !lock.overlay_windows().is_empty(),
+        "the overlay came down during failing-closed backoff"
+    );
+}
+
+#[test]
+fn failing_closed_correct_pin_releases_after_backoff() {
+    let _guard = gate();
+    let nonce = Nonce::install();
+    let extra = nonce.extra();
+    let lock = arm(spec_hash(), None);
+    enter_failing_closed(&lock);
+    five_wrong_pins(&lock, extra);
+    submit_pin(&lock, CORRECT, extra);
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            lock.pin_chars() == 0 && lock.is_locked()
+        }),
+        "a correct pin during failing-closed backoff released the guard"
+    );
+    thread::sleep(Duration::from_secs(32));
+    assert!(lock.is_locked(), "the guard released during the wait");
+    submit_pin(&lock, CORRECT, extra);
+    assert!(
+        wait_for(Duration::from_secs(25), || !lock.is_locked()),
+        "a correct pin did not release the guard after failing-closed backoff"
+    );
+}
+
+#[test]
+fn a_hook_thread_panic_tries_the_os_lock_then_drops_the_hooks() {
+    let _guard = gate();
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let nonce = Nonce::install();
+    let extra = nonce.extra();
+    let lock = arm("unused", None);
+    lock.stub_os_lock_unavailable();
+    let _quiet = quiet_hook();
+    lock.panic_hook_thread();
+    assert!(
+        wait_for(Duration::from_secs(3), || lock.os_lock_attempts() >= 1),
+        "a hook-thread panic did not try the OS lock"
+    );
+    send_virtual_key(VK_F14, extra).expect("after hook panic");
+    probe
+        .wait_for_key(VK_F14, Duration::from_secs(3))
+        .expect("input stayed trapped after the hook thread panicked");
+}
+
+#[test]
+fn a_liveness_thread_panic_tries_the_os_lock_without_trapping_input() {
+    let _guard = gate();
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let nonce = Nonce::install();
+    let extra = nonce.extra();
+    let lock = arm("unused", None);
+    lock.stub_os_lock_unavailable();
+    let _quiet = quiet_hook();
+    lock.panic_liveness_thread();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            lock.os_lock_attempts() >= 1 && lock.is_locked() && !lock.overlay_windows().is_empty()
+        }),
+        "a liveness panic did not keep the overlay up after trying the OS lock"
+    );
+    // The window thread is still up, so the guard is the lock, not a trap.
+    send_virtual_key(VK_F14, extra).expect("while the guard remains");
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        probe
+            .inputs()
+            .iter()
+            .all(|input| input.virtual_key != VK_F14),
+        "the liveness panic removed the guard and left input open"
+    );
 }

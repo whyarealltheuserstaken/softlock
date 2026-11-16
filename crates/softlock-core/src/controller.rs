@@ -478,7 +478,13 @@ impl<P: Platform> LockController<P> {
     }
 
     fn on_submit_secret(&mut self, method: MethodId, secret: Secret) {
-        if !matches!(self.state, LockState::Locked { .. }) {
+        // `FailingClosed` is still a lock. A wrong PIN has to count, and a
+        // PIN during backoff has to be refused, or the OS-lock retry would
+        // allow unlimited guessing.
+        if !matches!(
+            self.state,
+            LockState::Locked { .. } | LockState::FailingClosed { .. }
+        ) {
             self.reject("SubmitSecret");
             drop(secret);
             return;
@@ -490,8 +496,14 @@ impl<P: Platform> LockController<P> {
         }
         let verdict = Credentials::verify_secret(&self.platform, &method, &secret);
         drop(secret);
-        if verdict == Verdict::Verified {
+        if verdict == Verdict::Verified && matches!(self.state, LockState::Locked { .. }) {
             self.begin_unlock();
+        } else if verdict == Verdict::Verified {
+            // A verified credential while failing closed does not take the
+            // Locked unlock path. That path would skip the broker nonce.
+            // The dev launch releases on its own PIN check once backoff is
+            // clear. Counting this as a failure would punish a correct PIN.
+            self.reject("SubmitSecret");
         } else {
             self.note_failure();
         }
@@ -502,9 +514,6 @@ impl<P: Platform> LockController<P> {
         self.journal.set_failures(self.failure_count);
         self.journal.flush();
         let delay = crate::backoff::delay_after_failure(self.failure_count);
-        let LockState::Locked { source, .. } = self.state.clone() else {
-            return;
-        };
         let prompt = if delay.is_zero() {
             self.backoff_until = None;
             PromptState::Idle
@@ -515,6 +524,11 @@ impl<P: Platform> LockController<P> {
                 until,
                 failures: self.failure_count,
             }
+        };
+        // The delay is recorded for both states. Only `Locked` has a prompt
+        // to show it. `FailingClosed` stays `FailingClosed`.
+        let LockState::Locked { source, .. } = self.state.clone() else {
+            return;
         };
         self.enter(LockState::Locked { source, prompt });
     }
