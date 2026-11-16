@@ -834,7 +834,7 @@ fn wall_ms() -> u64 {
 fn install_stop_handler() {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = handle_stop as usize;
+        action.sa_sigaction = handle_stop as *const () as usize;
         action.sa_flags = 0;
         libc::sigemptyset(&mut action.sa_mask);
         libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
