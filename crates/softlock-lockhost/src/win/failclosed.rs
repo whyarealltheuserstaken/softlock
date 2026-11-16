@@ -5,8 +5,10 @@
 //! sets that value and never clears it. Ticket 15 clears it before calling
 //! `LockWorkStation`. If the session is not actually locked, the in-session
 //! fall-back is `WTSDisconnectSession`, which does not depend on the policy.
-//! If that fails too, the caller releases the overlay and the hooks. Leaving
-//! them up would block input with no OS lock and no way out.
+//! If that fails too, the guard and the overlay stay up. The PIN is the only
+//! release, and the OS lock is retried. A hook that has already died is not
+//! blocking input; the overlay still shows the error and the retry still runs.
+//! Ctrl+Alt+Del is the secure attention sequence and is not swallowed.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,6 +30,20 @@ use super::session::Shared;
 use crate::real_lock::{RealLock, decide};
 
 pub(crate) fn lock_or_disconnect(session: u32) -> RealLock {
+    if let Some(shared) = super::session::installed_session() {
+        shared
+            .os_lock_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        if shared
+            .os_lock_stub
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            // The Windows calls are not made. The decision is the real one:
+            // neither path confirmed.
+            return decide(false, false);
+        }
+    }
     let _ = unsafe { LockWorkStation() };
     let session = if session == u32::MAX {
         own_session().unwrap_or_else(console_session)

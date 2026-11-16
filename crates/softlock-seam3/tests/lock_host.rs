@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use softlock_lockhost::{
-    DevConfig, DevLock, OVERLAY_MARKER, RunNonce, clear_run_nonce, current_session_id,
-    disconnect_session, set_run_nonce,
+    DevConfig, DevLock, OVERLAY_MARKER, RealLock, RunNonce, clear_run_nonce, current_session_id,
+    decide, disconnect_session, set_run_nonce,
 };
 use softlock_seam3::{
     Probe, Rgb, capture_marker, capture_near, cursor_position, keyboard_focus, send_left_click,
@@ -263,10 +263,11 @@ fn arming_stays_under_500ms_and_swallows_physical_keys() {
         })),
     })
     .expect("lock host did not arm");
+    let measured = lock.elapsed();
+    println!("arming took {} ms", measured.as_millis());
     assert!(
-        lock.elapsed() < Duration::from_millis(500),
-        "arming took {:?}",
-        lock.elapsed()
+        measured < Duration::from_millis(500),
+        "arming took {measured:?}"
     );
     assert!(
         started.elapsed() < Duration::from_millis(500),
@@ -362,40 +363,225 @@ fn wts_disconnect_on_an_unused_session_fails() {
     );
 }
 
+fn wake(lock: &DevLock, extra: u64) {
+    send_virtual_key(VK_F13, extra).expect("wake");
+    assert!(
+        wait_for(Duration::from_secs(3), || lock.prompt_open()),
+        "the wake key did not open the pin prompt"
+    );
+}
+
+fn submit_pin(lock: &DevLock, bytes: &[u8], extra: u64) {
+    type_codes(bytes, extra);
+    let count = u32::try_from(bytes.len()).unwrap_or(0);
+    assert!(
+        wait_for(Duration::from_secs(3), || lock.pin_chars() == count),
+        "the pin was not collected"
+    );
+    send_virtual_key(VK_RETURN, extra).expect("submit");
+}
+
 #[test]
-fn both_os_lock_paths_failing_releases_the_soft_lock() {
+fn a_correct_pin_during_backoff_stays_locked() {
+    let _guard = gate();
+    let nonce = Nonce::install();
+    let extra = nonce.extra();
+    let lock = arm(spec_hash(), None);
+    wake(&lock, extra);
+    for _ in 0..4 {
+        submit_pin(&lock, WRONG, extra);
+        assert!(
+            wait_for(Duration::from_secs(20), || {
+                lock.pin_chars() == 0 && lock.is_locked()
+            }),
+            "a wrong pin did not leave the host locked"
+        );
+    }
+    submit_pin(&lock, CORRECT, extra);
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            lock.pin_chars() == 0 && lock.is_locked()
+        }),
+        "a correct pin during backoff unlocked"
+    );
+    thread::sleep(Duration::from_millis(400));
+    assert!(
+        lock.is_locked(),
+        "the host unlocked before backoff had expired"
+    );
+}
+
+#[test]
+fn backoff_expires_after_the_advanced_time() {
+    let _guard = gate();
+    let nonce = Nonce::install();
+    let extra = nonce.extra();
+    let lock = arm(spec_hash(), None);
+    wake(&lock, extra);
+    for _ in 0..4 {
+        submit_pin(&lock, WRONG, extra);
+        assert!(
+            wait_for(Duration::from_secs(20), || {
+                lock.pin_chars() == 0 && lock.is_locked()
+            }),
+            "a wrong pin did not leave the host locked"
+        );
+    }
+    submit_pin(&lock, CORRECT, extra);
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            lock.pin_chars() == 0 && lock.is_locked()
+        }),
+        "a correct pin during backoff unlocked"
+    );
+    // The window loop feeds wall time in with `Event::AdvanceTime`. The
+    // fourth failure waits 30 seconds. This sleep is that advanced time.
+    thread::sleep(Duration::from_secs(32));
+    assert!(lock.is_locked(), "the host unlocked during the wait");
+    submit_pin(&lock, CORRECT, extra);
+    assert!(
+        wait_for(Duration::from_secs(25), || !lock.is_locked()),
+        "the correct pin did not unlock after backoff expired"
+    );
+}
+
+#[test]
+fn the_heartbeat_watchdog_fires() {
+    let _guard = gate();
+    let lock = arm("unused", None);
+    lock.stub_os_lock_unavailable();
+    lock.hold_heartbeats();
+    assert!(
+        wait_for(Duration::from_secs(3), || lock.heartbeat_missed()),
+        "the heartbeat watchdog did not fail closed"
+    );
+    assert!(lock.is_locked(), "the watchdog released the soft lock");
+    assert!(
+        !lock.overlay_windows().is_empty(),
+        "the watchdog took the overlay down"
+    );
+    assert!(
+        lock.os_lock_attempts() >= 1,
+        "the watchdog did not try the OS lock"
+    );
+    let notice = lock.overlay_notice().expect("overlay error");
+    assert!(notice.contains("Windows lock did not engage"));
+}
+
+#[test]
+fn both_os_lock_paths_failing_keeps_the_guard_and_retries() {
     let _guard = gate();
     let probe = Probe::open().expect("probe");
     probe.claim_focus();
     let nonce = Nonce::install();
     let extra = nonce.extra();
-    let lock = arm("unused", None);
+    let lock = arm(spec_hash(), None);
+    // Stubbed Windows calls. `decide` is the real decision both paths use.
+    assert_eq!(decide(false, false), RealLock::Unavailable);
+    lock.stub_os_lock_unavailable();
+    lock.signal_guard_down();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            lock.os_lock_attempts() >= 1 && lock.os_lock_error() && lock.is_locked()
+        }),
+        "both OS lock paths failing did not stay locked"
+    );
+    assert!(
+        !lock.overlay_windows().is_empty(),
+        "the overlay came down when both OS lock paths failed"
+    );
+    let notice = lock.overlay_notice().expect("overlay error");
+    assert!(notice.contains("Ctrl+Alt+Del"));
 
-    send_virtual_key(VK_F14, extra).expect("while locked");
+    send_virtual_key(VK_F14, extra).expect("while guarded");
     thread::sleep(Duration::from_millis(200));
     assert!(
         probe
             .inputs()
             .iter()
             .all(|input| input.virtual_key != VK_F14),
-        "simulated-physical input reached the probe before the release"
+        "simulated-physical input reached the probe while the OS lock was unavailable"
+    );
+    assert!(
+        wait_for(Duration::from_secs(3), || lock.os_lock_attempts() >= 2),
+        "the OS lock was not retried"
     );
 
-    // Same release the platform runs when LockWorkStation did not lock and
-    // WTSDisconnectSession did not disconnect. Neither API is called here:
-    // calling them on this session would lock or disconnect the runner.
-    lock.release_soft_lock();
+    wake(&lock, extra);
+    submit_pin(&lock, WRONG, extra);
     assert!(
-        !lock.is_locked(),
-        "the soft lock stayed up after both OS paths were unavailable"
+        wait_for(Duration::from_secs(20), || {
+            lock.pin_chars() == 0 && lock.is_locked()
+        }),
+        "a wrong pin released the guard"
+    );
+    submit_pin(&lock, CORRECT, extra);
+    assert!(
+        wait_for(Duration::from_secs(25), || !lock.is_locked()),
+        "a verified pin did not release the guard"
     );
     assert!(
         lock.overlay_windows().is_empty(),
-        "the overlay stayed up after both OS paths were unavailable"
+        "the overlay stayed up after the verified pin"
     );
-
     send_virtual_key(VK_F14, extra).expect("after release");
     probe
         .wait_for_key(VK_F14, Duration::from_secs(3))
-        .expect("input stayed blocked after both OS lock paths failed");
+        .expect("input stayed blocked after the verified pin");
+}
+
+#[test]
+fn a_liveness_miss_fail_closes() {
+    let _guard = gate();
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let nonce = Nonce::install();
+    let extra = nonce.extra();
+    let lock = arm("unused", None);
+    lock.stub_os_lock_unavailable();
+    lock.ignore_liveness_marker();
+    assert!(
+        wait_for(Duration::from_secs(4), || {
+            lock.os_lock_attempts() >= 1 && lock.os_lock_error() && lock.is_locked()
+        }),
+        "a liveness miss did not fail closed"
+    );
+    assert!(
+        !lock.overlay_windows().is_empty(),
+        "a liveness miss took the overlay down"
+    );
+    // The hook is still installed. It stopped counting the marker; it did
+    // not die. Input stays blocked. A hook that had actually died would not
+    // be blocking input.
+    send_virtual_key(VK_F14, extra).expect("while guarded");
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        probe
+            .inputs()
+            .iter()
+            .all(|input| input.virtual_key != VK_F14),
+        "simulated-physical input reached the probe after the liveness miss"
+    );
+}
+
+#[test]
+fn a_window_thread_panic_tries_the_os_lock_then_drops_the_hooks() {
+    let _guard = gate();
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let nonce = Nonce::install();
+    let extra = nonce.extra();
+    let lock = arm("unused", None);
+    lock.stub_os_lock_unavailable();
+    lock.panic_window_thread();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            !lock.is_locked() && lock.overlay_windows().is_empty() && lock.os_lock_attempts() >= 1
+        }),
+        "a window-thread panic left the guard up or skipped the OS lock"
+    );
+    send_virtual_key(VK_F14, extra).expect("after panic");
+    probe
+        .wait_for_key(VK_F14, Duration::from_secs(3))
+        .expect("input stayed blocked after the window thread panicked");
 }

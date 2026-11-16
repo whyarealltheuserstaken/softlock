@@ -290,6 +290,11 @@ unsafe fn paint_screen(hwnd: HWND, dc: HDC) {
     }
 }
 
+/// Drawn when neither Windows lock call could be confirmed. Ctrl+Alt+Del is
+/// the secure attention sequence; the hook does not swallow it.
+pub(crate) const OS_LOCK_NOTICE: &str =
+    "Windows lock did not engage. Enter PIN. Ctrl+Alt+Del still reaches Windows.";
+
 fn caption() -> Vec<u16> {
     let shared = super::guard::session_ptr();
     let prompt = shared
@@ -302,13 +307,25 @@ fn caption() -> Vec<u16> {
     let chars = shared
         .map(|shared| shared.pin_chars.load(std::sync::atomic::Ordering::Acquire))
         .unwrap_or(0);
+    let failed = shared
+        .map(|shared| {
+            shared
+                .os_lock_error
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
+        .unwrap_or(false);
     let time = unsafe { GetLocalTime() };
     let clock = format!("{:02}:{:02}", time.wHour, time.wMinute);
+    let notice = if failed {
+        format!("\n{OS_LOCK_NOTICE}")
+    } else {
+        String::new()
+    };
     let text = if prompt {
         let dots = "\u{25cf}".repeat(chars as usize);
-        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nEnter PIN\n{dots}")
+        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nEnter PIN\n{dots}{notice}")
     } else {
-        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nPress any key to unlock")
+        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nPress any key to unlock{notice}")
     };
     utf16(&text)
 }

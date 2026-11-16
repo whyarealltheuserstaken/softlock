@@ -114,6 +114,16 @@ pub(crate) fn remove(shared: &Shared) {
 }
 
 pub(crate) fn liveness(shared: Arc<Shared>) {
+    let on_panic = Arc::clone(&shared);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        liveness_loop(shared);
+    }));
+    if panicked.is_err() {
+        super::session::worker_panic(&on_panic);
+    }
+}
+
+fn liveness_loop(shared: Arc<Shared>) {
     let mut seen = shared.last_event.load(std::sync::atomic::Ordering::Acquire);
     while !shared.stop.load(std::sync::atomic::Ordering::Acquire) {
         if !sleep_until(LIVENESS_PERIOD, &shared) {
@@ -232,12 +242,19 @@ fn hook_thread(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<u32, (
     let thread_id = unsafe { GetCurrentThreadId() };
     let _ = ready.send(Ok(thread_id));
     // Keep the arc alive for the callbacks, which load the raw pointer.
-    let _keep = shared;
-    loop {
-        let status = unsafe { GetMessageW(&mut message, None, 0, 0) };
-        if status.0 == 0 || status.0 == -1 {
-            break;
+    let keep = shared;
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loop {
+            let status = unsafe { GetMessageW(&mut message, None, 0, 0) };
+            if status.0 == 0 || status.0 == -1 {
+                break;
+            }
         }
+    }));
+    if panicked.is_err() {
+        // OS lock first, then the hooks come down below. A hook thread that
+        // has already panicked is not blocking input.
+        super::session::worker_panic(&keep);
     }
     unsafe {
         let _ = UnhookWindowsHookEx(keyboard);
@@ -260,9 +277,16 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         let extra = info.dwExtraInfo as u64;
         let vk = info.vkCode as u16;
         if vk == VK_F24.0 && extra == LIVENESS_EXTRA {
-            shared
-                .marker_seen
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            // A test can stop the hook from counting the marker. The key is
+            // still swallowed, so the miss is "the hook did not see it".
+            if !shared
+                .ignore_liveness_marker
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                shared
+                    .marker_seen
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
             return LRESULT(1);
         }
         let injected = info.flags.contains(LLKHF_INJECTED);

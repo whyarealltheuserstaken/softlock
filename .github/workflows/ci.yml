@@ -185,9 +185,15 @@ jobs:
           grep -F "captures_omit_the_overlay_marker ... ok" target/seam3-lock-host.txt
           grep -F "simulated_physical_mouse_does_not_move_the_cursor ... ok" target/seam3-lock-host.txt
           grep -F "arming_stays_under_500ms_and_swallows_physical_keys ... ok" target/seam3-lock-host.txt
+          grep -E "arming took [0-9]+ ms" target/seam3-lock-host.txt
           grep -F "correct_pin_unlocks_and_wrong_pin_does_not ... ok" target/seam3-lock-host.txt
           grep -F "wts_disconnect_on_an_unused_session_fails ... ok" target/seam3-lock-host.txt
-          grep -F "both_os_lock_paths_failing_releases_the_soft_lock ... ok" target/seam3-lock-host.txt
+          grep -F "a_correct_pin_during_backoff_stays_locked ... ok" target/seam3-lock-host.txt
+          grep -F "backoff_expires_after_the_advanced_time ... ok" target/seam3-lock-host.txt
+          grep -F "the_heartbeat_watchdog_fires ... ok" target/seam3-lock-host.txt
+          grep -F "both_os_lock_paths_failing_keeps_the_guard_and_retries ... ok" target/seam3-lock-host.txt
+          grep -F "a_liveness_miss_fail_closes ... ok" target/seam3-lock-host.txt
+          grep -F "a_window_thread_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
       - name: Release build of the Windows target omits the test feature
         shell: bash
         run: |

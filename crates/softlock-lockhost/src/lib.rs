@@ -9,6 +9,8 @@
 mod classify;
 mod real_lock;
 
+pub use real_lock::{RealLock, decide};
+
 #[cfg(feature = "dev-launch")]
 mod dev_marker;
 

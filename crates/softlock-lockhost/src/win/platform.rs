@@ -104,15 +104,27 @@ impl SessionControl for WinPlatform {
     fn os_lock(&mut self, session: SessionId) -> Result<(), OsLockError> {
         match failclosed::lock_or_disconnect(session.0) {
             crate::real_lock::RealLock::Workstation | crate::real_lock::RealLock::Disconnected => {
+                self.shared
+                    .os_lock_unavailable
+                    .store(false, std::sync::atomic::Ordering::Release);
+                self.shared
+                    .os_lock_error
+                    .store(false, std::sync::atomic::Ordering::Release);
                 Ok(())
             }
             crate::real_lock::RealLock::Unavailable => {
-                // Both Windows paths failed. Drop our guard so the desktop is
-                // not trapped under an overlay that swallows input.
-                super::session::release_session(&self.shared);
+                // Both Windows paths failed. Stay guarded. The overlay keeps
+                // the PIN prompt and says why. The window thread retries.
+                // Releasing here would be an `Unlocked` end to an `Arming` or
+                // `Locked` failure. If the hook itself is already dead, it is
+                // not blocking input; the overlay and the retry still run.
                 self.shared
-                    .locked
-                    .store(false, std::sync::atomic::Ordering::Release);
+                    .os_lock_unavailable
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.shared
+                    .os_lock_error
+                    .store(true, std::sync::atomic::Ordering::Release);
+                overlay::invalidate(&self.shared);
                 Err(OsLockError::Failed)
             }
         }

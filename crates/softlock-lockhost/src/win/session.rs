@@ -1,14 +1,17 @@
 //! Dev-launch session. The window thread owns the lock controller. The hook
 //! thread only stores events.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering,
+};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use softlock_core::{
-    Event, GuardHealth, HeartbeatReport, LockController, LockSource, LockState, MethodId, Overlay,
-    Secret, Verdict, verify_softlock_pin,
+    Event, FailReason, GuardHealth, HEARTBEAT_INTERVAL, HeartbeatReport, LockController,
+    LockSource, LockState, MethodId, Overlay, Secret, Verdict, verify_softlock_pin,
 };
 use zeroize::Zeroize;
 
@@ -17,6 +20,10 @@ use super::guard;
 use super::overlay;
 use super::platform::WinPlatform;
 use super::queue::{EventQueue, KIND_CLICK, KIND_KEY, KIND_WHEEL, RawEvent};
+use crate::real_lock::RealLock;
+
+/// How long to wait before asking Windows to lock again after both calls failed.
+const OS_LOCK_RETRY: Duration = Duration::from_secs(1);
 
 /// Colour the overlay fills with. Captures must not contain it.
 pub const OVERLAY_MARKER: (u8, u8, u8) = (1, 255, 2);
@@ -72,7 +79,16 @@ impl DevLock {
         let shared = Shared::new(config.pin_hash, config.while_arming);
         let worker = Arc::clone(&shared);
         let (tx, rx) = std::sync::mpsc::channel();
-        let ui = thread::spawn(move || ui_main(worker, tx));
+        let ui = thread::spawn(move || {
+            let on_panic = Arc::clone(&worker);
+            let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| ui_main(worker, tx)));
+            if panicked.is_err() {
+                // The window thread is gone, so nothing is left to draw the
+                // overlay or take a PIN. Try the OS lock, then drop the hooks.
+                // Leaving them installed would swallow input with no UI.
+                emergency(&on_panic);
+            }
+        });
         match rx.recv_timeout(Duration::from_secs(8)) {
             Ok(Ok(elapsed)) => Ok(Self {
                 shared,
@@ -128,11 +144,49 @@ impl DevLock {
             .clone()
     }
 
-    /// Drops the overlay and the hooks. Used when neither `LockWorkStation`
-    /// nor `WTSDisconnectSession` reached the real lock screen.
-    pub fn release_soft_lock(&self) {
-        release_session(&self.shared);
-        self.shared.locked.store(false, Ordering::Release);
+    /// Makes `lock_or_disconnect` return `decide(false, false)` without
+    /// calling `LockWorkStation` or `WTSDisconnectSession`.
+    pub fn stub_os_lock_unavailable(&self) {
+        self.shared.os_lock_stub.store(1, Ordering::Release);
+    }
+
+    pub fn os_lock_attempts(&self) -> u32 {
+        self.shared.os_lock_attempts.load(Ordering::Acquire)
+    }
+
+    pub fn os_lock_error(&self) -> bool {
+        self.shared.os_lock_error.load(Ordering::Acquire)
+    }
+
+    pub fn overlay_notice(&self) -> Option<&'static str> {
+        if self.os_lock_error() {
+            Some(overlay::OS_LOCK_NOTICE)
+        } else {
+            None
+        }
+    }
+
+    /// Same flag the liveness thread sets when the marker is missed.
+    pub fn signal_guard_down(&self) {
+        self.shared.fail.store(true, Ordering::Release);
+    }
+
+    pub fn ignore_liveness_marker(&self) {
+        self.shared
+            .ignore_liveness_marker
+            .store(true, Ordering::Release);
+    }
+
+    pub fn hold_heartbeats(&self) {
+        self.shared.hold_heartbeats.store(true, Ordering::Release);
+    }
+
+    pub fn heartbeat_missed(&self) -> bool {
+        self.shared.heartbeat_missed.load(Ordering::Acquire)
+    }
+
+    pub fn panic_window_thread(&self) {
+        self.shared.panic_window.store(true, Ordering::Release);
     }
 }
 
@@ -183,6 +237,17 @@ pub(crate) struct Shared {
     pub cursor_y: AtomicI32,
     pub cursor_gen: AtomicU64,
     pub snap_gen: AtomicU64,
+    /// `0` calls Windows. Anything else makes both OS lock paths fail.
+    pub os_lock_stub: AtomicU8,
+    pub os_lock_attempts: AtomicU32,
+    pub os_lock_unavailable: AtomicBool,
+    pub os_lock_error: AtomicBool,
+    pub ignore_liveness_marker: AtomicBool,
+    pub hold_heartbeats: AtomicBool,
+    pub panic_window: AtomicBool,
+    pub failing_closed: AtomicBool,
+    pub heartbeat_missed: AtomicBool,
+    pub emergency_ran: AtomicBool,
     pub windows: Mutex<Vec<isize>>,
     pub hook: Mutex<Option<JoinHandle<()>>>,
     pub liveness: Mutex<Option<JoinHandle<()>>>,
@@ -218,6 +283,16 @@ impl Shared {
             cursor_y: AtomicI32::new(0),
             cursor_gen: AtomicU64::new(0),
             snap_gen: AtomicU64::new(0),
+            os_lock_stub: AtomicU8::new(0),
+            os_lock_attempts: AtomicU32::new(0),
+            os_lock_unavailable: AtomicBool::new(false),
+            os_lock_error: AtomicBool::new(false),
+            ignore_liveness_marker: AtomicBool::new(false),
+            hold_heartbeats: AtomicBool::new(false),
+            panic_window: AtomicBool::new(false),
+            failing_closed: AtomicBool::new(false),
+            heartbeat_missed: AtomicBool::new(false),
+            emergency_ran: AtomicBool::new(false),
             windows: Mutex::new(Vec::new()),
             hook: Mutex::new(None),
             liveness: Mutex::new(None),
@@ -288,21 +363,39 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
     }
     let mut entry = PinEntry::default();
     let mut last_minute = overlay::minute_now();
+    let mut clock = Instant::now();
+    let mut os_retry_at: Option<Instant> = None;
     loop {
+        if shared.panic_window.load(Ordering::Acquire) {
+            panic!("lock host window thread");
+        }
+        advance_clock(&mut controller, &shared, &mut clock);
+        note_controller(&controller, &shared);
         guard::restore_cursor(&shared);
         if shared.stop.load(Ordering::Acquire) {
             break;
         }
         if shared.fail.swap(false, Ordering::AcqRel) {
             report_guard_down(&mut controller, &shared);
-            break;
+            note_controller(&controller, &shared);
         }
+        retry_os_lock(&mut controller, &shared, &mut os_retry_at);
         if shared.display_changed.swap(false, Ordering::AcqRel) {
             overlay::destroy(&shared);
             if overlay::create(&shared).is_err() {
                 report_guard_down(&mut controller, &shared);
-                break;
+                note_controller(&controller, &shared);
             }
+        }
+        // OS lock confirmed: the controller already disarmed. Leave.
+        // Unavailable: stay. The guard, the overlay, and the PIN remain.
+        if matches!(controller.state(), LockState::OsLocked { .. }) {
+            break;
+        }
+        if matches!(controller.state(), LockState::FailingClosed { .. })
+            && !shared.os_lock_unavailable.load(Ordering::Acquire)
+        {
+            break;
         }
         let minute = overlay::minute_now();
         if minute != last_minute {
@@ -319,6 +412,120 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
     }
     entry.bytes.zeroize();
     shutdown(&shared);
+}
+
+/// The controller clock does not move unless told. Wall time is fed in here
+/// so a backoff can expire and so a missed heartbeat can fail closed. While
+/// the hook is healthy the advance is split into one interval at a time and
+/// a heartbeat is sent after each step. A verify can block this thread for
+/// longer than three intervals; one jump of that size would look like a
+/// dead hook. Holding heartbeats lets the watchdog run for real.
+fn advance_clock(
+    controller: &mut LockController<WinPlatform>,
+    shared: &Shared,
+    clock: &mut Instant,
+) {
+    let now = Instant::now();
+    let delta = now.saturating_duration_since(*clock);
+    *clock = now;
+    if delta.is_zero() {
+        return;
+    }
+    let healthy = !shared.hold_heartbeats.load(Ordering::Acquire)
+        && !shared.fail.load(Ordering::Acquire)
+        && matches!(controller.state(), LockState::Locked { .. });
+    if !healthy {
+        controller.handle(Event::AdvanceTime(delta));
+        return;
+    }
+    let mut left = delta;
+    while !left.is_zero() {
+        let step = left.min(HEARTBEAT_INTERVAL);
+        controller.handle(Event::AdvanceTime(step));
+        left = left.saturating_sub(step);
+        if !matches!(controller.state(), LockState::Locked { .. }) {
+            break;
+        }
+        beat(controller, shared);
+    }
+}
+
+fn beat(controller: &mut LockController<WinPlatform>, shared: &Shared) {
+    if shared.hold_heartbeats.load(Ordering::Acquire) {
+        return;
+    }
+    if !matches!(controller.state(), LockState::Locked { .. }) {
+        return;
+    }
+    let seq = controller.next_heartbeat_seq();
+    controller.handle(Event::Heartbeat(HeartbeatReport {
+        seq,
+        guard: GuardHealth {
+            hook_alive: true,
+            last_physical_input_ms: shared.physical_ms(),
+        },
+        overlay: Overlay::health(controller.platform()),
+    }));
+}
+
+fn note_controller(controller: &LockController<WinPlatform>, shared: &Shared) {
+    if let LockState::FailingClosed { reason } = controller.state() {
+        shared.failing_closed.store(true, Ordering::Release);
+        if matches!(reason, FailReason::HeartbeatMissed) {
+            shared.heartbeat_missed.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn retry_os_lock(
+    controller: &mut LockController<WinPlatform>,
+    shared: &Shared,
+    os_retry_at: &mut Option<Instant>,
+) {
+    if !shared.os_lock_unavailable.load(Ordering::Acquire) {
+        return;
+    }
+    let due = os_retry_at.get_or_insert_with(|| Instant::now() + OS_LOCK_RETRY);
+    if Instant::now() < *due {
+        return;
+    }
+    *due = Instant::now() + OS_LOCK_RETRY;
+    match failclosed::lock_or_disconnect(failclosed::console_session()) {
+        RealLock::Unavailable => {
+            shared.os_lock_error.store(true, Ordering::Release);
+            overlay::invalidate(shared);
+        }
+        RealLock::Workstation | RealLock::Disconnected => {
+            shared.os_lock_unavailable.store(false, Ordering::Release);
+            shared.os_lock_error.store(false, Ordering::Release);
+            controller.handle(Event::OsLockConfirmed);
+        }
+    }
+}
+
+/// OS lock, then hooks. Used when a lock-host thread panics. Does not join
+/// the caller: the hook and liveness threads can be the caller.
+pub(crate) fn worker_panic(shared: &Shared) {
+    let _ = failclosed::lock_or_disconnect(failclosed::console_session());
+    shared.fail.store(true, Ordering::Release);
+}
+
+fn emergency(shared: &Shared) {
+    if shared.emergency_ran.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _ = failclosed::lock_or_disconnect(failclosed::console_session());
+    release_session(shared);
+    shared.locked.store(false, Ordering::Release);
+}
+
+pub(crate) fn installed_session() -> Option<&'static Shared> {
+    let pointer = SESSION.load(Ordering::Acquire);
+    if pointer.is_null() {
+        None
+    } else {
+        Some(unsafe { &*pointer })
+    }
 }
 
 fn report_guard_down(controller: &mut LockController<WinPlatform>, shared: &Shared) {
@@ -382,7 +589,9 @@ struct PinEntry {
 impl Default for PinEntry {
     fn default() -> Self {
         Self {
-            bytes: Vec::new(),
+            // UTF-8 is at most four bytes per character. Pre-sizing means a
+            // full PIN cannot reallocate and leave an old copy behind.
+            bytes: Vec::with_capacity(PIN_CHAR_LIMIT as usize * 4),
             chars: 0,
             layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL(std::ptr::null_mut()),
         }
@@ -462,24 +671,42 @@ fn on_key(
 }
 
 fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: &mut PinEntry) {
-    let mut bytes = std::mem::take(&mut entry.bytes);
-    let secret = Secret::new(&bytes);
-    bytes.zeroize();
+    let secret = Secret::new(&entry.bytes);
+    // `Zeroize` for `Vec` clears the length and keeps the allocation, so the
+    // next PIN reuses this buffer instead of abandoning a copy.
+    entry.bytes.zeroize();
     entry.chars = 0;
     shared.pin_chars.store(0, Ordering::Release);
+    // Any PIN, right or wrong, is refused while the controller's backoff is
+    // running. `SubmitSecret` is how that refusal is recorded: the controller
+    // drops the secret and does not start an unlock.
+    if !controller.backoff_delay().is_zero() {
+        controller.handle(Event::SubmitSecret {
+            method: MethodId::softlock_pin(),
+            secret,
+        });
+        overlay::invalidate(shared);
+        return;
+    }
     // Argon2id compare, constant time, spec parameters. `Verdict::Verified`
-    // here is the credential verdict and carries no nonce. Unlocking still
-    // goes through `Event::Verified`, whose nonce `RequestHello` just drew
-    // with `LaunchNonce::generate` (32 CSPRNG bytes). Production code does
-    // not call `LaunchNonce::from_bytes`.
+    // here is the credential verdict and carries no nonce.
     let matched = verify_softlock_pin(&secret, &shared.pin_hash) == Verdict::Verified;
-    if matched {
+    if matched && matches!(controller.state(), LockState::Locked { .. }) {
         drop(secret);
         unlock_with_broker_nonce(controller, shared);
         return;
     }
-    // Wrong PIN. `verify_secret` stays `Rejected`, so this records the
-    // failure and does not unlock.
+    if matched && shared.os_lock_unavailable.load(Ordering::Acquire) {
+        // The controller is `FailingClosed`, so `RequestHello` is refused.
+        // A verified PIN is the only release while both OS locks keep failing.
+        drop(secret);
+        release_session(shared);
+        shared.prompt_open.store(false, Ordering::Release);
+        shared.locked.store(false, Ordering::Release);
+        return;
+    }
+    // Wrong PIN, or a PIN the controller will not accept. `verify_secret`
+    // stays `Rejected`, so a `Locked` controller records the failure.
     controller.handle(Event::SubmitSecret {
         method: MethodId::softlock_pin(),
         secret,
@@ -488,6 +715,11 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
 }
 
 fn unlock_with_broker_nonce(controller: &mut LockController<WinPlatform>, shared: &Shared) {
+    // Dev launch only. `RequestHello` makes this process draw the nonce with
+    // `LaunchNonce::generate` (32 bytes from `getrandom`) and store it here.
+    // Ticket 13 must not do that. The Broker owns the nonce, and the lock
+    // host has to receive that nonce across the process boundary before
+    // `Event::Verified`. Production code does not call `LaunchNonce::from_bytes`.
     controller.handle(Event::RequestHello);
     let Some(nonce) = controller.broker_nonce() else {
         overlay::invalidate(shared);
