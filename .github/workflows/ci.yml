@@ -184,8 +184,10 @@ jobs:
           grep -F "locking_leaves_keyboard_focus_unchanged ... ok" target/seam3-lock-host.txt
           grep -F "captures_omit_the_overlay_marker ... ok" target/seam3-lock-host.txt
           grep -F "simulated_physical_mouse_does_not_move_the_cursor ... ok" target/seam3-lock-host.txt
-          grep -F "arming_stays_under_500ms_and_swallows_physical_keys ... ok" target/seam3-lock-host.txt
-          grep -E "arming took [0-9]+ ms" target/seam3-lock-host.txt
+          arming=$(grep -E "arming_stays_under_500ms_and_swallows_physical_keys \.\.\. arming took [0-9]+ ms ok" target/seam3-lock-host.txt)
+          echo "$arming"
+          arming_ms=$(printf '%s\n' "$arming" | grep -oE "arming took [0-9]+" | grep -oE "[0-9]+")
+          test "$arming_ms" -lt 500
           grep -F "correct_pin_unlocks_and_wrong_pin_does_not ... ok" target/seam3-lock-host.txt
           grep -F "wts_disconnect_on_an_unused_session_fails ... ok" target/seam3-lock-host.txt
           grep -F "a_correct_pin_during_backoff_stays_locked ... ok" target/seam3-lock-host.txt

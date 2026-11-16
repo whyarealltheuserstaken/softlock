@@ -264,7 +264,9 @@ fn arming_stays_under_500ms_and_swallows_physical_keys() {
     })
     .expect("lock host did not arm");
     let measured = lock.elapsed();
-    println!("arming took {} ms", measured.as_millis());
+    // No newline: the test harness finishes the same line with `ok`.
+    print!("arming took {} ms ", measured.as_millis());
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     assert!(
         measured < Duration::from_millis(500),
         "arming took {measured:?}"
@@ -573,11 +575,16 @@ fn a_window_thread_panic_tries_the_os_lock_then_drops_the_hooks() {
     let extra = nonce.extra();
     let lock = arm("unused", None);
     lock.stub_os_lock_unavailable();
+    // The panic is caught. A quiet hook keeps the test line as `... ok`.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
     lock.panic_window_thread();
+    let finished = wait_for(Duration::from_secs(3), || {
+        !lock.is_locked() && lock.overlay_windows().is_empty() && lock.os_lock_attempts() >= 1
+    });
+    std::panic::set_hook(previous);
     assert!(
-        wait_for(Duration::from_secs(3), || {
-            !lock.is_locked() && lock.overlay_windows().is_empty() && lock.os_lock_attempts() >= 1
-        }),
+        finished,
         "a window-thread panic left the guard up or skipped the OS lock"
     );
     send_virtual_key(VK_F14, extra).expect("after panic");
