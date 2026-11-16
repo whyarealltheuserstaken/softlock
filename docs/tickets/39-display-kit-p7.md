@@ -8,7 +8,7 @@
 
 **Needs Henry's hardware:** Yes. The ThinkStation P7.
 
-**Status:** waiting for Henry. Not a GitHub issue. Not ready-for-agent.
+**Status:** waiting for Henry. Not a GitHub issue. Not ready-for-agent. The display rows stay in scope. The inbound Remote Desktop row is post-v1 and also waits on 38. Ticket 31's v1 gating is unchanged.
 
 - [ ] External display hot-plug while locked: the new display shows the lock, and unplugging it leaves the remaining displays covered (sheet)
 - [ ] A scale, DPI, or resolution change while locked leaves every display covered (sheet)

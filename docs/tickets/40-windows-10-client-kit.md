@@ -8,7 +8,7 @@
 
 **Needs Henry's hardware:** Yes, and no machine is identified. Henry's laptop is not assumed to be Windows 10. The sheet on that laptop, if it is Windows 11, stays with the Hello tickets already on the roadmap. This ticket starts when someone records a Windows 10 client.
 
-**Status:** blocked. No Windows 10 client is identified. Not a GitHub issue. Not ready-for-agent.
+**Status:** blocked. No Windows 10 client is identified. Not a GitHub issue. Not ready-for-agent. The display rows stay in scope once a machine is named. The inbound Remote Desktop row is post-v1 and also waits on 38. Ticket 31's v1 gating is unchanged.
 
 - [ ] The machine is named, and the sheet records Windows 10 and the build (sheet)
 - [ ] External display hot-plug while locked covers the new display (sheet)

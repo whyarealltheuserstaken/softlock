@@ -1,8 +1,8 @@
 # m22: Remote session lock and unlock
 
-**What to build:** Locking while Screen Sharing, VNC, Chrome Remote Desktop, TeamViewer, AnyDesk, or a remote view of the same kind is connected covers that view. Connecting to a Mac that is already SoftLocked shows the SoftLock screen on the remote view. Unlock is the Broker: a `Verified` verdict with the 32-byte `LaunchNonce`. Touch ID is offered where that remote stack supports it. Otherwise the account password or the dev PIN, the same methods as m18 and m19, and no weaker path. Keys and clicks from the remote view before unlock are the open remote-input entry in Decision 20. Screen Sharing input arrives as posted events, and this ticket does not claim the tap can tell them from an agent's. A killed lock host, or both D5 paths failing, keeps the guard up or reaches the real lock, and the state is not Unlocked. The surface that stays visible to the remote viewer is the option Henry picks in D9 (SPEC.md Decision 20). Option A there is likely infeasible. This ticket does not pick.
+**What to build:** Locking while Screen Sharing, VNC, Chrome Remote Desktop, TeamViewer, AnyDesk, or a remote view of the same kind is connected covers that view. Connecting to a Mac that is already SoftLocked shows the SoftLock screen on the remote view. Unlock is the Broker: a `Verified` verdict with the 32-byte `LaunchNonce`. Touch ID is offered where that remote stack supports it. Otherwise the account password or the dev PIN, the same methods as m18 and m19, and no weaker path. By default the remote viewer sees the SoftLock lock screen. The real screen appears on that view only after the configurable remote pass, a separate credential from the Broker. Remote-tool input is blocked until that pass succeeds, except what the unlock screen needs. Local agent input still follows the normal rules. If m21 finds Screen Sharing input arrives as a posted event, that is a risk this ticket implements around. The rule does not weaken. A killed lock host, or both D5 paths failing, keeps the guard up or reaches the real lock, and the state is not Unlocked.
 
-**Blocked by:** m14, m17, m18, m19, m21, and D9, including the macOS remote-input entry. It stays blocked while D9 is open.
+**Blocked by:** m14, m17, m18, m19, and m21. D9 is closed. This ticket does not wait on a choice.
 
 **Blocks:** m23 and m24 (the inbound Screen Sharing rows).
 
@@ -12,12 +12,12 @@
 
 **Type:** Product ticket. The hardware rows are m23, not a second copy here.
 
-**Status:** blocked on D9. Not ready-for-agent. Not a GitHub issue.
+**Status:** post-v1. Not ready-for-agent. Not a GitHub issue. The display rows on m23 and m24 are not this ticket and are not post-v1.
 
 - [ ] Locking while a remote view is connected covers that view with the SoftLock screen
 - [ ] An inbound connection to an already locked Mac shows the SoftLock screen before desktop input
-- [ ] Unlock accepts only a Broker `Verified` verdict. Touch ID is offered only where the remote stack supports it. Otherwise the account password or the dev PIN. No weaker path
-- [ ] Remote input before unlock reaches the unlock UI and does not reach another app
+- [ ] SoftLock unlock accepts only a Broker `Verified` verdict. Touch ID is offered only where the remote stack supports it. Otherwise the account password or the dev PIN. No weaker path. The real screen on the remote view also requires the configurable remote pass
+- [ ] Remote-tool input before that pass reaches only what the unlock screen needs, and local agent input still reaches another app. If m21 could not tell those inputs apart, this box still holds
 - [ ] A killed lock host, or both D5 paths failing, keeps the guard up or reaches the real lock, and the state is not Unlocked
 
 Common to every ticket: red-green TDD at the named seams, CI green, no planned paid or enterprise features (allowlists, rules, fleet management, remote triggers, the CLI, MDM profiles), the product name only via the name constant.

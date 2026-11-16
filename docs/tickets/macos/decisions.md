@@ -4,7 +4,7 @@ Read against `23b5a39bc92c2ee32f470256d78be27d030dc59f`. The addendum is [`docs/
 
 Each item has a recommendation until someone decides it. Changing an answer rewrites the tickets that name it. It does not rewrite the Windows spec.
 
-Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7 on 16 November 2026, as written. The lead also decided D8 the same day. The test-machine paragraph is D1, and the other macOS files link to it. D9 is SPEC.md Decision 20. It is open. The lead's recommendation is written there. This file does not close it.
+Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7 on 16 November 2026, as written. The lead also decided D8 the same day. The test-machine paragraph is D1, and the other macOS files link to it. D9 is closed. Henry's decision is SPEC.md Decision 20: a remote viewer sees the SoftLock lock screen until a separate configurable pass, and remote-tool input is blocked until that pass except what the unlock screen needs. The earlier options and the lead recommendation are not the decision.
 
 ## D1. Universal 2, macOS 11, his Intel Mac, arm64 on macos-latest
 
@@ -80,10 +80,8 @@ Windows does not return to Unlocked when arming fails or the real lock fails. ma
 
 Tickets m08 and m17 add the chooser row: documented path unavailable or password not required → never Unlocked; refuse to arm. m08's sheet records the password-after-screensaver setting and the delay.
 
-## D9. Capture exclusion and a remote view (macOS only)
+## D9. Remote view and remote input (macOS only)
 
-This is the macOS entry in SPEC.md Implementation Decision 20. Henry decided the behavior on 16 November 2026, for Windows 11, Windows 10, Linux, and the macOS Universal build, both slices. He did not decide how a capture-excluded overlay stays visible on a remote view. Windows and Linux have their own open entries in that decision, because the mechanism is not this flag.
+**Decision, Henry, 16 November 2026.** Closed. The words are in SPEC.md Implementation Decision 20, and they apply on Windows 11, Windows 10, Linux, and both macOS slices. By default only a local viewer sees the real screen. A remote viewer sees the SoftLock lock screen, and sees the real screen only after a configurable pass, a separate remote credential. Remote-tool input is blocked until that pass succeeds, except what the unlock screen needs. Agent input on the local session still follows the normal rules. A crash or failure ends locked.
 
-`NSWindow.SharingType.none` is the macOS flag under test (D6), on Intel and on Apple Silicon. Screen Sharing, VNC, AirPlay, and DisplayLink are capture or pixel-forwarding paths, so a window excluded from capture can be invisible on the remote view. The macOS options and the lead recommendation are in Decision 20. A is marked likely infeasible there, because Screen Sharing and a local capture read the same window-server image and `.none` is a legacy constant the page says macOS no longer uses. C is the documented limit. D is agent-side ScreenCaptureKit exclusion. This file does not copy those options. The dropped Windows per-session option is not a macOS option. The macOS remote-input entry is in the same decision.
-
-**Open.** Henry decides. m21 measures the arm64 runner. m23 measures the Intel Mac. m22 waits until this is closed. Accepting D2, D3, D4, D6, and D7 does not close D9.
+`NSWindow.SharingType.none` is still the flag under test (D6), on Intel and on Apple Silicon. Screen Sharing and a local capture read the same window-server image, and Apple says `.none` is a legacy constant not to be used to hide content from capture. m21, which is post-v1, records whether a remote path shows the marker and whether its input arrives as a posted event. That measurement is a risk. It does not replace this decision. The display rows on m23 stay in scope. The Screen Sharing row is post-v1 with m22.

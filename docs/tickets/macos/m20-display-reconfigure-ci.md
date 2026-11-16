@@ -12,7 +12,7 @@
 
 **Type:** Prototype spike. Deliverable is a written finding plus the proof job.
 
-**Status:** waiting for Henry to approve the macOS set. Not ready-for-agent. Not a GitHub issue. Does not wait on D9.
+**Status:** waiting for Henry to approve the macOS set. Not ready-for-agent. Not a GitHub issue. This ticket is the display callback. It is not post-v1 and it is not a remote-view ticket.
 
 - [ ] The job logs a begin-configuration callback and a set-mode callback for the mode change it performed (job log)
 - [ ] Add, remove, and mirror flags are logged when they arrive. When they do not, the log says the runner did not add, remove, or mirror a display (job log)

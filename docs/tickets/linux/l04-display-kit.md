@@ -10,7 +10,7 @@
 
 **Type:** Hardware kit.
 
-**Status:** blocked. No machine is named, and there is no Linux platform plan. Not ready-for-agent. Not a GitHub issue.
+**Status:** blocked. No machine is named, and there is no Linux platform plan. Not ready-for-agent. Not a GitHub issue. The display rows are not post-v1. The remote-view rows are post-v1 and also wait on l03.
 
 - [ ] The machine is named, and the sheet records the distribution and whether the session is X11 or Wayland (sheet)
 - [ ] Hot-plug of an external display while locked covers the new display, on each session type the machine can run (sheet)

@@ -12,7 +12,7 @@
 
 **Type:** Hardware kit. Deliverable is the filled sheet under `docs/findings/`.
 
-**Status:** waiting for Henry. Not ready-for-agent. Not a GitHub issue.
+**Status:** waiting for Henry. Not ready-for-agent. Not a GitHub issue. The display rows stay in scope. The inbound Screen Sharing row is post-v1 and also waits on m22.
 
 - [ ] External display hot-plug while locked: the new display shows the lock, or the sheet names the miss (sheet)
 - [ ] Closed lid with an external display awake: the external display shows the lock. If no second keyboard is available, the sheet says the row could not be run (sheet)

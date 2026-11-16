@@ -10,7 +10,7 @@
 
 **Type:** Hardware kit.
 
-**Status:** blocked. No machine is named. Not ready-for-agent. Not a GitHub issue.
+**Status:** blocked. No machine is named. Not ready-for-agent. Not a GitHub issue. The display rows stay in scope once a machine is named. The inbound Screen Sharing row is post-v1 and also waits on m22.
 
 - [ ] The machine is named, and the sheet records the chip and `sw_vers` (sheet)
 - [ ] External display hot-plug while locked covers the new display, and the sheet records how many displays that chip kept awake (sheet)

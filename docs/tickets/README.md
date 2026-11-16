@@ -1,6 +1,6 @@
 # Windows tickets for connected and remote displays
 
-Planning files, 16 November 2026. They are not GitHub issues. The behavior is SPEC.md Implementation Decision 20. The capture-versus-remote mechanism in that decision is open.
+Planning files, 16 November 2026. They are not GitHub issues. The behavior is SPEC.md Implementation Decision 20, closed by Henry the same day: a remote viewer sees the SoftLock lock screen until a separate configurable pass, and remote-tool input is blocked until that pass except what the unlock screen needs. Connected and multi-display rows stay in scope. Remote rows are post-v1. Ticket 31's v1 gating is unchanged.
 
 Windows v1 tickets 1–31 and 35 stay the GitHub issues linked from [issue 33](https://github.com/whyarealltheuserstaken/softlock/issues/33). The next free ticket number after 35 is 36. These files are 36–40. Linux display tickets are a separate set in [`linux/`](linux/README.md), blocked on a Linux platform plan. macOS is [`macos/`](macos/README.md).
 
@@ -19,10 +19,10 @@ When the lead edits #18, the proposed text is: keep topmost re-assert, the shell
 | Id | Title | Blocked by | Where |
 |---|---|---|---|
 | [36](36-display-change-ci.md) | Seam 3: display add, remove, and change | 11, 12 | CI, `windows-2022` and `windows-2025` |
-| [37](37-capture-remote-spike.md) | Spike: capture exclusion versus a remote view | 11, finding 02 | CI, and a written miss if the runner has no remote terminal |
-| [38](38-remote-session-lock.md) | Remote session lock and unlock | 15, 21, 22, 37, Decision 20 | CI for the rules that do not need a second machine; the client-SKU session move is 39 |
-| [39](39-display-kit-p7.md) | Kit: hot-plug, DisplayLink, inbound RDP on the P7 | 36; the RDP row also 38 | ThinkStation P7 |
-| [40](40-windows-10-client-kit.md) | Kit: the same rows on a Windows 10 client | a named Windows 10 client; the RDP row also 38 | No machine identified |
+| [37](37-capture-remote-spike.md) | Spike: capture exclusion versus a remote view. Post-v1 | 11, finding 02 | CI, and a written miss if the runner has no remote terminal |
+| [38](38-remote-session-lock.md) | Remote session lock, the remote pass, and remote-tool input. Post-v1 | 15, 21, 22, 37 | CI for the rules that do not need a second machine; the client-SKU session move is 39 |
+| [39](39-display-kit-p7.md) | Kit: hot-plug and DisplayLink in scope. Inbound RDP is post-v1 | 36; the RDP row also 38 | ThinkStation P7 |
+| [40](40-windows-10-client-kit.md) | Kit: display rows in scope. Inbound RDP is post-v1 | a named Windows 10 client; the RDP row also 38 | No machine identified |
 
 ## Blocking edges
 
@@ -39,6 +39,6 @@ When the lead edits #18, the proposed text is: keep topmost re-assert, the shell
 38 --> 40
 ```
 
-The Windows capture entry and the Windows remote-input entry in Decision 20 block 38 until Henry closes them. 36 and 37 do not wait on them. They run on `windows-2022` (Windows 10 family, Server) and `windows-2025` (Windows 11 family, Server) and compare the two. The Windows 10 versus Windows 11 behavior list is in SPEC.md Decision 20. Ticket 40 is the Windows 10 client, and no such machine is identified. Ticket 31 stays blocked by 18. Henry is deciding whether Decision 20 is v1 or post-v1, so this file does not change ticket 31's gating. The display and inbound-RDP rows live on 39 and 40.
+Henry closed the Windows entries. 38 is post-v1 and waits on 15, 21, 22, and 37, not on a choice. 36 stays in scope. It runs on `windows-2022` (Windows 10 family, Server) and `windows-2025` (Windows 11 family, Server) and compares the two. 37 is the post-v1 spike on those same images. The Windows 10 versus Windows 11 behavior list is in SPEC.md Decision 20. Ticket 40 is the Windows 10 client, and no such machine is identified. Ticket 31 stays blocked by 18. This file does not change ticket 31's gating. Display rows live on 36, 39, and 40. Inbound RDP lives on 39 and 40 and is post-v1.
 
 GitHub issue #18 is not edited by these files. The proposed issue text is the follow-up above. This change does not create or edit GitHub issues.
