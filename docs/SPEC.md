@@ -365,7 +365,7 @@ pub enum Verdict { Verified { user: UserId }, Rejected { reason: RejectReason },
 
 | Method | Input | Verified by | Notes |
 |---|---|---|---|
-| `windows_hello` | `SystemDialog` (face or fingerprint need no keys. PIN uses credential passthrough) | The Broker calls `UserConsentVerifier.RequestVerificationAsync` in the user context | The result comes back over the Broker's inherited pipe. Available only if Hello is set up |
+| `windows_hello` | `SystemDialog` (face or fingerprint need no keys. PIN uses credential passthrough) | The Broker calls `IUserConsentVerifierInterop::RequestVerificationForWindowAsync` (desktop UserConsentVerifier, parented to a window) in the user context | The result comes back over the Broker's inherited pipe. Available only if Hello is set up |
 | `os_password` | `SecretEntry` in the SoftLock prompt | The Service calls `LogonUserW` (network logon, then the token is closed right away) for the session user, including `MicrosoftAccount\<email>` | Failures count toward Windows' account-lockout counter, so SoftLock's backoff starts first |
 | `softlock_pin` | `SecretEntry` | The Service checks Argon2id (m = 64 MiB, t = 3, p = 1, 16-byte random salt), using a constant-time comparison | The hash is stored in the Service's SYSTEM-only secrets store, **never in the user-editable config** |
 
