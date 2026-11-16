@@ -26,13 +26,24 @@ pub fn desktop_supported() -> bool {
     cfg!(windows)
 }
 
+// The dev-launch tests are the callers. This reference keeps both dependencies
+// in use for the library target on hosts where those tests are cfg'd out.
+#[cfg(feature = "dev-launch")]
+#[allow(dead_code)]
+fn dev_launch_dependencies() {
+    let _ = softlock_lockhost::dev_launch_marker_bytes();
+    let _ = std::any::type_name::<softlock_core::Secret>();
+}
+
 #[cfg(all(windows, feature = "simulated-physical"))]
 pub use win::classify_observed;
 #[cfg(windows)]
 pub use win::{
-    CaptureMethod, DeviceInfo, FocusState, HarnessError, HookObservation, MethodCapture, PowerHold,
-    Probe, RecordedInput, capture_marker, delete_tree, observe_injected_key, put_dword,
-    send_virtual_key, snapshot_devices, snapshot_key, snapshot_power_requests, snapshot_values,
+    CaptureMethod, DeviceInfo, FocusState, HarnessError, HookObservation, KeyboardFocus,
+    MethodCapture, PowerHold, Probe, RecordedClick, RecordedInput, capture_marker, capture_near,
+    cursor_position, delete_tree, keyboard_focus, observe_injected_key, put_dword, send_left_click,
+    send_mouse_absolute, send_mouse_move, send_virtual_key, snapshot_devices, snapshot_key,
+    snapshot_power_requests, snapshot_values, window_pixels,
 };
 
 #[cfg(test)]

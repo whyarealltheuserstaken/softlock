@@ -67,20 +67,65 @@ struct Frame {
     pixels: Vec<u8>,
 }
 
+/// Pixels of `color` in the window's own device context.
+///
+/// Screen-capture exclusion does not apply to the window DC, so this shows
+/// whether the window actually painted.
+pub fn window_pixels(
+    hwnd: isize,
+    color: crate::pixels::Rgb,
+    tolerance: u8,
+) -> Result<u64, HarnessError> {
+    let window = HWND(hwnd as *mut _);
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetClientRect(window, &mut rect)
+            .map_err(|error| explain(error, "GetClientRect"))?;
+    }
+    let frame = rect_from_dc(
+        Some(window),
+        0,
+        0,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+    )?;
+    Ok(pixels::count_near(&frame.pixels, color, tolerance))
+}
+
 pub fn capture_marker(hwnd: isize) -> Result<Vec<MethodCapture>, HarnessError> {
+    capture_near(hwnd, MARKER, 12)
+}
+
+/// Counts `color` in one frame from each capture API.
+///
+/// `MethodCapture::marker_pixels` is the count of `color`, not the probe marker,
+/// unless `color` is that marker. Frame selection still prefers the probe marker
+/// so a capture that missed the desktop does not look empty.
+pub fn capture_near(
+    hwnd: isize,
+    color: crate::pixels::Rgb,
+    tolerance: u8,
+) -> Result<Vec<MethodCapture>, HarnessError> {
     let _ = ensure_mta();
     let window = HWND(hwnd as *mut _);
     Ok(vec![
-        one(CaptureMethod::Gdi, || capture_gdi(hwnd))?,
-        one(CaptureMethod::DxgiDuplication, || capture_dxgi(hwnd))?,
-        one(CaptureMethod::WindowsGraphicsCapture, || {
-            capture_wgc(window, hwnd)
+        one(CaptureMethod::Gdi, color, tolerance, || capture_gdi(hwnd))?,
+        one(CaptureMethod::DxgiDuplication, color, tolerance, || {
+            capture_dxgi(hwnd)
         })?,
+        one(
+            CaptureMethod::WindowsGraphicsCapture,
+            color,
+            tolerance,
+            || capture_wgc(window, hwnd),
+        )?,
     ])
 }
 
 fn one(
     method: CaptureMethod,
+    color: crate::pixels::Rgb,
+    tolerance: u8,
     capture: impl FnOnce() -> Result<Frame, HarnessError>,
 ) -> Result<MethodCapture, HarnessError> {
     let frame =
@@ -89,7 +134,7 @@ fn one(
         method,
         width: frame.width,
         height: frame.height,
-        marker_pixels: pixels::count_near(&frame.pixels, MARKER, 12),
+        marker_pixels: pixels::count_near(&frame.pixels, color, tolerance),
     })
 }
 
@@ -126,25 +171,35 @@ fn capture_gdi(hwnd: isize) -> Result<Frame, HarnessError> {
 }
 
 fn rect_capture(x: i32, y: i32, width: i32, height: i32) -> Result<Frame, HarnessError> {
+    rect_from_dc(None, x, y, width, height)
+}
+
+fn rect_from_dc(
+    window: Option<HWND>,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<Frame, HarnessError> {
     if width <= 0 || height <= 0 {
         return Err(HarnessError::new(format!(
             "capture size is {width}x{height}"
         )));
     }
     unsafe {
-        let screen = GetDC(None);
+        let screen = GetDC(window);
         if screen.0.is_null() {
             return Err(HarnessError::new("screen dc is empty"));
         }
         let memory = CreateCompatibleDC(Some(screen));
         if memory.0.is_null() {
-            let _ = ReleaseDC(None, screen);
+            let _ = ReleaseDC(window, screen);
             return Err(HarnessError::new("memory dc failed"));
         }
         let bitmap = CreateCompatibleBitmap(screen, width, height);
         if bitmap.0.is_null() {
             let _ = DeleteDC(memory);
-            let _ = ReleaseDC(None, screen);
+            let _ = ReleaseDC(window, screen);
             return Err(HarnessError::new("bitmap failed"));
         }
         let previous = SelectObject(memory, HGDIOBJ(bitmap.0));
@@ -156,7 +211,7 @@ fn rect_capture(x: i32, y: i32, width: i32, height: i32) -> Result<Frame, Harnes
         let _ = SelectObject(memory, previous);
         let _ = DeleteObject(HGDIOBJ(bitmap.0));
         let _ = DeleteDC(memory);
-        let _ = ReleaseDC(None, screen);
+        let _ = ReleaseDC(window, screen);
         image
     }
 }

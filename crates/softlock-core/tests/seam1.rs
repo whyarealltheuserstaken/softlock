@@ -1363,6 +1363,139 @@ fn prompt_events_do_not_clear_the_backoff_deadline() {
 }
 
 #[test]
+fn failing_closed_counts_wrong_secrets_and_applies_backoff() {
+    let mut controller = locked_started();
+    controller.handle(Event::HostExited);
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed {
+            reason: FailReason::HostExited
+        }
+    ));
+
+    for attempt in 1..=3 {
+        controller.handle(Event::SubmitSecret {
+            method: MethodId::softlock_pin(),
+            secret: Secret::new("nope"),
+        });
+        assert_eq!(controller.failure_count(), attempt);
+        assert_eq!(controller.backoff_delay(), Duration::ZERO);
+        assert_eq!(controller.journal().failures(), attempt);
+        assert!(matches!(
+            controller.state(),
+            LockState::FailingClosed {
+                reason: FailReason::HostExited
+            }
+        ));
+    }
+
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::softlock_pin(),
+        secret: Secret::new("nope"),
+    });
+    assert_eq!(controller.failure_count(), 4);
+    assert_eq!(controller.backoff_delay(), Duration::from_secs(30));
+    assert_eq!(controller.journal().failures(), 4);
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed {
+            reason: FailReason::HostExited
+        }
+    ));
+
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::softlock_pin(),
+        secret: Secret::new("nope"),
+    });
+    assert_eq!(
+        controller.failure_count(),
+        4,
+        "the 5th attempt is held for the delay"
+    );
+    assert!(
+        controller
+            .rejection_log()
+            .iter()
+            .any(|rejection| rejection.event == "SubmitSecret")
+    );
+
+    controller.handle(Event::AdvanceTime(Duration::from_secs(30)));
+    assert_eq!(controller.backoff_delay(), Duration::ZERO);
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed {
+            reason: FailReason::HostExited
+        }
+    ));
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::softlock_pin(),
+        secret: Secret::new("nope"),
+    });
+    assert_eq!(controller.failure_count(), 5);
+    assert_eq!(controller.backoff_delay(), Duration::from_secs(60));
+}
+
+#[test]
+fn failing_closed_unlocks_only_through_a_matching_nonce() {
+    let mut available = locked_started();
+    available.handle(Event::HostExited);
+    assert!(!available.os_lock_unavailable());
+    available.handle(Event::RequestHello);
+    assert!(available.broker_nonce().is_none());
+    available.handle(Event::Verified {
+        nonce: counter_nonce(1),
+    });
+    assert!(
+        matches!(available.state(), LockState::FailingClosed { .. }),
+        "a nonce unlock ran while the OS lock was still available"
+    );
+
+    let mut platform = FakePlatform::new();
+    platform.fail_os_lock(true);
+    let mut controller = started(platform);
+    controller.handle(Event::LockRequested {
+        source: LockSource::Hotkey,
+    });
+    controller.handle(Event::HostExited);
+    assert!(controller.os_lock_unavailable());
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed { .. }
+    ));
+
+    controller.handle(Event::Verified {
+        nonce: counter_nonce(1),
+    });
+    assert!(
+        matches!(controller.state(), LockState::FailingClosed { .. }),
+        "a missing nonce left FailingClosed"
+    );
+
+    controller.handle(Event::RequestHello);
+    let nonce = controller.broker_nonce().expect("broker nonce");
+    controller.handle(Event::Verified {
+        nonce: counter_nonce(9),
+    });
+    assert!(
+        matches!(controller.state(), LockState::FailingClosed { .. }),
+        "a bad nonce left FailingClosed"
+    );
+
+    controller.handle(Event::Verified { nonce });
+    assert!(
+        controller
+            .visited()
+            .iter()
+            .any(|state| matches!(state, LockState::Unlocking { .. })),
+        "a matching nonce did not pass through Unlocking"
+    );
+    assert!(
+        matches!(controller.state(), LockState::Unlocked),
+        "a matching nonce did not unlock"
+    );
+}
+
+#[test]
 fn note_failure_flushes_the_failure_count() {
     let mut controller = locked_started();
     controller.handle(Event::SubmitSecret {
@@ -2064,9 +2197,12 @@ proptest! {
                     controller.handle(Event::Session(notification));
                 }
                 Step::VerifiedBroker => {
+                    let unavailable = controller.os_lock_unavailable();
                     controller.handle(Event::RequestHello);
                     if let Some(nonce) = controller.broker_nonce() {
-                        genuine = matches!(before, LockState::Locked { .. });
+                        genuine = matches!(before, LockState::Locked { .. })
+                            || (unavailable
+                                && matches!(before, LockState::FailingClosed { .. }));
                         controller.handle(Event::Verified { nonce });
                     }
                 }

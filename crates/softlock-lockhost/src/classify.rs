@@ -75,6 +75,13 @@ impl RunNonce {
 #[cfg(feature = "simulated-physical")]
 static RUN_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// The nonce installed for this process, or zero when none is installed.
+#[cfg(feature = "simulated-physical")]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn current_run_nonce() -> u64 {
+    RUN_NONCE.load(Ordering::SeqCst)
+}
+
 /// Installs the nonce for this process. Pass [`RunNonce::random`] once per test run.
 #[cfg(feature = "simulated-physical")]
 pub fn set_run_nonce(nonce: RunNonce) {
