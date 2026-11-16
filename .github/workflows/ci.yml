@@ -47,6 +47,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Seam 1
         run: cargo test --workspace --all-targets
+      - name: Hello spike smoke
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        run: cargo run -p softlock-hello-spike -- smoke
+      - name: Hello spike stays out of release binaries
+        if: runner.os == 'Windows'
+        timeout-minutes: 30
+        run: |
+          cargo build --release -p softlock-hello-spike -p softlock-core -p softlock-windows -p softlock-service -p softlock-lockhost -p softlock-broker -p softlock-app
+          powershell -File spikes/hello-consent/ci/scan-release.ps1
 
   deny:
     name: licenses and advisories
