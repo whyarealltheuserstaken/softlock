@@ -521,8 +521,12 @@ pub fn failure_reasons(report: &ProofReport) -> Vec<String> {
     reasons
 }
 
-/// The marker window left the image when `.none` matches the ordered-out baseline
-/// and the default capture still holds the window area on top of that baseline.
+/// A live frame can disagree with the ordered-out frame by a few predicate pixels.
+/// 16 is far below the 76800-pixel window.
+pub const BASELINE_NOISE: i32 = 16;
+
+/// The marker window left the image when the default capture holds the window
+/// area above the ordered-out baseline, and `.none` stays within `BASELINE_NOISE` of that baseline.
 pub fn window_removed(
     default_count: i32,
     none_count: i32,
@@ -531,7 +535,7 @@ pub fn window_removed(
 ) -> bool {
     window_area > 0
         && default_count >= baseline_count.saturating_add(window_area)
-        && none_count == baseline_count
+        && (none_count - baseline_count).abs() <= BASELINE_NOISE
 }
 
 /// This runner does not by itself let m14 claim a path. m06 has to agree.
@@ -1991,6 +1995,7 @@ mod tests {
     #[test]
     fn counts_76834_34_34_remove_the_window_and_stay_unclaimed() {
         assert!(window_removed(76834, 34, 34, 76800));
+        assert!(window_removed(76831, 34, 31, 76800));
         assert!(!window_removed(76834, 76834, 34, 76800));
         assert!(!window_removed(34, 34, 34, 76800));
         let sharing = measured_sharing();

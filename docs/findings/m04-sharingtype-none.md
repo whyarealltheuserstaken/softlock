@@ -1,59 +1,46 @@
-# m04: sharingType none on the four capture paths
+# m04: sharingType none removed the marker window
 
 Measured on 16 November 2026 UTC by the workspace-excluded probe `spikes/macos-desktop-proof`.
 
-The proof run is [macOS desktop proof run 43978092654](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43978092654), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43978092654/job/133687166956). The measured head is `187d3e699cc204796cc2767431d6faf7f1ac2b6a`. The job printed `result=pass`. This is one 1024x768 virtual display. It does not prove a second monitor, a Space switch, or a full-screen app. Those stay on m06.
-
-## What the runner is
-
-`macos-latest`, `uname -m` `arm64`.
+The proof run is [macOS desktop proof run 43981145176](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43981145176), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43981145176/job/133697617096). The measured head is `1885882`. macOS 26.7.2, arm64, one 1024x768 display. `CGShieldingWindowLevel()` was not called. The window stayed visible, unoccluded, and listed by `CGWindowListCopyWindowInfo` after `sharingType` was set to `.none`.
 
 ```
 ProductName:	macOS
 ProductVersion:	26.7.2
 BuildVersion:	25G332
-uname -m
-arm64
+display-image-api=CGWindowListCreateImage,CGDisplayCreateImage
+sharing-presence=visible=true occlusion=true listed=true area=76800
 ```
 
-## The window
+The display-image calls were `CGWindowListCreateImage` and `CGDisplayCreateImage`. ScreenCaptureKit was `SCScreenshotManager` with an empty `excludingWindows` list, plus one `SCStream` frame of the display with the same empty list.
 
-Borderless, marker colour sRGB 0.86, 0.04, 0.63, 320 by 240. Level `NSWindow.Level.screenSaver`. Collection behaviour `canJoinAllSpaces` and `fullScreenAuxiliary`. `ignoresMouseEvents` set. `CGShieldingWindowLevel()` was not called.
+The marker window is 320 by 240, 76800 pixels. `baseline` is the same capture with both windows ordered out. `control` is a second window, a different colour, left at the default sharing type, and it is only on screen for the `.none` captures.
 
-```
-sharing-window=level=screenSaver collection=canJoinAllSpaces,fullScreenAuxiliary ignoresMouseEvents=true shielding=false ordered-front=true error=none
-sharing-readback-default=NSWindowSharingReadOnly
-sharing-readback-none=NSWindowSharingNone
-display-image-api=CGWindowListCreateImage
-```
+On this runner `.none` removed the window from every measured path. Apple's page says not to rely on that value to hide content. The counts still say the window left the image. m14 may not claim any path until m06 on Henry's Intel Mac agrees, so every row stays `do-not-claim`.
 
-The display-image call is `CGWindowListCreateImage`. The symbol was present. `CGDisplayCreateImage` is the same runtime lookup the m02 harness uses, and on this OS it returned an image. ScreenCaptureKit is the harness entry `SCScreenshotManager` with `SCContentFilter initWithDisplay:excludingWindows:` and an empty window list. No path was unavailable.
+| Path | Default | `.none` | Baseline | Control in `.none` | Removed |
+|---|---:|---:|---:|---:|---|
+| `CGWindowListCreateImage` | 76834 | 34 | 34 | 77615 | yes |
+| `CGDisplayCreateImage` | 76834 | 34 | 34 | 77615 | yes |
+| `screencapture` | 76834 | 34 | 34 | 77615 | yes |
+| ScreenCaptureKit | 76834 | 34 | 34 | 77615 | yes |
+| `SCStream` | 76831 | 34 | 31 | 77615 | yes |
 
-## Marker counts
+The four still images match the baseline exactly. The `SCStream` frame is 3 predicate pixels off the ordered-out frame (34 against 31). That is not the window: default minus baseline is 76800, the window area. The comparison allows 16 such pixels. A window that stayed in the image would miss by tens of thousands.
 
-The window is 76800 pixels. Every path counted 76834 marker pixels with sharing left at the default (`NSWindowSharingReadOnly`), and 34 with `NSWindowSharingNone`. The drop is 76800 on every path, the size of the window. The 34 that remain are the same surplus the default image had over that size.
-
-```
-sharing-default-CGWindowListCreateImage=marker pixels=76834 width=1024 height=768
-sharing-default-CGDisplayCreateImage=marker pixels=76834 width=1024 height=768
-sharing-default-screencapture=marker pixels=76834 width=1024 height=768
-sharing-default-ScreenCaptureKit=marker pixels=76834 width=1024 height=768 entry=SCScreenshotManager excludingWindows empty
-sharing-none-CGWindowListCreateImage=marker pixels=34 width=1024 height=768
-sharing-none-CGDisplayCreateImage=marker pixels=34 width=1024 height=768
-sharing-none-screencapture=marker pixels=34 width=1024 height=768
-sharing-none-ScreenCaptureKit=marker pixels=34 width=1024 height=768 entry=SCScreenshotManager excludingWindows empty
-sharing-m14-CGWindowListCreateImage=do-not-claim
-sharing-m14-CGDisplayCreateImage=do-not-claim
-sharing-m14-screencapture=do-not-claim
-sharing-m14-ScreenCaptureKit=do-not-claim
-```
-
-Apple's page for `NSWindow.SharingType.none` calls it a legacy constant and says not to use it to hide content from capture. On this OS it is not a pure no-op in the counts: the window's own pixels left every image. It is also not a zero. The claim rule is a zero marker count with the marker present at the default. 34 is not zero, so no path omits the marker, and m14 may claim none of these four paths (decision D6). m06 repeats the same counts on Henry's Intel Mac before any path is claimed.
+The control window is in every `.none` capture (77615 green pixels). The ordered-out frames still have 815 of that colour, and 77615 minus 815 is 76800.
 
 ## Remote viewer
 
-SPEC says an agent's screenshot shows the real desktop because the lock screen is excluded from capture. With sharing left at the default, all four paths contain the marker window, so a remote viewer of those captures sees the lock screen. That is the picture until a path measures zero. `.none` removed one window of marker pixels here and left 34. The job does not turn that into a claim. Until m04 and m06 both show a zero, the macOS lock stays a physical-input lock, and the docs keep the remote viewer on the lock screen.
+Local capture is story 20: an agent's screenshot. On this runner `.none` took the marker window out of those screenshots.
+
+A remote viewer is a different decision. Under Decision 20 (PR #73), a remote viewer sees the lock screen by default until the separate remote pass, whatever capture does. Screen Sharing reads the same window-server image these paths read, so `.none` probably hides the lock from Screen Sharing too. That would conflict with Decision 20. m14 and m22 must not apply `.none` while a remote session is detected and before the remote pass. Measuring that detection is m21. The real Screen Sharing test is m23.
 
 ## Henry's Intel Mac
 
-No hardware serial belongs in this repo. m06 runs this probe on his machine: MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), macOS Tahoe 26.7.3. The runner does not stand in for that OS, a second display, a Space switch, or a full-screen app.
+No hardware serial belongs in this repo. His machine is a MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), macOS Tahoe 26.7.3. Still on that Mac:
+
+- m06: the same marker counts on his OS, including a Space switch and a full-screen app.
+- The TCC Screen Recording prompt. This runner already had the permission.
+- A real Screen Sharing viewer (m23).
+- An external display he plugs in while the windows are up (m06 and m23).
