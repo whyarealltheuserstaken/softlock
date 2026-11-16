@@ -44,7 +44,6 @@ require_minos() {
         lines="$(printf '%s\n%s\n' "${lines}" "${arch_lines}")"
       fi
     done
-    lines="$(printf '%s\n' "${lines}" | sed '/^$/d' | awk '!seen[$0]++')"
   fi
   printf '%s\n' "${lines}"
   if [ -z "${lines}" ]; then
