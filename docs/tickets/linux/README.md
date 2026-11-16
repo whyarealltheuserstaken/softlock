@@ -11,7 +11,7 @@ Henry closed both Linux entries in Decision 20. A remote viewer sees the SoftLoc
 | Id | Title | Blocked by | Where |
 |---|---|---|---|
 | [l01](l01-display-session-ci.md) | Probe: what display session `ubuntu-latest` has | a Linux platform plan | CI, `ubuntu-latest` |
-| [l02](l02-capture-remote-spike.md) | Spike: capture versus xrdp, VNC, GNOME Remote Desktop, RustDesk. v1 type, v1.x/v2 probe | the plan, l01, for the probe | CI for whatever the runner already has |
+| [l02](l02-capture-remote-spike.md) | Spike: capture versus xrdp, VNC, GNOME Remote Desktop, RustDesk. v1 type, v1.x/v2 probe | the plan, l01, for the probe (v1.x/v2) | CI for whatever the runner already has |
 | [l03](l03-remote-session-lock.md) | Remote lock. v1 hook, pass types, fail-closed. v1.x/v2 the view | the plan. v1.x/v2 also l02 | Not runnable until the plan exists |
 | [l04](l04-display-kit.md) | Hardware kit | the plan, and a named Linux machine | No machine recorded |
 

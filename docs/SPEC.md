@@ -43,7 +43,7 @@ SoftLock is a second lock layer that sits beside the operating system's lock.
 
 ## User Stories
 
-Actors: **owner** (the person who installs SoftLock and owns the computer), **bystander** (anyone physically at the computer while it's SoftLocked, including the owner before they unlock), **agent** (any software running in the owner's session: AI agents, test runners, automation, remote-control tools), **administrator** (an IT person or power user managing the computer), **contributor** (an open-source developer), **maintainer** (Henry).
+Actors: **owner** (the person who installs SoftLock and owns the computer), **bystander** (anyone physically at the computer while it's SoftLocked, including the owner before they unlock), **agent** (any software running in the owner's session: AI agents, test runners, automation; remote-control tools are not agents, and Decision 20 blocks their input until the remote pass), **administrator** (an IT person or power user managing the computer), **contributor** (an open-source developer), **maintainer** (Henry).
 
 Stories 80–89 were added on 15 November 2026. They're numbered after the original 79, so existing references stay valid.
 
@@ -196,7 +196,7 @@ Stories 90–94 are the remote-display behavior. v1 includes only the architectu
 | Adversary | v1 position |
 |---|---|
 | **T1: A person physically at the computer** (keyboard, mouse, touch, pen, gamepad, USB devices, voice, power and lid buttons) | **In scope, and must be loophole-free.** They can't get to the desktop or any running app without an enabled unlock method. Their best options are a forced power-off or reboot (accepted, because it lands at the real Windows sign-in, which is why disk encryption is recommended) or disrupting the session (for example unplugging the network). Both are denial of service, not access. |
-| **T2: Software running as the owner** (agents, scripts, remote-control tools) | **Trusted to run, not trusted to unlock.** Software input from an agent in the session passes through by design. SoftLock's own interfaces offer no unlock path. SoftLock doesn't claim to stop *malicious* code running as the owner, because such code already has the owner's files and session. A remote viewer sees the SoftLock lock screen until the separate remote pass in Decision 20, and remote-tool input is blocked until that pass succeeds, except what the unlock screen needs. Agent input on the local session still passes. TeamViewer, AnyDesk, and Chrome Remote Desktop inject input the same way an agent does, and Mac Screen Sharing input arrives as posted events. Where the hook or the tap cannot tell those apart, that is a v1.x or v2 risk in tickets 37, 38, and m21. v1 only frameworks the detection hook. It is not a reason to let the remote input through, and it is not a reason to block the local agent's input. |
+| **T2: Software running as the owner** (agents and scripts; remote-control tools are Decision 20, not agents) | **Trusted to run, not trusted to unlock.** Software input from an agent in the session passes through by design. SoftLock's own interfaces offer no unlock path. SoftLock doesn't claim to stop *malicious* code running as the owner, because such code already has the owner's files and session. A remote viewer sees the SoftLock lock screen until the separate remote pass in Decision 20, and remote-tool input is blocked until that pass succeeds, except what the unlock screen needs. Agent input on the local session still passes. TeamViewer, AnyDesk, and Chrome Remote Desktop inject input the same way an agent does, and Mac Screen Sharing input arrives as posted events. Where the hook or the tap cannot tell those apart, that is a v1.x or v2 risk in tickets 37, 38, and m21. v1 only frameworks the detection hook. It is not a reason to let the remote input through, and it is not a reason to block the local agent's input. |
 | **T3: Hardware and pre-boot attacks** (DMA, cold boot, keyloggers, booting another OS) | Out of scope. Covered by BitLocker or Device Encryption and firmware settings. |
 
 **Physical vs. software input, defined:** on Windows, an input event is *software* if the low-level hook reports it as injected (`LLKHF_INJECTED` for keyboard, `LLMHF_INJECTED` for mouse) and *physical* otherwise. Some consequences:
@@ -628,7 +628,7 @@ Henry approved both features for v1 after the Insomnia review (market research a
 
 > this should be for all versions (Windows 11, 10, Linux, and MacOS Universal), not just MacOS.
 
-That decision is the behavior on every one of those platforms. Connected and multi-display support stays in scope. v1 frameworks remote display and does not ship it. Full remote support is v1.x or v2.
+That decision is the behavior on every one of those platforms. Connected and multi-display support stays in scope. v1 frameworks remote display and does not ship it. Full remote support is v1.x or v2. In this decision, **v1** is that platform's first release: the Windows v1 shipped in tickets 1–31, macOS phase 2's first release, and Linux phase 3's first release. **v1.x** and **v2** are later work on that platform.
 
 **Owner, Henry, 16 November 2026.** These close the capture-versus-remote entries and the remote-input entries. The earlier options (including a documented limit where a remote tool's input passes like an agent's, and a lead recommendation of that limit) are not the decision.
 
@@ -683,7 +683,7 @@ Story 20 says an agent's screenshot shows the desktop without the overlay. Henry
 
 The capture APIs differ by platform. They do not change the rule. On Windows, `WDA_EXCLUDEFROMCAPTURE` is the same on Windows 10 version 2004 and on Windows 11, and the affinity page does not name Remote Desktop. On macOS, Screen Sharing and a local capture read the same window-server image, and `NSWindow.SharingType.none` is a legacy constant Apple says not to use to hide content from capture. On Linux, the phase-3 sketch says capture exclusion has no portable Wayland mechanism, and this decision does not add one. Tickets 37, m21, and l02 measure those paths in v1.x or v2. v1 only has the detection-hook type those spikes will later fill. A measurement that cannot split the remote viewer from local agent capture is a risk on that ticket. It does not replace the rule with a limit that shows the remote viewer the real screen before the pass, and it does not block local agent input.
 
-Remote-tool input is the same shape. Tickets 37 and 38 record, on both runner images, whether an RDP key, an RDP shadow key, and a key from TeamViewer, AnyDesk, or Chrome Remote Desktop carry the injected flag an agent's `SendInput` sets. m21 records whether Screen Sharing, VNC, TeamViewer, AnyDesk, and Chrome Remote Desktop arrive as posted events. If they cannot be told apart from agent input, the v1.x or v2 work still blocks the remote-tool input until the pass succeeds, and local agent input still follows the normal rules. v1 does not ship that block as a feature. The fail-closed seam is in v1, so a remote session the hook reports cannot end unlocked. A second Remote Desktop Services session stays out of scope. There is no per-session option that needs that scope.
+Remote-tool input is the same shape. Tickets 37 and 38 will record, in v1.x or v2, on both runner images, whether an RDP key, an RDP shadow key, and a key from TeamViewer, AnyDesk, or Chrome Remote Desktop carry the injected flag an agent's `SendInput` sets. m21 will record, in v1.x or v2, whether Screen Sharing, VNC, TeamViewer, AnyDesk, and Chrome Remote Desktop arrive as posted events. If they cannot be told apart from agent input, the v1.x or v2 work still blocks the remote-tool input until the pass succeeds, and local agent input still follows the normal rules. v1 does not ship that block as a feature. The fail-closed seam is in v1, so a remote session the hook reports cannot end unlocked. A second Remote Desktop Services session stays out of scope. There is no per-session option that needs that scope.
 
 D9 in the macOS decisions file is this closed macOS entry. It is not open.
 
@@ -696,17 +696,17 @@ Connected and multi-display rows stay in scope. Each remote ticket has a v1 fram
 | Ticket | What it is | When | Blocked by |
 |---|---|---|---|
 | 36 | Seam 3 on `windows-2022` and `windows-2025`: display add, remove, and change | In scope. Not a remote ticket | 11, 12 |
-| 37 | Spike: capture versus a remote view, and whether remote-tool input shares the agent's injected flag | v1: detection-hook result type only. v1.x/v2: the probe | 11, and finding 02, for the probe |
+| 37 | Spike: capture versus a remote view, and whether remote-tool input shares the agent's injected flag | v1: detection-hook result type only. v1.x/v2: the probe | 11, and finding 02, for the probe (v1.x/v2) |
 | 38 | Remote-session lock, the remote pass, and remote-tool input | v1: hook, pass types, fail-closed with a fake session. v1.x/v2: the real view | v1: 15, 21, 22. v1.x/v2 also 37 |
 | 39 | P7 kit. Display rows in scope. Inbound RDP is a remote row | v1: the RDP row names the hook and is not run. v1.x/v2: the RDP sheet | 36; the RDP row also 38 |
 | 40 | Windows 10 client kit. Display rows in scope. Inbound RDP is a remote row | Same split as 39 | a named Windows 10 client machine; the RDP row also 38 |
 | m20 | CI probe on `macos-latest` (arm64 slice) | In scope. Not a remote ticket | m01, m02 |
-| m21 | Spike: remote view versus local capture, and whether remote input arrives as a posted event | v1: detection-hook result type only. v1.x/v2: the probe | m04, for the probe |
+| m21 | Spike: remote view versus local capture, and whether remote input arrives as a posted event | v1: detection-hook result type only. v1.x/v2: the probe | m04, for the probe (v1.x/v2) |
 | m22 | Remote-session lock, the remote pass, and remote-tool input | v1: hook, pass types, fail-closed with a fake session. v1.x/v2: the real view | v1: m15, m17. v1.x/v2 also m14, m18, m19, m21 |
-| m23 | Intel Mac kit, including the `x86_64` slice. Screen Sharing is a remote row | v1: the Screen Sharing row names the hook and is not run. v1.x/v2: the sheet | m06, m20; Screen Sharing also m22 |
-| m24 | Apple Silicon hardware kit. Screen Sharing is a remote row | Same split as m23 | a named Apple Silicon Mac; no such machine is recorded; Screen Sharing also m22 |
+| m23 | Intel Mac kit, including the `x86_64` slice. Screen Sharing is a remote row | v1: the Screen Sharing row names the hook and is not run. v1.x/v2: the sheet | m06, m20; Screen Sharing also m21, m22 |
+| m24 | Apple Silicon hardware kit. Screen Sharing is a remote row | Same split as m23 | a named Apple Silicon Mac; no such machine is recorded; Screen Sharing also m21, m22 |
 | l01 | `ubuntu-latest` display-session probe | In scope for displays. Not a remote ticket. Still blocked on a Linux plan | a Linux platform plan |
-| l02 | Spike: capture versus xrdp, VNC, GNOME Remote Desktop, RustDesk | v1: detection-hook result type only. v1.x/v2: the probe | the plan, and l01, for the probe |
+| l02 | Spike: capture versus xrdp, VNC, GNOME Remote Desktop, RustDesk | v1: detection-hook result type only. v1.x/v2: the probe | the plan, and l01, for the probe (v1.x/v2) |
 | l03 | Remote-session lock, the remote pass, and remote-tool input | v1: hook, pass types, fail-closed with a fake session. v1.x/v2: the real view | the plan. v1.x/v2 also l02 |
 | l04 | Hardware kit. Display rows follow l01. Remote rows are remote | v1: remote rows name the hook and are not run. v1.x/v2: the sheet | the plan, and a named Linux machine; remote rows also l03 |
 

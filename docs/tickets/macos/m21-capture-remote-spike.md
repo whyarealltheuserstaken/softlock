@@ -2,9 +2,9 @@
 
 **What to build:** On `macos-latest`, the m04 marker window with `sharingType` at the default and at `.none`, at `NSWindow.Level.screenSaver` with `canJoinAllSpaces` and `fullScreenAuxiliary`. Count the marker on the m04 paths, then on each remote-view path the runner can open: Screen Sharing, a VNC viewer, AirPlay, TeamViewer, AnyDesk, and Chrome Remote Desktop. If a path cannot be opened, the log says so and does not invent a count. This ticket does not install those programs. Where a path does open, record whether its input arrives as a posted event the tap cannot tell from an agent's `CGEventPost`. DisplayLink's [macOS page](https://support.displaylink.com/knowledgebase/articles/1932214-displaylink-manager-app-for-macos-introduction-in) says the driver needs Screen Recording permission to read pixels and send them over USB. The runner has no DisplayLink device, so that path is a written miss here and a row on m23 if Henry has the device. Apple's `NSWindow.SharingType.none` page says the value is a legacy constant macOS no longer uses, and not to use it to hide content from capture. Screen Sharing and a local capture read the same window-server image. Henry's Decision 20 still requires the remote viewer to see the lock until the configurable pass, and local agent capture still follows the normal rule. This spike measures the gap. It does not weaken either half.
 
-**Blocked by:** m04.
+**Blocked by:** m04, for the probe (v1.x/v2).
 
-**Blocks:** m22, m23.
+**Blocks:** m22's v1.x/v2 slice
 
 **Where:** CI only. Screen Sharing into Henry's Mac is m23.
 

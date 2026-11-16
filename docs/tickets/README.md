@@ -19,7 +19,7 @@ When the lead edits #18, the proposed text is: keep topmost re-assert, the shell
 | Id | Title | Blocked by | Where |
 |---|---|---|---|
 | [36](36-display-change-ci.md) | Seam 3: display add, remove, and change | 11, 12 | CI, `windows-2022` and `windows-2025` |
-| [37](37-capture-remote-spike.md) | Spike: capture versus a remote view. v1 type, v1.x/v2 probe | 11, finding 02, for the probe | CI, and a written miss if the runner has no remote terminal |
+| [37](37-capture-remote-spike.md) | Spike: capture versus a remote view. v1 type, v1.x/v2 probe | 11, finding 02, for the probe (v1.x/v2) | CI, and a written miss if the runner has no remote terminal |
 | [38](38-remote-session-lock.md) | Remote lock. v1 hook, pass types, fail-closed. v1.x/v2 the view | v1: 15, 21, 22. v1.x/v2 also 37 | CI for the fake session; the client-SKU move is 39 |
 | [39](39-display-kit-p7.md) | Kit: display rows in scope. RDP row is v1 note, v1.x/v2 sheet | 36; the RDP row also 38 | ThinkStation P7 |
 | [40](40-windows-10-client-kit.md) | Kit: display rows in scope. RDP row is v1 note, v1.x/v2 sheet | a named Windows 10 client; the RDP row also 38 | No machine identified |

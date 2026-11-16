@@ -2,7 +2,7 @@
 
 **What to build:** Henry runs this on his Intel Mac. The machine is the paragraph in D1. The sheet rows are an external display plugged in while locked, a closed lid with that display still awake, a scale or resolution change, mirroring versus an extended desktop, AirPlay if a receiver is available, Sidecar if an iPad that meets Apple's Sidecar requirements is available, DisplayLink if a DisplayLink device is available, and inbound Screen Sharing to the locked Mac. This 2020 MacBook Pro is in the Mac list on Apple's [Continuity requirements](https://support.apple.com/en-us/108046) (models introduced in 2016 or later). The iPad is the unknown, not the Mac. D7 is unchanged: a lid close with no external display is not a takeover feature. This closed-lid row is the case Apple's [MacBook Pro display guide](https://support.apple.com/guide/macbook-pro/connect-an-external-display-apd8cdd74f57/mac) describes, an external display and accessories such as a keyboard and mouse, with the lid shut. m06 keeps Spaces, full-screen, click-through, and the displays already attached when its probe starts. This ticket does not repeat those. The sheet records resolutions and built-in versus external. It does not record a serial number.
 
-**Blocked by:** m06, m20. The inbound Screen Sharing row is also blocked by m22.
+**Blocked by:** m06, m20. The inbound Screen Sharing row is also blocked by m21 and m22.
 
 **Blocks:** nothing on the first-demo path.
 

@@ -2,9 +2,9 @@
 
 **What to build:** A throwaway probe on `ubuntu-latest`, and only against a display server l01 found already running. Put a marker window on that server. Count the marker with the capture tool that is already installed. Then count it through a remote path only if that path is already installed. The paths the requirement names, and that this ticket does not install, are xrdp, a VNC server, GNOME Remote Desktop, and RustDesk. xrdp's README describes an RDP server that can sit on Xorg or Xvnc. GNOME's desktop-sharing help describes viewing and controlling the desktop. GNOME Connections connects with `rdp://`, `vnc://`, or `spice://`. RustDesk's README calls itself a remote desktop solution and its tree has a screen-capture library. If none of those servers is on the image, the log says each one is unavailable. The finding records the paths against the closed rule in Decision 20. It does not add a capture API to the phase-3 sketch, and it does not weaken the rule.
 
-**Blocked by:** a Linux platform plan, and l01.
+**Blocked by:** a Linux platform plan, and l01, for the probe (v1.x/v2).
 
-**Blocks:** l03.
+**Blocks:** l03's v1.x/v2 slice
 
 **Where:** CI only, to the extent l01 found a display server. A remote server that is not installed is a written miss, not a package to add.
 

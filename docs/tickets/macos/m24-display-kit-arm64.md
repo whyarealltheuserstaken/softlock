@@ -2,7 +2,7 @@
 
 **What to build:** The display rows that Apple's pages treat as chip-specific, on a physical Apple Silicon Mac. No Apple Silicon Mac is recorded. This ticket does not invent one. `macos-latest` is the arm64 CI run of the reconfiguration callback (m20). It is not a physical hot-plug, a closed lid, AirPlay, Sidecar, or DisplayLink. The Intel rows are m23. This ticket is the physical Apple Silicon rows: external display hot-plug, the display count that machine actually allows, a closed lid with an external display, AirPlay if a receiver is available, Sidecar if an iPad is available, DisplayLink if a device is available, and inbound Screen Sharing to the locked Mac. The requirement is the same as on Intel. The sheet records the chip and the macOS version. It does not record a serial number, and it does not copy the M5 and M6 counts from Apple's current MacBook Pro guide onto this machine.
 
-**Blocked by:** a named Apple Silicon Mac. The inbound Screen Sharing row is also blocked by m22.
+**Blocked by:** a named Apple Silicon Mac. The inbound Screen Sharing row is also blocked by m21 and m22.
 
 **Blocks:** nothing on the first-demo path. The first demo stays on Henry's Intel Mac.
 
