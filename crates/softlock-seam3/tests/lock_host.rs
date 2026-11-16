@@ -383,6 +383,71 @@ fn quiet_hook() -> RestoreHook {
     RestoreHook(Some(previous))
 }
 
+fn panic_log_hook() -> Option<RestoreHook> {
+    let path = std::env::var_os("SOFTLOCK_PANIC_LOG")?;
+    if path.is_empty() {
+        return None;
+    }
+    let _ = panic_log_path();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string payload");
+        let location = info
+            .location()
+            .map(|place| place.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("");
+        panic_line(&format!(
+            "panic thread={thread:?} name={name} loc={location} msg={message}"
+        ));
+    }));
+    Some(RestoreHook(Some(previous)))
+}
+
+fn panic_log_path() -> Option<&'static std::ffi::OsStr> {
+    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("SOFTLOCK_PANIC_LOG"))
+        .as_ref()
+        .map(std::ffi::OsString::as_os_str)
+}
+
+fn panic_note(message: &str) {
+    if panic_log_path().is_none() {
+        return;
+    }
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("");
+    panic_line(&format!("note thread={thread:?} name={name} {message}"));
+}
+
+fn panic_line(text: &str) {
+    let Some(path) = panic_log_path() else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    use std::io::Write;
+    let _ = file.write_all(text.as_bytes());
+    let _ = file.write_all(b"\n");
+    let _ = file.flush();
+    let _ = file.sync_all();
+}
+
 fn wake(lock: &DevLock, extra: u64) {
     send_virtual_key(VK_F13, extra).expect("wake");
     assert!(
@@ -735,21 +800,36 @@ fn a_liveness_thread_panic_tries_the_os_lock_without_trapping_input() {
 #[test]
 fn a_callback_panic_tries_the_os_lock_then_drops_the_hooks() {
     let _guard = gate();
+    // When SOFTLOCK_PANIC_LOG is set, record every panic's location and
+    // thread for the whole test. Otherwise install the quiet hook only after
+    // arming, so a caught callback panic still prints as `ok`.
+    let _logged = panic_log_hook();
+    panic_note("test-start");
     let probe = Probe::open().expect("probe");
     probe.claim_focus();
     let nonce = Nonce::install();
     let extra = nonce.extra();
+    panic_note("before-arm");
     let lock = arm("unused", None);
+    panic_note("armed");
     lock.stub_os_lock_unavailable();
-    let _quiet = quiet_hook();
+    let _quiet = if std::env::var_os("SOFTLOCK_PANIC_LOG").is_some() {
+        None
+    } else {
+        Some(quiet_hook())
+    };
     lock.panic_in_callback();
+    panic_note("flag-set");
     send_virtual_key(VK_F13, extra).expect("callback panic");
+    panic_note("send-returned");
     assert!(
         wait_for(Duration::from_secs(3), || lock.os_lock_attempts() >= 1),
         "a callback panic did not try the OS lock"
     );
+    panic_note("os-lock-seen");
     send_virtual_key(VK_F14, extra).expect("after callback panic");
     probe
         .wait_for_key(VK_F14, Duration::from_secs(3))
         .expect("input stayed trapped after the hook callback panicked");
+    panic_note("test-end");
 }
