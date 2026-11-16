@@ -178,7 +178,12 @@ fn correct_pin_consumes_the_service_nonce() {
                 pin: Secret::new(PIN),
             },
         );
-        assert_eq!(stored, ResponseKind::Ok);
+        assert_eq!(
+            stored,
+            ResponseKind::Ok,
+            "pin was not stored: {}",
+            capture.text()
+        );
         let hash = authority.pin_hash().expect("hash").to_string();
         assert!(hash.starts_with("$argon2id$"));
         let nonce = lock_with_note(&mut authority);

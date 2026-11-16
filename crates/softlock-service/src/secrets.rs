@@ -38,14 +38,25 @@ impl PinStore {
     fn write_hash(&self, parent: &Path, hash: &str) -> io::Result<()> {
         prepare_secret_directory(parent)?;
         let tmp = parent.join(format!("pin.{}.tmp", std::process::id()));
-        write_secret_file(&tmp, hash.as_bytes())?;
-        replace_file(&tmp, &self.path)?;
         if running_as_system() {
+            // The temp file is created with the SYSTEM-only DACL, then renamed
+            // over the destination. LocalSystem is in that DACL, so both steps
+            // are allowed.
+            write_secret_file(&tmp, hash.as_bytes())?;
+            replace_file(&tmp, &self.path)?;
             ensure_system_owner(&self.path)?;
             if !system_only_dacl(&self.path)? {
                 return Err(io::Error::other("pin dacl is not system-only"));
             }
+            return Ok(());
         }
+        // A user token is not in the SYSTEM-only DACL, so creating the temp
+        // file with that DACL is denied (and newer Windows reports the deny
+        // as an HRESULT, not raw error 5). Write and rename while the user
+        // still has access, then replace the DACL.
+        fs::write(&tmp, hash.as_bytes())?;
+        replace_file(&tmp, &self.path)?;
+        apply_system_dacl(&self.path)?;
         Ok(())
     }
 
@@ -119,15 +130,8 @@ fn prepare_secret_directory(dir: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn write_secret_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    match create_file_with_dacl(path) {
-        Ok(handle) => write_handle(handle, bytes),
-        Err(error) if error.raw_os_error() == Some(5) && !running_as_system() => {
-            fs::write(path, bytes)?;
-            apply_system_dacl(path)?;
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    let handle = create_file_with_dacl(path)?;
+    write_handle(handle, bytes)
 }
 
 #[cfg(windows)]

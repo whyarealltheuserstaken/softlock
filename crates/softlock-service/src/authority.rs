@@ -409,11 +409,9 @@ impl Authority {
         }
         match hash_softlock_pin(pin) {
             Ok(hash) => {
-                if crate::secrets::PinStore::in_dir(&pin_directory())
-                    .save(&hash)
-                    .is_err()
-                {
-                    audit("pin-set", &[("result", "rejected")]);
+                if let Err(error) = crate::secrets::PinStore::in_dir(&pin_directory()).save(&hash) {
+                    let code = error.raw_os_error().unwrap_or(0).to_string();
+                    audit("pin-set", &[("result", "rejected"), ("os", &code)]);
                     return ResponseKind::Unsupported;
                 }
                 self.pin_hash = Some(hash);
