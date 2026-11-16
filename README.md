@@ -31,6 +31,12 @@ cargo test --workspace --all-targets
 cargo deny check licenses advisories sources
 ```
 
+Seam 3 runs on the `windows-2022` and `windows-2025` GitHub runners. It opens a probe window, records `SendInput` and focus, captures through GDI, DXGI duplication, and Windows.Graphics.Capture, and diffs registry, device, and power-request snapshots. The lock host's `simulated-physical` feature is test-only:
+
+```bash
+cargo test -p softlock-lockhost --features simulated-physical --lib
+```
+
 Seam 4 runs the Tauri front end against an empty fake IPC bridge:
 
 ```bash
