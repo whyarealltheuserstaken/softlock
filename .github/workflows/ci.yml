@@ -48,6 +48,7 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy --workspace --all-targets --features softlock-core/test-support -- -D warnings
+          cargo clippy --workspace --all-targets --features softlock-lockhost/simulated-physical -- -D warnings
       - name: Core has no Windows-only dependency
         run: cargo build -p softlock-core --all-targets
       - name: Seam 1
@@ -64,6 +65,21 @@ jobs:
             echo "test-support feature reached a product crate"
             exit 1
           fi
+          if grep -F simulated-physical target/product-features.txt; then
+            echo "simulated-physical feature reached a product crate"
+            exit 1
+          fi
+      - name: Release binaries omit simulated-physical markers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked \
+            -p softlock-app -p softlock-service -p softlock-lockhost \
+            -p softlock-broker -p softlock-windows -p softlock-macos -p softlock-linux
+          SOFTLOCK_RELEASE_SCAN_DIR="$PWD/target/release" \
+            cargo test --locked -p softlock-lockhost --test release_binary -- --nocapture product_release_binaries \
+            2>&1 | tee target/release-scan.txt
+          grep -F "scanned release binaries" target/release-scan.txt
 
   deny:
     name: licenses and advisories
@@ -101,3 +117,66 @@ jobs:
       - name: Smoke test
         working-directory: crates/softlock-app
         run: npm run test:e2e
+
+  seam3:
+    name: seam 3 (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/softlock-app/package-lock.json
+      - name: Windows target
+        run: rustup target add x86_64-pc-windows-msvc
+      - name: Front end for the app binary
+        working-directory: crates/softlock-app
+        run: npm ci
+      - name: Probe harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          cargo test --locked -p softlock-seam3 --target x86_64-pc-windows-msvc -- --nocapture \
+            2>&1 | tee target/seam3-probe.txt
+          grep -F "probe_window_receives_sendinput_key_and_capture_contains_marker ... ok" target/seam3-probe.txt
+          grep -F "registry_device_and_power_snapshots_diff ... ok" target/seam3-probe.txt
+      - name: Simulated-physical classifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          cargo test --locked -p softlock-lockhost --features simulated-physical --target x86_64-pc-windows-msvc --lib -- --nocapture \
+            2>&1 | tee target/seam3-classify.txt
+          grep -F "nonce_tagged_injected_event_is_simulated_physical ... ok" target/seam3-classify.txt
+      - name: Nonce survives SendInput into the hook
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          cargo test --locked -p softlock-seam3 --features simulated-physical --target x86_64-pc-windows-msvc --test seam3 -- --nocapture hook_sees_nonce \
+            2>&1 | tee target/seam3-hook.txt
+          grep -F "hook_sees_nonce_tagged_sendinput_as_simulated_physical ... ok" target/seam3-hook.txt
+      - name: Release build of the Windows target omits the test feature
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          cargo build --release --locked --target x86_64-pc-windows-msvc \
+            -p softlock-app -p softlock-lockhost -p softlock-service \
+            -p softlock-broker -p softlock-windows
+          SOFTLOCK_RELEASE_SCAN_DIR="$PWD/target/x86_64-pc-windows-msvc/release" \
+            cargo test --locked -p softlock-lockhost --test release_binary -- --nocapture product_release_binaries \
+            2>&1 | tee target/windows-release-scan.txt
+          grep -F "scanned release binaries" target/windows-release-scan.txt

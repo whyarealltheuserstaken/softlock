@@ -12,7 +12,7 @@ No contributor agreement is required while the maintainer is the only author. A 
 
 ## Tests
 
-Behavior changes at the seams in `docs/SPEC.md` (Testing Decisions) are test-first: one failing seam test, then the code that makes it pass. `cargo test --workspace` runs seam 1. `npm run test:e2e` in `crates/softlock-app` runs seam 4.
+Behavior changes at the seams in `docs/SPEC.md` (Testing Decisions) are test-first: one failing seam test, then the code that makes it pass. `cargo test --workspace` runs seam 1. Seam 3 is the Windows probe harness in `crates/softlock-seam3`, run on `windows-2022` and `windows-2025`. `npm run test:e2e` in `crates/softlock-app` runs seam 4.
 
 ## Platforms
 

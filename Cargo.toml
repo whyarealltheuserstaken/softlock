@@ -7,6 +7,7 @@ members = [
     "crates/softlock-linux",
     "crates/softlock-service",
     "crates/softlock-lockhost",
+    "crates/softlock-seam3",
     "crates/softlock-broker",
     "crates/softlock-app/src-tauri",
 ]
