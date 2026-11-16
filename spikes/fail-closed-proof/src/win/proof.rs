@@ -213,12 +213,23 @@ fn measure(args: &Args, log: &Path, outcome: &mut Outcome) -> Result<(), String>
     let t0 = util::qpc();
     let locked = session::lock_workstation();
     let saw = listener
-        .wait(WTS_SESSION_LOCK, session, t0, Duration::from_millis(1100))
+        .wait(WTS_SESSION_LOCK, session, t0, Duration::from_millis(1500))
         .is_some();
     outcome.lock_saw_notification = saw;
-    outcome.lock_blocked = lock_blocked(locked.is_ok(), saw);
+    outcome.lock_blocked = lock_blocked(saw);
     outcome.lock_blocked_win32 = locked.as_ref().err().map(|error| session::win32_of(error));
     snapshot(args, outcome);
+    for note in super::notify::since(t0) {
+        log_line(
+            log,
+            &format!(
+                "lock-while-policy note kind={} name={} session={}",
+                note.kind,
+                verdict::notification_name(note.kind),
+                note.session
+            ),
+        );
+    }
     log_line(
         log,
         &format!(
@@ -227,8 +238,8 @@ fn measure(args: &Args, log: &Path, outcome: &mut Outcome) -> Result<(), String>
             locked.as_ref().err().map(String::as_str).unwrap_or("ok")
         ),
     );
-    if locked.is_ok() {
-        return Err("LockWorkStation succeeded while DisableLockWorkstation was set".to_string());
+    if saw {
+        return Err("the session locked while DisableLockWorkstation was set".to_string());
     }
     let _ = before_negative;
 

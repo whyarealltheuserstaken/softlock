@@ -63,8 +63,10 @@ pub fn lock_path_ok(path: &ObservedPath) -> bool {
             .is_some_and(|gap| gap < HEARTBEAT_GAP_LIMIT_MS)
 }
 
-pub fn lock_blocked(api_ok: bool, saw_lock: bool) -> bool {
-    !api_ok && !saw_lock
+/// `LockWorkStation` only reports that the request was started. The session
+/// notification is what shows whether the workstation actually locked.
+pub fn lock_blocked(saw_lock: bool) -> bool {
+    !saw_lock
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,9 +169,8 @@ mod tests {
 
     #[test]
     fn lock_while_the_policy_is_set_must_fail_without_a_notification() {
-        assert!(lock_blocked(false, false));
-        assert!(!lock_blocked(true, false));
-        assert!(!lock_blocked(false, true));
+        assert!(lock_blocked(false));
+        assert!(!lock_blocked(true));
     }
 
     #[test]

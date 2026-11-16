@@ -8,7 +8,7 @@ The probe is `spikes/fail-closed-proof`. It is not part of the product workspace
 
 All eight lockdown values are applied first. `DisableLockWorkstation` stays set for the disconnect paths. It is cleared only for the last path.
 
-1. `LockWorkStation` while `DisableLockWorkstation` is set. This must fail, and `WTS_SESSION_LOCK` must not arrive.
+1. `LockWorkStation` while `DisableLockWorkstation` is set. The call only reports that Windows accepted the request. The session must not send `WTS_SESSION_LOCK`.
 2. `WTSDisconnectSession` on the console session from the session-0 service. Confirmation is `WTS_CONSOLE_DISCONNECT`.
 3. `WTSDisconnectSession` on the probe's own session, from that session. This is the fall-back for when the service is gone. Confirmation is `WTS_CONSOLE_DISCONNECT`.
 4. Clear `DisableLockWorkstation`, then `LockWorkStation` immediately. Confirmation is `WTS_SESSION_LOCK`.
