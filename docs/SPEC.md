@@ -268,14 +268,15 @@ enum PromptState { Idle, Open { method: MethodId }, Passthrough { method: Method
 // Unlocking  --Done-->                          Unlocked
 // Unlocking  --RevertFailed-->                  OsLocked (after os_lock) + journal kept for retry
 // FailingClosed --OsLockConfirmed-->            OsLocked
-// OsLocked   --OsUnlocked-->                    Unlocked (journal reverted, user notified if after_fail)
+// OsLocked   --OsUnlocked, revert succeeds-->   Unlocked (journal reverted, user notified if after_fail)
+// OsLocked   --OsUnlocked, revert still failing--> OsLocked (guard and overlay disarmed, journal kept, Repair notice)
 // Recovering --SessionActiveAndJournalSaysLocked--> FailingClosed
 // Recovering --NoActiveLock-->                  Unlocked (journal reverted)
 // Any        --ServiceStopRequested while Locked--> FailingClosed, then stop
 ```
 
 Invariants (each one is a test):
-1. `Locked → Unlocking` happens only on a `Verified` verdict that arrived over the Lock Host's private channel, or from the Broker it launched. No public IPC verb produces it.
+1. `Locked → Unlocking` happens only on a `Verified` verdict from the Broker this service launched, checked against that launch's CSPRNG nonce, or on the credential verifier returning `Verified` for a `SubmitSecret`. The Lock Host does not verify and has no verdict that unlocks. No public IPC verb produces it.
 2. Every hardening change is in the persisted journal **before** it's applied.
 3. Any failure while `Arming` or `Locked` ends in `OsLocked`, never `Unlocked`.
 4. Config writes are rejected in every state except `Unlocked` with the session not OS-locked.
@@ -283,7 +284,7 @@ Invariants (each one is a test):
 
 ### 6. IPC contract
 
-- **Transport:** one named pipe owned by the Service. Its DACL allows SYSTEM and the interactive user. Messages are length-prefixed (u32, little-endian) UTF-8 JSON, which is easy to debug, and the volume is tiny. Every message has `{ "v": 1, "id": <u64>, "kind": ... }`. An unknown major version is rejected with `Unsupported`.
+- **Transport:** one named pipe owned by the Service. Its DACL allows SYSTEM and the interactive user. Messages are length-prefixed (u32, little-endian) UTF-8 JSON, which is easy to debug, and the volume is tiny. A frame whose length prefix is above 64 KiB is rejected before the body is allocated. Every message has `{ "v": 1, "id": <u64>, "kind": ... }`. An unknown major version is rejected with `Unsupported`. Unknown fields are rejected as malformed. The PIN requests use the fixed kinds `SetPin` and `ClearPin`.
 - **Named-pipe hardening, required by the service and lock-host tickets:** the server is created with `FILE_FLAG_FIRST_PIPE_INSTANCE` and an explicit DACL limited to SYSTEM and the interactive user. Clients verify the server's identity before sending a secret or trusting a reply. Without the first-instance flag, another process can create the pipe name first.
 - **Caller identity:** on connect, the Service reads the client's PID and token (`GetNamedPipeClientProcessId`, `ImpersonateNamedPipeClient`) and requires the client's session to be the active console session. The role comes from how the client connected:
   - **Lock Host and Broker:** private, launch-time pipes (inherited handles plus a one-time 256-bit nonce). They never use the public pipe.
@@ -304,7 +305,7 @@ Invariants (each one is a test):
 | `Subscribe` | App | all | event stream: `StateChanged`, `ConfigChanged`, `FellBackToOsLock { reason, at }`, `UpdateAvailable` |
 | `CheckUpdate` / `InstallUpdate { version }` | App | Unlocked only | `UpToDate`, `Available { version, notes }`, or `Installing` |
 
-\* `HardLock` while Locked is only accepted from the Lock Host's private channel, for the hard-lock fall-back.
+\* `HardLock` while Locked is accepted only from the App. Every other role is rejected and logged. It fails closed with its own reason. While Unlocked, the App's `HardLock` calls the OS lock and the state stays Unlocked.
 
 **There is no `Unlock` request on the public pipe.** This is the lock-only agent framework: in a later release, the CLI and remote triggers will be thin `LockClient`s on top of `Lock`.
 
@@ -399,7 +400,7 @@ After a fail-closed fall-back (or a hard lock) with `win_l` on, the takeover pol
   - The App disables editing while locked.
   - `PutConfig` returns `Locked` in any state except `Unlocked`, and also while the Windows lock is up (tracked through session notifications).
   - The file isn't re-read automatically after unlock. If it changed, the App offers "Apply changes made to the config file?"
-- **Sensitive fields** (anything in `[unlock]`, `[hardening]` or `[takeover]` that weakens protection) return `NeedsConfirmation`. They apply only after a Hello or password check in the App. **Turning any takeover setting on counts as weakening**, because it replaces the real Windows lock (section 17).
+- **Sensitive fields** return `NeedsConfirmation` and are not applied. A sensitive field is any top-level key `unlock`, `hardening`, or `takeover`, including dotted keys (`unlock.methods = []`), inline tables (`unlock = { methods = [] }`), and table headers with whitespace or a dotted suffix (`[ unlock ]`, `[unlock.pin]`). A document that does not parse also returns `NeedsConfirmation`, so an unreadable file cannot skip the check. These apply only after a Hello or password check in the App. **Turning any takeover setting on counts as weakening**, because it replaces the real Windows lock (section 17).
 - **Schema:** generated from the Rust types (`schemars`), published as JSON Schema, and used by the App UI and by agents. `schema_version` allows migrations.
 
 ```rust

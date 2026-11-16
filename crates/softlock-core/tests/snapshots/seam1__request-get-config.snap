@@ -1,0 +1,9 @@
+---
+source: crates/softlock-core/tests/seam1.rs
+expression: value
+---
+{
+  "id": 11,
+  "kind": "GetConfig",
+  "v": 1
+}

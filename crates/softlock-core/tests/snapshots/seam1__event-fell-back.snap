@@ -1,0 +1,11 @@
+---
+source: crates/softlock-core/tests/seam1.rs
+expression: value
+---
+{
+  "at_ms": 750,
+  "id": 11,
+  "kind": "FellBackToOsLock",
+  "reason": "HeartbeatMissed",
+  "v": 1
+}
