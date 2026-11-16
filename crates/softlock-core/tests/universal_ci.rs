@@ -52,6 +52,13 @@ fn universal_job_builds_both_slices_on_macos_latest() {
     );
     assert!(!text.contains("simulated-physical"));
     assert!(!text.contains("dev-launch"));
+    assert!(!text.contains("rustfmt"));
+    assert!(!text.contains("clippy"));
+    assert!(!text.contains("both_archs() {"));
+    assert!(!text.contains("D3"));
+    assert!(text.contains("Decision D2"));
+    assert!(text.matches(".github/universal-scan.sh").count() >= 2);
+    assert!(text.contains("scan_fails_when_fat_binary_has_markers"));
     assert!(
         !text.contains(PRODUCT_DISPLAY_NAME),
         "the workflow must use the name constant's crate, not a hard-coded display name"
@@ -79,11 +86,30 @@ fn universal_job_lipos_thins_and_scans_each_slice_and_the_app() {
     assert!(text.contains("scan_release target/universal/fat "));
     assert!(text.contains("scan_release target/x86_64-apple-darwin/release "));
     assert!(text.contains("scan_release target/aarch64-apple-darwin/release "));
-    assert!(text.contains("SOFTLOCK_RELEASE_SCAN_DIR"));
-    assert!(text.contains(
+    let script = scan_script();
+    assert!(script.contains("both_archs() {"));
+    assert!(script.contains("scan_release() {"));
+    assert!(script.contains("require_minos() {"));
+    assert!(script.contains("=== otool minos "));
+    assert!(script.contains("minos 11.0"));
+    assert!(script.contains("SOFTLOCK_RELEASE_SCAN_DIR"));
+    assert!(script.contains(
         "cargo test --locked -p softlock-lockhost --test release_binary -- --nocapture product_release_binaries"
     ));
-    assert!(text.contains("scanned release binaries"));
+    assert!(script.contains("scanned release binaries"));
+    assert!(script.contains("softlock-dev-launch-marker"));
+    assert!(script.contains("softlock_dev_launch_marker"));
+    assert!(script.contains("softlock-simulated-physical-marker"));
+    assert!(script.contains("softlock_simulated_physical_marker"));
+    assert!(script.contains("string=true symbol=true dev_string=true dev_symbol=true"));
+    assert!(script.contains("Decision D2"));
+    assert!(!script.contains("D3"));
+    let scanner = fs::read_to_string(
+        common::repo_root().join("crates/softlock-lockhost/tests/release_binary.rs"),
+    )
+    .expect("read release_binary.rs");
+    assert!(scanner.contains("softlock-dev-launch-marker"));
+    assert!(scanner.contains("softlock_dev_launch_marker"));
     assert!(text.contains("npm run tauri build -- --target universal-apple-darwin"));
     assert!(
         text.contains("scan_release target/universal/tauri "),
@@ -122,6 +148,11 @@ fn step(text: &str, name: &str) -> String {
 
 fn workflow() -> String {
     let path = common::repo_root().join(WORKFLOW);
+    fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
+fn scan_script() -> String {
+    let path = common::repo_root().join(".github/universal-scan.sh");
     fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
 
