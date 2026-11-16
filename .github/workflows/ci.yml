@@ -49,6 +49,7 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy --workspace --all-targets --features softlock-core/test-support -- -D warnings
           cargo clippy --workspace --all-targets --features softlock-lockhost/simulated-physical -- -D warnings
+          cargo clippy --workspace --all-targets --features softlock-lockhost/dev-launch,softlock-seam3/dev-launch -- -D warnings
       - name: Core has no Windows-only dependency
         run: cargo build -p softlock-core --all-targets
       - name: Seam 1
@@ -69,7 +70,11 @@ jobs:
             echo "simulated-physical feature reached a product crate"
             exit 1
           fi
-      - name: Release binaries omit simulated-physical markers
+          if grep -F dev-launch target/product-features.txt; then
+            echo "dev-launch feature reached a product crate"
+            exit 1
+          fi
+      - name: Release binaries omit test-only markers
         shell: bash
         run: |
           set -euo pipefail
@@ -168,6 +173,34 @@ jobs:
           cargo test --locked -p softlock-seam3 --features simulated-physical --target x86_64-pc-windows-msvc --test seam3 -- --nocapture hook_sees_nonce \
             2>&1 | tee target/seam3-hook.txt
           grep -F "hook_sees_nonce_tagged_sendinput_as_simulated_physical ... ok" target/seam3-hook.txt
+      - name: Lock host
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          cargo test --locked -p softlock-seam3 --features dev-launch --target x86_64-pc-windows-msvc --test lock_host -- --test-threads=1 --nocapture \
+            2>&1 | tee target/seam3-lock-host.txt
+          grep -F "injected_keys_and_clicks_reach_the_probe_while_locked ... ok" target/seam3-lock-host.txt
+          grep -F "locking_leaves_keyboard_focus_unchanged ... ok" target/seam3-lock-host.txt
+          grep -F "captures_omit_the_overlay_marker ... ok" target/seam3-lock-host.txt
+          grep -F "simulated_physical_mouse_does_not_move_the_cursor ... ok" target/seam3-lock-host.txt
+          arming=$(grep -E "arming_stays_under_500ms_and_swallows_physical_keys \.\.\. arming took [0-9]+ ms ok" target/seam3-lock-host.txt)
+          echo "$arming"
+          arming_ms=$(printf '%s\n' "$arming" | grep -oE "arming took [0-9]+" | grep -oE "[0-9]+")
+          test "$arming_ms" -lt 500
+          grep -F "correct_pin_unlocks_and_wrong_pin_does_not ... ok" target/seam3-lock-host.txt
+          grep -F "wts_disconnect_on_an_unused_session_fails ... ok" target/seam3-lock-host.txt
+          grep -F "a_correct_pin_during_backoff_stays_locked ... ok" target/seam3-lock-host.txt
+          grep -F "backoff_expires_after_the_advanced_time ... ok" target/seam3-lock-host.txt
+          grep -F "the_heartbeat_watchdog_fires ... ok" target/seam3-lock-host.txt
+          grep -F "both_os_lock_paths_failing_keeps_the_guard_and_retries ... ok" target/seam3-lock-host.txt
+          grep -F "a_liveness_miss_fail_closes ... ok" target/seam3-lock-host.txt
+          grep -F "a_window_thread_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
+          grep -F "failing_closed_wrong_pins_then_a_correct_pin_during_backoff_stays_locked ... ok" target/seam3-lock-host.txt
+          grep -F "failing_closed_correct_pin_releases_after_backoff ... ok" target/seam3-lock-host.txt
+          grep -F "a_hook_thread_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
+          grep -F "a_liveness_thread_panic_tries_the_os_lock_without_trapping_input ... ok" target/seam3-lock-host.txt
+          grep -F "a_callback_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
       - name: Release build of the Windows target omits the test feature
         shell: bash
         run: |

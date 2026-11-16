@@ -10,8 +10,17 @@ rust-version.workspace = true
 [features]
 # Enables the lock host's test-only classifier for the hook round-trip.
 simulated-physical = ["dep:softlock-lockhost", "softlock-lockhost/simulated-physical"]
+# Dev-launch lock host plus the classifier, so seam tests can treat nonce-tagged
+# SendInput as physical. Off unless a test asks for it.
+dev-launch = [
+    "dep:softlock-lockhost",
+    "dep:softlock-core",
+    "softlock-lockhost/dev-launch",
+    "softlock-lockhost/simulated-physical",
+]
 
 [dependencies]
+softlock-core = { path = "../softlock-core", optional = true }
 softlock-lockhost = { path = "../softlock-lockhost", optional = true }
 
 [target.'cfg(windows)'.dependencies]
