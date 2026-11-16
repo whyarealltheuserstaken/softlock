@@ -21,46 +21,44 @@ both_archs() {
   esac
 }
 
-# Print every minimum-macOS line from each slice, then require macOS 11.0.
+# Require macOS 11.0 on the x86_64 slice and on the arm64 slice separately.
+# `otool -arch all` is printed for display and is not the check.
+# LC_BUILD_VERSION uses `minos`. LC_VERSION_MIN_MACOSX uses `version`.
 require_minos() {
   bin="$1"
   echo "=== otool minos ${bin} ==="
-  universal_binary=0
-  if lipo -info "${bin}" >/dev/null 2>&1; then
-    archs="$(lipo -archs "${bin}")"
-    case "${archs}" in
-      *x86_64*)
-        case "${archs}" in
-          *arm64*) universal_binary=1 ;;
-        esac
-        ;;
-    esac
-  fi
-  lines="$(otool -arch all -l "${bin}" | grep 'minos ' || true)"
-  if [ "${universal_binary}" -eq 1 ]; then
-    for arch in x86_64 arm64; do
-      arch_lines="$(otool -arch "${arch}" -l "${bin}" | grep 'minos ' || true)"
-      if [ -n "${arch_lines}" ]; then
-        lines="$(printf '%s\n%s\n' "${lines}" "${arch_lines}")"
-      fi
-    done
-  fi
-  printf '%s\n' "${lines}"
-  if [ -z "${lines}" ]; then
-    echo "no minos in ${bin}"
-    exit 1
-  fi
-  bad="$(printf '%s\n' "${lines}" | grep -v 'minos 11.0' || true)"
-  if [ -n "${bad}" ]; then
-    echo "deployment target is not 11.0:"
-    printf '%s\n' "${bad}"
-    exit 1
-  fi
-  minos_count="$(printf '%s\n' "${lines}" | grep -c 'minos 11.0' || true)"
-  if [ "${universal_binary}" -eq 1 ] && [ "${minos_count}" -lt 2 ]; then
-    echo "fat binary needs at least two minos 11.0 lines, found ${minos_count}"
-    exit 1
-  fi
+  otool -arch all -l "${bin}" | grep 'minos ' || true
+  for slice_arch in x86_64 arm64; do
+    slice_lines="$(otool -arch "${slice_arch}" -l "${bin}" | grep 'minos ' || true)"
+    if [ -z "${slice_lines}" ]; then
+      slice_lines="$(vtool -arch "${slice_arch}" -show-build "${bin}" | awk '
+        /LC_VERSION_MIN_MACOSX/ { grab = 1; next }
+        /cmd LC_/ { grab = 0 }
+        grab && $1 == "version" { print $1 " " $2; grab = 0 }
+      ')"
+    fi
+    if [ -z "${slice_lines}" ]; then
+      echo "${slice_arch}: no minos or version in ${bin}"
+      exit 1
+    fi
+    while IFS= read -r slice_line; do
+      [ -z "${slice_line}" ] && continue
+      case "${slice_line}" in
+        *"minos 11.0"*)
+          echo "${slice_arch}: minos 11.0"
+          ;;
+        *"version 11.0"*)
+          echo "${slice_arch}: version 11.0"
+          ;;
+        *)
+          echo "${slice_arch}: deployment target is not 11.0: ${slice_line}"
+          exit 1
+          ;;
+      esac
+    done <<EOF
+${slice_lines}
+EOF
+  done
 }
 
 scan_release() {
