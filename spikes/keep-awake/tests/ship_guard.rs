@@ -6,8 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use softlock_spike_keep_awake::{
-    CLOSE_LID_LINE, MEASUREMENT_SCENARIOS, analyze_command, practice_command, run_command,
-    smoke_command,
+    CLOSE_LID_LINE, MEASUREMENT_SCENARIOS, analyze_command, run_command, smoke_command,
 };
 
 fn repo_root() -> PathBuf {
@@ -101,7 +100,14 @@ fn scan(dir: &Path, hits: &mut Vec<PathBuf>) {
 #[test]
 fn checklist_has_one_command_per_scenario_and_the_new_columns() {
     let checklist = read(&repo_root().join("docs/findings/08-keep-awake/CHECKLIST.md"));
-    assert!(checklist.contains(&practice_command()));
+    assert!(
+        checklist.contains(
+            "cargo run -p softlock-spike-keep-awake -- run --scenario practice --minutes 3"
+        )
+    );
+    assert!(checklist.contains("heat-guard"));
+    assert!(checklist.contains("passive_limit"));
+    assert!(checklist.contains("throttle_reasons"));
     assert!(checklist.contains(&analyze_command()));
     assert!(checklist.contains("spikes/keep-awake/logs/"));
     assert!(checklist.contains(CLOSE_LID_LINE));
@@ -115,7 +121,7 @@ fn checklist_has_one_command_per_scenario_and_the_new_columns() {
     assert!(checklist.contains("80%"));
     assert!(checklist.contains("20%"));
     assert!(checklist.contains("critical-battery"));
-    assert!(checklist.contains("drag"));
+    assert!(checklist.contains("Drag"));
     assert!(checklist.contains("issue #8"));
     assert!(checklist.contains("stray key"));
     assert!(checklist.contains("Ctrl+C"));

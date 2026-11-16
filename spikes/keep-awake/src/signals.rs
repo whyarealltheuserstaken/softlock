@@ -185,7 +185,7 @@ impl PowerSignals {
 
     pub fn progress_note(self) -> String {
         format!(
-            "battery={}% cooling={} cap={} heat_zone={} heat_battery={}",
+            "battery={}% cooling={} cap={} passive_limit={} throttle_reasons={} heat_zone={} heat_battery={}",
             percent_token(self.battery_percent),
             self.cooling.map(Cooling::token).unwrap_or("unknown"),
             match (self.speed_limited(), self.execution_throttled) {
@@ -193,6 +193,8 @@ impl PowerSignals {
                 (Some(false), Some(false)) => "no",
                 _ => "unknown",
             },
+            unavailable_token(self.passive_limit),
+            unavailable_token(self.throttle_reasons),
             unavailable_token(self.zone_dc),
             unavailable_token(self.battery_dc),
         )
@@ -268,6 +270,8 @@ pub struct SignalRollup {
     pub battery_low: usize,
     pub recorded_samples: usize,
     pub heat_samples: usize,
+    /// Samples where at least one heat field had a number, not `unavailable`.
+    pub heat_readable: usize,
     pub passive_below: usize,
     pub throttle_bit: usize,
     pub hottest_zone_dc: Option<i32>,
@@ -312,6 +316,13 @@ impl SignalRollup {
             || signals.battery_dc.is_some()
         {
             self.heat_samples += 1;
+            let readable = signals.passive_limit.is_some()
+                || signals.throttle_reasons.is_some()
+                || signals.zone_dc.is_some()
+                || signals.battery_dc.is_some();
+            if readable {
+                self.heat_readable += 1;
+            }
             if signals.passive_limit.is_some_and(|limit| limit < 100) {
                 self.passive_below += 1;
             }
@@ -357,12 +368,18 @@ impl SignalRollup {
         };
         let heat = if self.heat_samples == 0 {
             "heat: not recorded".to_string()
-        } else if self.passive_below == 0
-            && self.throttle_bit == 0
-            && self.hottest_zone_dc.is_none()
-            && self.hottest_battery_dc.is_none()
-        {
+        } else if self.heat_readable == 0 {
             "heat: unavailable".to_string()
+        } else if self.passive_below == 0 && self.throttle_bit == 0 {
+            if self.hottest_zone_dc.is_none() && self.hottest_battery_dc.is_none() {
+                "heat: readable, no throttling".to_string()
+            } else {
+                format!(
+                    "heat: readable, no throttling, hottest zone {}, hottest battery {}",
+                    format_dc(self.hottest_zone_dc),
+                    format_dc(self.hottest_battery_dc)
+                )
+            }
         } else {
             format!(
                 "heat: passive limit below 100 on {} samples, thermal throttle bit on {} samples, hottest zone {}, hottest battery {}",
@@ -474,6 +491,24 @@ mod tests {
             SignalRollup::default()
                 .summary_lines()
                 .contains("not recorded")
+        );
+    }
+
+    #[test]
+    fn the_progress_line_shows_the_heat_counters() {
+        let stuck = PowerSignals {
+            passive_limit: Some(80),
+            throttle_reasons: Some(1),
+            ..PowerSignals::default()
+        };
+        let note = stuck.progress_note();
+        assert!(note.contains("passive_limit=80"), "{note}");
+        assert!(note.contains("throttle_reasons=1"), "{note}");
+        let missing = PowerSignals::default().progress_note();
+        assert!(missing.contains("passive_limit=unavailable"), "{missing}");
+        assert!(
+            missing.contains("throttle_reasons=unavailable"),
+            "{missing}"
         );
     }
 }

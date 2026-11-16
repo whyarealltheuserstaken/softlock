@@ -614,6 +614,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_readable_calm_heat_sample_is_not_called_unavailable() {
+        let calm = LogEvent::Tick {
+            at_ms: 0,
+            scenario: "practice".to_string(),
+            ui_ok: true,
+            kind: "uia".to_string(),
+            signals: PowerSignals {
+                heat_checked: true,
+                passive_limit: Some(100),
+                throttle_reasons: Some(0),
+                ..PowerSignals::default()
+            },
+        };
+        let calm_summary =
+            summarize_text(&format!("{}\n", calm.format_line()), &["practice"]).unwrap();
+        assert!(
+            calm_summary.text.contains("heat: readable, no throttling"),
+            "{}",
+            calm_summary.text
+        );
+        assert!(
+            !calm_summary.text.contains("heat: unavailable"),
+            "{}",
+            calm_summary.text
+        );
+
+        let missing = LogEvent::Tick {
+            at_ms: 0,
+            scenario: "practice".to_string(),
+            ui_ok: true,
+            kind: "uia".to_string(),
+            signals: PowerSignals {
+                heat_checked: true,
+                ..PowerSignals::default()
+            },
+        };
+        let missing_summary =
+            summarize_text(&format!("{}\n", missing.format_line()), &["practice"]).unwrap();
+        assert!(
+            missing_summary.text.contains("heat: unavailable"),
+            "{}",
+            missing_summary.text
+        );
+        assert!(
+            !missing_summary.text.contains("readable, no throttling"),
+            "{}",
+            missing_summary.text
+        );
+
+        let hot = LogEvent::Tick {
+            at_ms: 0,
+            scenario: "practice".to_string(),
+            ui_ok: true,
+            kind: "uia".to_string(),
+            signals: PowerSignals {
+                heat_checked: true,
+                passive_limit: Some(80),
+                throttle_reasons: Some(1),
+                ..PowerSignals::default()
+            },
+        };
+        let hot_summary =
+            summarize_text(&format!("{}\n", hot.format_line()), &["practice"]).unwrap();
+        assert!(
+            hot_summary
+                .text
+                .contains("passive limit below 100 on 1 samples"),
+            "{}",
+            hot_summary.text
+        );
+        assert!(
+            hot_summary
+                .text
+                .contains("thermal throttle bit on 1 samples"),
+            "{}",
+            hot_summary.text
+        );
+    }
+
     fn unix_tail() -> u128 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

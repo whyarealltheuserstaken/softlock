@@ -36,7 +36,7 @@ use windows::Win32::System::Variant::{
 };
 use windows::Win32::System::Wmi::{
     IWbemLocator, IWbemServices, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY,
-    WBEM_INFINITE, WbemLocator,
+    WBEM_S_TIMEDOUT, WbemLocator,
 };
 use windows::core::{BSTR, PCWSTR, w};
 
@@ -44,6 +44,9 @@ use crate::guard::{
     plausible_battery_dc, plausible_passive_limit, plausible_throttle_reasons, plausible_zone_dc,
 };
 use crate::signals::PowerSignals;
+
+/// `IEnumWbemClassObject::Next` waits at most this long. A timeout leaves the zone unavailable.
+const WMI_QUERY_TIMEOUT_MS: i32 = 2_000;
 
 const RPC_C_AUTHN_WINNT: u32 = 10;
 const RPC_C_AUTHZ_NONE: u32 = 0;
@@ -250,7 +253,11 @@ fn hottest_zone(services: &IWbemServices) -> Option<i32> {
     loop {
         let mut objects = [None];
         let mut returned = 0u32;
-        let hr = unsafe { enumerator.Next(WBEM_INFINITE, &mut objects, &mut returned) };
+        let hr = unsafe { enumerator.Next(WMI_QUERY_TIMEOUT_MS, &mut objects, &mut returned) };
+        // A timeout is a success code. The zone reading is unavailable rather than a partial result.
+        if hr == windows::core::HRESULT(WBEM_S_TIMEDOUT.0) {
+            return None;
+        }
         if hr.is_err() || returned == 0 {
             break;
         }

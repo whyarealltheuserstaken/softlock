@@ -16,12 +16,12 @@ A battery run starts only when Windows shows 80% or more. If it is lower, charge
 
 A stray key ends the run. Run that scenario again. Ctrl+C also stops it.
 
-## 1. Practice (about 1 minute)
+## 1. Practice (about 3 minutes)
 
 Open a terminal in the folder that contains `Cargo.toml`. The first command compiles. That takes several minutes. Later commands are quicker.
 
 ```
-cargo run -p softlock-spike-keep-awake -- run --scenario practice --minutes 1
+cargo run -p softlock-spike-keep-awake -- run --scenario practice --minutes 3
 ```
 
 Read the line that starts with `Modern Standby (AoAc):`.
@@ -29,6 +29,8 @@ Read the line that starts with `Modern Standby (AoAc):`.
 If it says `Modern Standby (AoAc): no`, stop. Do not run the four long tests. Write "no" and the laptop model in the finding. The model and Windows version are in Settings, then System, then About.
 
 A dim screen appears. Clicks still reach the windows under it. Press any key to stop early.
+
+Stay for this one. It lasts 3 minutes, which is longer than the 2-minute heat check. Each progress line prints `passive_limit` and `throttle_reasons`. If a heat counter stays tripped, the run stops early and says `heat-guard`. Write that down. That early stop is a result.
 
 The log is `spikes/keep-awake/logs/practice.log`.
 
@@ -103,7 +105,7 @@ The lowest battery, the heat line, and the policy or cap line are the data for c
 
 ## 7. Share the four logs
 
-drag these four files into a comment on issue #8:
+Drag these four files into a comment on issue #8:
 
 - `spikes/keep-awake/logs/lid-open-plugged.log`
 - `spikes/keep-awake/logs/lid-open-battery.log`
