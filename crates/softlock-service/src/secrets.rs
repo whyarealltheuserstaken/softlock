@@ -44,13 +44,17 @@ impl PinStore {
         if !running_as_system() {
             return write_hash_without_system(parent, &self.path, hash);
         }
-        secure_service_directory(parent)?;
+        secure_service_directory(parent)
+            .map_err(|error| io::Error::other(format!("service directory: {error}")))?;
         // CREATE_NEW plus a random name. A planted file keeps its own DACL
         // under CREATE_ALWAYS, so a user who already holds a read handle
         // would see the hash. An existing name is a failure, not a reuse.
         let tmp = parent.join(random_temp_name()?);
         let handle = create_file_new_system(&tmp)?;
-        if let Err(error) = apply_security_on_handle(handle).and_then(|()| verify_handle(handle)) {
+        if let Err(error) = apply_security_on_handle(handle)
+            .map_err(|error| io::Error::other(format!("protect temp: {error}")))
+            .and_then(|()| verify_handle(handle))
+        {
             drop_handle(handle);
             let _ = remove_path_nofollow(&tmp);
             return Err(error);
@@ -281,7 +285,7 @@ fn create_file_new_system(path: &Path) -> io::Result<windows::Win32::Foundation:
     use windows::Win32::Security::SECURITY_ATTRIBUTES;
     use windows::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FILE_SHARE_MODE,
+        FILE_SHARE_MODE, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
     use windows::core::PCWSTR;
     let descriptor = security_descriptor()?;
@@ -294,7 +298,11 @@ fn create_file_new_system(path: &Path) -> io::Result<windows::Win32::Foundation:
     let handle = unsafe {
         CreateFileW(
             PCWSTR(wide_path.as_ptr()),
-            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+            FILE_GENERIC_READ.0
+                | FILE_GENERIC_WRITE.0
+                | READ_CONTROL.0
+                | WRITE_DAC.0
+                | WRITE_OWNER.0,
             FILE_SHARE_MODE(0),
             Some(&sa),
             CREATE_NEW,
