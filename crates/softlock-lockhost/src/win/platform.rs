@@ -11,7 +11,7 @@ use softlock_core::{
     GuardHealth, HardenError, Hardening, HardeningPlan, InputGuard, Journal, LockScreenLook,
     OsLockError, Overlay, OverlayError, OverlayHealth, PassthroughTarget, PhysicalInputSink,
     PolicySetting, PolicySettings, Power, PowerCaps, PowerError, PromptView, Secret,
-    SessionControl, SessionEvent, SessionId, UserId, Verdict, verify_softlock_pin,
+    SessionControl, SessionEvent, SessionId, UserId, Verdict,
 };
 
 use super::failclosed;
@@ -102,7 +102,20 @@ impl SessionControl for WinPlatform {
     }
 
     fn os_lock(&mut self, session: SessionId) -> Result<(), OsLockError> {
-        failclosed::lock_or_disconnect(session.0).map_err(|_| OsLockError::Failed)
+        match failclosed::lock_or_disconnect(session.0) {
+            crate::real_lock::RealLock::Workstation | crate::real_lock::RealLock::Disconnected => {
+                Ok(())
+            }
+            crate::real_lock::RealLock::Unavailable => {
+                // Both Windows paths failed. Drop our guard so the desktop is
+                // not trapped under an overlay that swallows input.
+                super::session::release_session(&self.shared);
+                self.shared
+                    .locked
+                    .store(false, std::sync::atomic::Ordering::Release);
+                Err(OsLockError::Failed)
+            }
+        }
     }
 
     fn session_events(&self) -> std::sync::mpsc::Receiver<SessionEvent> {
@@ -111,6 +124,10 @@ impl SessionControl for WinPlatform {
 }
 
 impl Hardening for WinPlatform {
+    /// Ticket 15 writes the lockdown policies, after the journal from ticket 16.
+    /// This dev launch does not write them and does not clear
+    /// `DisableLockWorkstation`. A success here only lets the state machine
+    /// reach Locked.
     fn apply(&mut self, _plan: &HardeningPlan, _journal: &mut Journal) -> Result<(), HardenError> {
         Ok(())
     }
@@ -150,10 +167,12 @@ impl Credentials for WinPlatform {
     }
 
     fn verify_secret(&self, method: &softlock_core::MethodId, secret: &Secret) -> Verdict {
-        if method.as_str() != softlock_core::MethodId::softlock_pin().as_str() {
-            return Verdict::Rejected;
-        }
-        verify_softlock_pin(secret, &self.shared.pin_hash)
+        // A `Verified` return from this method unlocks inside `SubmitSecret`
+        // with no Broker nonce. The dev launch therefore never returns one.
+        // The PIN compare and the `RequestHello` / `Event::Verified` path live
+        // in the window thread.
+        let _ = (method, secret, &self.shared.pin_hash);
+        Verdict::Rejected
     }
 }
 

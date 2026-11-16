@@ -186,6 +186,8 @@ jobs:
           grep -F "simulated_physical_mouse_does_not_move_the_cursor ... ok" target/seam3-lock-host.txt
           grep -F "arming_stays_under_500ms_and_swallows_physical_keys ... ok" target/seam3-lock-host.txt
           grep -F "correct_pin_unlocks_and_wrong_pin_does_not ... ok" target/seam3-lock-host.txt
+          grep -F "wts_disconnect_on_an_unused_session_fails ... ok" target/seam3-lock-host.txt
+          grep -F "both_os_lock_paths_failing_releases_the_soft_lock ... ok" target/seam3-lock-host.txt
       - name: Release build of the Windows target omits the test feature
         shell: bash
         run: |

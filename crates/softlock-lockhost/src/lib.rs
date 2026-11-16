@@ -7,6 +7,7 @@
 //! strings or symbols.
 
 mod classify;
+mod real_lock;
 
 #[cfg(feature = "dev-launch")]
 mod dev_marker;
@@ -27,4 +28,6 @@ pub use classify::{RunNonce, clear_run_nonce, set_run_nonce};
 #[cfg(feature = "dev-launch")]
 pub use dev_marker::dev_launch_marker_bytes;
 #[cfg(all(feature = "dev-launch", windows))]
-pub use win::{DevConfig, DevError, DevLock, OVERLAY_MARKER};
+pub use win::{
+    DevConfig, DevError, DevLock, OVERLAY_MARKER, current_session_id, disconnect_session,
+};

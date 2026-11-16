@@ -2,11 +2,10 @@
 //! allocation. Liveness is a marker this process injects, not a guess that
 //! Windows will remove a slow hook.
 //!
-//! Ticket 06 still has to check a client Windows logon whose token is split
-//! by UAC. The input-hook finding measured Server images only: the console
-//! token there is already high integrity and has no linked token. This dev
-//! launch installs the hooks in the calling process. Ticket 13 is the
-//! SYSTEM-in-session launch.
+//! A split token on client Windows is ticket 06. The input-hook finding
+//! measured Server images only: the console token there is already high
+//! integrity and has no linked token. This dev launch installs the hooks in
+//! the calling process. Ticket 13 is the SYSTEM-in-session launch.
 
 use std::sync::Arc;
 use std::thread;

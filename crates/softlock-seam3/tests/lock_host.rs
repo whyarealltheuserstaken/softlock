@@ -10,7 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use softlock_lockhost::{
-    DevConfig, DevLock, OVERLAY_MARKER, RunNonce, clear_run_nonce, set_run_nonce,
+    DevConfig, DevLock, OVERLAY_MARKER, RunNonce, clear_run_nonce, current_session_id,
+    disconnect_session, set_run_nonce,
 };
 use softlock_seam3::{
     Probe, Rgb, capture_marker, capture_near, cursor_position, keyboard_focus, send_left_click,
@@ -336,4 +337,59 @@ fn correct_pin_unlocks_and_wrong_pin_does_not() {
             .all(|input| !(0x30..=0x39).contains(&input.virtual_key)),
         "a typed pin character reached the probe"
     );
+}
+
+#[test]
+fn wts_disconnect_on_an_unused_session_fails() {
+    let _guard = gate();
+    let before = current_session_id();
+    // `0xFFFFFFFF` is WTS_CURRENT_SESSION and would disconnect this runner.
+    let unused = 0x00FE_FFFE;
+    assert!(
+        !disconnect_session(unused),
+        "disconnecting an unused session should fail"
+    );
+    assert_eq!(
+        current_session_id(),
+        before,
+        "the failed disconnect changed this session"
+    );
+}
+
+#[test]
+fn both_os_lock_paths_failing_releases_the_soft_lock() {
+    let _guard = gate();
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let nonce = Nonce::install();
+    let extra = nonce.extra();
+    let lock = arm("unused", None);
+
+    send_virtual_key(VK_F14, extra).expect("while locked");
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        probe
+            .inputs()
+            .iter()
+            .all(|input| input.virtual_key != VK_F14),
+        "simulated-physical input reached the probe before the release"
+    );
+
+    // Same release the platform runs when LockWorkStation did not lock and
+    // WTSDisconnectSession did not disconnect. Neither API is called here:
+    // calling them on this session would lock or disconnect the runner.
+    lock.release_soft_lock();
+    assert!(
+        !lock.is_locked(),
+        "the soft lock stayed up after both OS paths were unavailable"
+    );
+    assert!(
+        lock.overlay_windows().is_empty(),
+        "the overlay stayed up after both OS paths were unavailable"
+    );
+
+    send_virtual_key(VK_F14, extra).expect("after release");
+    probe
+        .wait_for_key(VK_F14, Duration::from_secs(3))
+        .expect("input stayed blocked after both OS lock paths failed");
 }

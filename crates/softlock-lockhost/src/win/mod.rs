@@ -7,4 +7,5 @@ mod platform;
 mod queue;
 mod session;
 
+pub use failclosed::{current_session_id, disconnect_session};
 pub use session::{DevConfig, DevError, DevLock, OVERLAY_MARKER};

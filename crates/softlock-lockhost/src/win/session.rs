@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use softlock_core::{
     Event, GuardHealth, HeartbeatReport, LockController, LockSource, LockState, MethodId, Overlay,
-    Secret,
+    Secret, Verdict, verify_softlock_pin,
 };
 use zeroize::Zeroize;
 
@@ -126,6 +126,13 @@ impl DevLock {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+
+    /// Drops the overlay and the hooks. Used when neither `LockWorkStation`
+    /// nor `WTSDisconnectSession` reached the real lock screen.
+    pub fn release_soft_lock(&self) {
+        release_session(&self.shared);
+        self.shared.locked.store(false, Ordering::Release);
     }
 }
 
@@ -325,7 +332,7 @@ fn shutdown(shared: &Shared) {
     shared.locked.store(false, Ordering::Release);
 }
 
-fn release_session(shared: &Shared) {
+pub(crate) fn release_session(shared: &Shared) {
     overlay::destroy(shared);
     guard::remove(shared);
     failclosed::clear_execution_state(shared);
@@ -448,10 +455,33 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
     bytes.zeroize();
     entry.chars = 0;
     shared.pin_chars.store(0, Ordering::Release);
+    // Argon2id compare, constant time, spec parameters. `Verdict::Verified`
+    // here is the credential verdict and carries no nonce. Unlocking still
+    // goes through `Event::Verified`, whose nonce `RequestHello` just drew
+    // with `LaunchNonce::generate` (32 CSPRNG bytes). Production code does
+    // not call `LaunchNonce::from_bytes`.
+    let matched = verify_softlock_pin(&secret, &shared.pin_hash) == Verdict::Verified;
+    if matched {
+        drop(secret);
+        unlock_with_broker_nonce(controller, shared);
+        return;
+    }
+    // Wrong PIN. `verify_secret` stays `Rejected`, so this records the
+    // failure and does not unlock.
     controller.handle(Event::SubmitSecret {
         method: MethodId::softlock_pin(),
         secret,
     });
+    overlay::invalidate(shared);
+}
+
+fn unlock_with_broker_nonce(controller: &mut LockController<WinPlatform>, shared: &Shared) {
+    controller.handle(Event::RequestHello);
+    let Some(nonce) = controller.broker_nonce() else {
+        overlay::invalidate(shared);
+        return;
+    };
+    controller.handle(Event::Verified { nonce });
     if matches!(controller.state(), LockState::Unlocked) {
         shared.prompt_open.store(false, Ordering::Release);
         shared.locked.store(false, Ordering::Release);
