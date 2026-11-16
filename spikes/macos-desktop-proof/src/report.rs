@@ -473,6 +473,10 @@ fn version_failures(version: &VersionReport) -> Vec<String> {
     reasons
 }
 
+pub fn window_proof_unfinished(error: Option<&str>) -> bool {
+    error.is_some_and(|text| text.contains("proof started"))
+}
+
 fn probe_crashed(error: Option<&str>) -> bool {
     error.is_some_and(|text| text.contains("process exited") || text.contains("timed out"))
 }
@@ -596,10 +600,8 @@ fn job_failures(job: &JobReport) -> Vec<String> {
     if job.loaded && job.graphic_session.is_none() {
         reasons.push(format!("{} loaded but wrote no marker", job.kind));
     }
-    if job
-        .window_error
-        .as_deref()
-        .is_some_and(|error| error.contains("proof started") || probe_crashed(Some(error)))
+    if window_proof_unfinished(job.window_error.as_deref())
+        || probe_crashed(job.window_error.as_deref())
     {
         reasons.push(format!("{} window proof crashed", job.kind));
     }

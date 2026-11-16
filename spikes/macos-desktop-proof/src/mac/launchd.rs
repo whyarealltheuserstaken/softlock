@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use crate::labels::{AGENT_LABEL, DAEMON_LABEL, DAEMON_PLIST};
 use crate::launchctl::{PrintState, parse_pid, parse_print};
 use crate::plist::{PlistOpts, agent_plist_path, job_arguments, job_plist};
-use crate::report::{JobMarker, JobObservation, JobReport, job_from_observation};
+use crate::report::{
+    JobMarker, JobObservation, JobReport, job_from_observation, window_proof_unfinished,
+};
 use crate::text::one_line;
 
 pub fn exercise(exe: &Path, output_dir: &Path) -> Vec<JobReport> {
@@ -267,11 +269,16 @@ fn wait_for_marker(
         let (ok, stdout, _stderr) = print_job(sudo, target);
         state = parse_print(ok, &stdout);
         pid = parse_pid(&stdout).or(pid);
-        if marker.is_none() {
-            if sudo {
-                chmod_readable(marker_path);
+        if sudo {
+            chmod_readable(marker_path);
+        }
+        if let Some(next) = read_marker(marker_path) {
+            let unfinished = window_proof_unfinished(next.window_error.as_deref());
+            marker = Some(next);
+            if unfinished {
+                thread::sleep(Duration::from_millis(200));
+                continue;
             }
-            marker = read_marker(marker_path);
         }
         if marker.is_some()
             && (state == PrintState::Running || start.elapsed() > Duration::from_secs(2))
