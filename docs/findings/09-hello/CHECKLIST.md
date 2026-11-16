@@ -59,7 +59,7 @@ Cover the camera and do not touch the fingerprint reader, so Hello asks for the 
 2. When the PIN box is in front, the dark screen changes. It says you can type the PIN.
 3. Type the right PIN.
 4. Write down whether the digits showed up in the Hello window, and whether Hello accepted them.
-5. Write down the `hello result:` line and the `signature file=` line. The verify part should say `catalog` for the system credential window.
+5. Write down the `hello result:` line and the `signature file=` line. `trusted=true` is the result you want. `verify` may say `embedded` or `catalog`. Either one is fine.
 
 The mouse does nothing on purpose. You cannot click the PIN box. If it is not ready for typing, write that down.
 
@@ -101,6 +101,8 @@ A wrong password counts toward Windows' account-lockout counter. Use the correct
 
 This command does not block the keyboard. The tool prints `logon form tried:` before it asks for the password. Write that line down. It is the exact account form that was checked.
 
+The first build has to finish while you are still online. The hello runs above do that. After the network is off, Cargo must not try to download anything, so both password commands use `--offline`.
+
 Turn the network off before either password run:
 
 1. Turn Wi-Fi off, and unplug the ethernet cable if there is one.
@@ -114,7 +116,7 @@ If you do not know your Microsoft account password, or you sign in without a pas
 Replace `<your email>` with the email you use for the Microsoft account. Keep `MicrosoftAccount\` in front of it. Quotes matter in PowerShell.
 
 ```text
-cargo run -p softlock-hello-spike -- password --account "MicrosoftAccount\<your email>"
+cargo run --offline -p softlock-hello-spike -- password --account "MicrosoftAccount\<your email>"
 ```
 
 Type `yes`, then your Windows password. Write down `account kind`, `logon form tried`, `result`, and `win32 error` if there is one. The password is not printed.
@@ -142,7 +144,7 @@ It asks for the temporary password twice.
 Then, still signed in as yourself, with the network off:
 
 ```text
-cargo run -p softlock-hello-spike -- password --account ".\slp6test"
+cargo run --offline -p softlock-hello-spike -- password --account ".\slp6test"
 ```
 
 Type `yes` and the temporary password. Write down the same lines as before. `logon form tried` should be `.\slp6test`.
@@ -157,7 +159,7 @@ Or, from an Administrator terminal:
 net user slp6test /delete
 ```
 
-Settings sometimes leaves the folder `C:\Users\slp6test`. Delete that folder too. If it will not delete, write that in the finding and leave it for later.
+`net user slp6test /delete` usually leaves the folder `C:\Users\slp6test` behind. Settings, Remove usually deletes that folder. If the folder is still there, delete it. If it will not delete, write that in the finding and leave it for later.
 
 Turn the network back on.
 
