@@ -2,13 +2,13 @@
 
 | | |
 |---|---|
-| **Status** | Planning only. Not approved as a set, and the tickets are not GitHub issues. Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7, and decided D8 (a failure never ends Unlocked). His Intel Mac is recorded in D1: MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), macOS Tahoe 26.7.3, laptop, Touch ID, T2. He sometimes uses an external display. How many are attached at once is still open. Whether a second keyboard is available is still unknown. macOS 11 through 15 are untested. No product code comes with it. Connected displays and remote views are SPEC.md Decision 20, which is open on the capture-exclusion conflict. |
+| **Status** | Planning only. Not approved as a set, and the tickets are not GitHub issues. Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7, and decided D8 (a failure never ends Unlocked). His Intel Mac is the test-machine paragraph in D1, which cites Henry, 16 November 2026, on an external display. No product code comes with it. Connected displays and remote views are SPEC.md Decision 20. The capture entry and the remote-input entry are both open. |
 | **Date** | 16 November 2026 |
 | **Read against** | `23b5a39bc92c2ee32f470256d78be27d030dc59f` on `main` |
 | **Supersedes** | The macOS bullets that used to live in SPEC.md Implementation Decision 16, and the short phase-2 note that used to be this file |
 | **Does not change** | Windows v1, the lock state machine, the Broker nonce rule, the open-core boundary, or the Linux note |
 
-This is the macOS half of the product, planned in parallel with Windows. Henry decided D1 in [`docs/tickets/macos/decisions.md`](../tickets/macos/decisions.md): Universal 2, macOS 11 or later, his Intel Mac for the Intel slice, and `macos-latest` for arm64. That Mac is a MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), 2 GHz quad-core Intel Core i5, Intel Iris Plus Graphics, 16 GB LPDDR4X, running macOS Tahoe 26.7.3. It is a laptop, and it has Touch ID and the T2 chip. He sometimes uses an external display. How many are attached at once is still open. Whether a second keyboard is available is still unknown. macOS 26.7.3 is well above the macOS 11 floor, so arm64 CI on `macos-latest` plus this machine on 26.x leaves macOS 11 through 15 untested.
+This is the macOS half of the product, planned in parallel with Windows. Henry decided D1 in [`docs/tickets/macos/decisions.md`](../tickets/macos/decisions.md): Universal 2, macOS 11 or later, his Intel Mac for the Intel slice, and `macos-latest` for arm64. The machine paragraph, including Henry, 16 November 2026, on an external display, is that decision. This file does not copy it.
 
 Every claim below is tagged.
 
@@ -215,7 +215,7 @@ Simulated physical input on a runner is the nonce in `kCGEventSourceUserData`, a
 
 ## 9. Connected displays and remote views
 
-Henry's decision is SPEC.md Implementation Decision 20, 16 November 2026. Locking covers a remote view that is already up. Connecting to a locked Mac shows the SoftLock screen. Unlock is the same Broker. Remote input before unlock reaches only the unlock UI. A crash or any other failure ends in the D5 lock for that session and never in Unlocked (D8). Displays added, removed, mirrored, rescaled, or changed, including AirPlay, Sidecar, a DisplayLink or other USB display, and a closed lid with an external display still awake, are covered or the failure is fail-closed.
+Henry's decision is SPEC.md Implementation Decision 20, 16 November 2026. Locking covers a remote view that is already up. Connecting to a locked Mac shows the SoftLock screen. Unlock is the same Broker. Remote input before unlock is the open remote-input entry there: Screen Sharing arrives as posted events, and the tap cannot tell those from an agent's. A crash or any other failure is invariant 3 in SPEC.md Decision 5 (D8 on this platform): the guard stays up or the real lock is reached, and the state is not Unlocked. Displays added, removed, mirrored, rescaled, or changed, including AirPlay, Sidecar, a DisplayLink or other USB display, and a closed lid with an external display still awake, are covered or the failure takes that same path.
 
 D7 still stands. Closing the lid with no external display is forced sleep on the QA1340 page, and phase 2 does not offer lid-close takeover. A closed lid with an external display is a different case. Apple's current MacBook Pro guide says that after an external display is connected, the lid can be closed and work continues with connected accessories such as a keyboard and mouse. m23 records that case. It does not turn D7 into a feature.
 
@@ -233,7 +233,7 @@ D7 still stands. Closing the lid with no external display is forced sleep on the
 
 **Spike m20 (runner) and m23 (Henry's Intel Mac).** m20 registers the callback and changes the virtual display's mode. It states, in the finding, that the runner cannot prove a physical hot-plug, a closed lid, AirPlay, Sidecar, DisplayLink, or a second physical panel. m23 is those rows. m06 keeps the displays already attached when its probe starts.
 
-**Spike m21 and m22.** m21 counts the marker on any remote-view path the runner can open, with `.none` and with the default, and writes a miss where the runner has no Screen Sharing client. m22 is the lock and the Broker on that view, after Henry closes Decision 20. Neither ticket chooses the option.
+**Spike m21 and m22.** m21 counts the marker on Screen Sharing, VNC, AirPlay, TeamViewer, AnyDesk, and Chrome Remote Desktop, with `.none` and with the default, and writes a miss where the runner cannot open that path. m22 is the lock and the Broker on that view, after Henry closes Decision 20. Neither ticket chooses the option. macOS option A is marked likely infeasible in that decision.
 
 ## 10. What this addendum will not pretend
 

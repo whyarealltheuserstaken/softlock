@@ -19,7 +19,7 @@ This kit does not install the product service. It measures the two paths D5 alre
 
 **Where:** Henry's Intel Mac for the sheet. CI for the four chooser rows, in the existing verify job. Locking the session is a poor default CI job. A later CI job that locks a runner is allowed only if m02 says the runner comes back after a lock, and it runs in its own workflow. The proof that a path shows a lock screen is his Mac.
 
-**Test machine:** MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports). 2 GHz quad-core Intel Core i5. Intel Iris Plus Graphics. 16 GB LPDDR4X. macOS Tahoe 26.7.3. Laptop, with Touch ID and the T2 chip, so a FileVault-on pre-boot screen is the Secure Enclave path. The number of external displays is still unknown. macOS 11 through 15 are untested: this machine is on 26.x, and arm64 CI is `macos-latest`. Full list: D1 and [Henry's sheet](henry-sheet.md).
+**Test machine:** The paragraph in D1 of [`decisions.md`](decisions.md). [Henry's sheet](henry-sheet.md) points at the same paragraph. A FileVault-on pre-boot screen on this machine is the Secure Enclave path.
 
 **Type:** Hardware kit, plus the chooser test. Deliverable is the sheet under `docs/findings/`, and a green verify job.
 

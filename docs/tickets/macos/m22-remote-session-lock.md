@@ -1,14 +1,14 @@
 # m22: Remote session lock and unlock
 
-**What to build:** Locking while Screen Sharing, VNC, Chrome Remote Desktop, or a remote view of the same kind is connected covers that view. Connecting to a Mac that is already SoftLocked shows the SoftLock screen on the remote view. Unlock is the Broker: a `Verified` verdict with the 32-byte `LaunchNonce`. Touch ID is offered where that remote stack supports it. Otherwise the account password or the dev PIN, the same methods as m18 and m19, and no weaker path. Keys and clicks from the remote view before unlock reach only the unlock UI. A crash or any other failure takes the D5 path and then D8: the session does not end Unlocked. The surface that stays visible to the remote viewer is the option Henry picks in D9 (SPEC.md Decision 20). This ticket does not pick it.
+**What to build:** Locking while Screen Sharing, VNC, Chrome Remote Desktop, TeamViewer, AnyDesk, or a remote view of the same kind is connected covers that view. Connecting to a Mac that is already SoftLocked shows the SoftLock screen on the remote view. Unlock is the Broker: a `Verified` verdict with the 32-byte `LaunchNonce`. Touch ID is offered where that remote stack supports it. Otherwise the account password or the dev PIN, the same methods as m18 and m19, and no weaker path. Keys and clicks from the remote view before unlock are the open remote-input entry in Decision 20. Screen Sharing input arrives as posted events, and this ticket does not claim the tap can tell them from an agent's. A killed lock host, or both D5 paths failing, keeps the guard up or reaches the real lock, and the state is not Unlocked. The surface that stays visible to the remote viewer is the option Henry picks in D9 (SPEC.md Decision 20). Option A there is likely infeasible. This ticket does not pick.
 
-**Blocked by:** m14, m18, m19, m21, and D9. It stays blocked while D9 is open.
+**Blocked by:** m14, m17, m18, m19, m21, and D9, including the macOS remote-input entry. It stays blocked while D9 is open.
 
-**Blocks:** m23 (the inbound Screen Sharing row).
+**Blocks:** m23 and m24 (the inbound Screen Sharing rows).
 
 **Where:** The remote view itself is Henry's Intel Mac, recorded on m23. CI keeps the D8 chooser tests green and does not claim Screen Sharing on `macos-latest`.
 
-**Test machine:** MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports). 2 GHz quad-core Intel Core i5. Intel Iris Plus Graphics. 16 GB LPDDR4X. macOS Tahoe 26.7.3. Laptop, with Touch ID and the T2 chip. He sometimes uses an external display. How many are attached at once is still unknown. Whether a second keyboard is available is still unknown. macOS 11 through 15 are untested: this machine is on 26.x, and arm64 CI is `macos-latest`. Full list: D1 and [Henry's sheet](henry-sheet.md).
+**Test machine:** The paragraph in D1 of [`decisions.md`](decisions.md). [Henry's sheet](henry-sheet.md) points at the same paragraph.
 
 **Type:** Product ticket. The hardware rows are m23, not a second copy here.
 

@@ -8,7 +8,7 @@
 
 **Where:** Henry's Intel Mac.
 
-**Test machine:** MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports). 2 GHz quad-core Intel Core i5. Intel Iris Plus Graphics. 16 GB LPDDR4X. macOS Tahoe 26.7.3. Laptop, with Touch ID and the T2 chip, so the password sheet may offer Touch ID. This ticket still uses the password. The number of external displays is still unknown. macOS 11 through 15 are untested: this machine is on 26.x, and arm64 CI is `macos-latest`. Full list: D1 and [Henry's sheet](henry-sheet.md).
+**Test machine:** The paragraph in D1 of [`decisions.md`](decisions.md). [Henry's sheet](henry-sheet.md) points at the same paragraph. The password sheet may offer Touch ID. This ticket still uses the password.
 
 **Type:** Hardware kit. Deliverable is the sheet under `docs/findings/`.
 

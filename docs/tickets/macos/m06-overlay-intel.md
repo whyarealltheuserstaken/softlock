@@ -6,9 +6,9 @@
 
 **Blocks:** m14, m23.
 
-**Where:** Henry's Intel Mac. The displays already attached at the start. Hot-plug is m23. The sheet says how many displays were attached at the start. He sometimes uses an external display. How many are attached at once is still unknown.
+**Where:** Henry's Intel Mac. The displays already attached at the start. Hot-plug is m23. The sheet says how many displays were attached at the start. The machine paragraph is D1.
 
-**Test machine:** MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports). 2 GHz quad-core Intel Core i5. Intel Iris Plus Graphics. 16 GB LPDDR4X. macOS Tahoe 26.7.3. Laptop, with Touch ID and the T2 chip. He sometimes uses an external display. How many are attached at once is still unknown. Whether a second keyboard is available is still unknown. macOS 11 through 15 are untested: this machine is on 26.x, and arm64 CI is `macos-latest`. Full list: D1 and [Henry's sheet](henry-sheet.md).
+**Test machine:** The paragraph in D1 of [`decisions.md`](decisions.md). [Henry's sheet](henry-sheet.md) points at the same paragraph.
 
 **Type:** Hardware kit. Deliverable is the filled sheet and the probe log under `docs/findings/`.
 
