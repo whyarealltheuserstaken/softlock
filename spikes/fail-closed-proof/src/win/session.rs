@@ -11,8 +11,6 @@ use windows::core::{PCWSTR, PWSTR};
 
 use super::util::{self, wide};
 
-pub const LOGONID_CURRENT: u32 = 0xFFFF_FFFF;
-
 pub fn disconnect(session: u32, wait: bool) -> Result<(), String> {
     unsafe { WTSDisconnectSession(None, session, wait) }
         .map_err(|error| util::explain(error, "WTSDisconnectSession"))
@@ -32,33 +30,34 @@ pub fn win32_of(error: &str) -> u32 {
 }
 
 pub fn reconnect(session: u32) -> Result<String, String> {
-    let console = unsafe { WTSGetActiveConsoleSessionId() };
-    let mut attempts = vec![
-        (session, LOGONID_CURRENT, "session-to-current"),
-        (session, session, "session-to-self"),
-    ];
-    if console != u32::MAX && console != 0 && console != session {
-        attempts.push((session, console, "session-to-console"));
-        attempts.push((LOGONID_CURRENT, console, "current-to-console"));
-    }
-    let mut errors = Vec::new();
-    for (logon, target, label) in attempts {
-        if logon == LOGONID_CURRENT && target == LOGONID_CURRENT {
-            continue;
-        }
-        match connect(logon, target) {
-            Ok(()) => {
-                if wait_until_active(session, Duration::from_secs(5)).is_ok() {
-                    return Ok(label.to_string());
-                }
-                errors.push(format!(
-                    "{label}: the call returned success but session {session} stayed disconnected"
-                ));
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut last = String::from("no console session to attach");
+    while std::time::Instant::now() < deadline {
+        if connect_state(session).ok() == Some(0) {
+            let console = unsafe { WTSGetActiveConsoleSessionId() };
+            if console == session {
+                return Ok("already-active".to_string());
             }
-            Err(error) => errors.push(format!("{label}: {error}")),
         }
+        let console = unsafe { WTSGetActiveConsoleSessionId() };
+        if console != u32::MAX && console != 0 && console != session {
+            match connect(session, console) {
+                Ok(()) => {
+                    if wait_until_active(session, Duration::from_secs(2)).is_ok() {
+                        return Ok(format!("session-to-console:{console}"));
+                    }
+                    last = format!(
+                        "session-to-console:{console} returned success but session {session} stayed disconnected"
+                    );
+                }
+                Err(error) => last = format!("session-to-console:{console}: {error}"),
+            }
+        } else {
+            last = format!("console session is {console}");
+        }
+        thread::sleep(Duration::from_millis(200));
     }
-    Err(errors.join("; "))
+    Err(last)
 }
 
 fn connect(logon: u32, target: u32) -> Result<(), String> {

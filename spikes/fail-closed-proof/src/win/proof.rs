@@ -266,12 +266,8 @@ fn service_disconnect(
     let before = read_beat(&args.output_dir)?;
     let result = call_service(args, protocol::OP_DISCONNECT_CONSOLE, 0)?;
     log_line(log, &format!("service disconnect {}", describe(&result)));
-    if !result.reconnect_ok {
-        match session::reconnect(result.session) {
-            Ok(label) => log_line(log, &format!("user reconnect={label}")),
-            Err(error) => log_line(log, &format!("user reconnect failed: {error}")),
-        }
-    }
+    let label = session::reconnect(result.session)?;
+    log_line(log, &format!("user reconnect={label}"));
     Ok(observed(&result, result.api_ok, before, &args.output_dir))
 }
 
@@ -312,12 +308,8 @@ fn user_disconnect(args: &Args, log: &Path, session: u32) -> Result<ObservedPath
         result.error = Some(error.clone());
     }
     log_line(log, &format!("user disconnect {}", describe(&result)));
-    if !result.reconnect_ok {
-        match session::reconnect(session) {
-            Ok(label) => log_line(log, &format!("user reconnect={label}")),
-            Err(error) => log_line(log, &format!("user reconnect failed: {error}")),
-        }
-    }
+    let label = session::reconnect(session)?;
+    log_line(log, &format!("user reconnect={label}"));
     Ok(observed(&result, result.api_ok, before, &args.output_dir))
 }
 
@@ -328,10 +320,23 @@ fn user_lock(
     session: u32,
 ) -> Result<ObservedPath, String> {
     let before = read_beat(&args.output_dir)?;
+    let restored = session::reconnect(session)?;
+    log_line(log, &format!("user lock reconnect={restored}"));
     let t0 = util::qpc();
     let freq = util::qpc_freq();
     let api = session::lock_workstation();
     let note = listener.wait(WTS_SESSION_LOCK, session, t0, Duration::from_millis(1500));
+    for seen in super::notify::since(t0) {
+        log_line(
+            log,
+            &format!(
+                "user-lock note kind={} name={} session={}",
+                seen.kind,
+                verdict::notification_name(seen.kind),
+                seen.session
+            ),
+        );
+    }
     log_line(
         log,
         &format!(

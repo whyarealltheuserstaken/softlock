@@ -227,7 +227,6 @@ fn disconnect_console(command: &Command, log: &Path) -> CommandResult {
     let note = await_note(WTS_CONSOLE_DISCONNECT, session, t0);
     let notes = notify::since(t0);
     log_notes(log, &notes);
-    let (reconnect_ok, reconnect) = reconnect_after(session, log);
     finish(
         command,
         Observed {
@@ -237,8 +236,8 @@ fn disconnect_console(command: &Command, log: &Path) -> CommandResult {
             api,
             note,
             notes,
-            reconnect_ok,
-            reconnect,
+            reconnect_ok: false,
+            reconnect: "left-to-user-session".to_string(),
         },
     )
 }
@@ -270,7 +269,6 @@ fn watch_user(command: &Command, args: &Args, log: &Path) -> CommandResult {
         .map(|timing| notify::since(timing.t0))
         .unwrap_or_default();
     log_notes(log, &notes);
-    let (reconnect_ok, reconnect) = reconnect_after(command.session, log);
     let _ = std::fs::remove_file(&watching);
     finish(
         command,
@@ -281,8 +279,8 @@ fn watch_user(command: &Command, args: &Args, log: &Path) -> CommandResult {
             api: Ok(()),
             note,
             notes,
-            reconnect_ok,
-            reconnect,
+            reconnect_ok: false,
+            reconnect: "left-to-user-session".to_string(),
         },
     )
 }
@@ -296,19 +294,6 @@ fn await_note(kind: u32, session: u32, t0: u64) -> Option<Note> {
         thread::sleep(Duration::from_millis(5));
     }
     notify::find(kind, session, t0)
-}
-
-fn reconnect_after(session: u32, log: &Path) -> (bool, String) {
-    match session::reconnect(session) {
-        Ok(label) => {
-            log_line(log, &format!("reconnect={label}"));
-            (true, label)
-        }
-        Err(error) => {
-            log_line(log, &format!("reconnect failed: {error}"));
-            (false, error)
-        }
-    }
 }
 
 struct Observed {
