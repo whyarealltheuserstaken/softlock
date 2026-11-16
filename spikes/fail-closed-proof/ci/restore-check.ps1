@@ -24,25 +24,52 @@ function Wait-Armed([string]$Dir) {
     }
 }
 
+function Invoke-Captured([string]$FileName, [string[]]$ArgumentList) {
+    # Windows PowerShell turns a native program's stderr into a terminating error
+    # under ErrorAction Stop. ProcessStartInfo keeps the exit code instead.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FileName
+    $psi.Arguments = ($ArgumentList | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+        }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $proc.StandardOutput.ReadToEndAsync()
+    $stderr = $proc.StandardError.ReadToEndAsync()
+    $proc.WaitForExit()
+    return @{ Code = $proc.ExitCode; Text = ($stdout.Result + $stderr.Result) }
+}
+
 function Assert-Restored([string]$Dir, [string]$Label) {
     $deadline = (Get-Date).AddSeconds(60)
     $last = ''
     $code = 1
     while ((Get-Date) -lt $deadline) {
-        $last = & $exePath --check-restored --output-dir $Dir 2>&1 | Out-String
-        $code = $LASTEXITCODE
+        $ran = Invoke-Captured $exePath @('--check-restored', '--output-dir', $Dir)
+        $code = $ran.Code
+        $last = $ran.Text
         if ($code -eq 0) { break }
         Start-Sleep -Milliseconds 400
     }
-    if ($code -ne 0) { throw "$Label check-restored failed: $last" }
-    Write-Output $last.TrimEnd()
-    $revert = & $exePath --revert --output-dir $Dir 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0 -or $revert -notmatch 'journal=absent') {
-        throw "$Label revert did not report an absent journal: $revert"
+    if ($code -ne 0) {
+        Write-Output (Get-Process fail-closed-proof -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, StartTime | Out-String)
+        $guard = Join-Path $Dir 'guard.log'
+        if (Test-Path $guard) { Write-Output (Get-Content -Raw $guard) }
+        $proof = Join-Path $Dir 'proof.log'
+        if (Test-Path $proof) { Write-Output (Get-Content -Raw $proof) }
+        throw "$Label check-restored failed: $last"
     }
-    Write-Output $revert.TrimEnd()
-    & sc.exe query FailClosedProbe | Out-Null
-    if ($LASTEXITCODE -eq 0) { throw "$Label service still installed" }
+    Write-Output $last.TrimEnd()
+    $revert = Invoke-Captured $exePath @('--revert', '--output-dir', $Dir)
+    if ($revert.Code -ne 0 -or $revert.Text -notmatch 'journal=absent') {
+        throw "$Label revert did not report an absent journal: $($revert.Text)"
+    }
+    Write-Output $revert.Text.TrimEnd()
+    $service = Invoke-Captured 'sc.exe' @('query', 'FailClosedProbe')
+    if ($service.Code -eq 0) { throw "$Label service still installed: $($service.Text)" }
     Write-Output "$Label policies=original journal=absent service=gone"
 }
 

@@ -81,6 +81,8 @@ fn run_revert(args: &Args) -> i32 {
 }
 
 fn run_guard(args: &Args) -> i32 {
+    let log = args.output_dir.join("guard.log");
+    log_line(&log, &format!("guard watching pid {}", args.parent_pid));
     if args.parent_pid != 0
         && let Ok(parent) = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, args.parent_pid) }
     {
@@ -89,12 +91,17 @@ fn run_guard(args: &Args) -> i32 {
             let _ = windows::Win32::Foundation::CloseHandle(parent);
         }
     }
+    log_line(&log, "guard parent finished, restoring");
     let _ = std::fs::write(args.output_dir.join(HEARTBEAT_STOP), b"stop\n");
     let restored = policy::restore_at(&policy::journal_path(&args.output_dir));
     service::stop_and_delete();
     match restored {
-        Ok(_) => 0,
+        Ok(restored) => {
+            log_line(&log, &format!("guard restored={restored}"));
+            0
+        }
         Err(error) => {
+            log_line(&log, &error);
             eprintln!("{error}");
             1
         }
