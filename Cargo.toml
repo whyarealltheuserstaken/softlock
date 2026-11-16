@@ -11,7 +11,11 @@ members = [
     "crates/softlock-broker",
     "crates/softlock-app/src-tauri",
 ]
-exclude = ["spikes/desktop-proof", "spikes/input-hook"]
+exclude = [
+    "spikes/desktop-proof",
+    "spikes/input-hook",
+    "spikes/macos-desktop-proof",
+]
 
 [workspace.package]
 version = "0.1.0"
