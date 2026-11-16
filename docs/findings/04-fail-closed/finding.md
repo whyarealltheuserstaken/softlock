@@ -25,8 +25,45 @@ Fall-back when the service is killed: the in-session process calls `WTSDisconnec
 
 Ticket 17 must clear `DisableLockWorkstation` before `LockWorkStation`. The proof's first step is there to show `LockWorkStation` fails while the value is set, and the last step is there to show it succeeds right after the value is cleared. The other lockdown values stay applied the whole time.
 
-This choice stands when both runner images print `result=pass`. If a path fails, the lines below are the evidence and the choice is revised from those lines. Henry's laptop run is still required. Server runners can differ from that laptop, so issue 4 stays open.
+This choice is what both runner images measured. Henry's laptop run is still required. Server runners can differ from that laptop, so issue 4 stays open.
 
 ## Measured timings
 
-Filled from `report.txt` after the proof job finishes. No number is written here before that log exists.
+Copied from `report.txt` in [Fail-closed proof run 43891281142](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43891281142), commit `0ab3d21b1b76b4b1c0befcd7a83a76b401ea9a72`. Both images printed `result=pass`. The session was 2 and the service session was 0. `LockWorkStation` returned success while `DisableLockWorkstation` was set (`win32=none`) and no `WTS_SESSION_LOCK` arrived (`notified=false`). After that value was cleared, `WTS_SESSION_LOCK` did arrive. The three path times below are the `elapsed-us` fields. All three are under one second, and the background heartbeat kept writing.
+
+- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43891281142/job/133382829116)
+- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43891281142/job/133382829781)
+
+### windows-2022
+
+```
+result=pass
+runner-image=windows-2022
+session=2
+service-session=0
+policies-applied=DisableTaskMgr,DisableChangePassword,DisableLockWorkstation,NoLogoff,NoClose,HideFastUserSwitching,ConsentPromptBehaviorAdmin,ConsentPromptBehaviorUser
+lock-while-policy=fail win32=none notified=false
+path-service-disconnect=ok notification=WTS_CONSOLE_DISCONNECT elapsed-us=63160 within-1s=true api-ok=true heartbeat-gap-ms=52
+path-session-disconnect=ok notification=WTS_CONSOLE_DISCONNECT elapsed-us=45724 within-1s=true api-ok=true heartbeat-gap-ms=58
+cleared-disable-lock-workstation=true
+path-user-lock=ok notification=WTS_SESSION_LOCK elapsed-us=66426 within-1s=true api-ok=true heartbeat-gap-ms=54
+background-kept-running=true
+policies-restored=true
+```
+
+### windows-2025
+
+```
+result=pass
+runner-image=windows-2025
+session=2
+service-session=0
+policies-applied=DisableTaskMgr,DisableChangePassword,DisableLockWorkstation,NoLogoff,NoClose,HideFastUserSwitching,ConsentPromptBehaviorAdmin,ConsentPromptBehaviorUser
+lock-while-policy=fail win32=none notified=false
+path-service-disconnect=ok notification=WTS_CONSOLE_DISCONNECT elapsed-us=84335 within-1s=true api-ok=true heartbeat-gap-ms=67
+path-session-disconnect=ok notification=WTS_CONSOLE_DISCONNECT elapsed-us=84028 within-1s=true api-ok=true heartbeat-gap-ms=60
+cleared-disable-lock-workstation=true
+path-user-lock=ok notification=WTS_SESSION_LOCK elapsed-us=83093 within-1s=true api-ok=true heartbeat-gap-ms=51
+background-kept-running=true
+policies-restored=true
+```
