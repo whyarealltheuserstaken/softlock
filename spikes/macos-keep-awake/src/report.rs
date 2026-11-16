@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use crate::args::REASON_PREFIX;
 use crate::scrub::{contains_serial, scrub};
 use crate::text::one_line;
@@ -444,7 +445,8 @@ fn row_token(row: &HardwareRow) -> String {
     row.outcome.clone().unwrap_or_else(|| row.status.clone())
 }
 
-pub fn passing_runner_fixture() -> KitReport {
+#[cfg(test)]
+fn passing_runner_fixture() -> KitReport {
     let down = 160;
     let up = 158;
     let (slowed, sentence) = slowed_sentence(down, up);

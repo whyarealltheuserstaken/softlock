@@ -28,11 +28,15 @@ extern "C" fn handle_stop(_signal: i32) {
 }
 
 pub fn dispatch(args: Args) -> i32 {
-    match args.mode {
-        Mode::Timer => run_timer(&args),
-        Mode::Overlay => run_overlay(&args),
-        Mode::Heartbeat => run_heartbeat(&args),
-        Mode::Runner | Mode::Kit => run_orchestrator(&args),
+    if args.mode.holds_assertions() {
+        run_orchestrator(&args)
+    } else {
+        match args.mode {
+            Mode::Timer => run_timer(&args),
+            Mode::Overlay => run_overlay(&args),
+            Mode::Heartbeat => run_heartbeat(&args),
+            Mode::Runner | Mode::Kit => unreachable!("orchestrator already ran"),
+        }
     }
 }
 
@@ -402,7 +406,6 @@ fn record_lid(
         .stderr(Stdio::null())
         .spawn()
         .ok();
-    let started = Instant::now();
     let choice = match preset {
         Some(value) => value.to_string(),
         None => read_choice(&["slept", "awake", "no-external-display", "skip"]),
@@ -411,7 +414,7 @@ fn record_lid(
         let _ = child.kill();
         let _ = child.wait();
     }
-    let gap = heartbeat_gap(&beat, started.elapsed());
+    let gap = heartbeat_gap(&beat);
     match parse(&choice) {
         Ok(outcome) => hardware_row(
             "recorded".to_string(),
@@ -453,14 +456,11 @@ fn read_choice(allowed: &[&str]) -> String {
     match io::stdin().lock().read_line(&mut line) {
         Ok(0) => "skip".to_string(),
         Ok(_) => {
-            let value = line.trim().to_string();
-            if allowed.contains(&value.as_str())
-                || value == "needs-terminal"
-                || value == "not-run-on-runner"
-            {
-                value
+            let value = line.trim();
+            if allowed.contains(&value) {
+                value.to_string()
             } else {
-                value
+                "skip".to_string()
             }
         }
         Err(_) => "skip".to_string(),
@@ -471,7 +471,7 @@ fn stdin_is_terminal() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
-fn heartbeat_gap(path: &Path, elapsed: Duration) -> Option<u64> {
+fn heartbeat_gap(path: &Path) -> Option<u64> {
     let text = fs::read_to_string(path).ok()?;
     let mut times = Vec::new();
     for line in text.lines() {
@@ -486,14 +486,7 @@ fn heartbeat_gap(path: &Path, elapsed: Duration) -> Option<u64> {
     if let Some(last) = times.last() {
         gap = gap.max(wall_ms().saturating_sub(*last));
     }
-    let sample = elapsed.as_millis() as u64;
-    if gap > sample.saturating_add(1500) {
-        Some(gap)
-    } else if gap > 2_000 {
-        Some(gap)
-    } else {
-        Some(gap)
-    }
+    Some(gap)
 }
 
 fn caffeinate_control() -> CaffeinateReport {
