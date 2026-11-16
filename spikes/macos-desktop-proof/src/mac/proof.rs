@@ -469,6 +469,7 @@ fn child_m03(exe: &Path, output_dir: &Path) -> (ClassifyReport, Option<String>) 
                 dead_ms: 0,
                 dead_misses: 0,
                 healthy_ms: 0,
+                healthy_seen: false,
                 reenabled: false,
                 error: Some(format!("m03 process exited {}", outcome.code)),
             },

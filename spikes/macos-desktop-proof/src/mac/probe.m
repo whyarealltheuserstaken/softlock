@@ -106,6 +106,10 @@ static volatile int g_key_received = 0;
 }
 @end
 
+static void run_loop(NSTimeInterval seconds) {
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, true);
+}
+
 static void pump(NSTimeInterval seconds) {
     NSDate *until = [NSDate dateWithTimeIntervalSinceNow:seconds];
     while ([until timeIntervalSinceNow] > 0) {
@@ -897,6 +901,8 @@ typedef struct {
     int key_reached_after;
     int dead_misses;
     int reenabled;
+    int healthy_seen;
+    int pad2;
     char disable_event[64];
     char slow_error[256];
     char marker_error[256];
@@ -1272,9 +1278,9 @@ static void one_post(const char *exe, const char *dir, const char *source, int s
     }
     NSDate *until = [NSDate dateWithTimeIntervalSinceNow:0.6];
     while (atomic_load(&g_tap_saw) == 0 && [until timeIntervalSinceNow] > 0) {
-        pump(0.05);
+        run_loop(0.05);
     }
-    pump(0.15);
+    run_loop(0.15);
     int after = before;
     read_target_state(dir, &after, &ignored, &last0, &last1);
     PostRow *row = &out->posts[out->post_count];
@@ -1357,7 +1363,7 @@ static void run_slow(const char *dir, M03Out *out) {
         if (returned != 0 && after_return_budget == 0) {
             after_return_budget = now_ms() + 1500;
         }
-        pump(0.05);
+        run_loop(0.05);
         if (returned != 0 && (atomic_load(&g_disable_type) != 0 || now_ms() >= after_return_budget)) {
             break;
         }
@@ -1444,9 +1450,10 @@ static void run_marker(M03Out *out) {
     }
     NSDate *until = [NSDate dateWithTimeIntervalSinceNow:0.25];
     while (atomic_load(&g_marker_seen) == 0 && [until timeIntervalSinceNow] > 0) {
-        pump(0.01);
+        run_loop(0.01);
     }
     out->healthy_ms = now_ms() - healthy_start;
+    out->healthy_seen = atomic_load(&g_marker_seen) != 0 ? 1 : 0;
     if (atomic_load(&g_marker_seen) == 0 && out->marker_error[0] == 0) {
         snprintf(out->marker_error, sizeof out->marker_error,
                  "marker callback did not see the no-op within one heartbeat");

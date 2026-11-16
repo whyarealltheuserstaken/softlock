@@ -127,6 +127,7 @@ pub struct MarkerObservation {
     pub dead_ms: i64,
     pub dead_misses: u32,
     pub healthy_ms: i64,
+    pub healthy_seen: bool,
     pub reenabled: bool,
     pub error: Option<String>,
 }
@@ -582,6 +583,7 @@ fn marker_bounds_met(marker: &MarkerObservation) -> bool {
     marker.dead_ms >= 0
         && marker.healthy_ms >= 0
         && dead_callback_reported_in_time(marker.dead_misses, marker.dead_ms as u64)
+        && marker.healthy_seen
         && healthy_callback_within_one_heartbeat(marker.healthy_ms as u64)
 }
 
@@ -623,12 +625,15 @@ fn classify_lines(report: &ProofReport) -> Vec<String> {
             classify.marker.dead_misses,
             classify.marker.dead_ms as u64,
         );
-    let healthy = healthy_callback_within_one_heartbeat(classify.marker.healthy_ms.max(0) as u64);
+    let healthy = classify.marker.healthy_seen
+        && classify.marker.healthy_ms >= 0
+        && healthy_callback_within_one_heartbeat(classify.marker.healthy_ms as u64);
     lines.push(format!(
-        "marker dead-ms={} dead-misses={} healthy-ms={} dead-within-1s={} healthy-within-heartbeat={} reenabled={} error={}",
+        "marker dead-ms={} dead-misses={} healthy-ms={} healthy-seen={} dead-within-1s={} healthy-within-heartbeat={} reenabled={} error={}",
         classify.marker.dead_ms,
         classify.marker.dead_misses,
         classify.marker.healthy_ms,
+        classify.marker.healthy_seen,
         dead,
         healthy,
         classify.marker.reenabled,
@@ -1068,6 +1073,7 @@ fn passing_classify() -> ClassifyReport {
             dead_ms: 750,
             dead_misses: 3,
             healthy_ms: 20,
+            healthy_seen: true,
             reenabled: false,
             error: None,
         },
