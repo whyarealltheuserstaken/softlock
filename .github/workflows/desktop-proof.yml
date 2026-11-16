@@ -1,0 +1,55 @@
+name: Desktop proof
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: desktop-proof-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proof:
+    name: desktop proof (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: spikes/desktop-proof -> spikes/desktop-proof/target
+      - name: Record the runner session
+        shell: powershell
+        continue-on-error: true
+        run: |
+          cmd /c "query user"
+          cmd /c "query session"
+          Write-Output "ImageOS=$env:ImageOS"
+          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' | Select-Object ProductName, DisplayVersion, CurrentBuild, InstallationType, EditionID | Format-List
+      - name: Format
+        run: cargo fmt --manifest-path spikes/desktop-proof/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path spikes/desktop-proof/Cargo.toml --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --manifest-path spikes/desktop-proof/Cargo.toml
+      - name: Run the desktop proof
+        shell: cmd
+        run: cargo run --release --manifest-path spikes/desktop-proof/Cargo.toml -- --runner-image ${{ matrix.image }} --output-dir proof-output
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: desktop-proof-${{ matrix.image }}
+          path: proof-output
+          if-no-files-found: warn
