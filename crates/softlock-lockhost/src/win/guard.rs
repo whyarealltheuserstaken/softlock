@@ -1,6 +1,10 @@
-//! Low-level keyboard and mouse hooks. The callback does no I/O and no
-//! allocation. Liveness is a marker this process injects, not a guess that
-//! Windows will remove a slow hook.
+//! Low-level keyboard and mouse hooks. The callback does no allocation and
+//! does not log. A swallowed move only stores an atomic: the cursor has
+//! already moved by the time `WH_MOUSE_LL` runs, and the window thread puts
+//! it back. An injected move reads the cursor once, after the event is
+//! delivered, so that undo has the position it actually landed on. Liveness
+//! is a marker this process injects, not a guess that Windows will remove a
+//! slow hook.
 //!
 //! A split token on client Windows is ticket 06. The input-hook finding
 //! measured Server images only: the console token there is already high
@@ -11,7 +15,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HINSTANCE, HMODULE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HMODULE, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
     GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
@@ -20,11 +24,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_F24,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_UP, LLMHF_INJECTED, MSG,
-    MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
-    WM_XBUTTONDOWN,
+    CallNextHookEx, GetCursorPos, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_UP,
+    LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
+    SetCursorPos, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
+    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_XBUTTONDOWN,
 };
 use windows::core::PCWSTR;
 
@@ -222,6 +226,9 @@ fn hook_thread(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<u32, (
     unsafe {
         let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
     }
+    if let Some((x, y)) = cursor_now() {
+        note_allowed_cursor(&shared, x, y);
+    }
     let thread_id = unsafe { GetCurrentThreadId() };
     let _ = ready.send(Ok(thread_id));
     // Keep the arc alive for the callbacks, which load the raw pointer.
@@ -291,14 +298,32 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         shared
             .last_event
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        let extra = info.dwExtraInfo as u64;
+        let message = wparam.0 as u32;
         let injected = info.flags & LLMHF_INJECTED != 0;
+        let extra = mouse_extra(info, injected);
         if !blocks(injected, extra) {
-            return CallNextHookEx(None, code, wparam, lparam);
+            let forwarded = CallNextHookEx(None, code, wparam, lparam);
+            // Injected moves are allowed to move the cursor. Read it after
+            // the event is delivered so a later swallowed move can be undone.
+            if message == WM_MOUSEMOVE
+                && let Some((x, y)) = cursor_now()
+            {
+                note_allowed_cursor(shared, x, y);
+            }
+            return forwarded;
         }
         note_physical(shared);
-        let message = wparam.0 as u32;
-        if message == WM_LBUTTONDOWN
+        // The cursor has already moved by the time this hook runs. Ask the
+        // window thread to put it back. The callback itself does not call
+        // out to user32.
+        if message == WM_MOUSEMOVE {
+            let generation = shared.cursor_gen.load(std::sync::atomic::Ordering::Acquire);
+            if generation != 0 {
+                shared
+                    .snap_gen
+                    .store(generation, std::sync::atomic::Ordering::Release);
+            }
+        } else if message == WM_LBUTTONDOWN
             || message == WM_RBUTTONDOWN
             || message == WM_MBUTTONDOWN
             || message == WM_XBUTTONDOWN
@@ -321,7 +346,6 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 scan: 0,
             });
         }
-        let _ = WM_MOUSEMOVE;
         LRESULT(1)
     }
 }
@@ -334,6 +358,58 @@ fn blocks(injected: bool, extra_info: u64) -> bool {
         }),
         InputClass::Injected
     )
+}
+
+/// `dwExtraInfo` on a mouse hook. The keyboard struct is naturally aligned, so
+/// its extra field is reliable. The mouse struct has 4 bytes of padding before
+/// the extra field when it is 8-aligned, and none when it is packed to 4.
+/// Read both and keep the one the classifier treats as blocked.
+fn mouse_extra(info: &MSLLHOOKSTRUCT, injected: bool) -> u64 {
+    let aligned = info.dwExtraInfo as u64;
+    if blocks(injected, aligned) {
+        return aligned;
+    }
+    let packed = unsafe {
+        let raw = (info as *const MSLLHOOKSTRUCT).cast::<u8>();
+        std::ptr::read_unaligned(raw.add(20).cast::<u64>())
+    };
+    if packed != aligned && blocks(injected, packed) {
+        packed
+    } else {
+        aligned
+    }
+}
+
+fn note_allowed_cursor(shared: &Shared, x: i32, y: i32) {
+    shared
+        .cursor_x
+        .store(x, std::sync::atomic::Ordering::Release);
+    shared
+        .cursor_y
+        .store(y, std::sync::atomic::Ordering::Release);
+    shared
+        .cursor_gen
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+fn cursor_now() -> Option<(i32, i32)> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point).ok()? };
+    Some((point.x, point.y))
+}
+
+/// Put the cursor back after a swallowed move. Runs on the window thread.
+pub(crate) fn restore_cursor(shared: &Shared) {
+    let snap = shared.snap_gen.load(std::sync::atomic::Ordering::Acquire);
+    let generation = shared.cursor_gen.load(std::sync::atomic::Ordering::Acquire);
+    if snap == 0 || snap != generation {
+        return;
+    }
+    let x = shared.cursor_x.load(std::sync::atomic::Ordering::Acquire);
+    let y = shared.cursor_y.load(std::sync::atomic::Ordering::Acquire);
+    unsafe {
+        let _ = SetCursorPos(x, y);
+    }
 }
 
 fn note_physical(shared: &Shared) {

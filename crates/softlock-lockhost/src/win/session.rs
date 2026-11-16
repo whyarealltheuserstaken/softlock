@@ -1,7 +1,7 @@
 //! Dev-launch session. The window thread owns the lock controller. The hook
 //! thread only stores events.
 
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -176,6 +176,13 @@ pub(crate) struct Shared {
     pub topmost: AtomicBool,
     pub execution: AtomicBool,
     pub display_changed: AtomicBool,
+    /// Cursor position last accepted from an injected move. A swallowed
+    /// physical move has already shifted the cursor by the time the hook
+    /// runs; `snap_gen` asks the window thread to put it back.
+    pub cursor_x: AtomicI32,
+    pub cursor_y: AtomicI32,
+    pub cursor_gen: AtomicU64,
+    pub snap_gen: AtomicU64,
     pub windows: Mutex<Vec<isize>>,
     pub hook: Mutex<Option<JoinHandle<()>>>,
     pub liveness: Mutex<Option<JoinHandle<()>>>,
@@ -207,6 +214,10 @@ impl Shared {
             topmost: AtomicBool::new(false),
             execution: AtomicBool::new(false),
             display_changed: AtomicBool::new(false),
+            cursor_x: AtomicI32::new(0),
+            cursor_y: AtomicI32::new(0),
+            cursor_gen: AtomicU64::new(0),
+            snap_gen: AtomicU64::new(0),
             windows: Mutex::new(Vec::new()),
             hook: Mutex::new(None),
             liveness: Mutex::new(None),
@@ -278,6 +289,7 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
     let mut entry = PinEntry::default();
     let mut last_minute = overlay::minute_now();
     loop {
+        guard::restore_cursor(&shared);
         if shared.stop.load(Ordering::Acquire) {
             break;
         }

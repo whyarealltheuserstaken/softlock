@@ -120,10 +120,16 @@ fn injected_keys_and_clicks_reach_the_probe_while_locked() {
         }),
         "injected move did not place the cursor on the probe"
     );
+    // SendInput delivers the click before it returns, so the count has to
+    // be taken first. Waiting for a click that is already recorded times out.
+    let before_clicks = probe.clicks().len();
     send_left_click(0).expect("injected click");
-    probe
-        .wait_for_click(Duration::from_secs(3))
-        .expect("injected click did not reach the probe");
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            probe.clicks().len() > before_clicks
+        }),
+        "injected click did not reach the probe"
+    );
     let clicks = probe.clicks().len();
     send_left_click(nonce.extra()).expect("simulated click");
     thread::sleep(Duration::from_millis(250));
