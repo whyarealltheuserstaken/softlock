@@ -2,7 +2,7 @@
 
 Measured on 16 November 2026 UTC by the workspace-excluded probe `spikes/macos-desktop-proof`.
 
-The proof run is [macOS desktop proof run 43959209214](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43959209214), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43959209214/job/133621767075). The measured head is `f663253c174bc65ee00db3ee67dfb96c057bb233`. The job printed `result=pass`. This probe did not lock the session, so it does not say the runner comes back after a lock (decision D8).
+The proof run is [macOS desktop proof run 43959914537](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43959914537), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43959914537/job/133624232691). The measured head is `6fd8fc5afa65736600b496b8626eac5cb815177e`. The job printed `result=pass`. This probe did not lock the session, so it does not say the runner comes back after a lock (decision D8).
 
 An earlier head, `525018cfe1330629f7e9f122f106ca2b760d69c9`, printed `result=pass` with `window-error=NSWindow proof process exited 139`. That exit was a double release in the probe, not a runner capability. A later head blamed `CGEventPost` for missing the window. This run is after the activation change: the proof process waits until the app is active and the window is key, using `activateIgnoringOtherApps` and `NSRunningApplication activateWithOptions`. A crash in the probe still fails the job.
 

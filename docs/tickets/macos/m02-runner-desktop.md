@@ -10,7 +10,7 @@
 
 **Type:** Prototype spike. Deliverable is a written finding plus a minimal proof job. The finding names the dependents above and says which later tickets stay on the runner and which move entirely to Henry's Intel Mac.
 
-**Status:** runner finding recorded in `docs/findings/m02-macos-runner-desktop.md` ([issue 51](https://github.com/whyarealltheuserstaken/softlock/issues/51)), from run 43959209214 on `f663253c174bc65ee00db3ee67dfb96c057bb233`. The proof window became key and received the `CGEventPost` key. The LaunchAgent window was key and did not receive it (`CGPreflightPostEventAccess=false`). Hardware follow-ups are in that finding's section for Henry's Intel Mac.
+**Status:** runner finding recorded in `docs/findings/m02-macos-runner-desktop.md` ([issue 51](https://github.com/whyarealltheuserstaken/softlock/issues/51)), from run 43959914537 on `6fd8fc5afa65736600b496b8626eac5cb815177e`. The proof window became key and received the `CGEventPost` key. The LaunchAgent window was key and did not receive it (`CGPreflightPostEventAccess=false`). Hardware follow-ups are in that finding's section for Henry's Intel Mac.
 
 - [x] The proof job prints `sw_vers` and `uname -m`, and `uname -m` is `arm64` (job log)
 - [x] The proof job shows a window and a `CGEventPost` key that the window receives, or a written miss that names the API error (job log)
