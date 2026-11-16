@@ -2,10 +2,10 @@
 
 Measured on 16 November 2026 UTC by the workspace-excluded probe `spikes/input-hook`.
 
-The `result=measured` lines below are from [Input hook proof run 43895906522](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43895906522), commit `3c42fba03facfff2c946a4ba7cd03720f655444e`. That is the run that printed them. The earlier run [43894384199](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43894384199) printed `result=fail` for the same operating-system outcome, because the harness still treated "the hook was not removed" as a job failure.
+The `result=measured` lines below are from [Input hook proof run 43899551358](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43899551358), commit `e399397de95fe6699f7f094e82bb65fb289cfaf9`. That run printed them. The earlier run [43894384199](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43894384199) printed `result=fail` for the same operating-system outcome, because the harness still treated "the hook was not removed" as a job failure.
 
-- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43895906522/job/133399283309)
-- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43895906522/job/133399283803)
+- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43899551358/job/133412132202)
+- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43899551358/job/133412132660)
 
 ## Decision
 
@@ -63,10 +63,10 @@ Windows Server 2022 Datacenter, 21H2, build 20348. The callback slept 900 ms. `S
 
 ```
 slow-sleep-ms=900
-slow-strike index=1 blocked-ms=903 timed-out=false
+slow-strike index=1 blocked-ms=909 timed-out=false
 slow-strikes=0 entered=1 returned=1 probe-seen=true
 hook-removed=false
-liveness-detect-ms=906
+liveness-detect-ms=913
 result=measured
 ```
 
@@ -76,20 +76,20 @@ Windows Server 2025 Datacenter, 24H2, build 26100. Each of 11 markers returned i
 
 ```
 slow-sleep-ms=900
-slow-strike index=1 blocked-ms=600 timed-out=true
-slow-strike index=2 blocked-ms=611 timed-out=true
-slow-strike index=3 blocked-ms=600 timed-out=true
-slow-strike index=4 blocked-ms=615 timed-out=true
-slow-strike index=5 blocked-ms=602 timed-out=true
-slow-strike index=6 blocked-ms=602 timed-out=true
+slow-strike index=1 blocked-ms=603 timed-out=true
+slow-strike index=2 blocked-ms=602 timed-out=true
+slow-strike index=3 blocked-ms=601 timed-out=true
+slow-strike index=4 blocked-ms=601 timed-out=true
+slow-strike index=5 blocked-ms=601 timed-out=true
+slow-strike index=6 blocked-ms=601 timed-out=true
 slow-strike index=7 blocked-ms=601 timed-out=true
-slow-strike index=8 blocked-ms=614 timed-out=true
-slow-strike index=9 blocked-ms=611 timed-out=true
-slow-strike index=10 blocked-ms=610 timed-out=true
-slow-strike index=11 blocked-ms=601 timed-out=true
+slow-strike index=8 blocked-ms=606 timed-out=true
+slow-strike index=9 blocked-ms=604 timed-out=true
+slow-strike index=10 blocked-ms=601 timed-out=true
+slow-strike index=11 blocked-ms=600 timed-out=true
 slow-strikes=11 entered=11 returned=11 probe-seen=true
 hook-removed=false
-liveness-detect-ms=333
+liveness-detect-ms=321
 result=measured
 ```
 
