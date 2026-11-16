@@ -169,6 +169,7 @@ pub fn hardware_row(
 }
 
 pub fn expected_ticks(sample_ms: u64, interval_ms: u64) -> u64 {
+    // Each tick: pump(0.01) then sleep(interval_ms). The pump wait is capped at 10 ms.
     let step = interval_ms.saturating_add(10).max(1);
     sample_ms / step
 }
@@ -177,11 +178,19 @@ pub fn pmset_shows(excerpt: &str, needle: &str) -> bool {
     excerpt.contains(needle)
 }
 
-pub fn slowed_sentence(down: u64, up: u64) -> (bool, String) {
+pub fn slowed_sentence(down: u64, up: u64, expected: u64) -> (bool, String) {
     if down == 0 {
         return (
             false,
             "No overlay-down count was recorded, so slowing is not claimed.".to_string(),
+        );
+    }
+    if expected > 0 && down * 100 < expected * 80 {
+        return (
+            false,
+            format!(
+                "not claimed: baseline below expected ({down} uncovered ticks, expected {expected})"
+            ),
         );
     }
     let slowed = up * 100 < down * 80;
@@ -227,13 +236,13 @@ pub fn hardware_only_list() -> Vec<String> {
 
 pub fn instructions(kit: bool) -> &'static str {
     if kit {
-        "step=1 Stay at the Mac. This kit does not lock it and does not swallow the keyboard.\n\
+        "step=1 Stay at the Mac. This kit does not lock it and does not swallow the keyboard. Control-C ends it any time; Terminal still has keyboard focus behind the black screen.\n\
          step=2 It holds both IOPMAssertionCreateWithName idle-system and idle-display assertions through the lid and power-key steps (QA1340). They are released afterwards.\n\
-         step=3 A timer process ticks. The same sample runs with the overlay down, then covering that window. The overlay is fully opaque, ignores the mouse, and does not become key. Escape ends it early only if Terminal has Accessibility permission; otherwise it closes by itself after about 60 s.\n\
-         step=4 Hands-off App Nap: the overlay covers the timer for 300 s (--sample-ms 300000). Do not touch the Mac. Check the App Nap column in Activity Monitor for the timer process.\n\
+         step=3 A timer process ticks for 60 s with the overlay down, then 60 s covering that window. The overlay is fully opaque, ignores the mouse, and does not become key. Escape ends it early only if Terminal has Accessibility permission; otherwise it closes by itself after about 60 s. Control-C ends it any time; Terminal still has keyboard focus behind the black screen.\n\
+         step=4 Hands-off App Nap: --kit then covers only the timer window for 300 s. Activity Monitor stays visible. Do not touch the Mac. Check the App Nap column for the timer process. Control-C ends it any time; Terminal still has keyboard focus behind the black screen.\n\
          step=5 Lid closed on power, no external display if you can unplug it. Stay next to the machine. After about 20 seconds, open the lid. Type slept, awake, or skip. \"no lid\" is not a row on this laptop. Both assertions stay held.\n\
          step=6 If you use an external display, plug it in, wait until it shows the desktop, close the lid, wait, open the lid. Type slept, awake, no-external-display, or skip. Both assertions stay held.\n\
-         step=7 Tap the power key once. Do not hold it. Type slept, restart-panel, nothing, or skip. Both assertions are still held for this row (assertion-held=true). They are released after this step. Nothing is left armed. Paste the filtered JSON onto the sheet."
+         step=7 On this 2020 MacBook Pro the power key is the Touch ID button. A tap may sleep the display or lock the screen: unlock with Touch ID or your password, then answer. Type slept, restart-panel, nothing, or skip. Both assertions are still held for this row (assertion-held=true). They are released after this step. Nothing is left armed. Paste the filtered JSON onto the sheet."
     } else {
         "step=1 Runner proof only. No lid, no power key, no real idle App Nap.\n\
          step=2 Create idle-system and idle-display assertions with IOPMAssertionCreateWithName and keep them held.\n\
@@ -551,7 +560,11 @@ fn row_token(row: &HardwareRow) -> String {
 fn passing_runner_fixture() -> KitReport {
     let down = 160;
     let up = 158;
-    let (slowed, sentence) = slowed_sentence(down, up);
+    let (slowed, sentence) = slowed_sentence(
+        down,
+        up,
+        expected_ticks(RUNNER_SAMPLE_MS, DEFAULT_INTERVAL_MS),
+    );
     let assertions = AssertionReport {
         names_compiled: AssertionNames {
             prevent_user_idle_system_sleep: true,
@@ -647,12 +660,16 @@ mod tests {
 
     #[test]
     fn covered_process_slowing_uses_an_eighty_percent_bar() {
-        let (slowed, sentence) = slowed_sentence(100, 90);
+        let (slowed, sentence) = slowed_sentence(100, 90, 100);
         assert!(!slowed);
         assert!(sentence.contains("did not slow"));
-        let (slowed, sentence) = slowed_sentence(100, 50);
+        let (slowed, sentence) = slowed_sentence(100, 50, 100);
         assert!(slowed);
         assert!(sentence.contains("slowed"));
+        let (slowed, sentence) = slowed_sentence(50, 50, 133);
+        assert!(!slowed);
+        assert!(sentence.contains("not claimed: baseline below expected"));
+        assert!(sentence.contains("50 uncovered ticks, expected 133"));
     }
 
     #[test]

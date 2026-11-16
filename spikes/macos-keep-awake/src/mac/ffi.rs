@@ -28,6 +28,10 @@ struct WindowOut {
     ordered_front: i32,
     display_count: i32,
     opaque: i32,
+    frame_x: f64,
+    frame_y: f64,
+    frame_w: f64,
+    frame_h: f64,
     error: [u8; 256],
 }
 
@@ -43,7 +47,7 @@ unsafe extern "C" {
     fn m07_assertions_create(reason: *const c_char, out: *mut AssertOut) -> i32;
     fn m07_assertions_release(system_id: u32, display_id: u32) -> i32;
     fn m07_display_count() -> i32;
-    fn m07_overlay_open(out: *mut WindowOut) -> i32;
+    fn m07_overlay_open(out: *mut WindowOut, x: f64, y: f64, w: f64, h: f64, use_rect: i32) -> i32;
     fn m07_overlay_close() -> i32;
     fn m07_overlay_escape_seen() -> i32;
     fn m07_overlay_pump(millis: u32);
@@ -142,14 +146,26 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn open() -> Self {
+        Overlay::open_rect(None)
+    }
+
+    pub fn open_rect(frame: Option<(i32, i32, i32, i32)>) -> Self {
         let mut out = WindowOut {
             ordered_front: 0,
             display_count: 0,
             opaque: 0,
+            frame_x: 0.0,
+            frame_y: 0.0,
+            frame_w: 0.0,
+            frame_h: 0.0,
             error: [0; 256],
         };
+        let (x, y, w, h, use_rect) = match frame {
+            Some((x, y, w, h)) => (x as f64, y as f64, w as f64, h as f64, 1),
+            None => (0.0, 0.0, 0.0, 0.0, 0),
+        };
         unsafe {
-            m07_overlay_open(&mut out);
+            m07_overlay_open(&mut out, x, y, w, h, use_rect);
         }
         Overlay {
             ordered_front: out.ordered_front != 0,
@@ -184,6 +200,7 @@ impl Drop for Overlay {
 
 pub struct TimerWindow {
     pub ordered_front: bool,
+    pub frame: (f64, f64, f64, f64),
     pub error: Option<String>,
 }
 
@@ -193,6 +210,10 @@ impl TimerWindow {
             ordered_front: 0,
             display_count: 0,
             opaque: 0,
+            frame_x: 0.0,
+            frame_y: 0.0,
+            frame_w: 0.0,
+            frame_h: 0.0,
             error: [0; 256],
         };
         unsafe {
@@ -200,6 +221,7 @@ impl TimerWindow {
         }
         TimerWindow {
             ordered_front: out.ordered_front != 0,
+            frame: (out.frame_x, out.frame_y, out.frame_w, out.frame_h),
             error: optional_text(&out.error),
         }
     }

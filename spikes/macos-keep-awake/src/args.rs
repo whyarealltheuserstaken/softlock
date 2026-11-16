@@ -33,6 +33,7 @@ pub struct Args {
     pub lid_external: Option<String>,
     pub power_key: Option<String>,
     pub count_file: Option<String>,
+    pub cover_frame: Option<(i32, i32, i32, i32)>,
 }
 
 pub fn parse_env() -> Result<Args, String> {
@@ -53,6 +54,7 @@ where
     let mut lid_external = None;
     let mut power_key = None;
     let mut count_file = None;
+    let mut cover_frame = None;
     let mut tokens = tokens.into_iter();
     while let Some(token) = tokens.next() {
         match token.as_str() {
@@ -104,6 +106,11 @@ where
             "--count-file" => {
                 count_file = Some(tokens.next().ok_or("--count-file needs a value")?);
             }
+            "--cover-frame" => {
+                cover_frame = Some(parse_frame(
+                    &tokens.next().ok_or("--cover-frame needs x,y,w,h")?,
+                )?);
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -138,12 +145,31 @@ where
         lid_external,
         power_key,
         count_file,
+        cover_frame,
     })
 }
 
 fn parse_ms(text: &str, flag: &str) -> Result<u64, String> {
     text.parse()
         .map_err(|_| format!("{flag} needs a millisecond count"))
+}
+
+fn parse_frame(text: &str) -> Result<(i32, i32, i32, i32), String> {
+    let parts: Vec<&str> = text.split(',').collect();
+    if parts.len() != 4 {
+        return Err("--cover-frame needs x,y,w,h".to_string());
+    }
+    let parse = |value: &str| {
+        value
+            .parse::<i32>()
+            .map_err(|_| "--cover-frame needs integers".to_string())
+    };
+    Ok((
+        parse(parts[0])?,
+        parse(parts[1])?,
+        parse(parts[2])?,
+        parse(parts[3])?,
+    ))
 }
 
 fn require_choice(value: String, allowed: &[&str], flag: &str) -> Result<String, String> {

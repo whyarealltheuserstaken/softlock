@@ -32,6 +32,10 @@ typedef struct {
     int ordered_front;
     int display_count;
     int opaque;
+    double frame_x;
+    double frame_y;
+    double frame_w;
+    double frame_h;
     char error[256];
 } WindowOut;
 
@@ -49,10 +53,18 @@ static atomic_int g_escape = 0;
 static id g_escape_monitor = nil;
 
 static void pump(NSTimeInterval seconds) {
+    if (seconds <= 0) {
+        return;
+    }
     NSDate *until = [NSDate dateWithTimeIntervalSinceNow:seconds];
     while ([until timeIntervalSinceNow] > 0) {
+        NSTimeInterval remaining = [until timeIntervalSinceNow];
+        NSTimeInterval slice = remaining < 0.01 ? remaining : 0.01;
+        if (slice <= 0) {
+            break;
+        }
         NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                            untilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]
+                                            untilDate:[NSDate dateWithTimeIntervalSinceNow:slice]
                                                inMode:NSDefaultRunLoopMode
                                               dequeue:YES];
         if (event) {
@@ -184,32 +196,58 @@ static void install_escape_monitor(void) {
                                                }];
 }
 
-int m07_overlay_open(WindowOut *out) {
+static CoverWindow *make_cover(NSRect frame) {
+    CoverWindow *window = [[CoverWindow alloc] initWithContentRect:frame
+                                                        styleMask:NSWindowStyleMaskBorderless
+                                                          backing:NSBackingStoreBuffered
+                                                            defer:NO];
+    window.releasedWhenClosed = NO;
+    window.opaque = YES;
+    window.alphaValue = 1.0;
+    window.hasShadow = NO;
+    window.ignoresMouseEvents = YES;
+    window.level = NSStatusWindowLevel;
+    window.backgroundColor = [NSColor blackColor];
+    window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                NSWindowCollectionBehaviorFullScreenAuxiliary;
+    [window orderFrontRegardless];
+    return window;
+}
+
+static int overlay_is_opaque(void) {
+    if (g_overlay.count == 0) {
+        return 0;
+    }
+    for (NSWindow *window in g_overlay) {
+        if (!window.isOpaque || window.alphaValue < 0.999) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int m07_overlay_open(WindowOut *out, double x, double y, double w, double h, int use_rect) {
     if (out == NULL) {
         return 1;
     }
     memset(out, 0, sizeof *out);
     @autoreleasepool {
         ensure_app();
-        NSArray<NSScreen *> *screens = [NSScreen screens];
-        out->display_count = (int)screens.count;
         g_overlay = [NSMutableArray array];
-        for (NSScreen *screen in screens) {
-            CoverWindow *window = [[CoverWindow alloc] initWithContentRect:screen.frame
-                                                                styleMask:NSWindowStyleMaskBorderless
-                                                                  backing:NSBackingStoreBuffered
-                                                                    defer:NO];
-            window.releasedWhenClosed = NO;
-            window.opaque = YES;
-            window.alphaValue = 1.0;
-            window.hasShadow = NO;
-            window.ignoresMouseEvents = YES;
-            window.level = NSStatusWindowLevel;
-            window.backgroundColor = [NSColor blackColor];
-            window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
-                                        NSWindowCollectionBehaviorFullScreenAuxiliary;
-            [window orderFrontRegardless];
+        if (use_rect && w > 1 && h > 1) {
+            CoverWindow *window = make_cover(NSMakeRect(x, y, w, h));
+            out->display_count = (int)[NSScreen screens].count;
+            out->frame_x = NSMinX(window.frame);
+            out->frame_y = NSMinY(window.frame);
+            out->frame_w = NSWidth(window.frame);
+            out->frame_h = NSHeight(window.frame);
             [g_overlay addObject:window];
+        } else {
+            NSArray<NSScreen *> *screens = [NSScreen screens];
+            out->display_count = (int)screens.count;
+            for (NSScreen *screen in screens) {
+                [g_overlay addObject:make_cover(screen.frame)];
+            }
         }
         install_escape_monitor();
         pump(0.2);
@@ -220,7 +258,7 @@ int m07_overlay_open(WindowOut *out) {
             }
         }
         out->ordered_front = front ? 1 : 0;
-        out->opaque = 1;
+        out->opaque = overlay_is_opaque();
         if (!front) {
             snprintf(out->error, sizeof out->error, "overlay windows were not visible");
         }
@@ -282,6 +320,10 @@ int m07_timer_open(WindowOut *out) {
         g_timer = window;
         g_timer_label = label;
         out->display_count = (int)[NSScreen screens].count;
+        out->frame_x = NSMinX(window.frame);
+        out->frame_y = NSMinY(window.frame);
+        out->frame_w = NSWidth(window.frame);
+        out->frame_h = NSHeight(window.frame);
         out->ordered_front = window.isVisible ? 1 : 0;
         if (!window.isVisible) {
             snprintf(out->error, sizeof out->error, "timer window was not visible");

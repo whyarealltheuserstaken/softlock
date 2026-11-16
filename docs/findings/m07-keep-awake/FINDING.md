@@ -2,44 +2,29 @@
 
 Planning ticket: `docs/tickets/macos/m07-keep-awake-intel.md`. Issue 56. Blocked m16.
 
-The kit is the workspace-excluded probe `spikes/macos-keep-awake`. The product path is `IOPMAssertionCreateWithName`, with a reason string the operator can find in `pmset -g assertions`. Both idle assertions stay held through the lid and power-key rows (QA1340); they are released afterwards. `caffeinate` is only a control (`caffeinate -i -t 5 -w <kit pid>`) if that binary exists. The kit does not lock the session, does not swallow the keyboard, does not change sleep settings, and does not read a hardware serial number. Assertions are released on exit, including SIGINT without `SA_RESTART`.
+The kit is the workspace-excluded probe `spikes/macos-keep-awake`. The product path is `IOPMAssertionCreateWithName`, with a reason string the operator can find in `pmset -g assertions`. Both idle assertions stay held through the lid and power-key rows (QA1340); they are released afterwards. `caffeinate` is only a control (`caffeinate -i -t 5 -w <kit pid>`) if that binary exists. The kit does not lock the session, does not swallow the keyboard, does not change sleep settings, and does not read a hardware serial number. Assertions are released on exit, including SIGINT without `SA_RESTART`. Control-C ends it any time; Terminal still has keyboard focus behind the black screen.
 
 The kit never prints or stores the full `pmset -g assertions` dump. stdout, `m07.json`, and the sheet excerpt keep only the system-wide summary counts plus this probe's own lines (filtered by pid or reason). Other apps' names, paths, and device names must not be committed.
 
-m02 (`docs/findings/m02-macos-runner-desktop.md`) already showed that `macos-latest` can host a window. This kit reuses that shape for a fully opaque covering overlay and records the timer window's occlusion state. m02 also said m07 moves entirely to Henry's Intel Mac for lid, real idle, and App Nap. The GitHub job here is the slice that can still run on the runner: create the idle assertions, print the names that compile, grep a **filtered** `pmset` excerpt for the reason string, optionally run `caffeinate` as a control, take two equal-length timer counts with the overlay down and covering the timer window, skip the 300 s hands-off App Nap step, leave hardware rows `not-run-on-runner` while the assertions are still held, then release them.
+m02 (`docs/findings/m02-macos-runner-desktop.md`) already showed that `macos-latest` can host a window. This kit reuses that shape for a fully opaque covering overlay and records the timer window's occlusion state. The 60 s overlay-up sample can cover the display; the 300 s App Nap sample covers **only the timer window**, so Activity Monitor stays visible. m02 also said m07 moves entirely to Henry's Intel Mac for lid, real idle, and App Nap. The GitHub job here is the slice that can still run on the runner: create the idle assertions, print the names that compile, grep a **filtered** `pmset` excerpt for the reason string, optionally run `caffeinate` as a control, take two equal-length timer counts with the overlay down and covering the timer window, skip the 300 s hands-off App Nap step, leave hardware rows `not-run-on-runner` while the assertions are still held, then release them.
+
+Each timer tick pumps the run loop for at most 10 ms (`untilDate` capped at `min(remaining, 0.01)`), then sleeps `interval-ms` (50). `timer-expected-ticks` is `sample_ms / (interval_ms + 10)`: **133** in an 8 s runner sample. If the uncovered count is below ~80% of that, `timer-sentence` is `not claimed: baseline below expected`. Earlier jobs that printed ~50 ticks were waiting 50 ms inside `pump(0.01)` because `nextEventMatchingMask` used a 0.05 s `untilDate`; that was the kit, not runner throttling.
 
 ## What the runner can prove
 
-Filled from GitHub Actions run [43978880733](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43978880733/job/133689862871) (`macos keep-awake runner` on this PR, then `2cafefc`). The job prints `sw_vers` and `uname -m`. `uname -m` must be `arm64`. The runner has no lid and no power key.
+Filled from the macOS keep-awake workflow on this PR after the pump cap. Quote the job log exactly. `uname -m` must be `arm64`. The runner has no lid and no power key.
 
-Recorded on that run:
-
-```
-ProductName:		macOS
-ProductVersion:		26.7.2
-BuildVersion:		25G332
-uname -m:		arm64
-assertion-reason=m07-keep-awake-probe-2759
-assertion-created=true
-assertion-released=true
-pmset-shows-reason=true
-timer-overlay-down=51
-timer-overlay-up=50
-timer-sentence=The covered process did not slow in this sample (50 ticks with the overlay up, 51 with it down).
-result=pass
-```
-
-Each timer tick sleeps `interval-ms` (50) plus a 10 ms run-loop pump, so an 8 s sample should land near **133 ticks** (`8000 / 60`). The runner produced about **50 ticks**. That baseline was throttled. The runner therefore does **not** prove "did not slow". A later job on this PR still must not claim App Nap from those counts.
+Log lines from the latest green `--runner` job on this PR will be pasted here after CI (see the PR and the `macos keep-awake runner` job). Until that paste, do not claim "did not slow" and do not claim the runner was throttled.
 
 | Claim | Runner |
 |---|---|
 | `PreventUserIdleSystemSleep` and `PreventUserIdleDisplaySleep` compile | job log `assertion-compiled-*` |
 | `IOPMAssertionCreateWithName` holds both, reason string in filtered `pmset` | `pmset-shows-reason=true` plus the filtered excerpt |
-| Assertions stay held through skipped hardware rows | `*-assertion-held=true`, then `step=7` releases them |
+| Assertions stay held through skipped hardware rows | `*-assertion-held=true` measured from filtered `pmset`, then `step=7` releases them |
 | Assertions release, and filtered `pmset` no longer shows the reason | `assertion-released=true`, `pmset-after-shows-reason=false` |
 | `caffeinate -i -t 5 -w <pid>` present or absent, used only as a control | `caffeinate-*` |
-| Timer counts overlay-down and overlay-up, same duration, opaque overlay, occlusion recorded | `timer-overlay-*`, `overlay-opaque`, `timer-occlusion-visible-*` |
-| Short sample is not App Nap | expected ~133 ticks / 8 s; run 43978880733 saw ~50; throttled; does not prove "did not slow" |
+| Timer counts overlay-down and overlay-up, same duration, opaque overlay, occlusion recorded | `timer-overlay-*`, `overlay-opaque`, `timer-occlusion-visible-*`, `timer-expected-ticks` |
+| Short sample is not App Nap | `--runner` is 8 s; `--kit` is 60 s then 300 s over the timer window only |
 | Lid closed on power | `not-run-on-runner` |
 | Lid closed with an external display | `not-run-on-runner` |
 | Power key tap | `not-run-on-runner` |
@@ -56,14 +41,16 @@ He runs:
 cargo run --locked --release --manifest-path spikes/macos-keep-awake/Cargo.toml -- --kit
 ```
 
-The binary prints numbered steps. The overlay is fully opaque, ignores the mouse, does not become key, and quits on Escape **only if Terminal has Accessibility permission**; otherwise it closes by itself after about 60 s. Control-C sets `interrupted=true` and exits non-zero after releasing assertions. He stays next to the machine for the lid rows. He taps the power key; he does not hold it. He does not paste a full `pmset` dump or any hardware serial number.
+That command is 60 s overlay-down, 60 s overlay-up, then 300 s App Nap covering only the timer window. Do not pass `--sample-ms 300000`; `--kit` already schedules those durations.
+
+The binary prints numbered `step=` lines. The overlay is fully opaque, ignores the mouse, does not become key, and quits on Escape **only if Terminal has Accessibility permission**; otherwise it closes by itself after the sample. Control-C ends it any time; Terminal still has keyboard focus behind the black screen. He stays next to the machine for the lid rows. On this 2020 MacBook Pro the power key is the Touch ID button. A tap may sleep the display or lock the screen: unlock with Touch ID or your password, then answer. He taps once; he does not hold it. He does not paste a full `pmset` dump or any hardware serial number.
 
 Rows that CI cannot fill:
 
-1. **Lid closed on power**, no external display if he can unplug it: slept or stayed awake, with `assertion-held=true`. This Mac is a laptop, so the row is one of those two (or skip).
-2. **Lid closed with an external display** (clamshell): slept, stayed awake, or no-external-display. He sometimes uses an external display, so this row is in the kit even while the display count on the sheet is still open.
-3. **Power key tap**: slept, showed the restart panel, or did nothing. m06 has not recorded this yet, so the row lives here. Assertions are still held for this row, then released (`step=7`).
-4. **App Nap**: numbered hands-off step, overlay covering the timer for 300 s (`--sample-ms 300000`). Do not touch the Mac. Check the App Nap column in Activity Monitor for the timer process. Compare overlay-down vs overlay-up counts on a real idle. A throttled runner sample does not prove the Intel Mac will not nap.
+1. **Lid closed on power**, no external display if he can unplug it: slept or stayed awake, with `assertion-held=true` from filtered `pmset`. This Mac is a laptop, so the row is one of those two (or skip).
+2. **Lid closed with an external display** (clamshell): slept, stayed awake, or no-external-display.
+3. **Power key tap** (Touch ID button): slept, showed the restart panel, or did nothing. Unlock first if the tap locked the screen, then answer. Assertions are still held for this row, then released (`step=7`).
+4. **App Nap**: numbered `step=4`, overlay covering **only the timer window** for 300 s so Activity Monitor stays visible. Compare the 60 s overlay-down vs overlay-up counts on a real idle.
 
 QA1340 says a lid close is forced sleep and an assertion cannot prevent it. The product condition for the m16 idle-sleep claim is that both assertions are held during that measurement. Clamshell-with-display is the extra measurement. Neither result turns into a takeover feature in this phase.
 

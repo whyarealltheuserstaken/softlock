@@ -22,14 +22,14 @@ Do not paste a hardware serial number. Do not paste a full `pmset -g assertions`
 | `sw_vers` / `uname -m` | |
 | Assertion names that compiled | |
 | Filtered `pmset` shows reason string | |
-| Timer count, overlay down | |
-| Timer count, overlay up | |
+| Timer count, overlay down (60 s on `--kit`, 8 s on `--runner`) | |
+| Timer count, overlay up (same duration) | |
 | Timer occlusion visible down / up | |
 | Covered process slowed? | |
-| Hands-off App Nap (300 s, Activity Monitor column) | |
+| Hands-off App Nap (300 s, overlay covers only the timer window) | |
 | Lid closed on power (`assertion-held`) | slept / awake (not "no lid") |
 | Lid closed with an external display (`assertion-held`) | slept / awake / no-external-display |
-| Power key tap (`assertion-held`) | slept / restart-panel / nothing |
+| Power key tap (`assertion-held`; Touch ID button, unlock first if it locks) | slept / restart-panel / nothing |
 | Assertions released after those rows | |
 | Keep-awake claim for m16 | idle sleep only, pending these rows |
 

@@ -86,9 +86,9 @@ fn run_orchestrator(args: &Args) -> i32 {
     };
     interrupted = interrupted || stop_requested();
     let (lid_on_power, lid_external, power_key) = if interrupted {
-        skipped_hardware("interrupted", held.is_held())
+        skipped_hardware("interrupted", measure_held(pid, &held.reason))
     } else {
-        hardware_rows(args, held.is_held())
+        hardware_rows(args, pid, &held.reason)
     };
     interrupted = interrupted || stop_requested();
     held.release();
@@ -210,8 +210,9 @@ fn sample_timers(args: &Args) -> Result<TimerReport, String> {
     if stop_requested() {
         return Err("interrupted".to_string());
     }
+    let expected = expected_ticks(args.sample_ms, args.interval_ms);
     let (slowed, sentence) = match (down.ticks, up.ticks) {
-        (Some(down_n), Some(up_n)) => slowed_sentence(down_n, up_n),
+        (Some(down_n), Some(up_n)) => slowed_sentence(down_n, up_n, expected),
         _ => (
             false,
             "Timer counts are incomplete, so slowing is not claimed.".to_string(),
@@ -222,11 +223,10 @@ fn sample_timers(args: &Args) -> Result<TimerReport, String> {
     let mut app_nap_ran = false;
     if args.mode == Mode::Kit && !stop_requested() {
         println!(
-            "STEP hands-off App Nap: overlay covers the timer for {APP_NAP_SAMPLE_MS} ms. Do not touch the Mac. Check the App Nap column in Activity Monitor for the timer process. Escape works only if Terminal has Accessibility permission."
+            "STEP hands-off App Nap: --kit covers only the timer window for 300 s (the overlay-down/up pair is 60 s each). Activity Monitor stays visible. Do not touch the Mac. Check the App Nap column for the timer process. Control-C ends it any time; Terminal still has keyboard focus behind the black screen."
         );
         let _ = io::stdout().flush();
-        let nap =
-            run_child_timer_with_overlay(&exe, args, "timer-app-nap.json", APP_NAP_SAMPLE_MS)?;
+        let nap = run_app_nap_timer(&exe, args, "timer-app-nap.json", APP_NAP_SAMPLE_MS)?;
         app_nap_count = nap.0.ticks;
         app_nap_occlusion = nap.0.occlusion_visible;
         app_nap_ran = true;
@@ -294,6 +294,27 @@ fn run_child_timer(exe: &Path, args: &Args, count_file: &str) -> Result<CountFil
     read_count(&path)
 }
 
+struct OverlayChild {
+    child: Option<Child>,
+}
+
+impl OverlayChild {
+    fn spawn(exe: &Path, extra: &[&str]) -> Result<Self, String> {
+        Ok(Self {
+            child: Some(spawn_role(exe, extra)?),
+        })
+    }
+}
+
+impl Drop for OverlayChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn run_child_timer_with_overlay(
     exe: &Path,
     args: &Args,
@@ -305,7 +326,7 @@ fn run_child_timer_with_overlay(
     let out = args.output_dir.to_str().unwrap_or(".").to_string();
     let sample = sample_ms.to_string();
     let interval = args.interval_ms.to_string();
-    let mut overlay = spawn_role(
+    let _overlay = OverlayChild::spawn(
         exe,
         &[
             "--role",
@@ -333,8 +354,6 @@ fn run_child_timer_with_overlay(
         ],
     )?;
     let timer_status = wait_child(&mut timer)?;
-    let _ = overlay.kill();
-    let _ = overlay.wait();
     if !timer_status.success() {
         return Err(format!(
             "timer {count_file} overlay-up exited {timer_status}"
@@ -342,6 +361,87 @@ fn run_child_timer_with_overlay(
     }
     let count = read_count(&timer_json)?;
     Ok((count, read_overlay(&overlay_json)))
+}
+
+fn run_app_nap_timer(
+    exe: &Path,
+    args: &Args,
+    count_file: &str,
+    sample_ms: u64,
+) -> Result<(CountFile, OverlayState), String> {
+    let overlay_json = args.output_dir.join("overlay.json");
+    let timer_json = args.output_dir.join(count_file);
+    let frame_path = args.output_dir.join("timer-frame.json");
+    let _ = fs::remove_file(&frame_path);
+    let out = args.output_dir.to_str().unwrap_or(".").to_string();
+    let sample = sample_ms.to_string();
+    let interval = args.interval_ms.to_string();
+    let mut timer = spawn_role(
+        exe,
+        &[
+            "--role",
+            "timer",
+            "--output-dir",
+            &out,
+            "--sample-ms",
+            &sample,
+            "--interval-ms",
+            &interval,
+            "--count-file",
+            count_file,
+        ],
+    )?;
+    let frame = match wait_for_frame(&frame_path) {
+        Ok(frame) => frame,
+        Err(error) => {
+            let _ = timer.kill();
+            let _ = timer.wait();
+            return Err(error);
+        }
+    };
+    let cover = format!("{},{},{},{}", frame.0, frame.1, frame.2, frame.3);
+    let _overlay = match OverlayChild::spawn(
+        exe,
+        &[
+            "--role",
+            "overlay",
+            "--output-dir",
+            &out,
+            "--sample-ms",
+            &sample,
+            "--cover-frame",
+            &cover,
+        ],
+    ) {
+        Ok(overlay) => overlay,
+        Err(error) => {
+            let _ = timer.kill();
+            let _ = timer.wait();
+            return Err(error);
+        }
+    };
+    let timer_status = wait_child(&mut timer)?;
+    if !timer_status.success() {
+        return Err(format!("timer {count_file} App Nap exited {timer_status}"));
+    }
+    let count = read_count(&timer_json)?;
+    Ok((count, read_overlay(&overlay_json)))
+}
+
+fn wait_for_frame(path: &Path) -> Result<(i32, i32, i32, i32), String> {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        if stop_requested() {
+            return Err("interrupted".to_string());
+        }
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Ok(file) = serde_json::from_str::<FrameFile>(&text) {
+                return Ok((file.x as i32, file.y as i32, file.w as i32, file.h as i32));
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err("timer window frame was not published".to_string())
 }
 
 fn spawn_role(exe: &Path, extra: &[&str]) -> Result<Child, String> {
@@ -379,6 +479,16 @@ fn run_timer(args: &Args) -> i32 {
         );
         return 1;
     }
+    let frame = FrameFile {
+        x: window.frame.0,
+        y: window.frame.1,
+        w: window.frame.2,
+        h: window.frame.3,
+    };
+    if let Err(error) = write_json(&args.output_dir.join("timer-frame.json"), &frame) {
+        eprintln!("{error}");
+        return 1;
+    }
     let started = Instant::now();
     let limit = Duration::from_millis(args.sample_ms);
     let step = Duration::from_millis(args.interval_ms.max(1));
@@ -414,7 +524,7 @@ fn run_timer(args: &Args) -> i32 {
 
 fn run_overlay(args: &Args) -> i32 {
     install_stop_handler();
-    let overlay = ffi::Overlay::open();
+    let overlay = ffi::Overlay::open_rect(args.cover_frame);
     let path = args.output_dir.join("overlay.json");
     let marker = OverlayFile {
         ordered_front: overlay.ordered_front,
@@ -465,7 +575,15 @@ fn parent_alive(parent: libc::pid_t) -> bool {
     unsafe { libc::getppid() == parent }
 }
 
-fn hardware_rows(args: &Args, held: bool) -> (HardwareRow, HardwareRow, HardwareRow) {
+fn measure_held(pid: u32, reason: &str) -> bool {
+    let excerpt = filtered_pmset(pid, reason);
+    pmset_shows(&excerpt, reason)
+        && pmset_shows(&excerpt, SYSTEM_ASSERTION)
+        && pmset_shows(&excerpt, DISPLAY_ASSERTION)
+}
+
+fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareRow, HardwareRow) {
+    let held = measure_held(pid, reason);
     if args.mode == Mode::Runner {
         return (
             runner_hardware_row("lid close on power", held),
@@ -474,9 +592,9 @@ fn hardware_rows(args: &Args, held: bool) -> (HardwareRow, HardwareRow, Hardware
         );
     }
     if stop_requested() {
-        return skipped_hardware("interrupted", held);
+        return skipped_hardware("interrupted", measure_held(pid, reason));
     }
-    let lid = record_lid(
+    let mut lid = record_lid(
         args,
         "lid-on-power",
         args.lid_on_power.as_deref(),
@@ -488,14 +606,16 @@ fn hardware_rows(args: &Args, held: bool) -> (HardwareRow, HardwareRow, Hardware
             "Type slept, awake, or skip. Do not type no-lid.",
         ],
         laptop_lid_row,
+        &["slept", "awake", "skip"],
         900_000,
         held,
     );
+    lid.assertion_held = measure_held(pid, reason);
     if stop_requested() {
-        let rest = skipped_hardware("interrupted", held);
+        let rest = skipped_hardware("interrupted", lid.assertion_held);
         return (lid, rest.1, rest.2);
     }
-    let external = record_lid(
+    let mut external = record_lid(
         args,
         "lid-external",
         args.lid_external.as_deref(),
@@ -507,25 +627,30 @@ fn hardware_rows(args: &Args, held: bool) -> (HardwareRow, HardwareRow, Hardware
             "Type slept, awake, no-external-display, or skip.",
         ],
         lid_external_row,
+        &["slept", "awake", "no-external-display", "skip"],
         900_000,
-        held,
+        lid.assertion_held,
     );
+    external.assertion_held = measure_held(pid, reason);
     if stop_requested() {
-        let rest = skipped_hardware("interrupted", held);
+        let rest = skipped_hardware("interrupted", external.assertion_held);
         return (lid, external, rest.2);
     }
-    let power = record_choice(
+    let mut power = record_choice(
         args.power_key.as_deref(),
         &[
             "STEP power-key",
-            "Tap the power key once. Do not hold it. Holding it can force a shutdown.",
+            "On this 2020 MacBook Pro the power key is the Touch ID button. A tap may sleep the display or lock the screen: unlock with Touch ID or your password, then answer.",
+            "Tap it once. Do not hold it. Holding it can force a shutdown.",
             "Both idle assertions are still held. They are released after this row.",
             "Type slept, restart-panel, nothing, or skip.",
         ],
         power_key_row,
+        &["slept", "restart-panel", "nothing", "skip"],
         "power key tap",
-        held,
+        external.assertion_held,
     );
+    power.assertion_held = measure_held(pid, reason);
     (lid, external, power)
 }
 
@@ -535,6 +660,7 @@ fn record_lid(
     preset: Option<&str>,
     steps: &[&str],
     parse: fn(&str) -> Result<String, String>,
+    allowed: &[&str],
     wait_ms: u64,
     held: bool,
 ) -> HardwareRow {
@@ -575,7 +701,7 @@ fn record_lid(
         .ok();
     let choice = match preset {
         Some(value) => value.to_string(),
-        None => read_choice(&["slept", "awake", "no-external-display", "skip"]),
+        None => read_choice(allowed),
     };
     if let Some(mut child) = child.take() {
         let _ = child.kill();
@@ -607,6 +733,7 @@ fn record_choice(
     preset: Option<&str>,
     steps: &[&str],
     parse: fn(&str) -> Result<String, String>,
+    allowed: &[&str],
     note: &str,
     held: bool,
 ) -> HardwareRow {
@@ -625,7 +752,7 @@ fn record_choice(
     }
     let choice = match preset {
         Some(value) => value.to_string(),
-        None => read_choice(&["slept", "restart-panel", "nothing", "skip"]),
+        None => read_choice(allowed),
     };
     if choice == "interrupted" || stop_requested() {
         return hardware_row(
@@ -846,6 +973,14 @@ fn install_stop_handler() {
 struct TickFile {
     ticks: u64,
     occlusion_visible: bool,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct FrameFile {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
 }
 
 #[derive(Serialize, serde::Deserialize)]
