@@ -11,7 +11,8 @@ fn main() {
     }
     #[cfg(not(windows))]
     {
+        // A macOS smoke launch of the product binary has nothing to do.
         eprintln!("the lock host runs on Windows");
-        std::process::exit(1);
+        std::process::exit(0);
     }
 }

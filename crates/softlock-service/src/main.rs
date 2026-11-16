@@ -20,8 +20,17 @@ fn main() {
             std::process::exit(code);
         }
         _ => {
-            let code = softlock_service::run_service();
-            std::process::exit(code);
+            #[cfg(windows)]
+            {
+                let code = softlock_service::run_service();
+                std::process::exit(code);
+            }
+            #[cfg(not(windows))]
+            {
+                // A macOS smoke launch of the product binary has nothing to do.
+                eprintln!("the service runs on Windows");
+                std::process::exit(0);
+            }
         }
     }
 }
