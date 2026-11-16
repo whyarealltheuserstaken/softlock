@@ -90,6 +90,38 @@ fn counter_nonce(value: u8) -> LaunchNonce {
     LaunchNonce::from_bytes(bytes)
 }
 
+/// One byte of the real broker nonce differs. The other 31 match, so a compare
+/// that stops early or skips an end still has to reject this verdict.
+fn flipped_broker_nonce_stays_locked(index: usize) {
+    let mut controller = locked_started();
+    controller.handle(Event::RequestHello);
+    let nonce = controller.broker_nonce().expect("broker nonce");
+    let mut bytes = *nonce.as_bytes();
+    bytes[index] ^= 0x01;
+    assert_ne!(bytes[index], nonce.as_bytes()[index]);
+    assert_eq!(&bytes[..index], &nonce.as_bytes()[..index]);
+    assert_eq!(&bytes[index + 1..], &nonce.as_bytes()[index + 1..]);
+
+    controller.handle(Event::Verified {
+        nonce: LaunchNonce::from_bytes(bytes),
+    });
+    assert!(
+        matches!(controller.state(), LockState::Locked { .. }),
+        "flipping byte {index} of the broker nonce must stay Locked, state is {:?}",
+        controller.state()
+    );
+    assert!(
+        !controller.returned_to_unlocked(),
+        "flipping byte {index} unlocked"
+    );
+
+    controller.handle(Event::Verified { nonce });
+    assert!(
+        matches!(controller.state(), LockState::Unlocked),
+        "the unflipped broker nonce must still verify"
+    );
+}
+
 fn public(kind: RequestKind) -> Event {
     Event::Public {
         role: Role::App,
@@ -225,6 +257,87 @@ fn locked_leaves_only_on_a_verified_broker_verdict() {
 fn is_counter_nonce(nonce: &LaunchNonce) -> bool {
     let bytes = nonce.as_bytes();
     bytes[1..].iter().all(|byte| *byte == 0)
+}
+
+#[test]
+fn verified_verdict_rejects_a_broker_nonce_flipped_only_in_the_last_byte() {
+    flipped_broker_nonce_stays_locked(31);
+}
+
+#[test]
+fn verified_verdict_rejects_a_broker_nonce_flipped_only_in_the_first_byte() {
+    flipped_broker_nonce_stays_locked(0);
+}
+
+#[test]
+fn secret_equality_uses_the_constant_time_comparison() {
+    let pin = b"pin-value";
+    assert_eq!(Secret::new(pin), Secret::new(pin));
+    assert_ne!(Secret::new(pin), Secret::new(b"other-val"));
+    assert_ne!(Secret::new(pin), Secret::new(b"pin-value-extra"));
+    assert_ne!(Secret::new(b"pin-value-extra"), Secret::new(pin));
+    assert_ne!(Secret::new(pin), Secret::new(b"pin-valuE"));
+
+    let source = include_str!("../src/state.rs");
+    let eq = function_body_after(source, "impl PartialEq for Secret", "fn eq(");
+    // `len == len && constant_time_eq(...)` still skips the walk when the lengths differ.
+    assert_eq!(
+        trimmed_fn_body(eq),
+        "constant_time_eq(&self.bytes, &other.bytes)",
+        "Secret::eq must be only the constant-time call, body was {eq}"
+    );
+    let ct = function_body(source, "fn constant_time_eq(");
+    assert!(
+        !leaves_early(ct),
+        "constant_time_eq must not return on the first mismatch, body was {ct}"
+    );
+    assert!(
+        ct.contains("diff == 0"),
+        "constant_time_eq must decide only after the full walk"
+    );
+}
+
+fn trimmed_fn_body(body: &str) -> &str {
+    body.trim()
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(body)
+        .trim()
+}
+
+fn leaves_early(body: &str) -> bool {
+    body.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|word| word == "return" || word == "break")
+}
+
+fn function_body_after<'a>(source: &'a str, marker: &str, signature: &str) -> &'a str {
+    let region = source
+        .find(marker)
+        .map(|start| &source[start..])
+        .unwrap_or_else(|| panic!("missing {marker}"));
+    function_body(region, signature)
+}
+
+fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing {signature}"));
+    let rest = &source[start..];
+    let open = rest.find('{').expect("function body");
+    let mut depth = 0;
+    for (index, byte) in rest[open..].bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[open..=open + index];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unclosed {signature}");
 }
 
 fn debug_output(controller: &LockController<FakePlatform>) -> String {
