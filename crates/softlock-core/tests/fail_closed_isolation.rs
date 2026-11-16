@@ -13,7 +13,7 @@ const SPIKE_PACKAGE: &str = "fail-closed-proof";
 const PROOF_WORKFLOW: &str = ".github/workflows/fail-closed-proof.yml";
 const CHECKLIST: &str = "docs/findings/04-fail-closed/CHECKLIST.md";
 const FINDING: &str = "docs/findings/04-fail-closed/finding.md";
-const SERVICE_NAME: &str = "RunnerFailClosedProbe";
+const SERVICE_NAME: &str = "FailClosedProbe";
 
 const POLICIES: [&str; 8] = [
     "DisableLockWorkstation",
@@ -112,6 +112,27 @@ fn fail_closed_workflow_covers_both_runner_images_and_pins_actions() {
         text.contains("--revert"),
         "cleanup must run the tool's journal revert"
     );
+    assert!(text.contains("taskkill"), "the job must kill the probe");
+    assert!(
+        text.contains("--arm-and-wait"),
+        "the job must arm the policies before the abnormal exit"
+    );
+    assert!(
+        text.contains("--check-restored"),
+        "the job must check that the eight values were restored"
+    );
+    assert!(
+        text.contains("panic-after-arm"),
+        "the panic exit must be a separate feature"
+    );
+    let restore = fs::read_to_string(root.join("spikes/fail-closed-proof/ci/restore-check.ps1"))
+        .expect("restore check script");
+    assert!(restore.contains("taskkill.exe /F /PID"));
+    assert!(!restore.contains("taskkill.exe /F /T"));
+    assert!(restore.contains("CTRL_BREAK_EVENT"));
+    assert!(restore.contains("--panic-after-arm"));
+    assert!(restore.contains("--check-restored"));
+    assert!(restore.contains(SERVICE_NAME));
     assert!(
         !text.contains("actions: write"),
         "proof workflow must not request actions: write"
@@ -179,6 +200,10 @@ fn fail_closed_proof_journals_every_lockdown_policy() {
         !source.contains("P7Desktop") && !source.contains("P7 desktop"),
         "spike must not use the school machine name"
     );
+    assert!(
+        source.contains("feature = \"panic-after-arm\""),
+        "the panic flag must be feature-gated"
+    );
 }
 
 #[test]
@@ -194,6 +219,16 @@ fn checklist_and_finding_cover_cleanup_and_the_dependent_tickets() {
         checklist.to_ascii_lowercase().contains("minute"),
         "checklist must say how long the run takes"
     );
+    assert!(checklist.contains("rustup"));
+    assert!(checklist.contains("1.100.0"));
+    assert!(checklist.contains("git clone"));
+    assert!(checklist.contains("git checkout"));
+    assert!(checklist.contains("Task Manager"));
+    assert!(checklist.contains("reboot"));
+    assert!(checklist.contains("15 minutes"));
+    assert!(checklist.contains("report.txt"));
+    assert!(checklist.contains("proof.log"));
+    assert!(checklist.contains("service.log"));
     for policy in POLICIES {
         assert!(
             checklist.contains(policy),

@@ -11,6 +11,8 @@ pub const REPORT_FILE: &str = "report.txt";
 pub const HEARTBEAT_FILE: &str = "heartbeat.log";
 pub const HEARTBEAT_STOP: &str = "heartbeat.stop";
 pub const JOURNAL_FILE: &str = "journal.json";
+pub const BASELINE_FILE: &str = "baseline.json";
+pub const ARMED_FILE: &str = "armed.json";
 
 pub const OP_DISCONNECT_CONSOLE: &str = "disconnect-console";
 pub const OP_WATCH_USER: &str = "watch-user-disconnect";

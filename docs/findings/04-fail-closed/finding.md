@@ -23,13 +23,15 @@ Fall-back when that process is gone: the service calls `WTSDisconnectSession` on
 
 Fall-back when the service is killed: the in-session process calls `WTSDisconnectSession` on its own session. That call does not need `DisableLockWorkstation` cleared. The proof runs it while the value is still set.
 
-Ticket 17 must clear `DisableLockWorkstation` before `LockWorkStation`. The proof's first step is there to show `LockWorkStation` fails while the value is set, and the last step is there to show it succeeds right after the value is cleared. The other lockdown values stay applied the whole time.
+Ticket 17 must clear `DisableLockWorkstation` before `LockWorkStation`. The proof's first step is there to show `LockWorkStation` fails while the value is set, and the last step is there to show it succeeds right after the value is cleared. The other lockdown values stay applied the whole time. The report word for a lock that did not happen is `blocked`. That line also records the session lock flag from `WTSSessionInfoEx`. The own-session disconnect has to be seen by the in-session process as well as by the service.
 
 This choice is what both runner images measured. Henry's laptop run is still required. Server runners can differ from that laptop, so issue 4 stays open.
 
 ## Measured timings
 
 Copied from `report.txt` in [Fail-closed proof run 43891281142](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43891281142), commit `0ab3d21b1b76b4b1c0befcd7a83a76b401ea9a72`. Both images printed `result=pass`. The session was 2 and the service session was 0. `LockWorkStation` returned success while `DisableLockWorkstation` was set (`win32=none`) and no `WTS_SESSION_LOCK` arrived (`notified=false`). After that value was cleared, `WTS_SESSION_LOCK` did arrive. The three path times below are the `elapsed-us` fields. All three are under one second, and the background heartbeat kept writing.
+
+That run printed `lock-while-policy=fail`. Later reports say `blocked` for the same result, and they add `session-lock-state`.
 
 - [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43891281142/job/133382829116)
 - [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43891281142/job/133382829781)

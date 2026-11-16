@@ -104,6 +104,42 @@ impl Document {
     }
 }
 
+/// Lockdown names saved in `entries` that a restore check still has to see.
+pub fn lockdown_names_missing(entries: &[Entry]) -> Vec<&'static str> {
+    LOCKDOWN
+        .iter()
+        .filter(|policy| {
+            !entries.iter().any(|entry| {
+                entry.hive == policy.hive
+                    && entry.subkey == policy.subkey
+                    && entry.name == policy.name
+            })
+        })
+        .map(|policy| policy.name)
+        .collect()
+}
+
+/// `None` when the live registry value is the journaled original.
+pub fn unrestored(entry: &Entry, current: Option<u32>) -> Option<String> {
+    if entry.previous == current {
+        None
+    } else {
+        Some(format!(
+            "{} is {}, original was {}",
+            entry.name,
+            value_text(current),
+            value_text(entry.previous)
+        ))
+    }
+}
+
+fn value_text(value: Option<u32>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => "absent".to_string(),
+    }
+}
+
 pub trait PolicyStore {
     fn read(&self, hive: Hive, subkey: &str, name: &str) -> Result<Option<u32>, String>;
     fn write(&mut self, hive: Hive, subkey: &str, name: &str, value: u32) -> Result<(), String>;
@@ -481,5 +517,33 @@ mod tests {
         journal.remove().expect("remove");
         assert!(journal.load().expect("load").is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restore_check_requires_every_original_value() {
+        assert!(lockdown_names_missing(&[]).contains(&DISABLE_LOCK));
+        let entries: Vec<Entry> = LOCKDOWN
+            .iter()
+            .map(|policy| Entry {
+                hive: policy.hive,
+                subkey: policy.subkey.to_string(),
+                name: policy.name.to_string(),
+                previous: None,
+            })
+            .collect();
+        assert!(lockdown_names_missing(&entries).is_empty());
+        let kept = &entries[0];
+        assert!(unrestored(kept, None).is_none());
+        assert_eq!(
+            unrestored(kept, Some(1)).as_deref(),
+            Some("DisableTaskMgr is 1, original was absent")
+        );
+        let mut changed = entries[2].clone();
+        changed.previous = Some(7);
+        assert!(unrestored(&changed, Some(7)).is_none());
+        assert_eq!(
+            unrestored(&changed, None).as_deref(),
+            Some("DisableLockWorkstation is absent, original was 7")
+        );
     }
 }

@@ -4,8 +4,9 @@ use std::thread;
 use std::time::Duration;
 
 use windows::Win32::System::RemoteDesktop::{
-    WTSConnectSessionW, WTSConnectState, WTSDisconnectSession, WTSFreeMemory,
-    WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW,
+    WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNKNOWN, WTS_SESSIONSTATE_UNLOCK, WTSConnectSessionW,
+    WTSConnectState, WTSDisconnectSession, WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSINFOEXW,
+    WTSQuerySessionInformationW, WTSSessionInfoEx,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -97,4 +98,34 @@ fn connect_state(session: u32) -> Result<i32, String> {
 
 pub fn console_session() -> u32 {
     unsafe { WTSGetActiveConsoleSessionId() }
+}
+
+/// `Ok(Some(true))` when the session lock flag says locked.
+/// `Ok(None)` when Windows reports the flag as unknown.
+pub fn session_lock_state(session: u32) -> Result<Option<bool>, String> {
+    let mut buffer = PWSTR::null();
+    let mut bytes = 0u32;
+    unsafe {
+        WTSQuerySessionInformationW(None, session, WTSSessionInfoEx, &mut buffer, &mut bytes)
+            .map_err(|error| util::explain(error, "WTSQuerySessionInformationW"))?;
+        if buffer.is_null() {
+            return Err("session info buffer was empty".to_string());
+        }
+        let info = &*buffer.0.cast::<WTSINFOEXW>();
+        let level = info.Level;
+        let flags = info.Data.WTSInfoExLevel1.SessionFlags as u32;
+        WTSFreeMemory(buffer.0.cast());
+        if level != 1 {
+            return Err(format!("session info level {level}"));
+        }
+        if flags == WTS_SESSIONSTATE_LOCK {
+            Ok(Some(true))
+        } else if flags == WTS_SESSIONSTATE_UNLOCK {
+            Ok(Some(false))
+        } else if flags == WTS_SESSIONSTATE_UNKNOWN {
+            Ok(None)
+        } else {
+            Err(format!("session lock flag {flags}"))
+        }
+    }
 }

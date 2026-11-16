@@ -41,6 +41,9 @@ pub fn within_one_second(elapsed_us: u128) -> bool {
 pub struct ObservedPath {
     pub api_ok: bool,
     pub notification: Option<u32>,
+    /// Set when this process also waited for the notification on its own listener.
+    pub checked_locally: bool,
+    pub local_notification: Option<u32>,
     pub elapsed_us: Option<u128>,
     pub heartbeat_gap_ms: Option<u128>,
 }
@@ -64,9 +67,10 @@ pub fn lock_path_ok(path: &ObservedPath) -> bool {
 }
 
 /// `LockWorkStation` only reports that the request was started. The session
-/// notification is what shows whether the workstation actually locked.
-pub fn lock_blocked(saw_lock: bool) -> bool {
-    !saw_lock
+/// notification, and the session lock flag, show whether it actually locked.
+/// `session_locked` is `None` when the flag could not be read.
+pub fn lock_blocked(saw_lock: bool, session_locked: Option<bool>) -> bool {
+    !saw_lock && session_locked != Some(true)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +82,8 @@ pub struct Outcome {
     pub lock_blocked: bool,
     pub lock_blocked_win32: Option<u32>,
     pub lock_saw_notification: bool,
+    /// `Some(true)` when `WTSSessionInfoEx` says the session is locked.
+    pub lock_session_locked: Option<bool>,
     pub service_disconnect: Option<ObservedPath>,
     pub session_disconnect: Option<ObservedPath>,
     pub lock_cleared: bool,
@@ -96,6 +102,7 @@ impl Outcome {
             lock_blocked: false,
             lock_blocked_win32: None,
             lock_saw_notification: false,
+            lock_session_locked: None,
             service_disconnect: None,
             session_disconnect: None,
             lock_cleared: false,
@@ -110,6 +117,7 @@ pub fn passed(outcome: &Outcome) -> bool {
     outcome.error.is_none()
         && outcome.lock_blocked
         && !outcome.lock_saw_notification
+        && outcome.lock_session_locked != Some(true)
         && outcome.lock_cleared
         && outcome.policies_restored
         && outcome.service_session_id == Some(0)
@@ -118,10 +126,11 @@ pub fn passed(outcome: &Outcome) -> bool {
             .service_disconnect
             .as_ref()
             .is_some_and(disconnect_path_ok)
-        && outcome
-            .session_disconnect
-            .as_ref()
-            .is_some_and(disconnect_path_ok)
+        && outcome.session_disconnect.as_ref().is_some_and(|path| {
+            disconnect_path_ok(path)
+                && path.checked_locally
+                && path.local_notification == Some(WTS_CONSOLE_DISCONNECT)
+        })
         && outcome.user_lock.as_ref().is_some_and(lock_path_ok)
 }
 
@@ -133,9 +142,18 @@ mod tests {
         ObservedPath {
             api_ok: true,
             notification: Some(notification),
+            checked_locally: false,
+            local_notification: None,
             elapsed_us: Some(12_000),
             heartbeat_gap_ms: Some(50),
         }
+    }
+
+    fn fast_local(notification: u32) -> ObservedPath {
+        let mut path = fast(notification);
+        path.checked_locally = true;
+        path.local_notification = Some(notification);
+        path
     }
 
     fn passing() -> Outcome {
@@ -150,8 +168,9 @@ mod tests {
             lock_blocked: true,
             lock_blocked_win32: Some(5),
             lock_saw_notification: false,
+            lock_session_locked: Some(false),
             service_disconnect: Some(fast(WTS_CONSOLE_DISCONNECT)),
-            session_disconnect: Some(fast(WTS_CONSOLE_DISCONNECT)),
+            session_disconnect: Some(fast_local(WTS_CONSOLE_DISCONNECT)),
             lock_cleared: true,
             user_lock: Some(fast(WTS_SESSION_LOCK)),
             policies_restored: true,
@@ -169,8 +188,25 @@ mod tests {
 
     #[test]
     fn lock_while_the_policy_is_set_must_fail_without_a_notification() {
-        assert!(lock_blocked(false));
-        assert!(!lock_blocked(true));
+        assert!(lock_blocked(false, Some(false)));
+        assert!(lock_blocked(false, None));
+        assert!(!lock_blocked(true, Some(false)));
+        assert!(!lock_blocked(false, Some(true)));
+    }
+
+    #[test]
+    fn the_in_session_listener_must_see_its_own_disconnect() {
+        let mut outcome = passing();
+        outcome
+            .session_disconnect
+            .as_mut()
+            .expect("session")
+            .local_notification = None;
+        assert!(!passed(&outcome));
+        let mut locked = passing();
+        locked.lock_session_locked = Some(true);
+        locked.lock_blocked = false;
+        assert!(!passed(&locked));
     }
 
     #[test]

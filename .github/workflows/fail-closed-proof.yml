@@ -21,7 +21,7 @@ jobs:
   proof:
     name: fail-closed proof (${{ matrix.image }})
     runs-on: ${{ matrix.image }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -48,8 +48,25 @@ jobs:
         run: cargo fmt --manifest-path spikes/fail-closed-proof/Cargo.toml -- --check
       - name: Clippy
         run: cargo clippy --manifest-path spikes/fail-closed-proof/Cargo.toml --all-targets -- -D warnings
+      - name: Clippy panic-after-arm
+        run: cargo clippy --manifest-path spikes/fail-closed-proof/Cargo.toml --all-targets --features panic-after-arm -- -D warnings
       - name: Unit tests
         run: cargo test --manifest-path spikes/fail-closed-proof/Cargo.toml
+      - name: Build the probe
+        run: cargo build --release --manifest-path spikes/fail-closed-proof/Cargo.toml
+      # Restore proof: taskkill /F, CTRL_BREAK_EVENT, and --panic-after-arm.
+      # Each case runs --arm-and-wait, then --check-restored and --revert.
+      - name: Prove restore after taskkill
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File spikes/fail-closed-proof/ci/restore-check.ps1 -Mode kill -Exe spikes/fail-closed-proof/target/release/fail-closed-proof.exe
+      - name: Prove restore after Ctrl+Break
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File spikes/fail-closed-proof/ci/restore-check.ps1 -Mode ctrl -Exe spikes/fail-closed-proof/target/release/fail-closed-proof.exe
+      - name: Build the panic-after-arm probe
+        run: cargo build --release --manifest-path spikes/fail-closed-proof/Cargo.toml --features panic-after-arm --target-dir spikes/fail-closed-proof/target/panic-arm
+      - name: Prove restore after panic
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File spikes/fail-closed-proof/ci/restore-check.ps1 -Mode panic -Exe spikes/fail-closed-proof/target/panic-arm/release/fail-closed-proof.exe
       - name: Run the fail-closed proof
         shell: cmd
         run: cargo run --release --manifest-path spikes/fail-closed-proof/Cargo.toml -- --runner-image ${{ matrix.image }} --output-dir proof-output
@@ -68,6 +85,6 @@ jobs:
         shell: powershell
         run: |
           cargo run --release --manifest-path spikes/fail-closed-proof/Cargo.toml -- --revert --output-dir proof-output
-          sc.exe stop RunnerFailClosedProbe
-          sc.exe delete RunnerFailClosedProbe
+          sc.exe stop FailClosedProbe
+          sc.exe delete FailClosedProbe
           exit 0

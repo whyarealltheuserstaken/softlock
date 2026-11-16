@@ -16,12 +16,16 @@ use windows::Win32::System::Threading::{
 use windows::core::w;
 
 use crate::guard::service_install_allowed;
+use crate::journal::{self, PolicyStore};
 use crate::protocol::{
-    self, Beat, COMMAND_FILE, HEARTBEAT_FILE, HEARTBEAT_STOP, READY_FILE, REPORT_FILE, RESULT_FILE,
-    TIMING_FILE, Timing, WATCHING_FILE, max_beat_gap, parse_beats,
+    self, ARMED_FILE, BASELINE_FILE, Beat, COMMAND_FILE, HEARTBEAT_FILE, HEARTBEAT_STOP,
+    JOURNAL_FILE, READY_FILE, REPORT_FILE, RESULT_FILE, TIMING_FILE, Timing, WATCHING_FILE,
+    max_beat_gap, parse_beats,
 };
 use crate::report::render;
-use crate::verdict::{self, ObservedPath, Outcome, WTS_SESSION_LOCK, elapsed_us, lock_blocked};
+use crate::verdict::{
+    self, ObservedPath, Outcome, WTS_CONSOLE_DISCONNECT, WTS_SESSION_LOCK, elapsed_us, lock_blocked,
+};
 
 use super::args::Args;
 use super::notify::Listener;
@@ -33,6 +37,9 @@ use super::util::{self, log_line};
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// The helper returns as soon as the parent exits. Fifteen minutes is only the cap:
+/// after that it restores even if the parent is still alive.
+const GUARD_WAIT_MS: u32 = 15 * 60 * 1000;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -45,6 +52,10 @@ pub fn dispatch(args: Args) -> i32 {
         run_revert(&args)
     } else if args.heartbeat {
         run_heartbeat(&args)
+    } else if args.arm_and_wait {
+        run_arm(&args)
+    } else if args.check_restored {
+        run_check(&args)
     } else {
         run_proof(&args)
     }
@@ -74,12 +85,14 @@ fn run_guard(args: &Args) -> i32 {
         && let Ok(parent) = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, args.parent_pid) }
     {
         unsafe {
-            let _ = WaitForSingleObject(parent, 15 * 60 * 1000);
+            let _ = WaitForSingleObject(parent, GUARD_WAIT_MS);
             let _ = windows::Win32::Foundation::CloseHandle(parent);
         }
     }
     let _ = std::fs::write(args.output_dir.join(HEARTBEAT_STOP), b"stop\n");
-    match policy::restore_at(&policy::journal_path(&args.output_dir)) {
+    let restored = policy::restore_at(&policy::journal_path(&args.output_dir));
+    service::stop_and_delete();
+    match restored {
         Ok(_) => 0,
         Err(error) => {
             eprintln!("{error}");
@@ -128,13 +141,7 @@ fn run_proof(args: &Args) -> i32 {
     let log = args.output_dir.join("proof.log");
     let journal = policy::journal_path(&args.output_dir);
     policy::arm(journal.clone());
-    install_ctrl_handler();
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        policy::restore_armed();
-        previous(info);
-    }));
-    let _restore_on_drop = RestoreOnDrop;
+    let _restore_on_drop = install_restore_hooks();
     if let Err(error) = policy::restore_at(&journal) {
         log_line(&log, &format!("leftover journal: {error}"));
         eprintln!("{error}");
@@ -215,8 +222,17 @@ fn measure(args: &Args, log: &Path, outcome: &mut Outcome) -> Result<(), String>
     let saw = listener
         .wait(WTS_SESSION_LOCK, session, t0, Duration::from_millis(1500))
         .is_some();
+    let lock_state = session::session_lock_state(session);
+    let session_locked = match &lock_state {
+        Ok(state) => *state,
+        Err(error) => {
+            log_line(log, &format!("session lock state: {error}"));
+            None
+        }
+    };
     outcome.lock_saw_notification = saw;
-    outcome.lock_blocked = lock_blocked(saw);
+    outcome.lock_session_locked = session_locked;
+    outcome.lock_blocked = lock_blocked(saw, session_locked);
     outcome.lock_blocked_win32 = locked.as_ref().err().map(|error| session::win32_of(error));
     snapshot(args, outcome);
     for note in super::notify::since(t0) {
@@ -233,12 +249,20 @@ fn measure(args: &Args, log: &Path, outcome: &mut Outcome) -> Result<(), String>
     log_line(
         log,
         &format!(
-            "lock-while-policy api={} saw={saw} detail={}",
+            "lock-while-policy api={} saw={saw} session-lock-state={} detail={}",
             locked.is_ok(),
+            lock_state
+                .as_ref()
+                .map(|state| match state {
+                    Some(true) => "locked",
+                    Some(false) => "unlocked",
+                    None => "unknown",
+                })
+                .unwrap_or("unread"),
             locked.as_ref().err().map(String::as_str).unwrap_or("ok")
         ),
     );
-    if saw {
+    if saw || session_locked == Some(true) {
         return Err("the session locked while DisableLockWorkstation was set".to_string());
     }
     let _ = before_negative;
@@ -246,7 +270,7 @@ fn measure(args: &Args, log: &Path, outcome: &mut Outcome) -> Result<(), String>
     outcome.service_disconnect = Some(service_disconnect(args, log, &listener)?);
     snapshot(args, outcome);
     thread::sleep(Duration::from_millis(300));
-    outcome.session_disconnect = Some(user_disconnect(args, log, session)?);
+    outcome.session_disconnect = Some(user_disconnect(args, log, &listener, session)?);
     snapshot(args, outcome);
     thread::sleep(Duration::from_millis(300));
     policy::clear_disable_lock(&args.output_dir, &document, &mut store)?;
@@ -271,7 +295,12 @@ fn service_disconnect(
     Ok(observed(&result, result.api_ok, before, &args.output_dir))
 }
 
-fn user_disconnect(args: &Args, log: &Path, session: u32) -> Result<ObservedPath, String> {
+fn user_disconnect(
+    args: &Args,
+    log: &Path,
+    listener: &Listener,
+    session: u32,
+) -> Result<ObservedPath, String> {
     let _ = std::fs::remove_file(args.output_dir.join(WATCHING_FILE));
     let _ = std::fs::remove_file(args.output_dir.join(TIMING_FILE));
     let _ = std::fs::remove_file(args.output_dir.join(RESULT_FILE));
@@ -293,11 +322,18 @@ fn user_disconnect(args: &Args, log: &Path, session: u32) -> Result<ObservedPath
     };
     write_synced(&args.output_dir.join(TIMING_FILE), &timing)?;
     let api = session::disconnect(session, false);
+    let local = listener.wait(
+        WTS_CONSOLE_DISCONNECT,
+        session,
+        timing.t0,
+        Duration::from_millis(1500),
+    );
     log_line(
         log,
         &format!(
-            "user disconnect api={} detail={}",
+            "user disconnect api={} local={} detail={}",
             api.is_ok(),
+            local.map(|note| note.kind).unwrap_or(0),
             api.as_ref().err().map(String::as_str).unwrap_or("ok")
         ),
     );
@@ -310,7 +346,10 @@ fn user_disconnect(args: &Args, log: &Path, session: u32) -> Result<ObservedPath
     log_line(log, &format!("user disconnect {}", describe(&result)));
     let label = session::reconnect(session)?;
     log_line(log, &format!("user reconnect={label}"));
-    Ok(observed(&result, result.api_ok, before, &args.output_dir))
+    let mut path = observed(&result, result.api_ok, before, &args.output_dir);
+    path.checked_locally = true;
+    path.local_notification = local.map(|note| note.kind);
+    Ok(path)
 }
 
 fn user_lock(
@@ -350,6 +389,8 @@ fn user_lock(
     Ok(ObservedPath {
         api_ok: api.is_ok(),
         notification: note.map(|note| note.kind),
+        checked_locally: false,
+        local_notification: None,
         elapsed_us: note.and_then(|note| elapsed_us(t0, note.qpc, freq)),
         heartbeat_gap_ms: gap,
     })
@@ -364,6 +405,8 @@ fn observed(
     ObservedPath {
         api_ok,
         notification: result.notification,
+        checked_locally: false,
+        local_notification: None,
         elapsed_us: elapsed_us(result.t0, result.t1, result.freq),
         heartbeat_gap_ms: wait_gap(dir, before),
     }
@@ -508,6 +551,21 @@ fn spawn_heartbeat(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+fn install_restore_hooks() -> RestoreOnDrop {
+    install_ctrl_handler();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        cleanup_armed();
+        previous(info);
+    }));
+    RestoreOnDrop
+}
+
+fn cleanup_armed() {
+    policy::restore_armed();
+    service::stop_and_delete();
+}
+
 fn install_ctrl_handler() {
     unsafe {
         let _ = SetConsoleCtrlHandler(Some(ctrl_handler), true);
@@ -516,7 +574,7 @@ fn install_ctrl_handler() {
 
 unsafe extern "system" fn ctrl_handler(ctrl: u32) -> windows::core::BOOL {
     if matches!(ctrl, 0 | 1 | 2 | 5 | 6) {
-        policy::restore_armed();
+        cleanup_armed();
         if ctrl == 0 || ctrl == 1 {
             unsafe {
                 windows::Win32::System::Threading::ExitProcess(3);
@@ -532,6 +590,106 @@ struct RestoreOnDrop;
 
 impl Drop for RestoreOnDrop {
     fn drop(&mut self) {
-        policy::restore_armed();
+        cleanup_armed();
     }
+}
+
+fn run_arm(args: &Args) -> i32 {
+    if let Err(reason) = service_install_allowed(
+        std::env::var("GITHUB_ACTIONS").ok().as_deref(),
+        args.allow_local_service,
+    ) {
+        eprintln!("{reason}");
+        return 2;
+    }
+    if let Err(error) = std::fs::create_dir_all(&args.output_dir) {
+        eprintln!("create output dir: {error}");
+        return 1;
+    }
+    let log = args.output_dir.join("proof.log");
+    policy::arm(policy::journal_path(&args.output_dir));
+    let _restore_on_drop = install_restore_hooks();
+    if let Err(error) = policy::restore_at(&policy::journal_path(&args.output_dir)) {
+        eprintln!("{error}");
+        return 1;
+    }
+    if let Err(error) = spawn_guard(args) {
+        eprintln!("{error}");
+        return 1;
+    }
+    if let Err(error) = arm_then_wait(args, &log) {
+        log_line(&log, &error);
+        eprintln!("{error}");
+        return 1;
+    }
+    0
+}
+
+fn arm_then_wait(args: &Args, log: &Path) -> Result<(), String> {
+    if !policy::is_elevated()? {
+        return Err("Run this from an Administrator terminal.".to_string());
+    }
+    let (document, _store) = policy::apply_lockdown(&args.output_dir)?;
+    util::write_json(&args.output_dir.join(BASELINE_FILE), &document)?;
+    log_line(log, &format!("policies applied for {}", document.sid));
+    service::install_and_start(args)?;
+    util::write_json(
+        &args.output_dir.join(ARMED_FILE),
+        &serde_json::json!({"ready": true}),
+    )?;
+    log_line(log, "armed");
+    #[cfg(feature = "panic-after-arm")]
+    if args.panic_after_arm {
+        panic!("panic-after-arm");
+    }
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
+    Err("arm-and-wait timed out before it was stopped".to_string())
+}
+
+fn run_check(args: &Args) -> i32 {
+    match check_restored(args) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+fn check_restored(args: &Args) -> Result<(), String> {
+    let baseline = args.output_dir.join(BASELINE_FILE);
+    let document: journal::Document = util::read_json(&baseline)?;
+    let missing = journal::lockdown_names_missing(&document.entries);
+    if !missing.is_empty() {
+        return Err(format!("baseline is missing {}", missing.join(",")));
+    }
+    let store = policy::RegistryStore::new(document.sid.clone());
+    let mut problems = Vec::new();
+    for entry in &document.entries {
+        let current = store.read(entry.hive, &entry.subkey, &entry.name)?;
+        if let Some(problem) = journal::unrestored(entry, current) {
+            problems.push(problem);
+        }
+    }
+    for name in [JOURNAL_FILE, "journal.bak", "journal.tmp"] {
+        let path = args.output_dir.join(name);
+        if path.exists() {
+            problems.push(format!("{} is still present", path.display()));
+        }
+    }
+    match service::installed() {
+        Ok(true) => problems.push(format!("{} is still installed", util::SERVICE_NAME)),
+        Ok(false) => {}
+        Err(error) => problems.push(error),
+    }
+    if !problems.is_empty() {
+        return Err(problems.join("; "));
+    }
+    println!("policies=original");
+    println!("journal=absent");
+    println!("service=gone");
+    Ok(())
 }

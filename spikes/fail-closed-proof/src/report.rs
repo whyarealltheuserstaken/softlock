@@ -25,10 +25,15 @@ pub fn render(outcome: &Outcome) -> String {
         .lock_blocked_win32
         .map(|code| code.to_string())
         .unwrap_or_else(|| "none".to_string());
+    let session_lock = match outcome.lock_session_locked {
+        Some(true) => "locked",
+        Some(false) => "unlocked",
+        None => "unknown",
+    };
     lines.push(format!(
-        "lock-while-policy={} win32={win32} notified={}",
+        "lock-while-policy={} win32={win32} notified={} session-lock-state={session_lock}",
         if outcome.lock_blocked {
-            "fail"
+            "blocked"
         } else {
             "unexpected"
         },
@@ -81,16 +86,25 @@ fn path_line(name: &str, path: Option<&ObservedPath>, expected: u32) -> String {
         .map(|value| value.to_string())
         .unwrap_or_else(|| "none".to_string());
     let within = path.elapsed_us.is_some_and(within_one_second);
-    let confirmed = path.api_ok && within && path.notification == Some(expected);
+    let local_ok = !path.checked_locally || path.local_notification == Some(expected);
+    let confirmed = path.api_ok && within && path.notification == Some(expected) && local_ok;
     let gap = path
         .heartbeat_gap_ms
         .map(|value| value.to_string())
         .unwrap_or_else(|| "none".to_string());
-    format!(
+    let mut line = format!(
         "{name}={} notification={notification} elapsed-us={elapsed} within-1s={within} api-ok={} heartbeat-gap-ms={gap}",
         if confirmed { "ok" } else { "fail" },
         path.api_ok
-    )
+    );
+    if path.checked_locally {
+        let local = path
+            .local_notification
+            .map(notification_name)
+            .unwrap_or("none");
+        line.push_str(&format!(" local-notification={local}"));
+    }
+    line
 }
 
 #[cfg(test)]
@@ -102,6 +116,8 @@ mod tests {
         ObservedPath {
             api_ok: true,
             notification: Some(notification),
+            checked_locally: false,
+            local_notification: None,
             elapsed_us: Some(8_000),
             heartbeat_gap_ms: Some(40),
         }
@@ -120,8 +136,14 @@ mod tests {
             lock_blocked: true,
             lock_blocked_win32: Some(5),
             lock_saw_notification: false,
+            lock_session_locked: Some(false),
             service_disconnect: Some(path(WTS_CONSOLE_DISCONNECT)),
-            session_disconnect: Some(path(WTS_CONSOLE_DISCONNECT)),
+            session_disconnect: Some({
+                let mut observed = path(WTS_CONSOLE_DISCONNECT);
+                observed.checked_locally = true;
+                observed.local_notification = Some(WTS_CONSOLE_DISCONNECT);
+                observed
+            }),
             lock_cleared: true,
             user_lock: Some(path(WTS_SESSION_LOCK)),
             policies_restored: true,
@@ -129,7 +151,10 @@ mod tests {
         };
         let text = render(&outcome);
         assert!(text.starts_with("result=pass\n"), "{text}");
-        assert!(text.contains("lock-while-policy=fail win32=5 notified=false"));
+        assert!(text.contains(
+            "lock-while-policy=blocked win32=5 notified=false session-lock-state=unlocked"
+        ));
+        assert!(text.contains("local-notification=WTS_CONSOLE_DISCONNECT"));
         assert!(text.contains(
             "path-service-disconnect=ok notification=WTS_CONSOLE_DISCONNECT elapsed-us=8000 within-1s=true"
         ));

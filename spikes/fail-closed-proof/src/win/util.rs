@@ -6,7 +6,7 @@ use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::core::PWSTR;
 
-pub const SERVICE_NAME: &str = "RunnerFailClosedProbe";
+pub const SERVICE_NAME: &str = "FailClosedProbe";
 
 pub fn explain(error: windows::core::Error, what: &str) -> String {
     format!("{what}: {error} win32 {}", win32_code(&error))

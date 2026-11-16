@@ -18,11 +18,11 @@ use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
     OpenServiceW, QueryServiceStatus, RegisterServiceCtrlHandlerExW, SC_HANDLE,
-    SC_MANAGER_ALL_ACCESS, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_CONTROL_STOP,
-    SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_RUNNING, SERVICE_START_PENDING,
-    SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED,
-    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus, StartServiceCtrlDispatcherW,
-    StartServiceW,
+    SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
+    SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS,
+    SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
+    SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+    SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken, PROCESS_SYNCHRONIZE,
@@ -71,13 +71,33 @@ pub fn install_and_start(args: &Args) -> Result<(), String> {
     remove_existing(scm, &name);
     let binary = service_command(args)?;
     let binary_wide = wide(&binary);
-    let display = wide("Runner fail-closed probe");
+    let display = wide("Fail-closed probe");
     let service = create_service(scm, &name, &display, &binary_wide)?;
     let started = unsafe { StartServiceW(service, None) };
     close_service(service);
     close_scm(scm);
     started.map_err(|error| explain(error, "StartServiceW"))?;
     Ok(())
+}
+
+pub fn installed() -> Result<bool, String> {
+    let scm = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+        .map_err(|error| explain(error, "OpenSCManagerW"))?;
+    let name = wide(SERVICE_NAME);
+    let opened = unsafe { OpenServiceW(scm, PCWSTR(name.as_ptr()), SERVICE_QUERY_STATUS) };
+    let exists = match opened {
+        Ok(service) => {
+            close_service(service);
+            true
+        }
+        Err(error) if win32_code(&error) == ERROR_SERVICE_DOES_NOT_EXIST.0 => false,
+        Err(error) => {
+            close_scm(scm);
+            return Err(explain(error, "OpenServiceW"));
+        }
+    };
+    close_scm(scm);
+    Ok(exists)
 }
 
 pub fn stop_and_delete() {
