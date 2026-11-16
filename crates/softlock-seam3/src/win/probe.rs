@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetStockObject, HBRUSH, HDC,
@@ -16,16 +16,20 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, BringWindowToTop, CreateWindowExW, DefWindowProcW,
-    DestroyWindow, DispatchMessageW, GetClientRect, GetForegroundWindow, GetMessageW,
-    GetSystemMetrics, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, MSG,
-    RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SPI_GETFOREGROUNDLOCKTIMEOUT,
-    SPI_SETFOREGROUNDLOCKTIMEOUT, SW_SHOW, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos,
-    ShowWindow, SystemParametersInfoW, TranslateMessage, WM_KEYDOWN, WM_PAINT, WM_SYSKEYDOWN,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    DestroyWindow, DispatchMessageW, GUITHREADINFO, GetClientRect, GetCursorPos,
+    GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetSystemMetrics, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, MSG, RegisterClassExW, SM_CXSCREEN,
+    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SPI_GETFOREGROUNDLOCKTIMEOUT, SPI_SETFOREGROUNDLOCKTIMEOUT, SW_SHOW, SWP_SHOWWINDOW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_PAINT, WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -50,8 +54,21 @@ pub struct FocusState {
     pub foreground_title: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordedClick {
+    pub message: u32,
+}
+
+/// Foreground window and the window that owns keyboard focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyboardFocus {
+    pub foreground: isize,
+    pub focus: isize,
+}
+
 struct Shared {
     inputs: Vec<RecordedInput>,
+    clicks: Vec<RecordedClick>,
 }
 
 pub struct Probe {
@@ -66,7 +83,10 @@ impl Probe {
     pub fn open() -> Result<Self, HarnessError> {
         per_monitor_dpi();
         let previous_lock_timeout = relax_foreground_lock();
-        let shared = Arc::new(Mutex::new(Shared { inputs: Vec::new() }));
+        let shared = Arc::new(Mutex::new(Shared {
+            inputs: Vec::new(),
+            clicks: Vec::new(),
+        }));
         let (tx, rx) = std::sync::mpsc::channel();
         let state = Arc::clone(&shared);
         let thread = thread::spawn(move || window_thread(state, tx));
@@ -97,6 +117,44 @@ impl Probe {
             .unwrap_or_else(|poison| poison.into_inner())
             .inputs
             .clone()
+    }
+
+    pub fn clicks(&self) -> Vec<RecordedClick> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clicks
+            .clone()
+    }
+
+    pub fn center(&self) -> (i32, i32) {
+        let mut rect = RECT::default();
+        unsafe {
+            if GetWindowRect(self.window(), &mut rect).is_err() {
+                return (0, 0);
+            }
+        }
+        (
+            rect.left + (rect.right - rect.left) / 2,
+            rect.top + (rect.bottom - rect.top) / 2,
+        )
+    }
+
+    pub fn wait_for_click(&self, timeout: Duration) -> Result<usize, HarnessError> {
+        let started = self.clicks().len();
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let count = self.clicks().len();
+            if count > started {
+                return Ok(count);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Err(HarnessError::new(format!(
+            "probe did not receive a click; focus={:?}; clicks={:?}",
+            self.focus(),
+            self.clicks()
+        )))
     }
 
     pub fn focus(&self) -> FocusState {
@@ -151,6 +209,83 @@ impl Drop for Probe {
         if let Some(timeout) = self.previous_lock_timeout {
             restore_foreground_lock(timeout);
         }
+    }
+}
+
+pub fn cursor_position() -> Result<(i32, i32), HarnessError> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point).map_err(|error| explain(error, "GetCursorPos"))? };
+    Ok((point.x, point.y))
+}
+
+pub fn keyboard_focus() -> KeyboardFocus {
+    let foreground = unsafe { GetForegroundWindow() };
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..GUITHREADINFO::default()
+    };
+    unsafe {
+        let _ = GetGUIThreadInfo(0, &mut info);
+    }
+    KeyboardFocus {
+        foreground: foreground.0 as isize,
+        focus: info.hwndFocus.0 as isize,
+    }
+}
+
+pub fn send_mouse_move(dx: i32, dy: i32, extra_info: u64) -> Result<(), HarnessError> {
+    send_mouse(&[mouse_event(dx, dy, MOUSEEVENTF_MOVE, extra_info)])
+}
+
+pub fn send_mouse_absolute(x: i32, y: i32, extra_info: u64) -> Result<(), HarnessError> {
+    let origin_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let origin_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+    let dx = (x.saturating_sub(origin_x)).clamp(0, width - 1) * 65535 / (width - 1).max(1);
+    let dy = (y.saturating_sub(origin_y)).clamp(0, height - 1) * 65535 / (height - 1).max(1);
+    send_mouse(&[mouse_event(
+        dx,
+        dy,
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        extra_info,
+    )])
+}
+
+pub fn send_left_click(extra_info: u64) -> Result<(), HarnessError> {
+    send_mouse(&[
+        mouse_event(0, 0, MOUSEEVENTF_LEFTDOWN, extra_info),
+        mouse_event(0, 0, MOUSEEVENTF_LEFTUP, extra_info),
+    ])
+}
+
+fn send_mouse(inputs: &[INPUT]) -> Result<(), HarnessError> {
+    let inserted = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if inserted == 0 {
+        Err(last_error("SendInput"))
+    } else {
+        Ok(())
+    }
+}
+
+fn mouse_event(
+    dx: i32,
+    dy: i32,
+    flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+    extra_info: u64,
+) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: extra_info as usize,
+            },
+        },
     }
 }
 
@@ -388,6 +523,10 @@ unsafe extern "system" fn wnd_proc(
                 record_key(hwnd, wparam.0 as u16);
                 LRESULT(0)
             }
+            WM_LBUTTONDOWN => {
+                record_click(hwnd, message);
+                LRESULT(0)
+            }
             windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => {
                 paint(hwnd, HDC(wparam.0 as *mut _));
                 LRESULT(1)
@@ -416,6 +555,15 @@ fn record_key(hwnd: HWND, virtual_key: u16) {
         reached_probe: true,
         probe_was_foreground: foreground,
     });
+}
+
+fn record_click(hwnd: HWND, message: u32) {
+    let map = states().lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(shared) = map.get(&(hwnd.0 as isize)) else {
+        return;
+    };
+    let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.clicks.push(RecordedClick { message });
 }
 
 unsafe fn paint(hwnd: HWND, dc: HDC) {

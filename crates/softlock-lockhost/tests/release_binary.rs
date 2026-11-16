@@ -6,12 +6,16 @@ use std::process::Command;
 
 const MARKER_STRING: &[u8] = b"softlock-simulated-physical-marker";
 const MARKER_SYMBOL: &[u8] = b"softlock_simulated_physical_marker";
+const DEV_STRING: &[u8] = b"softlock-dev-launch-marker";
+const DEV_SYMBOL: &[u8] = b"softlock_dev_launch_marker";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Hit {
     path: String,
     string: bool,
     symbol: bool,
+    dev_string: bool,
+    dev_symbol: bool,
 }
 
 #[test]
@@ -20,14 +24,38 @@ fn scanner_rejects_each_marker_on_its_own() {
     let string_only = root.join("string-only.rlib");
     let symbol_only = root.join("symbol-only.exe");
     let clean = root.join("clean.dll");
+    let dev_string_only = root.join("dev-string.dll");
+    let dev_symbol_only = root.join("dev-symbol.exe");
     fs::write(&string_only, padding(MARKER_STRING)).unwrap();
     fs::write(&symbol_only, padding(MARKER_SYMBOL)).unwrap();
+    fs::write(&dev_string_only, padding(DEV_STRING)).unwrap();
+    fs::write(&dev_symbol_only, padding(DEV_SYMBOL)).unwrap();
     fs::write(&clean, b"release binary without the test feature").unwrap();
 
     let string_hits = scan(&root, "string-only.rlib");
-    assert!(string_hits.iter().any(|hit| hit.string && !hit.symbol));
+    assert!(
+        string_hits
+            .iter()
+            .any(|hit| hit.string && !hit.symbol && !hit.dev_string)
+    );
     let symbol_hits = scan(&root, "symbol-only.exe");
-    assert!(symbol_hits.iter().any(|hit| hit.symbol && !hit.string));
+    assert!(
+        symbol_hits
+            .iter()
+            .any(|hit| hit.symbol && !hit.string && !hit.dev_symbol)
+    );
+    let dev_string_hits = scan(&root, "dev-string.dll");
+    assert!(
+        dev_string_hits
+            .iter()
+            .any(|hit| hit.dev_string && !hit.dev_symbol && !hit.string)
+    );
+    let dev_symbol_hits = scan(&root, "dev-symbol.exe");
+    assert!(
+        dev_symbol_hits
+            .iter()
+            .any(|hit| hit.dev_symbol && !hit.dev_string && !hit.symbol)
+    );
     assert!(
         scan(&root, "clean.dll").is_empty(),
         "a clean file must not trip the check"
@@ -91,7 +119,7 @@ fn contaminated_build_fails_the_release_binary_check() {
     let root = unique_dir("builds");
     let clean_dir = root.join("clean");
     let dirty_dir = root.join("dirty");
-    build(&clean_dir, false).expect("release build without the test feature");
+    build(&clean_dir, None).expect("release build without the test feature");
     let clean_hits = scan(&clean_dir.join("release"), "");
     assert!(
         clean_hits.is_empty(),
@@ -99,16 +127,30 @@ fn contaminated_build_fails_the_release_binary_check() {
         format_hits(&clean_hits)
     );
 
-    build(&dirty_dir, true).expect("release build with the test feature");
+    build(
+        &dirty_dir,
+        Some("softlock-lockhost/simulated-physical,softlock-lockhost/dev-launch"),
+    )
+    .expect("release build with the test features");
     let dirty_hits = scan(&dirty_dir.join("release"), "");
     assert!(
         dirty_hits.iter().any(|hit| hit.string),
-        "contaminated build must contain the marker string:\n{}",
+        "contaminated build must contain the simulated-physical marker string:\n{}",
         format_hits(&dirty_hits)
     );
     assert!(
         dirty_hits.iter().any(|hit| hit.symbol),
-        "contaminated build must contain the marker symbol:\n{}",
+        "contaminated build must contain the simulated-physical marker symbol:\n{}",
+        format_hits(&dirty_hits)
+    );
+    assert!(
+        dirty_hits.iter().any(|hit| hit.dev_string),
+        "contaminated build must contain the dev-launch marker string:\n{}",
+        format_hits(&dirty_hits)
+    );
+    assert!(
+        dirty_hits.iter().any(|hit| hit.dev_symbol),
+        "contaminated build must contain the dev-launch marker symbol:\n{}",
         format_hits(&dirty_hits)
     );
     let _ = fs::remove_dir_all(root);
@@ -128,13 +170,13 @@ fn product_release_binaries_omit_simulated_physical_markers() {
     );
     assert!(
         hits.is_empty(),
-        "simulated-physical markers in release binaries:\n{}",
+        "test-only markers in release binaries:\n{}",
         format_hits(&hits)
     );
     println!("scanned release binaries: {count}");
 }
 
-fn build(target_dir: &Path, simulated_physical: bool) -> Result<(), String> {
+fn build(target_dir: &Path, features: Option<&str>) -> Result<(), String> {
     let manifest = repo_root().join("Cargo.toml");
     let mut command = Command::new(env!("CARGO"));
     command
@@ -149,10 +191,8 @@ fn build(target_dir: &Path, simulated_physical: bool) -> Result<(), String> {
         .arg(target_dir)
         .env("CARGO_TARGET_DIR", target_dir)
         .current_dir(repo_root());
-    if simulated_physical {
-        command
-            .arg("--features")
-            .arg("softlock-lockhost/simulated-physical");
+    if let Some(features) = features {
+        command.arg("--features").arg(features);
     }
     let output = command
         .output()
@@ -183,11 +223,15 @@ fn scan(root: &Path, name_filter: &str) -> Vec<Hit> {
         };
         let string = contains(&bytes, MARKER_STRING);
         let symbol = contains(&bytes, MARKER_SYMBOL);
-        if string || symbol {
+        let dev_string = contains(&bytes, DEV_STRING);
+        let dev_symbol = contains(&bytes, DEV_SYMBOL);
+        if string || symbol || dev_string || dev_symbol {
             hits.push(Hit {
                 path: path.display().to_string(),
                 string,
                 symbol,
+                dev_string,
+                dev_symbol,
             });
         }
     }
@@ -281,7 +325,12 @@ fn format_hits(hits: &[Hit]) -> String {
         return "(no hits)".to_string();
     }
     hits.iter()
-        .map(|hit| format!("{} string={} symbol={}", hit.path, hit.string, hit.symbol))
+        .map(|hit| {
+            format!(
+                "{} string={} symbol={} dev_string={} dev_symbol={}",
+                hit.path, hit.string, hit.symbol, hit.dev_string, hit.dev_symbol
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
