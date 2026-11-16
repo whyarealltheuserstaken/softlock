@@ -2,7 +2,7 @@
 
 Measured on 16 November 2026 UTC by the workspace-excluded probe `spikes/macos-desktop-proof`.
 
-The proof run is [macOS desktop proof run 43963660084](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43963660084), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43963660084/job/133637315863). The measured head is `07d4074adbb94a7cbbfea0dd6178460f6cbdceca`. The job printed `result=pass`. This probe did not lock the session, so it does not say the runner comes back after a lock (decision D8).
+The proof run is [macOS desktop proof run 43965077959](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43965077959), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43965077959/job/133642253655). The measured head is `a1c8978e6d8fffeb2294afcbc9341a78a709a763`. The job printed `result=pass`. This probe did not lock the session, so it does not say the runner comes back after a lock (decision D8).
 
 An earlier head, `525018cfe1330629f7e9f122f106ca2b760d69c9`, printed `result=pass` with `window-error=NSWindow proof process exited 139`. That exit was a double release in the probe, not a runner capability. A later head blamed `CGEventPost` for missing the window. This run is after the activation change: the proof process waits until the app is active and the window is key, using `activateIgnoringOtherApps` and `NSRunningApplication activateWithOptions`. A crash in the probe still fails the job.
 
@@ -43,11 +43,11 @@ window-stage=key-received-done
 window-error=none
 ```
 
-The LaunchAgent is in the Aqua session. On this run its window did not stay visible, so it did not receive the key:
+The LaunchAgent is in the Aqua session. Its window was key. In that process `CGPreflightPostEventAccess=false`, and the local monitor did not see keyCode 0:
 
 ```
-job-agent-window-ordered-front=false
-job-agent-window-error=NSWindow orderFrontRegardless did not leave the window visible
+job-agent-window-ordered-front=true
+job-agent-window-error=the window was key and CGEventPost did not deliver keyCode 0 to the local monitor; CGPreflightPostEventAccess=false
 ```
 
 ## Taps
@@ -115,7 +115,7 @@ The daemon is root and has no graphic session, so it did not create a window. A 
 - **m07** moves entirely to Henry's Intel Mac. The runner has no lid, no App Nap from a closed lid, and no real idle the way a laptop does.
 - **m08** keeps its chooser rows on the existing verify job. Those rows are a pure function and do not lock. The sheet (lock timing, the screensaver, FileVault, and the password after the screensaver) is Henry's Mac. This spike did not lock the runner.
 - **m11** stays on Henry's Intel Mac. This run is arm64. A Rosetta run is not the x86_64 slice test.
-- **m15** can keep load/unload and the socket protocol on the runner. The daemon has no graphic session, so launchd has to start the agent at login for a window. The proof process's window became key and received the posted key. The LaunchAgent's window did not stay visible (`NSWindow orderFrontRegardless did not leave the window visible`), so a posted key reaching the product agent's window stays on Henry's Mac, along with installing the product agent and locking from a second process.
+- **m15** can keep load/unload and the socket protocol on the runner. The daemon has no graphic session, so launchd has to start the agent at login for a window. The proof process's window became key and received the posted key. The LaunchAgent's window was key and did not receive it (`CGPreflightPostEventAccess=false`), so a posted key reaching the product agent's window stays on Henry's Mac, along with installing the product agent and locking from a second process.
 
 ## Henry's Intel Mac
 
@@ -124,7 +124,7 @@ This section is only for Henry's machine: a 2020 Intel MacBook Pro (13-inch, Fou
 On that Mac:
 
 - m10: the TCC prompts. `accessibility=true` here was already granted and does not describe those prompts.
-- A posted key reaching a LaunchAgent window. The runner's proof process became key and received keyCode 0. The LaunchAgent window did not stay visible on this run.
+- A posted key reaching a LaunchAgent window. The runner's proof process became key and received keyCode 0. The LaunchAgent window was key and still did not receive it, because `CGPreflightPostEventAccess` was false in that process.
 - m07: lid, power assertions, and real idle.
 - m08: the lock sheet, the screensaver, and FileVault.
 - m11: the x86_64 slice.
