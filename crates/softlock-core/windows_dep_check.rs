@@ -1,7 +1,7 @@
 // Compile-time guard: softlock-core must not depend on a Windows-only crate.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const PACKAGE: &str = "softlock-core";
 
@@ -10,10 +10,21 @@ pub fn check_from_env() -> Result<(), String> {
         std::env::var("CARGO_MANIFEST_DIR")
             .map_err(|_| "CARGO_MANIFEST_DIR is not set".to_string())?,
     );
-    let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml"))
+    check_crate(&manifest_dir)
+}
+
+/// Reads a crate directory the way the build script does: its manifest, then
+/// a lockfile beside it or two directories up.
+pub fn check_crate(dir: &Path) -> Result<(), String> {
+    let manifest = fs::read_to_string(dir.join("Cargo.toml"))
         .map_err(|error| format!("read Cargo.toml: {error}"))?;
     check_manifest(&manifest)?;
-    let lock_path = manifest_dir.join("../../Cargo.lock");
+    let beside = dir.join("Cargo.lock");
+    let lock_path = if beside.exists() {
+        beside
+    } else {
+        dir.join("../../Cargo.lock")
+    };
     let lock = fs::read_to_string(&lock_path)
         .map_err(|error| format!("read {}: {error}", lock_path.display()))?;
     check_lock(&lock)
@@ -63,7 +74,14 @@ fn dependency_names(manifest: &str) -> Vec<String> {
         }
         if line.starts_with('[') && line.ends_with(']') {
             let table = line.trim_matches(['[', ']']).trim();
-            in_deps = table.split('.').any(|part| part.contains("dependencies"));
+            let segments = table_segments(table);
+            in_deps = false;
+            if let Some(index) = segments.iter().position(|segment| is_dep_table(segment)) {
+                if let Some(name) = segments.get(index + 1) {
+                    names.push(name.clone());
+                }
+                in_deps = true;
+            }
             continue;
         }
         if !in_deps {
@@ -144,6 +162,43 @@ fn quoted(line: &str) -> Option<&str> {
     let rest = &line[start + 1..];
     let end = rest.find('"')?;
     Some(&rest[..end])
+}
+
+fn is_dep_table(segment: &str) -> bool {
+    segment == "dependencies" || segment == "dev-dependencies" || segment == "build-dependencies"
+}
+
+/// Splits a TOML table path on dots that are outside quotes, so
+/// `target.'cfg(windows)'.dependencies.winreg` keeps `cfg(windows)` whole.
+fn table_segments(table: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for ch in table.chars() {
+        if let Some(mark) = quote {
+            if ch == mark {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == '.' {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
 }
 
 fn strip_comment(line: &str) -> &str {

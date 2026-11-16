@@ -17,7 +17,7 @@ mod state;
 pub use backoff::delay_after_failure;
 pub use controller::Event;
 pub use controller::{FallbackNotice, LockController, Rejection};
-pub use fake::FakePlatform;
+pub use fake::{ApplyEvent, FakePlatform, journal_is_durable_before_apply};
 pub use heartbeat::{
     ARM_STEP_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BEFORE_FAILURE, SERVICE_SILENCE_LIMIT,
     lock_host_fails_closed_when_service_is_silent,
@@ -32,12 +32,12 @@ pub use name::{
     SERVICE_NAME, pipe_name, registry_key,
 };
 pub use platform::{
-    ApplyObservation, AwakeGuard, AwakeRequest, CapabilityReport, Credentials, DiskEncryption,
-    EncryptionStatus, GuardError, GuardHealth, HardenError, Hardening, HardeningConfig,
-    HardeningPlan, InputGuard, LockScreenLook, OsLockError, Overlay, OverlayError, OverlayHealth,
-    PassthroughTarget, PhysicalInputSink, PlannedChange, Power, PowerCaps, PowerError, PromptView,
-    SessionControl, SessionId, SessionInfo, Support, UNSUPPORTED_PLATFORM_MESSAGE,
-    UnsupportedPlatform, UserId, Verdict,
+    ApplyObservation, AwakeGuard, AwakeRequest, CapabilityReport, ConfirmationCheck, Credentials,
+    DiskEncryption, EncryptionStatus, GuardError, GuardHealth, HardenError, Hardening,
+    HardeningConfig, HardeningPlan, InputGuard, LockScreenLook, OsLockError, Overlay, OverlayError,
+    OverlayHealth, PassthroughTarget, PhysicalInputSink, PlannedChange, Power, PowerCaps,
+    PowerError, PromptView, SessionControl, SessionId, SessionInfo, Support,
+    UNSUPPORTED_PLATFORM_MESSAGE, UnsupportedPlatform, UserId, Verdict,
 };
 pub use state::{
     ArmStep, DisarmStep, FailReason, FailureEvent, HeartbeatReport, LockSource, LockState,

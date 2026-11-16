@@ -6,7 +6,7 @@ use std::sync::mpsc::Receiver;
 use serde::{Deserialize, Serialize};
 
 use crate::journal::Journal;
-use crate::state::{ArmStep, Secret, SessionEvent};
+use crate::state::{ArmStep, MethodId, Secret, SessionEvent};
 
 pub const UNSUPPORTED_PLATFORM_MESSAGE: &str = "This platform isn't supported yet";
 
@@ -248,6 +248,11 @@ pub trait Credentials {
     fn verify_password(&self, user: &UserId, password: &Secret) -> Verdict;
 }
 
+/// Hello or the account password, checked by the Broker the service launched.
+pub trait ConfirmationCheck {
+    fn confirm(&mut self, method: MethodId) -> Verdict;
+}
+
 pub trait EncryptionStatus {
     fn system_volume(&self) -> DiskEncryption;
 }
@@ -384,6 +389,12 @@ impl Credentials for UnsupportedPlatform {
     }
 }
 
+impl ConfirmationCheck for UnsupportedPlatform {
+    fn confirm(&mut self, _method: MethodId) -> Verdict {
+        Verdict::Rejected
+    }
+}
+
 impl EncryptionStatus for UnsupportedPlatform {
     fn system_volume(&self) -> DiskEncryption {
         DiskEncryption::Unsupported
@@ -398,7 +409,7 @@ pub struct ApplyObservation {
 }
 
 /// Operations the lock controller needs from an in-memory platform.
-pub trait DrivenPlatform {
+pub trait DrivenPlatform: ConfirmationCheck {
     fn fail_at(&self) -> Option<ArmStep>;
     fn settings(&self) -> &std::collections::BTreeMap<String, String>;
     fn settings_mut(&mut self) -> &mut std::collections::BTreeMap<String, String>;
@@ -407,6 +418,7 @@ pub trait DrivenPlatform {
     fn set_overlay_shown(&mut self, shown: bool);
     fn set_power_held(&mut self, held: bool);
     fn record_os_lock(&mut self);
+    fn apply_hardened(&mut self, journal: &Journal, plan: &HardeningPlan);
     fn take_accept(&mut self) -> bool;
     fn revert_failed(&self) -> bool;
     fn guard_health(&self) -> GuardHealth;

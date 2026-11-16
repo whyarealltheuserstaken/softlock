@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::heartbeat::{ARM_STEP_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BEFORE_FAILURE};
 use crate::ipc::{RequestKind, ResponseKind, StatusFallback};
 use crate::journal::{Journal, JournalEntry};
-use crate::platform::{ApplyObservation, DrivenPlatform, standard_hardening_plan};
+use crate::platform::{ConfirmationCheck, DrivenPlatform, standard_hardening_plan};
 use crate::state::{
     ArmStep, DisarmStep, FailReason, HeartbeatReport, LockSource, LockState, MethodId,
     MonotonicInstant, PromptState, Role, Secret, SessionEvent, VerdictChannel,
@@ -36,6 +36,16 @@ pub enum Event {
     Verified {
         channel: VerdictChannel,
         method: MethodId,
+        nonce: u64,
+    },
+    PromptOpened {
+        method: MethodId,
+    },
+    PassthroughStarted {
+        method: MethodId,
+    },
+    VerificationStarted {
+        method: MethodId,
     },
     RequestHello,
     Session(SessionEvent),
@@ -65,9 +75,13 @@ pub struct LockController<P> {
     failure_count: u32,
     now: MonotonicInstant,
     last_heartbeat: Option<MonotonicInstant>,
-    arm_started: Option<MonotonicInstant>,
+    last_heartbeat_seq: Option<u64>,
+    step_started: Option<MonotonicInstant>,
     session_os_locked: bool,
     broker_launched: bool,
+    next_nonce: u64,
+    host_nonce: u64,
+    broker_nonce: Option<u64>,
     config_toml: String,
     config_revision: u64,
     last_response: Option<ResponseKind>,
@@ -87,9 +101,13 @@ impl<P: DrivenPlatform> LockController<P> {
             failure_count: 0,
             now: MonotonicInstant::zero(),
             last_heartbeat: None,
-            arm_started: None,
+            last_heartbeat_seq: None,
+            step_started: None,
             session_os_locked: false,
             broker_launched: false,
+            next_nonce: 1,
+            host_nonce: 0,
+            broker_nonce: None,
             config_toml: "schema_version = 1\n".to_string(),
             config_revision: 1,
             last_response: None,
@@ -103,7 +121,14 @@ impl<P: DrivenPlatform> LockController<P> {
             Event::Public { role, kind, .. } => {
                 self.last_response = Some(self.dispatch(role, kind));
             }
-            Event::Verified { channel, .. } => self.on_verified(channel),
+            Event::Verified { channel, nonce, .. } => self.on_verified(channel, nonce),
+            Event::PromptOpened { method } => self.on_prompt(PromptState::Open { method }),
+            Event::PassthroughStarted { method } => {
+                self.on_prompt(PromptState::Passthrough { method });
+            }
+            Event::VerificationStarted { method } => {
+                self.on_prompt(PromptState::Verifying { method });
+            }
             Event::RequestHello => self.on_request_hello(),
             Event::Session(notification) => self.on_session(notification),
             Event::OsLockConfirmed => self.on_os_lock_confirmed(),
@@ -189,6 +214,25 @@ impl<P: DrivenPlatform> LockController<P> {
         self.broker_launched
     }
 
+    pub fn host_nonce(&self) -> u64 {
+        self.host_nonce
+    }
+
+    pub fn broker_nonce(&self) -> Option<u64> {
+        self.broker_nonce
+    }
+
+    pub fn next_heartbeat_seq(&self) -> u64 {
+        self.last_heartbeat_seq
+            .map_or(1, |seq| seq.saturating_add(1))
+    }
+
+    /// Completes the current arming step. Tests use this to show the timeout
+    /// belongs to each step.
+    pub fn finish_arm_step(&mut self) {
+        self.one_arm_step();
+    }
+
     pub fn config_revision(&self) -> u64 {
         self.config_revision
     }
@@ -226,15 +270,23 @@ impl<P: DrivenPlatform> LockController<P> {
     }
 
     fn start_lock(&mut self, source: LockSource) {
-        self.arm_started = Some(self.now);
         self.failure_count = 0;
-        self.enter(LockState::Arming {
-            source,
-            step: ArmStep::Journal,
-        });
+        self.last_heartbeat_seq = None;
+        self.enter_arm(source, ArmStep::Journal);
         if !self.manual {
             self.pump_arm();
         }
+    }
+
+    fn enter_arm(&mut self, source: LockSource, step: ArmStep) {
+        self.step_started = Some(self.now);
+        self.enter(LockState::Arming { source, step });
+    }
+
+    fn issue_nonce(&mut self) -> u64 {
+        let nonce = self.next_nonce;
+        self.next_nonce = self.next_nonce.saturating_add(1);
+        nonce
     }
 
     fn pump_arm(&mut self) {
@@ -258,37 +310,29 @@ impl<P: DrivenPlatform> LockController<P> {
             ArmStep::Journal => {
                 self.journal.mark_locked();
                 self.journal.flush();
-                self.enter(LockState::Arming {
-                    source,
-                    step: ArmStep::Guard,
-                });
+                self.enter_arm(source, ArmStep::Guard);
             }
             ArmStep::Guard => {
                 self.platform.set_guard_armed(true);
-                self.enter(LockState::Arming {
-                    source,
-                    step: ArmStep::Overlay,
-                });
+                self.enter_arm(source, ArmStep::Overlay);
             }
             ArmStep::Overlay => {
                 self.platform.set_overlay_shown(true);
-                self.enter(LockState::Arming {
-                    source,
-                    step: ArmStep::Hardening,
-                });
+                self.enter_arm(source, ArmStep::Hardening);
             }
             ArmStep::Hardening => {
                 self.journal_and_apply();
-                self.enter(LockState::Arming {
-                    source,
-                    step: ArmStep::Power,
-                });
+                self.enter_arm(source, ArmStep::Power);
             }
             ArmStep::Power => {
                 self.platform.set_power_held(true);
                 self.journal.set_failures(0);
                 self.journal.flush();
                 self.last_heartbeat = Some(self.now);
+                self.last_heartbeat_seq = None;
+                self.host_nonce = self.issue_nonce();
+                self.broker_nonce = None;
+                self.broker_launched = false;
                 self.enter(LockState::Locked {
                     source,
                     prompt: PromptState::Idle,
@@ -308,27 +352,32 @@ impl<P: DrivenPlatform> LockController<P> {
             });
         }
         self.journal.flush();
-        self.platform.note_apply(ApplyObservation {
-            durable_entries: self.journal.durable_entries().to_vec(),
-            settings_before: current,
-        });
-        for change in &plan.changes {
-            self.platform
-                .settings_mut()
-                .insert(change.target.clone(), change.new_value.clone());
-        }
+        let journal = self.journal.clone();
+        self.platform.apply_hardened(&journal, &plan);
     }
 
-    fn on_verified(&mut self, channel: VerdictChannel) {
+    fn on_verified(&mut self, channel: VerdictChannel, nonce: u64) {
         if !matches!(self.state, LockState::Locked { .. }) {
             self.reject("Verified");
             return;
         }
-        if channel == VerdictChannel::Broker && !self.broker_launched {
+        let genuine = match channel {
+            VerdictChannel::LockHost => nonce == self.host_nonce && self.host_nonce != 0,
+            VerdictChannel::Broker => self.broker_launched && self.broker_nonce == Some(nonce),
+        };
+        if !genuine {
             self.reject("Verified");
             return;
         }
         self.begin_unlock();
+    }
+
+    fn on_prompt(&mut self, prompt: PromptState) {
+        let LockState::Locked { source, .. } = self.state.clone() else {
+            self.reject("Prompt");
+            return;
+        };
+        self.enter(LockState::Locked { source, prompt });
     }
 
     fn begin_unlock(&mut self) {
@@ -380,15 +429,20 @@ impl<P: DrivenPlatform> LockController<P> {
             self.reject("OsLockConfirmed");
             return;
         };
-        let _ = self.teardown();
+        let reverted = self.teardown();
         self.enter(LockState::OsLocked {
-            after_fail: Some(reason),
+            after_fail: Some(if reverted {
+                reason
+            } else {
+                FailReason::RevertFailed
+            }),
         });
     }
 
     fn on_request_hello(&mut self) {
         if matches!(self.state, LockState::Locked { .. }) {
             self.broker_launched = true;
+            self.broker_nonce = Some(self.issue_nonce());
         } else {
             self.reject("RequestHello");
         }
@@ -422,11 +476,7 @@ impl<P: DrivenPlatform> LockController<P> {
             return;
         }
         drop(secret);
-        if self.platform.take_accept() {
-            self.begin_unlock();
-        } else {
-            self.note_failure();
-        }
+        self.note_failure();
     }
 
     fn note_failure(&mut self) {
@@ -466,7 +516,7 @@ impl<P: DrivenPlatform> LockController<P> {
             }
         }
         if matches!(self.state, LockState::Arming { .. })
-            && let Some(started) = self.arm_started
+            && let Some(started) = self.step_started
             && self.now.saturating_duration_since(started) >= ARM_STEP_TIMEOUT
         {
             self.fail_closed(FailReason::ArmTimeout);
@@ -477,6 +527,10 @@ impl<P: DrivenPlatform> LockController<P> {
         if !matches!(self.state, LockState::Locked { .. }) {
             return;
         }
+        let fresh = match self.last_heartbeat_seq {
+            Some(previous) => report.seq == previous.saturating_add(1),
+            None => true,
+        };
         if !report.guard.hook_alive {
             self.fail_closed(FailReason::GuardUnhealthy);
             return;
@@ -488,6 +542,10 @@ impl<P: DrivenPlatform> LockController<P> {
             self.fail_closed(FailReason::OverlayUnhealthy);
             return;
         }
+        if !fresh {
+            return;
+        }
+        self.last_heartbeat_seq = Some(report.seq);
         self.last_heartbeat = Some(self.now);
     }
 
@@ -503,8 +561,11 @@ impl<P: DrivenPlatform> LockController<P> {
                 self.session_os_locked = false;
                 match self.state.clone() {
                     LockState::OsLocked { after_fail } => {
-                        if !self.journal.is_empty() {
-                            let _ = self.teardown();
+                        if !self.journal.is_empty() && !self.teardown() {
+                            self.enter(LockState::OsLocked {
+                                after_fail: Some(FailReason::RevertFailed),
+                            });
+                            return;
                         }
                         if let Some(reason) = after_fail {
                             self.notifications.push(FallbackNotice {
@@ -537,6 +598,7 @@ impl<P: DrivenPlatform> LockController<P> {
             return;
         }
         let says_locked = journal.says_locked();
+        self.failure_count = journal.failures();
         self.journal = journal;
         self.enter(LockState::Recovering);
         if self.manual {
@@ -546,6 +608,8 @@ impl<P: DrivenPlatform> LockController<P> {
             self.fail_closed(FailReason::ServiceStop);
         } else if self.teardown() {
             self.enter(LockState::Unlocked);
+        } else {
+            self.fail_closed(FailReason::RevertFailed);
         }
     }
 
@@ -665,11 +729,23 @@ impl<P: DrivenPlatform> LockController<P> {
 
     fn dispatch_sensitive(&mut self, role: Role) -> ResponseKind {
         if role != Role::App {
-            ResponseKind::Unauthorized
-        } else if self.config_writable() {
+            return ResponseKind::Unauthorized;
+        }
+        if !self.config_writable() {
+            return ResponseKind::Locked;
+        }
+        self.broker_launched = true;
+        self.broker_nonce = Some(self.issue_nonce());
+        let hello = ConfirmationCheck::confirm(&mut self.platform, MethodId::windows_hello());
+        let verdict = if hello == crate::platform::Verdict::Verified {
+            hello
+        } else {
+            ConfirmationCheck::confirm(&mut self.platform, MethodId::os_password())
+        };
+        if verdict == crate::platform::Verdict::Verified {
             ResponseKind::Ok
         } else {
-            ResponseKind::Locked
+            ResponseKind::Unauthorized
         }
     }
 

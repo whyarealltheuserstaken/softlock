@@ -2,22 +2,63 @@
 
 use std::collections::BTreeMap;
 
-use crate::journal::Journal;
+use crate::journal::{Journal, JournalEntry};
 use crate::platform::{
-    ApplyObservation, AwakeGuard, AwakeRequest, Credentials, DiskEncryption, DrivenPlatform,
-    EncryptionStatus, GuardError, GuardHealth, HardenError, Hardening, HardeningConfig,
-    HardeningPlan, InputGuard, LockScreenLook, OsLockError, Overlay, OverlayError, OverlayHealth,
-    PassthroughTarget, PhysicalInputSink, Power, PowerCaps, PowerError, PromptView, SessionControl,
-    SessionId, SessionInfo, UserId, Verdict,
+    ApplyObservation, AwakeGuard, AwakeRequest, ConfirmationCheck, Credentials, DiskEncryption,
+    DrivenPlatform, EncryptionStatus, GuardError, GuardHealth, HardenError, Hardening,
+    HardeningConfig, HardeningPlan, InputGuard, LockScreenLook, OsLockError, Overlay, OverlayError,
+    OverlayHealth, PassthroughTarget, PhysicalInputSink, Power, PowerCaps, PowerError, PromptView,
+    SessionControl, SessionId, SessionInfo, UserId, Verdict,
 };
-use crate::state::{ArmStep, Secret, SessionEvent};
+use crate::state::{ArmStep, MethodId, Secret, SessionEvent};
+
+/// What the fake saw, in order, while hardening was applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApplyEvent {
+    JournalDurable {
+        entries: Vec<JournalEntry>,
+        settings: BTreeMap<String, String>,
+    },
+    SettingApplied {
+        target: String,
+        value: String,
+    },
+}
+
+/// True only when every setting change is preceded by a durable journal record
+/// of that same target. A log that applies first returns false.
+pub fn journal_is_durable_before_apply(events: &[ApplyEvent]) -> bool {
+    let mut durable = std::collections::BTreeSet::new();
+    let mut applied = false;
+    for event in events {
+        match event {
+            ApplyEvent::JournalDurable { entries, .. } => {
+                if applied {
+                    return false;
+                }
+                for entry in entries {
+                    durable.insert(entry.target.clone());
+                }
+            }
+            ApplyEvent::SettingApplied { target, .. } => {
+                applied = true;
+                if !durable.contains(target) {
+                    return false;
+                }
+            }
+        }
+    }
+    applied
+}
 
 #[derive(Clone, Debug)]
 pub struct FakePlatform {
     settings: BTreeMap<String, String>,
     observations: Vec<ApplyObservation>,
+    apply_log: Vec<ApplyEvent>,
     fail_at: Option<ArmStep>,
     accept_next: bool,
+    confirmation: Verdict,
     revert_failed: bool,
     guard_armed: bool,
     overlay_shown: bool,
@@ -36,8 +77,10 @@ impl FakePlatform {
         Self {
             settings: BTreeMap::new(),
             observations: Vec::new(),
+            apply_log: Vec::new(),
             fail_at: None,
             accept_next: false,
+            confirmation: Verdict::Rejected,
             revert_failed: false,
             guard_armed: false,
             overlay_shown: false,
@@ -62,8 +105,25 @@ impl FakePlatform {
         self.accept_next = accept;
     }
 
+    pub fn set_confirmation(&mut self, verdict: Verdict) {
+        self.confirmation = verdict;
+    }
+
+    pub fn fail_revert(&mut self, fail: bool) {
+        self.revert_failed = fail;
+    }
+
     pub fn apply_observations(&self) -> &[ApplyObservation] {
         &self.observations
+    }
+
+    pub fn apply_events(&self) -> &[ApplyEvent] {
+        &self.apply_log
+    }
+
+    /// Records journal durability from `journal` itself, then applies settings.
+    pub fn apply_hardened(&mut self, journal: &Journal, plan: &HardeningPlan) {
+        DrivenPlatform::apply_hardened(self, journal, plan);
     }
 
     pub fn os_lock_count(&self) -> u32 {
@@ -102,6 +162,26 @@ impl DrivenPlatform for FakePlatform {
 
     fn record_os_lock(&mut self) {
         self.os_locks = self.os_locks.saturating_add(1);
+    }
+
+    fn apply_hardened(&mut self, journal: &Journal, plan: &HardeningPlan) {
+        let durable = journal.is_flushed()
+            && journal.durable_entries().len() == journal.entries().len()
+            && !journal.durable_entries().is_empty();
+        if durable {
+            self.apply_log.push(ApplyEvent::JournalDurable {
+                entries: journal.durable_entries().to_vec(),
+                settings: self.settings.clone(),
+            });
+        }
+        for change in &plan.changes {
+            self.settings
+                .insert(change.target.clone(), change.new_value.clone());
+            self.apply_log.push(ApplyEvent::SettingApplied {
+                target: change.target.clone(),
+                value: change.new_value.clone(),
+            });
+        }
     }
 
     fn take_accept(&mut self) -> bool {
@@ -234,6 +314,12 @@ impl Power for FakePlatform {
             supported: true,
             modern_standby: false,
         }
+    }
+}
+
+impl ConfirmationCheck for FakePlatform {
+    fn confirm(&mut self, _method: MethodId) -> Verdict {
+        self.confirmation
     }
 }
 
