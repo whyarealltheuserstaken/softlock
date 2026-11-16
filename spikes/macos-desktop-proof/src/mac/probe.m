@@ -49,6 +49,7 @@ typedef struct {
     int created;
     int deleted;
     int listen_saw;
+    int control_saw;
     int accessibility_trusted;
     int listen_preflight;
     int prompt;
@@ -229,11 +230,23 @@ static int post_key(CGEventSourceRef source, CGEventTapLocation location, char *
 static void activate_app(void) {
     NSApplication *app = [NSApplication sharedApplication];
     [app setActivationPolicy:NSApplicationActivationPolicyRegular];
-    if (@available(macOS 14.0, *)) {
-        [app activate];
-    } else {
-        [app activateIgnoringOtherApps:YES];
+    // [NSApp activate] on macOS 14+ does not take focus from another app.
+    NSRunningApplication *current = [NSRunningApplication currentApplication];
+    [current activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+    [app activateIgnoringOtherApps:YES];
+}
+
+static BOOL wait_until_key(ProbeWindow *window) {
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:2.0];
+    while ([until timeIntervalSinceNow] > 0) {
+        if (NSApp.isActive && window.isKeyWindow) {
+            return YES;
+        }
+        [window makeKeyAndOrderFront:nil];
+        activate_app();
+        pump(0.05);
     }
+    return NSApp.isActive && window.isKeyWindow;
 }
 
 int macos_window_open(WindowOut *out) {
@@ -269,13 +282,15 @@ int macos_window_open(WindowOut *out) {
             stage_line(out, "order-front");
             [window orderFrontRegardless];
             [window makeKeyAndOrderFront:nil];
-            pump(0.3);
+            stage_line(out, "activate");
+            BOOL became_key = wait_until_key(window);
+            stage_line(out, "activate-done");
             stage_line(out, "order-front-done");
 
             BOOL on_screen = window.isVisible && window.screen != nil;
             BOOL unoccluded = (window.occlusionState & NSWindowOcclusionStateVisible) != 0;
             out->ordered_front = (on_screen && unoccluded) ? 1 : 0;
-            out->key_window = window.isKeyWindow ? 1 : 0;
+            out->key_window = became_key ? 1 : 0;
             if (window.screen == nil) {
                 snprintf(out->error, sizeof out->error, "NSWindow screen is nil (no Aqua session)");
             } else if (out->ordered_front == 0) {
@@ -316,10 +331,16 @@ int macos_window_open(WindowOut *out) {
                         out->error[0] = 0;
                     }
                 }
-                if (g_key_received == 0 && out->error[0] == 0) {
+                out->key_window = window.isKeyWindow ? 1 : 0;
+                if (g_key_received == 0 && out->error[0] == 0 && out->key_window == 0) {
                     snprintf(out->error, sizeof out->error,
-                             "CGEventPost did not deliver keyCode %d (tried kCGSessionEventTap, "
-                             "kCGAnnotatedSessionEventTap, kCGHIDEventTap); CGPreflightPostEventAccess=%s",
+                             "CGEventPost reaches the session event stream (taps saw keyCode %d); "
+                             "the window was not key (activation did not make it key), so the app did not receive it",
+                             kProbeKey);
+                } else if (g_key_received == 0 && out->error[0] == 0) {
+                    snprintf(out->error, sizeof out->error,
+                             "the window was key and CGEventPost did not deliver keyCode %d to the local monitor; "
+                             "CGPreflightPostEventAccess=%s",
                              kProbeKey, post_preflight());
                 }
                 CFRelease(source);
@@ -364,9 +385,13 @@ static _Atomic int g_tap_fired = 0;
 
 static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *user) {
     (void)proxy;
-    (void)type;
     (void)user;
-    atomic_store(&g_tap_fired, 1);
+    if (type == kCGEventKeyDown) {
+        int64_t key = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        if (key == kProbeKey) {
+            atomic_store(&g_tap_fired, 1);
+        }
+    }
     return event;
 }
 
@@ -704,9 +729,37 @@ int macos_prove_active_tap(ActiveOut *out) {
     out->listen_preflight = -1;
     atomic_store(&g_active_deleted, 0);
     atomic_store(&g_listen_saw, 0);
-    fprintf(stderr, "stage=active-listen\n");
+    out->control_saw = 0;
+    fprintf(stderr, "stage=active-control\n");
     fflush(stderr);
     CGEventMask mask = CGEventMaskBit(kCGEventKeyDown);
+    CFMachPortRef control = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+                                             kCGEventTapOptionListenOnly, mask, active_listen_callback, NULL);
+    CFRunLoopSourceRef control_source = NULL;
+    if (control != NULL) {
+        control_source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, control, 0);
+        if (control_source != NULL) {
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), control_source, kCFRunLoopCommonModes);
+        }
+        CGEventTapEnable(control, true);
+        CGEventSourceRef control_events = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
+        if (control_events != NULL) {
+            char ignored[64];
+            post_key(control_events, kCGSessionEventTap, ignored, sizeof ignored);
+            CFRelease(control_events);
+        }
+        NSDate *control_until = [NSDate dateWithTimeIntervalSinceNow:0.6];
+        while (atomic_load(&g_listen_saw) == 0 && [control_until timeIntervalSinceNow] > 0) {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+        }
+        out->control_saw = atomic_load(&g_listen_saw) != 0 ? 1 : 0;
+    }
+    release_tap(control, control_source);
+    atomic_store(&g_listen_saw, 0);
+    fprintf(stderr, "stage=active-control-done\n");
+    fflush(stderr);
+    fprintf(stderr, "stage=active-listen\n");
+    fflush(stderr);
     CFMachPortRef listen = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
                                             kCGEventTapOptionListenOnly, mask, active_listen_callback, NULL);
     fprintf(stderr, "stage=active-default\n");

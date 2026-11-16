@@ -293,6 +293,7 @@ fn child_active(exe: &Path, output_dir: &Path) -> (TapReport, Option<String>) {
         },
         None,
         None,
+        None,
         "",
     );
     tap.error = Some(format!(

@@ -44,6 +44,7 @@ struct ActiveOut {
     created: i32,
     deleted: i32,
     listen_saw: i32,
+    control_saw: i32,
     accessibility_trusted: i32,
     listen_preflight: i32,
     prompt: i32,
@@ -141,6 +142,7 @@ pub fn prove_active_tap() -> TapReport {
             },
             None,
             None,
+            None,
             "kCGEventTapOptionDefault was not called",
         );
     }
@@ -150,6 +152,11 @@ pub fn prove_active_tap() -> TapReport {
         _ => None,
     };
     let listen_saw = match out.listen_saw {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    };
+    let control_saw = match out.control_saw {
         1 => Some(true),
         0 => Some(false),
         _ => None,
@@ -164,6 +171,7 @@ pub fn prove_active_tap() -> TapReport {
         },
         deleted,
         listen_saw,
+        control_saw,
         &text(&out.detail),
     )
 }

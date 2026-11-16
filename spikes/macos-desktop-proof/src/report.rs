@@ -34,6 +34,8 @@ pub struct TapReport {
     pub callback_fired: bool,
     pub key_deleted: Option<bool>,
     pub listen_saw: Option<bool>,
+    /// Listen-only tap saw keyCode 0 while no Default tap was installed.
+    pub control_saw: Option<bool>,
     pub tcc: String,
     pub accessibility_trusted: Option<bool>,
     pub listen_preflight: Option<bool>,
@@ -169,6 +171,7 @@ pub fn tap_from_bits(location: &str, privilege: &str, bits: TapBits) -> TapRepor
         callback_fired: bits.callback_fired,
         key_deleted: None,
         listen_saw: None,
+        control_saw: None,
         tcc,
         accessibility_trusted: bits.accessibility_trusted,
         listen_preflight: bits.listen_preflight,
@@ -181,12 +184,14 @@ pub fn active_tap(
     bits: TapBits,
     key_deleted: Option<bool>,
     listen_saw: Option<bool>,
+    control_saw: Option<bool>,
     detail: &str,
 ) -> TapReport {
     let mut tap = tap_from_bits("kCGSessionEventTap", "user", bits);
     tap.option = "default".to_string();
     tap.key_deleted = key_deleted;
     tap.listen_saw = listen_saw;
+    tap.control_saw = control_saw;
     if tap.created {
         let swallowed = key_deleted == Some(true) && listen_saw == Some(false);
         tap.callback_fired = key_deleted == Some(true);
@@ -234,6 +239,7 @@ pub fn tap_process_miss(location: &str, privilege: &str, code: i32, stderr: &str
         callback_fired: false,
         key_deleted: None,
         listen_saw: None,
+        control_saw: None,
         tcc: "null".to_string(),
         accessibility_trusted: None,
         listen_preflight: None,
@@ -254,6 +260,7 @@ pub fn tap_sudo_failed(location: &str, detail: &str) -> TapReport {
         callback_fired: false,
         key_deleted: None,
         listen_saw: None,
+        control_saw: None,
         tcc: "null".to_string(),
         accessibility_trusted: None,
         listen_preflight: None,
@@ -637,6 +644,9 @@ fn active_failure(tap: &TapReport) -> Option<String> {
     if !tap.created {
         return tap_failure(tap);
     }
+    if tap.control_saw != Some(true) {
+        return Some("listen-only control did not see keyCode 0".to_string());
+    }
     let swallowed = tap.key_deleted == Some(true) && tap.listen_saw == Some(false);
     if swallowed {
         return None;
@@ -685,12 +695,13 @@ fn active_line(report: &ProofReport) -> String {
         return "tap-active-kCGSessionEventTap-user=missing".to_string();
     };
     format!(
-        "tap-active-kCGSessionEventTap-user={} deleted={} listen-saw={} accessibility={} listen={} prompt={} error={}",
+        "tap-active-kCGSessionEventTap-user={} control={} deleted={} listen-saw={} accessibility={} listen={} prompt={} error={}",
         if tap.created {
             "created"
         } else {
             tap.tcc.as_str()
         },
+        flag(tap.control_saw),
         flag(tap.key_deleted),
         flag(tap.listen_saw),
         flag(tap.accessibility_trusted),
@@ -833,6 +844,7 @@ fn passing_fixture() -> ProofReport {
                 },
                 Some(true),
                 Some(false),
+                Some(true),
                 "",
             ),
         ],
@@ -985,6 +997,12 @@ mod tests {
         assert!(failure_reasons(&report).is_empty());
         assert!(render(&report).contains("window-error=CGEventPost"));
 
+        report.window.as_mut().expect("window").error = Some(
+            "CGEventPost reaches the session event stream (taps saw keyCode 0); the window was not key (activation did not make it key), so the app did not receive it"
+                .to_string(),
+        );
+        assert!(failure_reasons(&report).is_empty());
+
         report.window.as_mut().expect("window").error = Some("nope".to_string());
         assert!(
             failure_reasons(&report)
@@ -1041,6 +1059,24 @@ mod tests {
             );
         }
         assert!(failure_reasons(&report).is_empty());
+        report
+            .taps
+            .iter_mut()
+            .find(|tap| tap.option == "default")
+            .unwrap()
+            .control_saw = Some(false);
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("listen-only control"))
+        );
+        report
+            .taps
+            .iter_mut()
+            .find(|tap| tap.option == "default")
+            .unwrap()
+            .control_saw = Some(true);
+
         assert!(render(&report).contains("deleted=false"));
         assert!(render(&report).contains("listen-saw=true"));
 
@@ -1074,6 +1110,7 @@ mod tests {
         assert!(text.contains("nonblack=false pixels=0"));
         assert!(text.contains("marker=false pixels=0"));
         assert!(text.contains("tap-active-kCGSessionEventTap-user=created"));
+        assert!(text.contains("control=true"));
         assert!(text.contains("deleted=true"));
         assert!(text.contains("listen-saw=false"));
     }
