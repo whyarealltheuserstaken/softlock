@@ -2,7 +2,7 @@
 
 **What to build:** The permission path ticket m14's checklist will follow. No configuration profile and no MDM (decision D3, accepted by the lead). Henry resets `Accessibility` and `ListenEvent` with `tccutil` for the probe's bundle id, runs the swallowing session tap, and writes down which System Settings panes appear and which grants the tap actually needs before it can delete a physical key. An event tap that changes events usually needs only Accessibility. This spike confirms whether Input Monitoring is also needed. He rebuilds the ad-hoc binary once and records whether the grant survives. `PostEvent` is reset and recorded only if the probe prompted for it.
 
-**Blocked by:** m05, and D3. If he chooses an MDM profile instead, this ticket is rewritten before anyone files it.
+**Blocked by:** m05. D3 is accepted by the lead: MDM is out of scope, and this ticket does not wait on it.
 
 **Blocks:** m14. The lock host is not tested on his Mac until this sheet says how the grants are made.
 

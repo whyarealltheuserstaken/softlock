@@ -6,7 +6,7 @@ Capture exclusion is claimed only for the paths m04 and m06 measured as omitting
 
 If CI needs a swallow path, the test-only nonce in `kCGEventSourceUserData` is added in this ticket together with the release-binary scan, not as a follow-up. That is the rule already in SPEC.md Testing Decisions. The scan is the one m01 extended to both slices. Once PR #48 merges, that scan also names `softlock-dev-launch-marker` and `softlock_dev_launch_marker`.
 
-Lessons from PR #48, which this ticket copies: a correct PIN during backoff stays locked, the clock and the watchdog actually advance, and a panic on any thread fail-closes without leaving the tap swallowing input after the overlay is gone. Until m15, this dev launch may issue its own nonce. m15 stops that. The dev launch must not keep issuing its own nonce once m15 lands.
+Lessons from PR #48, which this ticket copies: a correct PIN during backoff stays locked, wrong PINs are counted and backed off in `FailingClosed` too, the clock and the watchdog actually advance, and a panic on any thread fail-closes without leaving the tap swallowing input after the overlay is gone. Until m15, this dev launch may issue its own nonce. m15 stops that. The dev launch must not keep issuing its own nonce once m15 lands.
 
 **Blocked by:** m01, m03, m04, m05, m06, m10, m11.
 
@@ -24,6 +24,7 @@ Lessons from PR #48, which this ticket copies: a correct PIN during backoff stay
 - [ ] Lock-to-armed time under 500 ms (CI)
 - [ ] The dev PIN unlocks. A wrong PIN does not. Typed characters do not reach the probe (CI for the posted path, his Mac for a physical key)
 - [ ] A correct PIN during backoff stays locked. The same PIN unlocks after the clock has advanced that backoff (CI). This is the lesson from PR #48
+- [ ] Wrong PINs are counted and backed off in FailingClosed too: 5 wrong, then a correct PIN during the backoff stays locked (CI)
 - [ ] The window loop advances time from the wall clock, so the backoff expires and the heartbeat watchdog runs (CI)
 - [ ] A panic on the tap thread, the overlay thread, or the liveness thread fail-closes and does not leave the tap swallowing input with no overlay (CI)
 - [ ] On his Mac, a physical key, click, and trackpad scroll do nothing except wake the PIN prompt, following the m10 grant steps (checklist)
