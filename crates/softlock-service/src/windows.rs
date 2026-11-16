@@ -625,13 +625,13 @@ fn serve_client(pipe: HANDLE, authority: &Arc<Mutex<Authority>>) {
     let (session, image) = match client_identity(pipe) {
         Ok(identity) => identity,
         Err(_) => {
-            let _ = write_response(pipe, 0, &softlock_core::ResponseKind::Unauthorized);
+            reject_client(pipe);
             return;
         }
     };
     if !admit_client(session, console_session()) {
         crate::audit("rejected", &[("reason", "session")]);
-        let _ = write_response(pipe, 0, &softlock_core::ResponseKind::Unauthorized);
+        reject_client(pipe);
         return;
     }
     let role = client_role(&image);
@@ -663,6 +663,22 @@ fn serve_client(pipe: HANDLE, authority: &Arc<Mutex<Authority>>) {
             break;
         }
     }
+}
+
+/// Read the request the client has already written, then send the refusal.
+/// Disconnecting before that read drops the reply, and the client only sees
+/// a broken pipe.
+fn reject_client(pipe: HANDLE) {
+    let mut prefix = [0u8; 4];
+    if read_exact(pipe, &mut prefix)
+        && let Ok(length) = softlock_core::checked_body_len(&prefix)
+    {
+        let mut body = vec![0u8; length];
+        let _ = read_exact(pipe, &mut body);
+    }
+    let _ = write_response(pipe, 0, &softlock_core::ResponseKind::Unauthorized);
+    let mut extra = [0u8; 1];
+    let _ = read_exact(pipe, &mut extra);
 }
 
 fn client_identity(pipe: HANDLE) -> std::io::Result<(u32, String)> {
