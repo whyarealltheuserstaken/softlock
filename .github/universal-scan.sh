@@ -25,7 +25,27 @@ both_archs() {
 require_minos() {
   bin="$1"
   echo "=== otool minos ${bin} ==="
+  universal_binary=0
+  if lipo -info "${bin}" >/dev/null 2>&1; then
+    archs="$(lipo -archs "${bin}")"
+    case "${archs}" in
+      *x86_64*)
+        case "${archs}" in
+          *arm64*) universal_binary=1 ;;
+        esac
+        ;;
+    esac
+  fi
   lines="$(otool -arch all -l "${bin}" | grep 'minos ' || true)"
+  if [ "${universal_binary}" -eq 1 ]; then
+    for arch in x86_64 arm64; do
+      arch_lines="$(otool -arch "${arch}" -l "${bin}" | grep 'minos ' || true)"
+      if [ -n "${arch_lines}" ]; then
+        lines="$(printf '%s\n%s\n' "${lines}" "${arch_lines}")"
+      fi
+    done
+    lines="$(printf '%s\n' "${lines}" | sed '/^$/d' | awk '!seen[$0]++')"
+  fi
   printf '%s\n' "${lines}"
   if [ -z "${lines}" ]; then
     echo "no minos in ${bin}"
@@ -38,17 +58,6 @@ require_minos() {
     exit 1
   fi
   minos_count="$(printf '%s\n' "${lines}" | grep -c 'minos 11.0' || true)"
-  universal_binary=0
-  if lipo -info "${bin}" >/dev/null 2>&1; then
-    archs="$(lipo -archs "${bin}")"
-    case "${archs}" in
-      *x86_64*)
-        case "${archs}" in
-          *arm64*) universal_binary=1 ;;
-        esac
-        ;;
-    esac
-  fi
   if [ "${universal_binary}" -eq 1 ] && [ "${minos_count}" -lt 2 ]; then
     echo "fat binary needs at least two minos 11.0 lines, found ${minos_count}"
     exit 1
