@@ -16,9 +16,11 @@ Install these before the reviewer asks you to run the check:
 - Rust 1.100.0 with rustup, from https://rustup.rs . After the installer finishes, open a new terminal and run `rustup toolchain install 1.100.0` and then `rustup default 1.100.0`.
 - The Visual Studio C++ Build Tools, with the "Desktop development with C++" workload. The Rust Windows build needs that linker.
 
+Estimate: the one-time installs take about an hour. Most of that is the Visual Studio C++ Build Tools download. Treat the hour as an estimate. A slow connection makes it longer.
+
 ## Get this exact copy
 
-Do not use `main`. Check out this program commit. A commit cannot contain its own id, so copy this command from the latest copy of this file:
+Do not use `main`. Copy the `git checkout` command from the latest `docs/findings/04-fail-closed/CHECKLIST.md` on the pull request branch. An older copy of this file can name a different commit. The command in that latest copy is the program to build:
 
 ```
 git clone https://github.com/whyarealltheuserstaken/softlock.git

@@ -73,6 +73,27 @@ function Assert-Restored([string]$Dir, [string]$Label) {
     Write-Output "$Label policies=original journal=absent service=gone"
 }
 
+function Assert-HandlerRestored([string]$Dir, [string]$Label) {
+    # The helper writes guard restored=false when the journal is already gone.
+    # Ctrl+Break and panic restore in-process before the process exits, so the
+    # helper must find nothing left to put back.
+    $guard = Join-Path $Dir 'guard.log'
+    $deadline = (Get-Date).AddSeconds(30)
+    $text = ''
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path $guard) {
+            $text = Get-Content -Raw $guard
+            if ($text -match 'guard restored=false') { break }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    if ($text) { Write-Output $text.TrimEnd() }
+    if ($text -notmatch 'guard restored=false') {
+        throw "$Label guard.log did not show guard restored=false"
+    }
+    Write-Output "$Label handler-restored=true helper-restored=false"
+}
+
 function Stop-Probe([int]$ProbePid) {
     if ($ProbePid -le 0) { return }
     & taskkill.exe /F /PID $ProbePid | Out-Null
@@ -104,6 +125,7 @@ if ($Mode -eq 'panic') {
         throw
     }
     Assert-Restored $out 'restore-step=panic'
+    Assert-HandlerRestored $out 'restore-step=panic'
     exit 0
 }
 
@@ -185,4 +207,5 @@ catch {
     throw
 }
 Assert-Restored $out 'restore-step=ctrl'
+Assert-HandlerRestored $out 'restore-step=ctrl'
 exit 0

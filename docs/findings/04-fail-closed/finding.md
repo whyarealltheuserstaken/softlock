@@ -29,14 +29,53 @@ This choice is what both runner images measured. Henry's laptop run is still req
 
 ## Measured timings
 
-Copied from `report.txt` in [Fail-closed proof run 43891281142](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43891281142), commit `0ab3d21b1b76b4b1c0befcd7a83a76b401ea9a72`. Both images printed `result=pass`. The session was 2 and the service session was 0. `LockWorkStation` returned success while `DisableLockWorkstation` was set (`win32=none`) and no `WTS_SESSION_LOCK` arrived (`notified=false`). After that value was cleared, `WTS_SESSION_LOCK` did arrive. The three path times below are the `elapsed-us` fields. All three are under one second, and the background heartbeat kept writing.
+Copied from `report.txt` in [Fail-closed proof run 43899750076](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43899750076), head `7da37ac8b8dc83b8153460b2d1881443e2c0c85c`. Both images printed `result=pass`. The session was 2 and the service session was 0. While `DisableLockWorkstation` was set, the report line was `lock-while-policy=blocked`, `win32=none`, `notified=false`, and `session-lock-state=unlocked`. After that value was cleared, `WTS_SESSION_LOCK` arrived. The own-session path also recorded `local-notification=WTS_CONSOLE_DISCONNECT`. The three path times below are the `elapsed-us` fields: service disconnect, own-session disconnect, then user lock. All three are under one second, and the background heartbeat kept writing.
 
-That run printed `lock-while-policy=fail`. Later reports say `blocked` for the same result, and they add `session-lock-state`.
+- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43899750076/job/133412840880)
+- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43899750076/job/133412841384)
+
+### windows-2022
+
+```
+result=pass
+runner-image=windows-2022
+session=2
+service-session=0
+policies-applied=DisableTaskMgr,DisableChangePassword,DisableLockWorkstation,NoLogoff,NoClose,HideFastUserSwitching,ConsentPromptBehaviorAdmin,ConsentPromptBehaviorUser
+lock-while-policy=blocked win32=none notified=false session-lock-state=unlocked
+path-service-disconnect=ok notification=WTS_CONSOLE_DISCONNECT elapsed-us=55376 within-1s=true api-ok=true heartbeat-gap-ms=51
+path-session-disconnect=ok notification=WTS_CONSOLE_DISCONNECT elapsed-us=61313 within-1s=true api-ok=true heartbeat-gap-ms=54 local-notification=WTS_CONSOLE_DISCONNECT
+cleared-disable-lock-workstation=true
+path-user-lock=ok notification=WTS_SESSION_LOCK elapsed-us=50768 within-1s=true api-ok=true heartbeat-gap-ms=50
+background-kept-running=true
+policies-restored=true
+```
+
+### windows-2025
+
+```
+result=pass
+runner-image=windows-2025
+session=2
+service-session=0
+policies-applied=DisableTaskMgr,DisableChangePassword,DisableLockWorkstation,NoLogoff,NoClose,HideFastUserSwitching,ConsentPromptBehaviorAdmin,ConsentPromptBehaviorUser
+lock-while-policy=blocked win32=none notified=false session-lock-state=unlocked
+path-service-disconnect=ok notification=WTS_CONSOLE_DISCONNECT elapsed-us=78854 within-1s=true api-ok=true heartbeat-gap-ms=68
+path-session-disconnect=ok notification=WTS_CONSOLE_DISCONNECT elapsed-us=46203 within-1s=true api-ok=true heartbeat-gap-ms=59 local-notification=WTS_CONSOLE_DISCONNECT
+cleared-disable-lock-workstation=true
+path-user-lock=ok notification=WTS_SESSION_LOCK elapsed-us=114536 within-1s=true api-ok=true heartbeat-gap-ms=91
+background-kept-running=true
+policies-restored=true
+```
+
+### Earlier run
+
+[Fail-closed proof run 43891281142](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43891281142), commit `0ab3d21b1b76b4b1c0befcd7a83a76b401ea9a72`, is a second data point. Both images printed `result=pass` there too. That report used `lock-while-policy=fail` and did not print `session-lock-state` or `local-notification`.
 
 - [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43891281142/job/133382829116)
 - [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43891281142/job/133382829781)
 
-### windows-2022
+### windows-2022, earlier run
 
 ```
 result=pass
@@ -53,7 +92,7 @@ background-kept-running=true
 policies-restored=true
 ```
 
-### windows-2025
+### windows-2025, earlier run
 
 ```
 result=pass
