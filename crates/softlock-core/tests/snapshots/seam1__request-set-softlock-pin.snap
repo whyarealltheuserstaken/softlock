@@ -4,7 +4,7 @@ expression: value
 ---
 {
   "id": 11,
-  "kind": "SetSoftLockPin",
+  "kind": "SetPin",
   "pin": "1234",
   "v": 1
 }

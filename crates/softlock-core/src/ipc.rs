@@ -3,14 +3,17 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::name::PRODUCT_DISPLAY_NAME;
 use crate::platform::{GuardHealth, OverlayHealth};
-use crate::state::{FailReason, LockSource, StateName};
+use crate::state::{Fallback, LockSource, StateName};
 
 pub const IPC_VERSION: u64 = 1;
 
+/// Largest accepted frame body. A longer length prefix is rejected before the
+/// body is copied or parsed. 64 KiB is enough for config documents and status.
+pub const MAX_FRAME: usize = 64 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", deny_unknown_fields)]
 pub enum RequestKind {
     Hello {
         client_version: String,
@@ -33,11 +36,11 @@ pub enum RequestKind {
     ConfirmSensitiveChange {
         token: String,
     },
-    /// Wire kind is `Set` + the product display name + `Pin`.
+    /// Canonical wire kind `SetPin`. A product rename must not change it.
     SetPin {
         pin: String,
     },
-    /// Wire kind is `Clear` + the product display name + `Pin`.
+    /// Canonical wire kind `ClearPin`. A product rename must not change it.
     ClearPin,
     Subscribe,
     CheckUpdate,
@@ -47,13 +50,7 @@ pub enum RequestKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StatusFallback {
-    pub reason: FailReason,
-    pub at_ms: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", deny_unknown_fields)]
 pub enum ResponseKind {
     Hello {
         service_version: String,
@@ -65,7 +62,7 @@ pub enum ResponseKind {
         lock_source: Option<LockSource>,
         guard: GuardHealth,
         overlay: OverlayHealth,
-        last_fallback: Option<StatusFallback>,
+        last_fallback: Option<Fallback>,
     },
     Accepted,
     AlreadyLocked,
@@ -99,8 +96,8 @@ pub enum ResponseKind {
         revision: u64,
     },
     FellBackToOsLock {
-        reason: FailReason,
-        at_ms: u64,
+        #[serde(flatten)]
+        fallback: Fallback,
     },
     UpdateAvailable {
         version: String,
@@ -119,27 +116,45 @@ pub enum IpcError {
     Malformed,
 }
 
-pub fn request_json(id: u64, kind: &RequestKind) -> String {
-    envelope(id, kind)
+pub fn message_json(id: u64, body: &impl Serialize) -> Result<String, IpcError> {
+    let value = serde_json::to_value(body).map_err(|_| IpcError::Malformed)?;
+    let Some(fields) = value.as_object() else {
+        return Err(IpcError::Malformed);
+    };
+    let mut object = Map::new();
+    object.insert("v".to_string(), Value::from(IPC_VERSION));
+    object.insert("id".to_string(), Value::from(id));
+    for (key, field) in fields {
+        object.insert(key.clone(), field.clone());
+    }
+    let json = serde_json::to_string(&Value::Object(object)).map_err(|_| IpcError::Malformed)?;
+    if json.len() > MAX_FRAME {
+        return Err(IpcError::Malformed);
+    }
+    Ok(json)
 }
 
-pub fn response_json(id: u64, kind: &ResponseKind) -> String {
-    envelope(id, kind)
-}
-
-pub fn encode_frame(json: &str) -> Vec<u8> {
+pub fn encode_frame(json: &str) -> Result<Vec<u8>, IpcError> {
+    if json.len() > MAX_FRAME {
+        return Err(IpcError::Malformed);
+    }
+    let length = u32::try_from(json.len()).map_err(|_| IpcError::Malformed)?;
     let mut frame = Vec::with_capacity(4 + json.len());
-    let length = u32::try_from(json.len()).expect("ipc message fits in a u32");
     frame.extend_from_slice(&length.to_le_bytes());
     frame.extend_from_slice(json.as_bytes());
-    frame
+    Ok(frame)
 }
 
 pub fn decode_request_frame(bytes: &[u8]) -> Result<DecodedRequest, IpcError> {
     if bytes.len() < 4 {
         return Err(IpcError::Malformed);
     }
-    let length = u32::from_le_bytes(bytes[..4].try_into().expect("four bytes")) as usize;
+    let mut prefix = [0u8; 4];
+    prefix.copy_from_slice(&bytes[..4]);
+    let length = u32::from_le_bytes(prefix) as usize;
+    if length > MAX_FRAME {
+        return Err(IpcError::Malformed);
+    }
     if bytes.len() != 4 + length {
         return Err(IpcError::Malformed);
     }
@@ -148,63 +163,38 @@ pub fn decode_request_frame(bytes: &[u8]) -> Result<DecodedRequest, IpcError> {
 }
 
 fn decode_request_json(json: &str) -> Result<DecodedRequest, IpcError> {
-    let mut value: Value = serde_json::from_str(json).map_err(|_| IpcError::Malformed)?;
-    let id = value
+    let value: Value = serde_json::from_str(json).map_err(|_| IpcError::Malformed)?;
+    let Some(object) = value.as_object() else {
+        return Err(IpcError::Malformed);
+    };
+    let id = object
         .get("id")
         .and_then(Value::as_u64)
         .ok_or(IpcError::Malformed)?;
-    let version = value
+    let version = object
         .get("v")
         .and_then(Value::as_u64)
         .ok_or(IpcError::Malformed)?;
     if version != IPC_VERSION {
         return Err(IpcError::Unsupported { id });
     }
-    rewrite_pin_kind(&mut value, false);
-    let kind = serde_json::from_value(value).map_err(|_| IpcError::Malformed)?;
+    let mut body = object.clone();
+    body.remove("v");
+    body.remove("id");
+    let kind: RequestKind =
+        serde_json::from_value(Value::Object(body.clone())).map_err(|_| IpcError::Malformed)?;
+    if !same_fields(&body, &kind)? {
+        return Err(IpcError::Malformed);
+    }
     Ok(DecodedRequest { id, kind })
 }
 
-fn envelope<T: Serialize>(id: u64, body: &T) -> String {
-    let mut value = serde_json::to_value(body).expect("message serializes");
-    rewrite_pin_kind(&mut value, true);
-    let mut object = Map::new();
-    object.insert("v".to_string(), Value::from(IPC_VERSION));
-    object.insert("id".to_string(), Value::from(id));
-    if let Some(fields) = value.as_object() {
-        for (key, field) in fields {
-            object.insert(key.clone(), field.clone());
-        }
-    }
-    serde_json::to_string(&Value::Object(object)).expect("message is json")
-}
-
-/// The spec's pin requests spell the product name. The source keeps that
-/// spelling in the name constant and rewrites it onto the wire.
-fn rewrite_pin_kind(value: &mut Value, to_wire: bool) {
-    let Some(kind) = value
-        .get("kind")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        return;
+/// Unit variants ignore unknown fields even with `deny_unknown_fields`.
+/// Compare the decoded message with the fields it actually owns.
+fn same_fields(body: &Map<String, Value>, kind: &RequestKind) -> Result<bool, IpcError> {
+    let canonical = serde_json::to_value(kind).map_err(|_| IpcError::Malformed)?;
+    let Some(canonical) = canonical.as_object() else {
+        return Err(IpcError::Malformed);
     };
-    let set_wire = format!("Set{PRODUCT_DISPLAY_NAME}Pin");
-    let clear_wire = format!("Clear{PRODUCT_DISPLAY_NAME}Pin");
-    let mapped = if to_wire {
-        match kind.as_str() {
-            "SetPin" => set_wire,
-            "ClearPin" => clear_wire,
-            _ => return,
-        }
-    } else if kind == set_wire {
-        "SetPin".to_string()
-    } else if kind == clear_wire {
-        "ClearPin".to_string()
-    } else {
-        return;
-    };
-    if let Some(object) = value.as_object_mut() {
-        object.insert("kind".to_string(), Value::String(mapped));
-    }
+    Ok(body.len() == canonical.len() && body.keys().all(|key| canonical.contains_key(key)))
 }

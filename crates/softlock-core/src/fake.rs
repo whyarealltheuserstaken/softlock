@@ -1,13 +1,16 @@
 //! In-memory platform. It records what the controller asked for and never locks a machine.
+//!
+//! Fault injection (`fail_step`, `fail_revert`, `accept_secrets`, manual verdicts)
+//! lives here. Those knobs are not part of the platform traits.
 
 use std::collections::BTreeMap;
 
 use crate::journal::{Journal, JournalEntry};
 use crate::platform::{
-    ApplyObservation, AwakeGuard, AwakeRequest, ConfirmationCheck, Credentials, DiskEncryption,
-    DrivenPlatform, EncryptionStatus, GuardError, GuardHealth, HardenError, Hardening,
-    HardeningConfig, HardeningPlan, InputGuard, LockScreenLook, OsLockError, Overlay, OverlayError,
-    OverlayHealth, PassthroughTarget, PhysicalInputSink, Power, PowerCaps, PowerError, PromptView,
+    AwakeGuard, AwakeRequest, ConfirmationCheck, Credentials, DiskEncryption, EncryptionStatus,
+    GuardError, GuardHealth, HardenError, Hardening, HardeningConfig, HardeningPlan, InputGuard,
+    LockScreenLook, OsLockError, Overlay, OverlayError, OverlayHealth, PassthroughTarget,
+    PhysicalInputSink, PolicySetting, PolicySettings, Power, PowerCaps, PowerError, PromptView,
     SessionControl, SessionId, SessionInfo, UserId, Verdict,
 };
 use crate::state::{ArmStep, MethodId, Secret, SessionEvent};
@@ -17,10 +20,10 @@ use crate::state::{ArmStep, MethodId, Secret, SessionEvent};
 pub enum ApplyEvent {
     JournalDurable {
         entries: Vec<JournalEntry>,
-        settings: BTreeMap<String, String>,
+        settings: Vec<(PolicySetting, Option<String>)>,
     },
     SettingApplied {
-        target: String,
+        target: PolicySetting,
         value: String,
     },
 }
@@ -42,7 +45,7 @@ pub fn journal_is_durable_before_apply(events: &[ApplyEvent]) -> bool {
             }
             ApplyEvent::SettingApplied { target, .. } => {
                 applied = true;
-                if !durable.contains(target) {
+                if !durable.contains(target.id()) {
                     return false;
                 }
             }
@@ -53,11 +56,12 @@ pub fn journal_is_durable_before_apply(events: &[ApplyEvent]) -> bool {
 
 #[derive(Clone, Debug)]
 pub struct FakePlatform {
-    settings: BTreeMap<String, String>,
-    observations: Vec<ApplyObservation>,
+    settings: BTreeMap<PolicySetting, String>,
     apply_log: Vec<ApplyEvent>,
     fail_at: Option<ArmStep>,
+    /// A platform flag. It must not change the credential verdict.
     accept_next: bool,
+    secret_verdict: Verdict,
     confirmation: Verdict,
     revert_failed: bool,
     guard_armed: bool,
@@ -76,10 +80,10 @@ impl FakePlatform {
     pub fn new() -> Self {
         Self {
             settings: BTreeMap::new(),
-            observations: Vec::new(),
             apply_log: Vec::new(),
             fail_at: None,
             accept_next: false,
+            secret_verdict: Verdict::Rejected,
             confirmation: Verdict::Rejected,
             revert_failed: false,
             guard_armed: false,
@@ -89,20 +93,25 @@ impl FakePlatform {
         }
     }
 
-    pub fn set_setting(&mut self, key: &str, value: &str) {
-        self.settings.insert(key.to_string(), value.to_string());
+    pub fn set_setting(&mut self, setting: PolicySetting, value: &str) {
+        self.write_policy(setting, value);
     }
 
-    pub fn settings(&self) -> &BTreeMap<String, String> {
-        &self.settings
+    pub fn setting(&self, setting: PolicySetting) -> Option<&str> {
+        self.settings.get(&setting).map(String::as_str)
     }
 
     pub fn fail_step(&mut self, step: ArmStep) {
         self.fail_at = Some(step);
     }
 
+    /// Arms a flag that used to unlock on its own. The verifier ignores it.
     pub fn accept_secrets(&mut self, accept: bool) {
         self.accept_next = accept;
+    }
+
+    pub fn set_secret_verdict(&mut self, verdict: Verdict) {
+        self.secret_verdict = verdict;
     }
 
     pub fn set_confirmation(&mut self, verdict: Verdict) {
@@ -113,100 +122,63 @@ impl FakePlatform {
         self.revert_failed = fail;
     }
 
-    pub fn apply_observations(&self) -> &[ApplyObservation] {
-        &self.observations
-    }
-
     pub fn apply_events(&self) -> &[ApplyEvent] {
         &self.apply_log
-    }
-
-    /// Records journal durability from `journal` itself, then applies settings.
-    pub fn apply_hardened(&mut self, journal: &Journal, plan: &HardeningPlan) {
-        DrivenPlatform::apply_hardened(self, journal, plan);
     }
 
     pub fn os_lock_count(&self) -> u32 {
         self.os_locks
     }
-}
 
-impl DrivenPlatform for FakePlatform {
-    fn fail_at(&self) -> Option<ArmStep> {
-        self.fail_at
+    pub fn power_is_held(&self) -> bool {
+        self.power_held
     }
 
-    fn settings(&self) -> &BTreeMap<String, String> {
-        &self.settings
+    fn write_policy(&mut self, setting: PolicySetting, value: &str) {
+        self.settings.insert(setting, value.to_string());
     }
 
-    fn settings_mut(&mut self) -> &mut BTreeMap<String, String> {
-        &mut self.settings
+    fn snapshot(&self) -> Vec<(PolicySetting, Option<String>)> {
+        PolicySetting::ALL
+            .into_iter()
+            .map(|setting| (setting, self.settings.get(&setting).cloned()))
+            .collect()
     }
 
-    fn note_apply(&mut self, observation: ApplyObservation) {
-        self.observations.push(observation);
-    }
-
-    fn set_guard_armed(&mut self, armed: bool) {
-        self.guard_armed = armed;
-    }
-
-    fn set_overlay_shown(&mut self, shown: bool) {
-        self.overlay_shown = shown;
-    }
-
-    fn set_power_held(&mut self, held: bool) {
-        self.power_held = held;
-    }
-
-    fn record_os_lock(&mut self) {
-        self.os_locks = self.os_locks.saturating_add(1);
-    }
-
-    fn apply_hardened(&mut self, journal: &Journal, plan: &HardeningPlan) {
+    fn record_apply(&mut self, journal: &Journal, plan: &HardeningPlan) {
         let durable = journal.is_flushed()
             && journal.durable_entries().len() == journal.entries().len()
             && !journal.durable_entries().is_empty();
         if durable {
             self.apply_log.push(ApplyEvent::JournalDurable {
                 entries: journal.durable_entries().to_vec(),
-                settings: self.settings.clone(),
+                settings: self.snapshot(),
             });
         }
         for change in &plan.changes {
-            self.settings
-                .insert(change.target.clone(), change.new_value.clone());
+            let Some(setting) = PolicySetting::from_id(&change.target) else {
+                continue;
+            };
+            self.write_policy(setting, &change.new_value);
             self.apply_log.push(ApplyEvent::SettingApplied {
-                target: change.target.clone(),
+                target: setting,
                 value: change.new_value.clone(),
             });
         }
     }
+}
 
-    fn take_accept(&mut self) -> bool {
-        let accept = self.accept_next;
-        self.accept_next = false;
-        accept
+impl PolicySettings for FakePlatform {
+    fn policy(&self, setting: PolicySetting) -> Option<String> {
+        self.settings.get(&setting).cloned()
     }
 
-    fn revert_failed(&self) -> bool {
-        self.revert_failed
+    fn set_policy(&mut self, setting: PolicySetting, value: &str) {
+        self.write_policy(setting, value);
     }
 
-    fn guard_health(&self) -> GuardHealth {
-        GuardHealth {
-            hook_alive: self.guard_armed,
-            last_physical_input_ms: None,
-        }
-    }
-
-    fn overlay_health(&self) -> OverlayHealth {
-        OverlayHealth {
-            covered_monitors: u32::from(self.overlay_shown),
-            capture_excluded: self.overlay_shown,
-            topmost: self.overlay_shown,
-        }
+    fn clear_policy(&mut self, setting: PolicySetting) {
+        self.settings.remove(&setting);
     }
 }
 
@@ -226,7 +198,10 @@ impl InputGuard for FakePlatform {
     fn set_passthrough(&mut self, _target: Option<PassthroughTarget>) {}
 
     fn health(&self) -> GuardHealth {
-        DrivenPlatform::guard_health(self)
+        GuardHealth {
+            hook_alive: self.guard_armed,
+            last_physical_input_ms: None,
+        }
     }
 }
 
@@ -246,7 +221,11 @@ impl Overlay for FakePlatform {
     }
 
     fn health(&self) -> OverlayHealth {
-        DrivenPlatform::overlay_health(self)
+        OverlayHealth {
+            covered_monitors: u32::from(self.overlay_shown),
+            capture_excluded: self.overlay_shown,
+            topmost: self.overlay_shown,
+        }
     }
 }
 
@@ -271,14 +250,7 @@ impl Hardening for FakePlatform {
         if self.fail_at == Some(ArmStep::Hardening) {
             return Err(HardenError::Failed);
         }
-        self.observations.push(ApplyObservation {
-            durable_entries: journal.durable_entries().to_vec(),
-            settings_before: self.settings.clone(),
-        });
-        for change in &plan.changes {
-            self.settings
-                .insert(change.target.clone(), change.new_value.clone());
-        }
+        self.record_apply(journal, plan);
         Ok(())
     }
 
@@ -287,12 +259,13 @@ impl Hardening for FakePlatform {
             return Err(HardenError::Failed);
         }
         for entry in journal.entries() {
+            let Some(setting) = PolicySetting::from_id(&entry.target) else {
+                continue;
+            };
             match &entry.previous {
-                Some(value) => {
-                    self.settings.insert(entry.target.clone(), value.clone());
-                }
+                Some(value) => self.write_policy(setting, value),
                 None => {
-                    self.settings.remove(&entry.target);
+                    self.settings.remove(&setting);
                 }
             }
         }
@@ -325,11 +298,12 @@ impl ConfirmationCheck for FakePlatform {
 
 impl Credentials for FakePlatform {
     fn verify_password(&self, _user: &UserId, _password: &Secret) -> Verdict {
-        if self.accept_next {
-            Verdict::Verified
-        } else {
-            Verdict::Rejected
-        }
+        self.secret_verdict
+    }
+
+    fn verify_secret(&self, _method: &MethodId, _secret: &Secret) -> Verdict {
+        let _platform_flag = self.accept_next;
+        self.secret_verdict
     }
 }
 

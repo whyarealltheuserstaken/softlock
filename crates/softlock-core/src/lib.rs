@@ -5,7 +5,10 @@
 //! a machine.
 
 mod backoff;
+mod config;
 mod controller;
+mod dispatch;
+#[cfg(feature = "test-support")]
 mod fake;
 mod heartbeat;
 mod ipc;
@@ -15,16 +18,18 @@ mod platform;
 mod state;
 
 pub use backoff::delay_after_failure;
+pub use config::Config;
 pub use controller::Event;
-pub use controller::{FallbackNotice, LockController, Rejection};
+pub use controller::{LockController, Rejection};
+#[cfg(feature = "test-support")]
 pub use fake::{ApplyEvent, FakePlatform, journal_is_durable_before_apply};
 pub use heartbeat::{
     ARM_STEP_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BEFORE_FAILURE, SERVICE_SILENCE_LIMIT,
     lock_host_fails_closed_when_service_is_silent,
 };
 pub use ipc::{
-    DecodedRequest, IPC_VERSION, IpcError, RequestKind, ResponseKind, decode_request_frame,
-    encode_frame, request_json, response_json,
+    DecodedRequest, IPC_VERSION, IpcError, MAX_FRAME, RequestKind, ResponseKind,
+    decode_request_frame, encode_frame, message_json,
 };
 pub use journal::{Journal, JournalEntry};
 pub use name::{
@@ -32,14 +37,14 @@ pub use name::{
     SERVICE_NAME, pipe_name, registry_key,
 };
 pub use platform::{
-    ApplyObservation, AwakeGuard, AwakeRequest, CapabilityReport, ConfirmationCheck, Credentials,
-    DiskEncryption, EncryptionStatus, GuardError, GuardHealth, HardenError, Hardening,
-    HardeningConfig, HardeningPlan, InputGuard, LockScreenLook, OsLockError, Overlay, OverlayError,
-    OverlayHealth, PassthroughTarget, PhysicalInputSink, PlannedChange, Power, PowerCaps,
-    PowerError, PromptView, SessionControl, SessionId, SessionInfo, Support,
+    AwakeGuard, AwakeRequest, CapabilityReport, ConfirmationCheck, Credentials, DiskEncryption,
+    EncryptionStatus, GuardError, GuardHealth, HardenError, Hardening, HardeningConfig,
+    HardeningPlan, InputGuard, LockScreenLook, OsLockError, Overlay, OverlayError, OverlayHealth,
+    PassthroughTarget, PhysicalInputSink, PlannedChange, Platform, PolicySetting, PolicySettings,
+    Power, PowerCaps, PowerError, PromptView, SessionControl, SessionId, SessionInfo, Support,
     UNSUPPORTED_PLATFORM_MESSAGE, UnsupportedPlatform, UserId, Verdict,
 };
 pub use state::{
-    ArmStep, DisarmStep, FailReason, FailureEvent, HeartbeatReport, LockSource, LockState,
-    MethodId, PromptState, Role, Secret, SessionEvent, StateName, VerdictChannel,
+    ArmStep, DisarmStep, FailReason, Fallback, HeartbeatReport, LockSource, LockState, MethodId,
+    PromptState, Role, Secret, SessionEvent, StateName, VerdictChannel,
 };

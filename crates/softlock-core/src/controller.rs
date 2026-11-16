@@ -2,25 +2,30 @@
 
 use std::time::Duration;
 
+use crate::config::{ConfigError, ConfigStore};
 use crate::heartbeat::{ARM_STEP_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BEFORE_FAILURE};
-use crate::ipc::{RequestKind, ResponseKind, StatusFallback};
+use crate::ipc::{RequestKind, ResponseKind};
 use crate::journal::{Journal, JournalEntry};
-use crate::platform::{ConfirmationCheck, DrivenPlatform, standard_hardening_plan};
+use crate::platform::{
+    AwakeGuard, AwakeRequest, ConfirmationCheck, Credentials, Hardening, InputGuard,
+    LockScreenLook, Overlay, PhysicalInputSink, Platform, PolicySetting, PolicySettings, Power,
+    SessionControl, SessionId, Verdict, standard_hardening_plan,
+};
 use crate::state::{
-    ArmStep, DisarmStep, FailReason, HeartbeatReport, LockSource, LockState, MethodId,
+    ArmStep, DisarmStep, FailReason, Fallback, HeartbeatReport, LockSource, LockState, MethodId,
     MonotonicInstant, PromptState, Role, Secret, SessionEvent, VerdictChannel,
 };
+
+/// One pump iteration per arming step: journal, guard, overlay, hardening, power.
+const ARM_STEP_LIMIT: usize = 5;
+
+/// Trace and rejection logs keep the newest entries only.
+const HISTORY_LIMIT: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rejection {
     pub state: crate::state::StateName,
     pub event: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FallbackNotice {
-    pub reason: FailReason,
-    pub at_ms: u64,
 }
 
 #[derive(Debug)]
@@ -68,6 +73,7 @@ pub struct LockController<P> {
     platform: P,
     state: LockState,
     trace: Vec<LockState>,
+    #[cfg(feature = "test-support")]
     manual: bool,
     journal: Journal,
     rejections: Vec<Rejection>,
@@ -82,18 +88,19 @@ pub struct LockController<P> {
     next_nonce: u64,
     host_nonce: u64,
     broker_nonce: Option<u64>,
-    config_toml: String,
-    config_revision: u64,
+    config: ConfigStore,
+    awake: Option<AwakeGuard>,
     last_response: Option<ResponseKind>,
-    notifications: Vec<FallbackNotice>,
+    notifications: Vec<Fallback>,
 }
 
-impl<P: DrivenPlatform> LockController<P> {
+impl<P: Platform> LockController<P> {
     pub fn new(platform: P) -> Self {
         Self {
             platform,
             state: LockState::Unlocked,
             trace: vec![LockState::Unlocked],
+            #[cfg(feature = "test-support")]
             manual: false,
             journal: Journal::empty(),
             rejections: Vec::new(),
@@ -108,8 +115,8 @@ impl<P: DrivenPlatform> LockController<P> {
             next_nonce: 1,
             host_nonce: 0,
             broker_nonce: None,
-            config_toml: "schema_version = 1\n".to_string(),
-            config_revision: 1,
+            config: ConfigStore::new(),
+            awake: None,
             last_response: None,
             notifications: Vec::new(),
         }
@@ -132,7 +139,7 @@ impl<P: DrivenPlatform> LockController<P> {
             Event::RequestHello => self.on_request_hello(),
             Event::Session(notification) => self.on_session(notification),
             Event::OsLockConfirmed => self.on_os_lock_confirmed(),
-            Event::SubmitSecret { secret, .. } => self.on_submit_secret(secret),
+            Event::SubmitSecret { method, secret } => self.on_submit_secret(method, secret),
             Event::AdvanceTime(by) => self.advance(by),
             Event::HostExited => self.on_host_exited(),
             Event::Heartbeat(report) => self.on_heartbeat(report),
@@ -146,6 +153,7 @@ impl<P: DrivenPlatform> LockController<P> {
         }
     }
 
+    #[cfg(feature = "test-support")]
     pub fn drive_manually(&mut self) {
         self.manual = true;
     }
@@ -229,36 +237,52 @@ impl<P: DrivenPlatform> LockController<P> {
 
     /// Completes the current arming step. Tests use this to show the timeout
     /// belongs to each step.
+    #[cfg(feature = "test-support")]
     pub fn finish_arm_step(&mut self) {
         self.one_arm_step();
     }
 
     pub fn config_revision(&self) -> u64 {
-        self.config_revision
+        self.config.revision()
     }
 
     pub fn config_toml(&self) -> &str {
-        &self.config_toml
+        self.config.document()
     }
 
     pub fn last_response(&self) -> Option<&ResponseKind> {
         self.last_response.as_ref()
     }
 
-    pub fn notifications(&self) -> &[FallbackNotice] {
+    pub fn notifications(&self) -> &[Fallback] {
         &self.notifications
+    }
+
+    fn automatic(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        {
+            !self.manual
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            let _ = self;
+            true
+        }
     }
 
     fn enter(&mut self, state: LockState) {
         self.state = state.clone();
-        self.trace.push(state);
+        push_bounded(&mut self.trace, state);
     }
 
     fn reject(&mut self, event: &'static str) {
-        self.rejections.push(Rejection {
-            state: self.state.name(),
-            event,
-        });
+        push_bounded(
+            &mut self.rejections,
+            Rejection {
+                state: self.state.name(),
+                event,
+            },
+        );
     }
 
     fn on_lock_requested(&mut self, source: LockSource) {
@@ -273,7 +297,7 @@ impl<P: DrivenPlatform> LockController<P> {
         self.failure_count = 0;
         self.last_heartbeat_seq = None;
         self.enter_arm(source, ArmStep::Journal);
-        if !self.manual {
+        if self.automatic() {
             self.pump_arm();
         }
     }
@@ -290,7 +314,7 @@ impl<P: DrivenPlatform> LockController<P> {
     }
 
     fn pump_arm(&mut self) {
-        for _ in 0..8 {
+        for _ in 0..ARM_STEP_LIMIT {
             if !matches!(self.state, LockState::Arming { .. }) {
                 return;
             }
@@ -302,10 +326,6 @@ impl<P: DrivenPlatform> LockController<P> {
         let LockState::Arming { source, step } = self.state.clone() else {
             return;
         };
-        if self.platform.fail_at() == Some(step) {
-            self.fail_closed(FailReason::ArmStep { step });
-            return;
-        }
         match step {
             ArmStep::Journal => {
                 self.journal.mark_locked();
@@ -313,47 +333,54 @@ impl<P: DrivenPlatform> LockController<P> {
                 self.enter_arm(source, ArmStep::Guard);
             }
             ArmStep::Guard => {
-                self.platform.set_guard_armed(true);
-                self.enter_arm(source, ArmStep::Overlay);
+                match InputGuard::arm(&mut self.platform, PhysicalInputSink::noop()) {
+                    Ok(()) => self.enter_arm(source, ArmStep::Overlay),
+                    Err(_) => self.fail_closed(FailReason::ArmStep { step }),
+                }
             }
-            ArmStep::Overlay => {
-                self.platform.set_overlay_shown(true);
-                self.enter_arm(source, ArmStep::Hardening);
-            }
-            ArmStep::Hardening => {
-                self.journal_and_apply();
-                self.enter_arm(source, ArmStep::Power);
-            }
-            ArmStep::Power => {
-                self.platform.set_power_held(true);
-                self.journal.set_failures(0);
-                self.journal.flush();
-                self.last_heartbeat = Some(self.now);
-                self.last_heartbeat_seq = None;
-                self.host_nonce = self.issue_nonce();
-                self.broker_nonce = None;
-                self.broker_launched = false;
-                self.enter(LockState::Locked {
-                    source,
-                    prompt: PromptState::Idle,
-                });
-            }
+            ArmStep::Overlay => match Overlay::show(&mut self.platform, &LockScreenLook::default())
+            {
+                Ok(()) => self.enter_arm(source, ArmStep::Hardening),
+                Err(_) => self.fail_closed(FailReason::ArmStep { step }),
+            },
+            ArmStep::Hardening => match self.journal_and_apply() {
+                Ok(()) => self.enter_arm(source, ArmStep::Power),
+                Err(_) => self.fail_closed(FailReason::ArmStep { step }),
+            },
+            ArmStep::Power => match Power::hold(&mut self.platform, AwakeRequest::system()) {
+                Ok(guard) => {
+                    self.awake = Some(guard);
+                    self.journal.set_failures(0);
+                    self.journal.flush();
+                    self.last_heartbeat = Some(self.now);
+                    self.last_heartbeat_seq = None;
+                    self.host_nonce = self.issue_nonce();
+                    self.broker_nonce = None;
+                    self.broker_launched = false;
+                    self.enter(LockState::Locked {
+                        source,
+                        prompt: PromptState::Idle,
+                    });
+                }
+                Err(_) => self.fail_closed(FailReason::ArmStep { step }),
+            },
         }
     }
 
-    fn journal_and_apply(&mut self) {
+    fn journal_and_apply(&mut self) -> Result<(), crate::platform::HardenError> {
         let plan = standard_hardening_plan();
-        let current = self.platform.settings().clone();
         for change in &plan.changes {
+            let previous = PolicySetting::from_id(&change.target)
+                .and_then(|setting| PolicySettings::policy(&self.platform, setting));
             self.journal.record(JournalEntry {
                 target: change.target.clone(),
-                previous: current.get(&change.target).cloned(),
+                previous,
                 new_value: change.new_value.clone(),
             });
         }
         self.journal.flush();
-        let journal = self.journal.clone();
-        self.platform.apply_hardened(&journal, &plan);
+        let mut journal = self.journal.clone();
+        Hardening::apply(&mut self.platform, &plan, &mut journal)
     }
 
     fn on_verified(&mut self, channel: VerdictChannel, nonce: u64) {
@@ -384,7 +411,7 @@ impl<P: DrivenPlatform> LockController<P> {
         self.enter(LockState::Unlocking {
             step: DisarmStep::RevertHardening,
         });
-        if self.manual {
+        if !self.automatic() {
             return;
         }
         if self.teardown() {
@@ -396,23 +423,12 @@ impl<P: DrivenPlatform> LockController<P> {
     }
 
     fn teardown(&mut self) -> bool {
-        if self.platform.revert_failed() {
+        if Hardening::revert(&mut self.platform, &self.journal).is_err() {
             return false;
         }
-        let entries = self.journal.entries().to_vec();
-        for entry in entries {
-            match entry.previous {
-                Some(value) => {
-                    self.platform.settings_mut().insert(entry.target, value);
-                }
-                None => {
-                    self.platform.settings_mut().remove(&entry.target);
-                }
-            }
-        }
-        self.platform.set_power_held(false);
-        self.platform.set_overlay_shown(false);
-        self.platform.set_guard_armed(false);
+        self.awake = None;
+        Overlay::hide(&mut self.platform);
+        InputGuard::disarm(&mut self.platform);
         self.journal.clear();
         self.failure_count = 0;
         true
@@ -420,7 +436,7 @@ impl<P: DrivenPlatform> LockController<P> {
 
     fn fail_closed(&mut self, reason: FailReason) {
         self.failure_events.push(reason);
-        self.platform.record_os_lock();
+        let _ = SessionControl::os_lock(&mut self.platform, SessionId(0));
         self.enter(LockState::FailingClosed { reason });
     }
 
@@ -460,12 +476,15 @@ impl<P: DrivenPlatform> LockController<P> {
     }
 
     fn on_stop(&mut self) {
-        if matches!(self.state, LockState::Locked { .. }) {
+        if matches!(
+            self.state,
+            LockState::Locked { .. } | LockState::Arming { .. }
+        ) {
             self.fail_closed(FailReason::ServiceStop);
         }
     }
 
-    fn on_submit_secret(&mut self, secret: Secret) {
+    fn on_submit_secret(&mut self, method: MethodId, secret: Secret) {
         if !matches!(self.state, LockState::Locked { .. }) {
             self.reject("SubmitSecret");
             drop(secret);
@@ -475,8 +494,13 @@ impl<P: DrivenPlatform> LockController<P> {
             drop(secret);
             return;
         }
+        let verdict = Credentials::verify_secret(&self.platform, &method, &secret);
         drop(secret);
-        self.note_failure();
+        if verdict == Verdict::Verified {
+            self.begin_unlock();
+        } else {
+            self.note_failure();
+        }
     }
 
     fn note_failure(&mut self) {
@@ -528,7 +552,7 @@ impl<P: DrivenPlatform> LockController<P> {
             return;
         }
         let fresh = match self.last_heartbeat_seq {
-            Some(previous) => report.seq == previous.saturating_add(1),
+            Some(previous) => report.seq > previous,
             None => true,
         };
         if !report.guard.hook_alive {
@@ -568,7 +592,7 @@ impl<P: DrivenPlatform> LockController<P> {
                             return;
                         }
                         if let Some(reason) = after_fail {
-                            self.notifications.push(FallbackNotice {
+                            self.notifications.push(Fallback {
                                 reason,
                                 at_ms: self.now.as_millis(),
                             });
@@ -601,11 +625,11 @@ impl<P: DrivenPlatform> LockController<P> {
         self.failure_count = journal.failures();
         self.journal = journal;
         self.enter(LockState::Recovering);
-        if self.manual {
+        if !self.automatic() {
             return;
         }
         if session_active && says_locked {
-            self.fail_closed(FailReason::ServiceStop);
+            self.fail_closed(FailReason::SessionActive);
         } else if self.teardown() {
             self.enter(LockState::Unlocked);
         } else {
@@ -614,6 +638,11 @@ impl<P: DrivenPlatform> LockController<P> {
     }
 
     fn dispatch(&mut self, role: Role, kind: RequestKind) -> ResponseKind {
+        if let Some(denied) =
+            crate::dispatch::denied(role, &kind, &self.state, self.session_os_locked)
+        {
+            return denied;
+        }
         match kind {
             RequestKind::Hello { .. } => ResponseKind::Hello {
                 service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -623,143 +652,67 @@ impl<P: DrivenPlatform> LockController<P> {
             RequestKind::GetStatus => ResponseKind::Status {
                 state: self.state.name(),
                 lock_source: self.state.source(),
-                guard: self.platform.guard_health(),
-                overlay: self.platform.overlay_health(),
-                last_fallback: self.notifications.last().map(|notice| StatusFallback {
-                    reason: notice.reason,
-                    at_ms: notice.at_ms,
-                }),
+                guard: InputGuard::health(&self.platform),
+                overlay: Overlay::health(&self.platform),
+                last_fallback: self.notifications.last().copied(),
             },
-            RequestKind::Lock { source, .. } => self.dispatch_lock(role, source),
-            RequestKind::HardLock => self.dispatch_hard_lock(role),
-            RequestKind::GetConfig => {
-                if self.public_reader(role) {
-                    ResponseKind::Config {
-                        toml: self.config_toml.clone(),
-                        revision: self.config_revision,
-                    }
-                } else {
-                    ResponseKind::Unauthorized
-                }
+            RequestKind::Lock { source, .. } => {
+                self.start_lock(source);
+                ResponseKind::Accepted
             }
-            RequestKind::ValidateConfig { toml } => {
-                if !self.public_reader(role) {
-                    ResponseKind::Unauthorized
-                } else if toml.trim().is_empty() {
-                    invalid_config()
+            RequestKind::HardLock => {
+                if role == Role::LockHost {
+                    self.fail_closed(FailReason::HardLock);
                 } else {
-                    ResponseKind::Valid
+                    let _ = SessionControl::os_lock(&mut self.platform, SessionId(0));
                 }
+                ResponseKind::Accepted
             }
+            RequestKind::GetConfig => ResponseKind::Config {
+                toml: self.config.document().to_string(),
+                revision: self.config.revision(),
+            },
+            RequestKind::ValidateConfig { toml } => match crate::config::Config::parse(&toml) {
+                Ok(_) => ResponseKind::Valid,
+                Err(errors) => ResponseKind::Invalid { errors },
+            },
             RequestKind::PutConfig {
                 toml,
                 base_revision,
-            } => self.dispatch_put(role, toml, base_revision),
+            } => match self.config.apply(toml, base_revision) {
+                Ok(()) => ResponseKind::Applied,
+                Err(ConfigError::Invalid(errors)) => ResponseKind::Invalid { errors },
+                Err(ConfigError::Conflict) => ResponseKind::Conflict,
+            },
             RequestKind::ConfirmSensitiveChange { .. }
             | RequestKind::SetPin { .. }
-            | RequestKind::ClearPin => self.dispatch_sensitive(role),
-            RequestKind::Subscribe => {
-                if role == Role::App {
-                    ResponseKind::Accepted
-                } else {
-                    ResponseKind::Unauthorized
-                }
-            }
-            RequestKind::CheckUpdate => {
-                if role != Role::App {
-                    ResponseKind::Unauthorized
-                } else if self.config_writable() {
-                    ResponseKind::UpToDate
-                } else {
-                    ResponseKind::Locked
-                }
-            }
-            RequestKind::InstallUpdate { .. } => {
-                if role != Role::App {
-                    ResponseKind::Unauthorized
-                } else if self.config_writable() {
-                    ResponseKind::Installing
-                } else {
-                    ResponseKind::Locked
-                }
-            }
+            | RequestKind::ClearPin => self.confirm_change(),
+            RequestKind::Subscribe => ResponseKind::Accepted,
+            RequestKind::CheckUpdate => ResponseKind::UpToDate,
+            RequestKind::InstallUpdate { .. } => ResponseKind::Installing,
         }
     }
 
-    fn dispatch_lock(&mut self, role: Role, source: LockSource) -> ResponseKind {
-        if !matches!(role, Role::App | Role::LockClient) {
-            return ResponseKind::Unauthorized;
-        }
-        if !matches!(self.state, LockState::Unlocked) {
-            return ResponseKind::AlreadyLocked;
-        }
-        self.start_lock(source);
-        ResponseKind::Accepted
-    }
-
-    fn dispatch_hard_lock(&mut self, role: Role) -> ResponseKind {
-        if role == Role::App && matches!(self.state, LockState::Unlocked) {
-            self.platform.record_os_lock();
-            return ResponseKind::Accepted;
-        }
-        if role == Role::LockHost && matches!(self.state, LockState::Locked { .. }) {
-            self.fail_closed(FailReason::ServiceStop);
-            return ResponseKind::Accepted;
-        }
-        ResponseKind::Unauthorized
-    }
-
-    fn dispatch_put(&mut self, role: Role, toml: String, base_revision: u64) -> ResponseKind {
-        if role != Role::App {
-            return ResponseKind::Unauthorized;
-        }
-        if !self.config_writable() {
-            return ResponseKind::Locked;
-        }
-        if toml.trim().is_empty() {
-            return invalid_config();
-        }
-        if base_revision != self.config_revision {
-            return ResponseKind::Conflict;
-        }
-        self.config_toml = toml;
-        self.config_revision = self.config_revision.saturating_add(1);
-        ResponseKind::Applied
-    }
-
-    fn dispatch_sensitive(&mut self, role: Role) -> ResponseKind {
-        if role != Role::App {
-            return ResponseKind::Unauthorized;
-        }
-        if !self.config_writable() {
-            return ResponseKind::Locked;
-        }
+    fn confirm_change(&mut self) -> ResponseKind {
         self.broker_launched = true;
         self.broker_nonce = Some(self.issue_nonce());
         let hello = ConfirmationCheck::confirm(&mut self.platform, MethodId::windows_hello());
-        let verdict = if hello == crate::platform::Verdict::Verified {
+        let verdict = if hello == Verdict::Verified {
             hello
         } else {
             ConfirmationCheck::confirm(&mut self.platform, MethodId::os_password())
         };
-        if verdict == crate::platform::Verdict::Verified {
+        if verdict == Verdict::Verified {
             ResponseKind::Ok
         } else {
             ResponseKind::Unauthorized
         }
     }
-
-    fn public_reader(&self, role: Role) -> bool {
-        matches!(role, Role::App | Role::LockClient)
-    }
-
-    fn config_writable(&self) -> bool {
-        matches!(self.state, LockState::Unlocked) && !self.session_os_locked
-    }
 }
 
-fn invalid_config() -> ResponseKind {
-    ResponseKind::Invalid {
-        errors: vec!["empty config".to_string()],
+fn push_bounded<T>(items: &mut Vec<T>, item: T) {
+    if items.len() == HISTORY_LIMIT {
+        items.remove(0);
     }
+    items.push(item);
 }

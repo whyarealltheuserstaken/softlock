@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// Monotonic clock reading owned by the controller. Tests advance it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -104,11 +105,7 @@ impl Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        for byte in &mut self.bytes {
-            // Volatile so the wipe is not removed as a dead store.
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
-        self.bytes.clear();
+        self.bytes.zeroize();
     }
 }
 
@@ -153,7 +150,9 @@ pub enum SessionEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailReason {
-    ArmStep { step: ArmStep },
+    ArmStep {
+        step: ArmStep,
+    },
     HeartbeatMissed,
     HostExited,
     GuardUnhealthy,
@@ -161,10 +160,19 @@ pub enum FailReason {
     ArmTimeout,
     RevertFailed,
     ServiceStop,
+    /// The Lock Host asked for a hard lock while the session was locked.
+    HardLock,
+    /// Recovery found a live session that still says it is locked.
+    SessionActive,
 }
 
-/// Alias used by the heartbeat rule. Same type as [`FailReason`].
-pub type FailureEvent = FailReason;
+/// Why the machine fell back to the OS lock, and when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fallback {
+    pub reason: FailReason,
+    pub at_ms: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptState {

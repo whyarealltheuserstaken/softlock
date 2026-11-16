@@ -6,12 +6,12 @@ use std::time::Duration;
 use proptest::prelude::*;
 use proptest::string::string_regex;
 use softlock_core::{
-    ARM_STEP_TIMEOUT, ArmStep, Event, FailReason, FailureEvent, FakePlatform, GuardHealth,
-    HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BEFORE_FAILURE, HardeningPlan, HeartbeatReport, IpcError,
-    Journal, JournalEntry, LockController, LockSource, LockState, MethodId, OverlayHealth,
-    PlannedChange, PromptState, RequestKind, ResponseKind, Role, SERVICE_SILENCE_LIMIT, Secret,
-    SessionEvent, StateName, UNSUPPORTED_PLATFORM_MESSAGE, UnsupportedPlatform, Verdict,
-    VerdictChannel, journal_is_durable_before_apply,
+    ARM_STEP_TIMEOUT, ArmStep, Event, FailReason, FakePlatform, Fallback, GuardHealth,
+    HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BEFORE_FAILURE, Hardening, HardeningPlan, HeartbeatReport,
+    IpcError, Journal, JournalEntry, LockController, LockSource, LockState, MAX_FRAME, MethodId,
+    OverlayHealth, PlannedChange, PolicySetting, PromptState, RequestKind, ResponseKind, Role,
+    SERVICE_SILENCE_LIMIT, Secret, SessionEvent, StateName, UNSUPPORTED_PLATFORM_MESSAGE,
+    UnsupportedPlatform, Verdict, VerdictChannel, journal_is_durable_before_apply,
 };
 
 fn started(platform: FakePlatform) -> LockController<FakePlatform> {
@@ -240,7 +240,7 @@ fn locked_leaves_only_on_a_verified_verdict_from_the_lock_host_or_its_broker() {
 #[test]
 fn hardening_changes_are_journaled_before_they_are_applied() {
     let mut platform = FakePlatform::new();
-    platform.set_setting("DisableTaskMgr", "admin-set");
+    platform.set_setting(PolicySetting::DisableTaskMgr, "admin-set");
     let mut controller = started(platform);
     controller.handle(Event::LockRequested {
         source: LockSource::App,
@@ -267,16 +267,15 @@ fn hardening_changes_are_journaled_before_they_are_applied() {
         "persisted journal did not contain the change before apply: {durable_entries:?}"
     );
     assert_eq!(
-        settings_before.get("DisableTaskMgr").map(String::as_str),
+        settings_before
+            .iter()
+            .find(|(setting, _)| *setting == PolicySetting::DisableTaskMgr)
+            .and_then(|(_, value)| value.as_deref()),
         Some("admin-set"),
         "the setting changed before the journal was durable"
     );
     assert_eq!(
-        controller
-            .platform()
-            .settings()
-            .get("DisableTaskMgr")
-            .map(String::as_str),
+        controller.platform().setting(PolicySetting::DisableTaskMgr),
         Some("1")
     );
     assert!(!controller.journal().is_empty());
@@ -285,7 +284,6 @@ fn hardening_changes_are_journaled_before_they_are_applied() {
 #[test]
 fn arming_or_locked_failure_ends_in_os_locked_never_unlocked() {
     for step in [
-        ArmStep::Journal,
         ArmStep::Guard,
         ArmStep::Overlay,
         ArmStep::Hardening,
@@ -460,20 +458,31 @@ fn config_writes_are_rejected_outside_unlocked_with_the_session_not_os_locked() 
 #[test]
 fn unlocked_leaves_the_journal_empty_and_restores_pre_lock_settings() {
     let mut platform = FakePlatform::new();
-    platform.set_setting("DisableTaskMgr", "admin-set");
-    platform.set_setting("DisableLockWorkstation", "0");
-    let before = platform.settings().clone();
+    platform.set_setting(PolicySetting::DisableTaskMgr, "admin-set");
+    platform.set_setting(PolicySetting::DisableLockWorkstation, "0");
     let mut controller = started(platform);
     controller.handle(Event::LockRequested {
         source: LockSource::LocalApi,
     });
-    assert_ne!(controller.platform().settings(), &before);
+    assert_eq!(
+        controller.platform().setting(PolicySetting::DisableTaskMgr),
+        Some("1")
+    );
     assert!(!controller.journal().is_empty());
 
     verify(&mut controller, VerdictChannel::LockHost);
     assert!(matches!(controller.state(), LockState::Unlocked));
     assert!(controller.journal().is_empty());
-    assert_eq!(controller.platform().settings(), &before);
+    assert_eq!(
+        controller.platform().setting(PolicySetting::DisableTaskMgr),
+        Some("admin-set")
+    );
+    assert_eq!(
+        controller
+            .platform()
+            .setting(PolicySetting::DisableLockWorkstation),
+        Some("0")
+    );
 
     controller.handle(Event::LockRequested {
         source: LockSource::Hotkey,
@@ -489,7 +498,16 @@ fn unlocked_leaves_the_journal_empty_and_restores_pre_lock_settings() {
     controller.handle(Event::Session(SessionEvent::OsUnlocked));
     assert!(matches!(controller.state(), LockState::Unlocked));
     assert!(controller.journal().is_empty());
-    assert_eq!(controller.platform().settings(), &before);
+    assert_eq!(
+        controller.platform().setting(PolicySetting::DisableTaskMgr),
+        Some("admin-set")
+    );
+    assert_eq!(
+        controller
+            .platform()
+            .setting(PolicySetting::DisableLockWorkstation),
+        Some("0")
+    );
     assert!(
         controller
             .notifications()
@@ -642,7 +660,7 @@ fn three_missed_heartbeats_or_an_unhealthy_guard_or_overlay_emits_a_failure() {
     beating.handle(Event::AdvanceTime(Duration::from_millis(249)));
     assert!(beating.failure_events().is_empty());
     beating.handle(Event::AdvanceTime(Duration::from_millis(1)));
-    assert_eq!(beating.failure_events(), &[FailureEvent::HeartbeatMissed]);
+    assert_eq!(beating.failure_events(), &[FailReason::HeartbeatMissed]);
 
     let mut reset = locked_started();
     reset.handle(Event::AdvanceTime(HEARTBEAT_INTERVAL * 2));
@@ -654,7 +672,7 @@ fn three_missed_heartbeats_or_an_unhealthy_guard_or_overlay_emits_a_failure() {
     reset.handle(Event::AdvanceTime(HEARTBEAT_INTERVAL * 2));
     assert!(reset.failure_events().is_empty());
     reset.handle(Event::AdvanceTime(HEARTBEAT_INTERVAL));
-    assert_eq!(reset.failure_events(), &[FailureEvent::HeartbeatMissed]);
+    assert_eq!(reset.failure_events(), &[FailReason::HeartbeatMissed]);
 
     let mut controller = locked_started();
     controller.handle(Event::Heartbeat(HeartbeatReport {
@@ -665,7 +683,7 @@ fn three_missed_heartbeats_or_an_unhealthy_guard_or_overlay_emits_a_failure() {
         },
         overlay: healthy_overlay(),
     }));
-    assert_eq!(controller.failure_events(), &[FailureEvent::GuardUnhealthy]);
+    assert_eq!(controller.failure_events(), &[FailReason::GuardUnhealthy]);
 
     let mut controller = locked_started();
     controller.handle(Event::Heartbeat(HeartbeatReport {
@@ -677,10 +695,7 @@ fn three_missed_heartbeats_or_an_unhealthy_guard_or_overlay_emits_a_failure() {
             topmost: false,
         },
     }));
-    assert_eq!(
-        controller.failure_events(),
-        &[FailureEvent::OverlayUnhealthy]
-    );
+    assert_eq!(controller.failure_events(), &[FailReason::OverlayUnhealthy]);
 
     let mut idle = started(FakePlatform::new());
     idle.handle(Event::AdvanceTime(Duration::from_secs(5)));
@@ -696,7 +711,7 @@ fn three_missed_heartbeats_or_an_unhealthy_guard_or_overlay_emits_a_failure() {
     ));
     assert!(arming.failure_events().is_empty());
     arming.handle(Event::AdvanceTime(Duration::from_millis(1)));
-    assert_eq!(arming.failure_events(), &[FailureEvent::ArmTimeout]);
+    assert_eq!(arming.failure_events(), &[FailReason::ArmTimeout]);
 
     let mut stepped = started(FakePlatform::new());
     stepped.drive_manually();
@@ -723,7 +738,7 @@ fn three_missed_heartbeats_or_an_unhealthy_guard_or_overlay_emits_a_failure() {
         "the 2s limit starts again on each arming step"
     );
     stepped.handle(Event::AdvanceTime(Duration::from_millis(1)));
-    assert_eq!(stepped.failure_events(), &[FailureEvent::ArmTimeout]);
+    assert_eq!(stepped.failure_events(), &[FailReason::ArmTimeout]);
 
     let mut replay = locked_started();
     replay.handle(Event::Heartbeat(HeartbeatReport {
@@ -740,7 +755,7 @@ fn three_missed_heartbeats_or_an_unhealthy_guard_or_overlay_emits_a_failure() {
     replay.handle(Event::AdvanceTime(Duration::from_millis(600)));
     assert_eq!(
         replay.failure_events(),
-        &[FailureEvent::HeartbeatMissed],
+        &[FailReason::HeartbeatMissed],
         "a replayed heartbeat must not refresh the watchdog"
     );
 
@@ -757,10 +772,28 @@ fn three_missed_heartbeats_or_an_unhealthy_guard_or_overlay_emits_a_failure() {
         overlay: healthy_overlay(),
     }));
     forged.handle(Event::AdvanceTime(Duration::from_millis(600)));
+    assert!(
+        forged.failure_events().is_empty(),
+        "a strictly later sequence is healthy"
+    );
+
+    let mut stale = locked_started();
+    stale.handle(Event::Heartbeat(HeartbeatReport {
+        seq: 5,
+        guard: healthy_guard(),
+        overlay: healthy_overlay(),
+    }));
+    stale.handle(Event::AdvanceTime(Duration::from_millis(200)));
+    stale.handle(Event::Heartbeat(HeartbeatReport {
+        seq: 4,
+        guard: healthy_guard(),
+        overlay: healthy_overlay(),
+    }));
+    stale.handle(Event::AdvanceTime(Duration::from_millis(600)));
     assert_eq!(
-        forged.failure_events(),
-        &[FailureEvent::HeartbeatMissed],
-        "a forged heartbeat sequence must not refresh the watchdog"
+        stale.failure_events(),
+        &[FailReason::HeartbeatMissed],
+        "a stale heartbeat must not refresh the watchdog"
     );
 }
 
@@ -818,13 +851,13 @@ fn ipc_request_kinds_serialize_to_versioned_json_snapshots() {
             },
         ),
     ] {
-        let json = softlock_core::request_json(11, &kind);
+        let json = softlock_core::message_json(11, &kind).expect("request json");
         let value: serde_json::Value = serde_json::from_str(&json).expect("request json");
         assert_eq!(value["v"], 1, "{name} is missing the version field");
         assert_eq!(value["id"], 11);
         insta::assert_json_snapshot!(name, value);
 
-        let frame = softlock_core::encode_frame(&json);
+        let frame = softlock_core::encode_frame(&json).expect("frame");
         let length = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
         assert_eq!(length, json.len());
         assert_eq!(&frame[4..], json.as_bytes());
@@ -905,8 +938,10 @@ fn ipc_response_kinds_serialize_to_versioned_json_snapshots() {
         (
             "event-fell-back",
             ResponseKind::FellBackToOsLock {
-                reason: FailReason::HeartbeatMissed,
-                at_ms: 750,
+                fallback: Fallback {
+                    reason: FailReason::HeartbeatMissed,
+                    at_ms: 750,
+                },
             },
         ),
         (
@@ -918,7 +953,7 @@ fn ipc_response_kinds_serialize_to_versioned_json_snapshots() {
     ];
 
     for (name, kind) in samples {
-        let json = softlock_core::response_json(11, &kind);
+        let json = softlock_core::message_json(11, &kind).expect("response json");
         let value: serde_json::Value = serde_json::from_str(&json).expect("response json");
         assert_eq!(value["v"], 1, "{name} is missing the version field");
         assert_eq!(value["id"], 11);
@@ -930,12 +965,12 @@ fn ipc_response_kinds_serialize_to_versioned_json_snapshots() {
 fn ipc_unknown_major_version_is_rejected_as_unsupported() {
     for version in [0, 2, 99] {
         let json = format!(r#"{{"v":{version},"id":9,"kind":"Hello","client_version":"0.1.0"}}"#);
-        let frame = softlock_core::encode_frame(&json);
+        let frame = softlock_core::encode_frame(&json).expect("frame");
         let error = softlock_core::decode_request_frame(&frame).expect_err("unknown major");
         assert_eq!(error, IpcError::Unsupported { id: 9 });
     }
 
-    let unlock = softlock_core::encode_frame(r#"{"v":1,"id":4,"kind":"Unlock"}"#);
+    let unlock = softlock_core::encode_frame(r#"{"v":1,"id":4,"kind":"Unlock"}"#).expect("frame");
     assert_eq!(
         softlock_core::decode_request_frame(&unlock),
         Err(IpcError::Malformed)
@@ -965,7 +1000,7 @@ fn common_json(relative: &str) -> serde_json::Value {
 #[test]
 fn apply_before_journal_flush_fails_the_order_check() {
     let mut platform = FakePlatform::new();
-    platform.set_setting("DisableTaskMgr", "admin-set");
+    platform.set_setting(PolicySetting::DisableTaskMgr, "admin-set");
     let mut journal = Journal::empty();
     journal.record(JournalEntry {
         target: "DisableTaskMgr".to_string(),
@@ -978,7 +1013,7 @@ fn apply_before_journal_flush_fails_the_order_check() {
             new_value: "1".to_string(),
         }],
     };
-    platform.apply_hardened(&journal, &plan);
+    assert!(platform.apply(&plan, &mut journal).is_ok());
     assert!(
         !journal_is_durable_before_apply(platform.apply_events()),
         "applying before the flush must fail the order check: {:?}",
@@ -1048,6 +1083,16 @@ fn flush_persists_failure_count_and_locked_flag_and_recovery_restores_backoff() 
     });
     assert_eq!(controller.failure_count(), 4);
     assert_eq!(controller.journal().failures(), 4);
+    let mut restarted = started(FakePlatform::new());
+    restarted.handle(Event::ServiceStarted {
+        journal: controller.journal().persisted(),
+        session_active: true,
+    });
+    assert_eq!(
+        restarted.failure_count(),
+        4,
+        "restarting from the saved journal must keep the backoff count"
+    );
     assert!(matches!(
         controller.state(),
         LockState::FailingClosed { .. }
@@ -1096,6 +1141,7 @@ fn sensitive_requests_return_ok_only_after_a_verified_broker_confirmation() {
 fn submit_secret_without_a_verified_verdict_does_not_unlock() {
     let mut controller = locked_started();
     controller.platform_mut().accept_secrets(true);
+    controller.platform_mut().fail_revert(true);
     controller.handle(Event::SubmitSecret {
         method: MethodId::os_password(),
         secret: Secret::new("ok"),
@@ -1107,6 +1153,132 @@ fn submit_secret_without_a_verified_verdict_does_not_unlock() {
             .iter()
             .any(|state| matches!(state, LockState::Unlocking { .. }))
     );
+
+    let mut verified = locked_started();
+    verified
+        .platform_mut()
+        .set_secret_verdict(Verdict::Verified);
+    verified.handle(Event::SubmitSecret {
+        method: MethodId::os_password(),
+        secret: Secret::new("ok"),
+    });
+    assert!(
+        verified
+            .visited()
+            .iter()
+            .any(|state| matches!(state, LockState::Unlocking { .. }))
+    );
+    assert!(matches!(verified.state(), LockState::Unlocked));
+}
+
+#[test]
+fn service_stop_during_arming_fails_closed() {
+    let mut controller = started(FakePlatform::new());
+    controller.drive_manually();
+    controller.handle(Event::LockRequested {
+        source: LockSource::Hotkey,
+    });
+    assert!(matches!(controller.state(), LockState::Arming { .. }));
+    controller.handle(Event::ServiceStopRequested);
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed {
+            reason: FailReason::ServiceStop
+        }
+    ));
+    assert!(!controller.returned_to_unlocked());
+}
+
+#[test]
+fn hard_lock_from_the_lock_host_uses_its_own_failure_reason() {
+    let mut controller = locked_started();
+    controller.handle(Event::Public {
+        role: Role::LockHost,
+        id: 1,
+        kind: RequestKind::HardLock,
+    });
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed {
+            reason: FailReason::HardLock
+        }
+    ));
+    assert!(!controller.returned_to_unlocked());
+}
+
+#[test]
+fn ipc_rejects_an_oversized_length_prefix() {
+    let mut declared = ((MAX_FRAME as u32) + 1).to_le_bytes().to_vec();
+    declared.extend_from_slice(&[b'{'; 8]);
+    assert_eq!(
+        softlock_core::decode_request_frame(&declared),
+        Err(IpcError::Malformed)
+    );
+    assert_eq!(
+        softlock_core::decode_request_frame(&u32::MAX.to_le_bytes()),
+        Err(IpcError::Malformed)
+    );
+    let oversized = "x".repeat(MAX_FRAME + 1);
+    assert!(softlock_core::encode_frame(&oversized).is_err());
+}
+
+#[test]
+fn ipc_unknown_fields_are_rejected() {
+    let frame = softlock_core::encode_frame(r#"{"v":1,"id":3,"kind":"GetStatus","extra":true}"#)
+        .expect("frame");
+    assert_eq!(
+        softlock_core::decode_request_frame(&frame),
+        Err(IpcError::Malformed)
+    );
+}
+
+#[test]
+fn pin_wire_kind_is_fixed() {
+    let json = softlock_core::message_json(
+        1,
+        &RequestKind::SetPin {
+            pin: "1234".to_string(),
+        },
+    )
+    .expect("json");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(value["kind"], "SetPin");
+    let cleared = softlock_core::message_json(1, &RequestKind::ClearPin).expect("json");
+    let cleared: serde_json::Value = serde_json::from_str(&cleared).expect("json");
+    assert_eq!(cleared["kind"], "ClearPin");
+}
+
+#[test]
+fn trace_and_rejections_stay_within_the_ring() {
+    let mut controller = started(FakePlatform::new());
+    for _ in 0..80 {
+        controller.handle(Event::Verified {
+            channel: VerdictChannel::LockHost,
+            method: MethodId::os_password(),
+            nonce: 1,
+        });
+    }
+    assert_eq!(controller.rejection_log().len(), 64);
+    assert!(controller.visited().len() <= 64);
+}
+
+proptest! {
+    #[test]
+    fn ipc_decoder_does_not_panic_on_arbitrary_bytes(
+        bytes in proptest::collection::vec(any::<u8>(), 0..256)
+    ) {
+        let _ = softlock_core::decode_request_frame(&bytes);
+    }
+
+    #[test]
+    fn ipc_decoder_rejects_every_oversized_prefix(
+        length in ((MAX_FRAME as u32) + 1)..=u32::MAX
+    ) {
+        prop_assert_eq!(
+            softlock_core::decode_request_frame(&length.to_le_bytes()),
+            Err(IpcError::Malformed)
+        );
+    }
 }
 
 #[test]
@@ -1125,7 +1297,7 @@ fn service_stop_requested_while_locked_fails_closed() {
 #[test]
 fn recovering_with_no_active_lock_reverts_the_journal_and_unlocks() {
     let mut platform = FakePlatform::new();
-    platform.set_setting("DisableTaskMgr", "1");
+    platform.set_setting(PolicySetting::DisableTaskMgr, "1");
     let mut journal = Journal::empty();
     journal.record(JournalEntry {
         target: "DisableTaskMgr".to_string(),
@@ -1148,11 +1320,7 @@ fn recovering_with_no_active_lock_reverts_the_journal_and_unlocks() {
     assert!(matches!(controller.state(), LockState::Unlocked));
     assert!(controller.journal().is_empty());
     assert_eq!(
-        controller
-            .platform()
-            .settings()
-            .get("DisableTaskMgr")
-            .map(String::as_str),
+        controller.platform().setting(PolicySetting::DisableTaskMgr),
         Some("0")
     );
 }
@@ -1181,7 +1349,7 @@ fn recovering_with_an_active_session_fails_closed() {
     assert!(matches!(
         controller.state(),
         LockState::FailingClosed {
-            reason: FailReason::ServiceStop
+            reason: FailReason::SessionActive
         }
     ));
     assert!(

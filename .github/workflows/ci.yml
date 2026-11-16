@@ -44,11 +44,13 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --features softlock-core/test-support -- -D warnings
       - name: Core has no Windows-only dependency
         run: cargo build -p softlock-core --all-targets
       - name: Seam 1
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --features softlock-core/test-support
 
   deny:
     name: licenses and advisories

@@ -6,17 +6,19 @@ use std::sync::mpsc::Receiver;
 use serde::{Deserialize, Serialize};
 
 use crate::journal::Journal;
-use crate::state::{ArmStep, MethodId, Secret, SessionEvent};
+use crate::state::{MethodId, Secret, SessionEvent};
 
 pub const UNSUPPORTED_PLATFORM_MESSAGE: &str = "This platform isn't supported yet";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GuardHealth {
     pub hook_alive: bool,
     pub last_physical_input_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OverlayHealth {
     pub covered_monitors: u32,
     pub capture_excluded: bool,
@@ -109,27 +111,13 @@ impl HardeningPlan {
 
 /// Fixed security settings applied while locked. Not a user allowlist.
 pub fn standard_hardening_plan() -> HardeningPlan {
-    let changes = [
-        ("DisableTaskMgr", "1"),
-        ("DisableLockWorkstation", "1"),
-        ("DisableChangePassword", "1"),
-        ("NoLogoff", "1"),
-        ("HideFastUserSwitching", "1"),
-        ("NoClose", "1"),
-        ("ConsentPromptBehaviorAdmin", "1"),
-        ("ConsentPromptBehaviorUser", "0"),
-        ("DisableTouchPen", "1"),
-        ("DisableGameControllers", "1"),
-        ("StopAccessibilityInput", "1"),
-        ("SuppressNotifications", "1"),
-        ("PowerButtonAction", "do-nothing"),
-    ]
-    .into_iter()
-    .map(|(target, new_value)| PlannedChange {
-        target: target.to_string(),
-        new_value: new_value.to_string(),
-    })
-    .collect();
+    let changes = PolicySetting::ALL
+        .into_iter()
+        .map(|setting| PlannedChange {
+            target: setting.id().to_string(),
+            new_value: setting.locked_value().to_string(),
+        })
+        .collect();
     HardeningPlan { changes }
 }
 
@@ -246,6 +234,113 @@ pub trait Power {
 
 pub trait Credentials {
     fn verify_password(&self, user: &UserId, password: &Secret) -> Verdict;
+
+    /// Forwards one submitted secret. Only [`Verdict::Verified`] may unlock.
+    fn verify_secret(&self, method: &MethodId, secret: &Secret) -> Verdict {
+        let _ = (method, secret);
+        Verdict::Rejected
+    }
+}
+
+/// Typed policy values. The journal stores these ids, not a string map the
+/// controller edits itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PolicySetting {
+    DisableTaskMgr,
+    DisableLockWorkstation,
+    DisableChangePassword,
+    NoLogoff,
+    HideFastUserSwitching,
+    NoClose,
+    ConsentPromptBehaviorAdmin,
+    ConsentPromptBehaviorUser,
+    DisableTouchPen,
+    DisableGameControllers,
+    StopAccessibilityInput,
+    SuppressNotifications,
+    PowerButtonAction,
+}
+
+impl PolicySetting {
+    pub const ALL: [Self; 13] = [
+        Self::DisableTaskMgr,
+        Self::DisableLockWorkstation,
+        Self::DisableChangePassword,
+        Self::NoLogoff,
+        Self::HideFastUserSwitching,
+        Self::NoClose,
+        Self::ConsentPromptBehaviorAdmin,
+        Self::ConsentPromptBehaviorUser,
+        Self::DisableTouchPen,
+        Self::DisableGameControllers,
+        Self::StopAccessibilityInput,
+        Self::SuppressNotifications,
+        Self::PowerButtonAction,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::DisableTaskMgr => "DisableTaskMgr",
+            Self::DisableLockWorkstation => "DisableLockWorkstation",
+            Self::DisableChangePassword => "DisableChangePassword",
+            Self::NoLogoff => "NoLogoff",
+            Self::HideFastUserSwitching => "HideFastUserSwitching",
+            Self::NoClose => "NoClose",
+            Self::ConsentPromptBehaviorAdmin => "ConsentPromptBehaviorAdmin",
+            Self::ConsentPromptBehaviorUser => "ConsentPromptBehaviorUser",
+            Self::DisableTouchPen => "DisableTouchPen",
+            Self::DisableGameControllers => "DisableGameControllers",
+            Self::StopAccessibilityInput => "StopAccessibilityInput",
+            Self::SuppressNotifications => "SuppressNotifications",
+            Self::PowerButtonAction => "PowerButtonAction",
+        }
+    }
+
+    pub fn locked_value(self) -> &'static str {
+        match self {
+            Self::ConsentPromptBehaviorUser => "0",
+            Self::PowerButtonAction => "do-nothing",
+            _ => "1",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|setting| setting.id() == id)
+    }
+}
+
+pub trait PolicySettings {
+    fn policy(&self, setting: PolicySetting) -> Option<String>;
+    fn set_policy(&mut self, setting: PolicySetting, value: &str);
+    fn clear_policy(&mut self, setting: PolicySetting);
+}
+
+/// The platform surface from the spec, plus typed policy settings and the
+/// broker confirmation check. Fault injection is not part of this trait.
+pub trait Platform:
+    InputGuard
+    + Overlay
+    + SessionControl
+    + Hardening
+    + Power
+    + Credentials
+    + EncryptionStatus
+    + PolicySettings
+    + ConfirmationCheck
+{
+}
+
+impl<T> Platform for T where
+    T: InputGuard
+        + Overlay
+        + SessionControl
+        + Hardening
+        + Power
+        + Credentials
+        + EncryptionStatus
+        + PolicySettings
+        + ConfirmationCheck
+{
 }
 
 /// Hello or the account password, checked by the Broker the service launched.
@@ -395,32 +490,18 @@ impl ConfirmationCheck for UnsupportedPlatform {
     }
 }
 
+impl PolicySettings for UnsupportedPlatform {
+    fn policy(&self, _setting: PolicySetting) -> Option<String> {
+        None
+    }
+
+    fn set_policy(&mut self, _setting: PolicySetting, _value: &str) {}
+
+    fn clear_policy(&mut self, _setting: PolicySetting) {}
+}
+
 impl EncryptionStatus for UnsupportedPlatform {
     fn system_volume(&self) -> DiskEncryption {
         DiskEncryption::Unsupported
     }
-}
-
-/// What the fake recorded at the start of `Hardening::apply`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ApplyObservation {
-    pub durable_entries: Vec<crate::journal::JournalEntry>,
-    pub settings_before: std::collections::BTreeMap<String, String>,
-}
-
-/// Operations the lock controller needs from an in-memory platform.
-pub trait DrivenPlatform: ConfirmationCheck {
-    fn fail_at(&self) -> Option<ArmStep>;
-    fn settings(&self) -> &std::collections::BTreeMap<String, String>;
-    fn settings_mut(&mut self) -> &mut std::collections::BTreeMap<String, String>;
-    fn note_apply(&mut self, observation: ApplyObservation);
-    fn set_guard_armed(&mut self, armed: bool);
-    fn set_overlay_shown(&mut self, shown: bool);
-    fn set_power_held(&mut self, held: bool);
-    fn record_os_lock(&mut self);
-    fn apply_hardened(&mut self, journal: &Journal, plan: &HardeningPlan);
-    fn take_accept(&mut self) -> bool;
-    fn revert_failed(&self) -> bool;
-    fn guard_health(&self) -> GuardHealth;
-    fn overlay_health(&self) -> OverlayHealth;
 }
