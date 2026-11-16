@@ -200,6 +200,7 @@ jobs:
           grep -F "failing_closed_correct_pin_releases_after_backoff ... ok" target/seam3-lock-host.txt
           grep -F "a_hook_thread_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
           grep -F "a_liveness_thread_panic_tries_the_os_lock_without_trapping_input ... ok" target/seam3-lock-host.txt
+          grep -F "a_callback_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
       - name: Release build of the Windows target omits the test feature
         shell: bash
         run: |

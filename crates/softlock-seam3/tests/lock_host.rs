@@ -731,3 +731,25 @@ fn a_liveness_thread_panic_tries_the_os_lock_without_trapping_input() {
         "the liveness panic removed the guard and left input open"
     );
 }
+
+#[test]
+fn a_callback_panic_tries_the_os_lock_then_drops_the_hooks() {
+    let _guard = gate();
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let nonce = Nonce::install();
+    let extra = nonce.extra();
+    let lock = arm("unused", None);
+    lock.stub_os_lock_unavailable();
+    let _quiet = quiet_hook();
+    lock.panic_in_callback();
+    send_virtual_key(VK_F13, extra).expect("callback panic");
+    assert!(
+        wait_for(Duration::from_secs(3), || lock.os_lock_attempts() >= 1),
+        "a callback panic did not try the OS lock"
+    );
+    send_virtual_key(VK_F14, extra).expect("after callback panic");
+    probe
+        .wait_for_key(VK_F14, Duration::from_secs(3))
+        .expect("input stayed trapped after the hook callback panicked");
+}

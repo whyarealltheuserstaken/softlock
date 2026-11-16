@@ -84,6 +84,10 @@ pub struct LockController<P> {
     session_os_locked: bool,
     broker_launched: bool,
     broker_nonce: Option<LaunchNonce>,
+    /// The last `os_lock` call failed. `FailingClosed` may then take the
+    /// same nonce-checked unlock as `Locked`. A call that succeeded leaves
+    /// this false, and `FailingClosed` waits for the OS lock instead.
+    os_lock_unavailable: bool,
     config: ConfigStore,
     awake: Option<AwakeGuard>,
     last_response: Option<ResponseKind>,
@@ -110,6 +114,7 @@ impl<P: Platform> LockController<P> {
             session_os_locked: false,
             broker_launched: false,
             broker_nonce: None,
+            os_lock_unavailable: false,
             config: ConfigStore::new(),
             awake: None,
             last_response: None,
@@ -155,6 +160,11 @@ impl<P: Platform> LockController<P> {
 
     pub fn state(&self) -> &LockState {
         &self.state
+    }
+
+    /// True after `os_lock` has failed and until a later call succeeds.
+    pub fn os_lock_unavailable(&self) -> bool {
+        self.os_lock_unavailable
     }
 
     pub fn visited(&self) -> &VecDeque<LockState> {
@@ -355,7 +365,7 @@ impl<P: Platform> LockController<P> {
     }
 
     fn on_verified(&mut self, nonce: LaunchNonce) {
-        if !matches!(self.state, LockState::Locked { .. }) {
+        if !self.nonce_unlock_allowed() {
             self.reject("Verified");
             return;
         }
@@ -369,6 +379,13 @@ impl<P: Platform> LockController<P> {
             return;
         }
         self.begin_unlock();
+    }
+
+    /// `Locked`, or `FailingClosed` after the OS lock call failed. A bad or
+    /// missing nonce still stays put. `begin_unlock` is the only exit.
+    fn nonce_unlock_allowed(&self) -> bool {
+        matches!(self.state, LockState::Locked { .. })
+            || (self.os_lock_unavailable && matches!(self.state, LockState::FailingClosed { .. }))
     }
 
     fn on_prompt(&mut self, prompt: PromptState) {
@@ -414,7 +431,10 @@ impl<P: Platform> LockController<P> {
     fn request_os_lock(&mut self) {
         let session = SessionControl::console_session(&self.platform);
         if SessionControl::os_lock(&mut self.platform, session).is_err() {
+            self.os_lock_unavailable = true;
             self.reject("OsLock");
+        } else {
+            self.os_lock_unavailable = false;
         }
     }
 
@@ -438,7 +458,7 @@ impl<P: Platform> LockController<P> {
     }
 
     fn on_request_hello(&mut self) {
-        if !matches!(self.state, LockState::Locked { .. }) {
+        if !self.nonce_unlock_allowed() {
             self.reject("RequestHello");
             return;
         }
@@ -499,10 +519,9 @@ impl<P: Platform> LockController<P> {
         if verdict == Verdict::Verified && matches!(self.state, LockState::Locked { .. }) {
             self.begin_unlock();
         } else if verdict == Verdict::Verified {
-            // A verified credential while failing closed does not take the
-            // Locked unlock path. That path would skip the broker nonce.
-            // The dev launch releases on its own PIN check once backoff is
-            // clear. Counting this as a failure would punish a correct PIN.
+            // A credential verdict carries no nonce. `FailingClosed` leaves
+            // only through `RequestHello` and `Verified`, same as `Locked`.
+            // Counting this as a failure would punish a correct PIN.
             self.reject("SubmitSecret");
         } else {
             self.note_failure();

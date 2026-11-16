@@ -193,8 +193,8 @@ impl DevLock {
         self.shared.panic_window.store(true, Ordering::Release);
     }
 
-    /// Wakes the hook thread so its loop panics. The callback itself is not
-    /// this path: a panic there aborts the process.
+    /// Wakes the hook thread so its message loop panics. A panic inside the
+    /// callback is caught there and does not use this flag.
     #[cfg(feature = "simulated-physical")]
     pub fn panic_hook_thread(&self) {
         self.shared.panic_hook.store(true, Ordering::Release);
@@ -214,6 +214,13 @@ impl DevLock {
     #[cfg(feature = "simulated-physical")]
     pub fn panic_liveness_thread(&self) {
         self.shared.panic_liveness.store(true, Ordering::Release);
+    }
+
+    /// The next hook callback panics. The catch swallows that event and asks
+    /// the window thread to try the OS lock.
+    #[cfg(feature = "simulated-physical")]
+    pub fn panic_in_callback(&self) {
+        self.shared.panic_in_callback.store(true, Ordering::Release);
     }
 }
 
@@ -274,6 +281,9 @@ pub(crate) struct Shared {
     pub panic_window: AtomicBool,
     pub panic_hook: AtomicBool,
     pub panic_liveness: AtomicBool,
+    pub hook_poisoned: AtomicBool,
+    #[cfg(feature = "simulated-physical")]
+    pub panic_in_callback: AtomicBool,
     pub failing_closed: AtomicBool,
     pub heartbeat_missed: AtomicBool,
     pub emergency_ran: AtomicBool,
@@ -321,6 +331,9 @@ impl Shared {
             panic_window: AtomicBool::new(false),
             panic_hook: AtomicBool::new(false),
             panic_liveness: AtomicBool::new(false),
+            hook_poisoned: AtomicBool::new(false),
+            #[cfg(feature = "simulated-physical")]
+            panic_in_callback: AtomicBool::new(false),
             failing_closed: AtomicBool::new(false),
             heartbeat_missed: AtomicBool::new(false),
             emergency_ran: AtomicBool::new(false),
@@ -409,6 +422,14 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
         if shared.fail.swap(false, Ordering::AcqRel) {
             report_guard_down(&mut controller, &shared);
             note_controller(&controller, &shared);
+            // A poisoned callback cannot take a PIN. If the OS lock did not
+            // engage, drop the hooks the same way a window-thread panic does.
+            if shared.hook_poisoned.load(Ordering::Acquire)
+                && shared.os_lock_unavailable.load(Ordering::Acquire)
+            {
+                emergency(&shared);
+                break;
+            }
         }
         retry_os_lock(&mut controller, &shared, &mut os_retry_at);
         if shared.display_changed.swap(false, Ordering::AcqRel) {
@@ -728,20 +749,19 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
     // Argon2id compare, constant time, spec parameters. `Verdict::Verified`
     // here is the credential verdict and carries no nonce.
     let matched = verify_softlock_pin(&secret, &shared.pin_hash) == Verdict::Verified;
-    if matched && matches!(controller.state(), LockState::Locked { .. }) {
+    // Backoff already returned above. `Locked`, and `FailingClosed` after the
+    // OS lock call failed, both release through `RequestHello` and `Verified`.
+    let releasing = matches!(controller.state(), LockState::Locked { .. })
+        || (matches!(controller.state(), LockState::FailingClosed { .. })
+            && shared.os_lock_unavailable.load(Ordering::Acquire));
+    if matched && releasing {
         drop(secret);
         unlock_with_broker_nonce(controller, shared);
         finish(shared);
         return;
     }
-    if matched && shared.os_lock_unavailable.load(Ordering::Acquire) {
-        // The controller is `FailingClosed`, so `RequestHello` is refused.
-        // A verified PIN is the only release while both OS locks keep failing.
-        // Backoff is clear here: a non-zero delay returned above.
+    if matched {
         drop(secret);
-        release_session(shared);
-        shared.prompt_open.store(false, Ordering::Release);
-        shared.locked.store(false, Ordering::Release);
         finish(shared);
         return;
     }
@@ -758,6 +778,8 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
 fn unlock_with_broker_nonce(controller: &mut LockController<WinPlatform>, shared: &Shared) {
     // Dev launch only. `RequestHello` makes this process draw the nonce with
     // `LaunchNonce::generate` (32 bytes from `getrandom`) and store it here.
+    // `Locked` and `FailingClosed` (only while the OS lock is unavailable)
+    // both accept it, and `Verified` moves through `Unlocking` on `eq_ct`.
     // Ticket 13 must not do that. The Broker owns the nonce, and the lock
     // host has to receive that nonce across the process boundary before
     // `Event::Verified`. Production code does not call `LaunchNonce::from_bytes`.

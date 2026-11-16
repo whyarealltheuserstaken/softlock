@@ -297,6 +297,9 @@ enum PromptState { Idle, Open { method: MethodId }, Passthrough { method: Method
 // Unlocking  --Done-->                          Unlocked
 // Unlocking  --RevertFailed-->                  OsLocked (after os_lock) + journal kept for retry
 // FailingClosed --OsLockConfirmed-->            OsLocked
+// FailingClosed --Verified{nonce}, and only while the OS lock call failed--> Unlocking
+//                 // same check as Locked: Broker nonce, eq_ct. A bad or missing nonce stays FailingClosed.
+//                 // While the OS lock is still available this transition is rejected.
 // OsLocked   --OsUnlocked, revert succeeds-->   Unlocked (journal reverted, user notified if after_fail)
 // OsLocked   --OsUnlocked, revert still failing--> OsLocked (guard and overlay disarmed, journal kept, Repair notice)
 // Recovering --SessionActiveAndJournalSaysLocked--> FailingClosed
@@ -305,9 +308,9 @@ enum PromptState { Idle, Open { method: MethodId }, Passthrough { method: Method
 ```
 
 Invariants (each one is a test):
-1. `Locked → Unlocking` happens only on a `Verified` verdict from the Broker this service launched, checked against that launch's CSPRNG nonce, or on the credential verifier returning `Verified` for a `SubmitSecret`. The Lock Host does not verify and has no verdict that unlocks. No public IPC verb produces it.
+1. `Locked → Unlocking` happens only on a `Verified` verdict from the Broker this service launched, checked against that launch's CSPRNG nonce, or on the credential verifier returning `Verified` for a `SubmitSecret`. `FailingClosed → Unlocking` happens only on that same nonce check, and only after the OS lock call has failed. A bad or missing nonce stays `FailingClosed`. The Lock Host does not verify and has no verdict that unlocks. No public IPC verb produces it.
 2. Every hardening change is in the persisted journal **before** it's applied.
-3. Any failure while `Arming` or `Locked` ends in `OsLocked`, never `Unlocked`.
+3. Any failure while `Arming` or `Locked` ends in `OsLocked`, never `Unlocked`, except when the OS lock call itself fails. Then `FailingClosed` stays guarded until a matching `Verified` nonce moves it to `Unlocking`. It does not unlock while the OS lock is still available.
 4. Config writes are rejected in every state except `Unlocked` with the session not OS-locked.
 5. After `Unlocked` is reached, the journal is empty and the system settings equal the values recorded before the lock.
 6. Every app SoftLock paused is resumed before `Unlocked` is reached and after the OS lock is confirmed in `FailingClosed`. A pause or resume failure never changes the lock state.

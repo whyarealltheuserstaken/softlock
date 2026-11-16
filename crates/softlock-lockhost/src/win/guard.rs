@@ -271,12 +271,35 @@ fn hook_thread(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<u32, (
     }
 }
 
-/// A panic inside this callback, or inside `mouse_proc`, aborts the process.
-/// Both are `extern "system"`, so unwinding out of them is an abort. The
-/// hooks die with the process and input is not left trapped. No OS lock is
-/// attempted. A flag set from a panic hook would not help: abort stops the
-/// other threads before the liveness thread can read it.
+/// A panic inside either callback is caught here. Unwinding out of
+/// `extern "system"` would abort the process and skip the OS lock. The catch
+/// marks the hook poisoned, asks the window thread to try the OS lock, and
+/// swallows the event. If that lock is unavailable, the window thread takes
+/// the same emergency path as a window-thread panic and drops the hooks. A
+/// broken callback cannot take a PIN.
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        keyboard_event(code, wparam, lparam)
+    }));
+    match caught {
+        Ok(result) => result,
+        Err(_) => poisoned_hook(),
+    }
+}
+
+fn poisoned_hook() -> LRESULT {
+    if let Some(shared) = session_ptr() {
+        shared
+            .hook_poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+        shared
+            .fail
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    LRESULT(1)
+}
+
+unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         if code < 0 {
             return CallNextHookEx(None, code, wparam, lparam);
@@ -284,6 +307,13 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         let Some(shared) = session_ptr() else {
             return CallNextHookEx(None, code, wparam, lparam);
         };
+        #[cfg(feature = "simulated-physical")]
+        if shared
+            .panic_in_callback
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            panic!("lock host hook callback");
+        }
         let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         shared
             .last_event
@@ -325,6 +355,16 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 }
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        mouse_event(code, wparam, lparam)
+    }));
+    match caught {
+        Ok(result) => result,
+        Err(_) => poisoned_hook(),
+    }
+}
+
+unsafe fn mouse_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         if code < 0 {
             return CallNextHookEx(None, code, wparam, lparam);
@@ -332,6 +372,13 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let Some(shared) = session_ptr() else {
             return CallNextHookEx(None, code, wparam, lparam);
         };
+        #[cfg(feature = "simulated-physical")]
+        if shared
+            .panic_in_callback
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            panic!("lock host hook callback");
+        }
         let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
         shared
             .last_event

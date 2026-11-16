@@ -1436,6 +1436,66 @@ fn failing_closed_counts_wrong_secrets_and_applies_backoff() {
 }
 
 #[test]
+fn failing_closed_unlocks_only_through_a_matching_nonce() {
+    let mut available = locked_started();
+    available.handle(Event::HostExited);
+    assert!(!available.os_lock_unavailable());
+    available.handle(Event::RequestHello);
+    assert!(available.broker_nonce().is_none());
+    available.handle(Event::Verified {
+        nonce: counter_nonce(1),
+    });
+    assert!(
+        matches!(available.state(), LockState::FailingClosed { .. }),
+        "a nonce unlock ran while the OS lock was still available"
+    );
+
+    let mut platform = FakePlatform::new();
+    platform.fail_os_lock(true);
+    let mut controller = started(platform);
+    controller.handle(Event::LockRequested {
+        source: LockSource::Hotkey,
+    });
+    controller.handle(Event::HostExited);
+    assert!(controller.os_lock_unavailable());
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed { .. }
+    ));
+
+    controller.handle(Event::Verified {
+        nonce: counter_nonce(1),
+    });
+    assert!(
+        matches!(controller.state(), LockState::FailingClosed { .. }),
+        "a missing nonce left FailingClosed"
+    );
+
+    controller.handle(Event::RequestHello);
+    let nonce = controller.broker_nonce().expect("broker nonce");
+    controller.handle(Event::Verified {
+        nonce: counter_nonce(9),
+    });
+    assert!(
+        matches!(controller.state(), LockState::FailingClosed { .. }),
+        "a bad nonce left FailingClosed"
+    );
+
+    controller.handle(Event::Verified { nonce });
+    assert!(
+        controller
+            .visited()
+            .iter()
+            .any(|state| matches!(state, LockState::Unlocking { .. })),
+        "a matching nonce did not pass through Unlocking"
+    );
+    assert!(
+        matches!(controller.state(), LockState::Unlocked),
+        "a matching nonce did not unlock"
+    );
+}
+
+#[test]
 fn note_failure_flushes_the_failure_count() {
     let mut controller = locked_started();
     controller.handle(Event::SubmitSecret {
@@ -2137,9 +2197,12 @@ proptest! {
                     controller.handle(Event::Session(notification));
                 }
                 Step::VerifiedBroker => {
+                    let unavailable = controller.os_lock_unavailable();
                     controller.handle(Event::RequestHello);
                     if let Some(nonce) = controller.broker_nonce() {
-                        genuine = matches!(before, LockState::Locked { .. });
+                        genuine = matches!(before, LockState::Locked { .. })
+                            || (unavailable
+                                && matches!(before, LockState::FailingClosed { .. }));
                         controller.handle(Event::Verified { nonce });
                     }
                 }
