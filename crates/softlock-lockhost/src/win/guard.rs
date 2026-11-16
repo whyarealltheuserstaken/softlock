@@ -82,18 +82,7 @@ pub(crate) fn install(shared: &Arc<Shared>) -> Result<(), softlock_core::GuardEr
     }
 }
 
-/// Stop the hook and liveness threads. The session pointer stays installed so
-/// a following OS-lock attempt is still counted.
-pub(crate) fn disarm_hooks(shared: &Shared) {
-    stop_workers(shared);
-}
-
 pub(crate) fn remove(shared: &Shared) {
-    stop_workers(shared);
-    SESSION.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
-}
-
-fn stop_workers(shared: &Shared) {
     shared
         .stop
         .store(true, std::sync::atomic::Ordering::Release);
@@ -124,6 +113,7 @@ fn stop_workers(shared: &Shared) {
     shared
         .hook_thread_id
         .store(0, std::sync::atomic::Ordering::Release);
+    SESSION.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn liveness(shared: Arc<Shared>) {
@@ -287,8 +277,8 @@ fn hook_thread(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<u32, (
 /// A panic inside either callback is caught here. Unwinding out of
 /// `extern "system"` would abort the process and skip the OS lock. The catch
 /// includes the poisoned path. That path only stores two atomics, so it does
-/// not allocate and does not panic. The window thread then removes the hooks
-/// before it publishes the OS-lock attempt. A broken callback cannot take a PIN.
+/// not allocate and does not panic. The window thread tries the OS lock
+/// first and drops these hooks only when that lock is unavailable.
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     catch_hook(|| unsafe { keyboard_event(code, wparam, lparam) })
 }

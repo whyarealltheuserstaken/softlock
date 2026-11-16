@@ -222,6 +222,15 @@ impl DevLock {
     pub fn panic_in_callback(&self) {
         self.shared.panic_in_callback.store(true, Ordering::Release);
     }
+
+    /// The hook thread has been joined. Its id is 0 only after `remove`.
+    /// Tests wait for this before sending a key that must reach the probe.
+    /// The product path tries the OS lock first and drops the hooks only
+    /// when that lock is unavailable.
+    #[cfg(feature = "simulated-physical")]
+    pub fn hooks_removed(&self) -> bool {
+        self.shared.hook_thread_id.load(Ordering::Acquire) == 0
+    }
 }
 
 impl Drop for DevLock {
@@ -420,17 +429,10 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             break;
         }
         if shared.fail.swap(false, Ordering::AcqRel) {
-            // The attempt counter increments inside the OS-lock call. A waiter
-            // that sees it sends the next key immediately. Take the poisoned
-            // hooks down first, while the session pointer is still installed,
-            // so that key is not swallowed.
-            if shared.hook_poisoned.load(Ordering::Acquire) {
-                guard::disarm_hooks(&shared);
-            }
             report_guard_down(&mut controller, &shared);
             note_controller(&controller, &shared);
             // A poisoned callback cannot take a PIN. If the OS lock did not
-            // engage, drop the rest the same way a window-thread panic does.
+            // engage, drop the hooks the same way a window-thread panic does.
             if shared.hook_poisoned.load(Ordering::Acquire)
                 && shared.os_lock_unavailable.load(Ordering::Acquire)
             {

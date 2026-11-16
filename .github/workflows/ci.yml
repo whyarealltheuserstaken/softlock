@@ -208,19 +208,7 @@ jobs:
           cargo test --locked -p softlock-seam3 --features dev-launch \
             --target x86_64-pc-windows-msvc --test lock_host --no-run \
             --message-format=json > target/lock-host-build.json
-          exe_win=$(python -c 'import json
-          exe=""
-          for line in open("target/lock-host-build.json", encoding="utf-8"):
-              line=line.strip()
-              if not line:
-                  continue
-              try:
-                  msg=json.loads(line)
-              except json.JSONDecodeError:
-                  continue
-              if msg.get("executable"):
-                  exe=msg["executable"]
-          print(exe)')
+          exe_win=$(python .github/lock-host-test-exe.py target/lock-host-build.json)
           exe=$(cygpath -u "$exe_win")
           test -f "$exe"
           passes=0

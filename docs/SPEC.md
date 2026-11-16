@@ -365,6 +365,7 @@ Invariants (each one is a test):
   - SCM recovery restarts the Service on crash.
   - While Locked, the Service doesn't accept `SERVICE_CONTROL_STOP`. An uninstall or stop request leads to fail-closed first.
   - If the Service process is killed outright (an administrator-level action), the Lock Host's fall-back covers it.
+- **Known gap, until ticket 13:** a dead Lock Host, and the case where both OS locks fail and a panic then runs `emergency()` (which releases the session and drops the hooks), still rely on the ticket-13 Service watchdog. That watchdog re-locks if the Lock Host dies. See issue #13 and PR #72. The callback-panic fix does not change `emergency()`.
 
 ### 8. Hardening applied while locked (Windows)
 
