@@ -144,6 +144,7 @@ fn command_loop(
             Command::Counts => {
                 let (vis_seen, vis_injected, load_seen, marker_seen, window_keys) =
                     callback::counts();
+                let (slow_entered, slow_returned) = callback::slow_state();
                 protocol::write_msg(
                     writer,
                     &Reply::Counts {
@@ -152,19 +153,19 @@ fn command_loop(
                         load_seen,
                         marker_seen,
                         window_keys,
+                        slow_entered,
+                        slow_returned,
                     },
                 )?;
             }
             Command::Slow { timeout_ms } => {
                 let reply = if role == ROLE_SYSTEM {
-                    run_slow(timeout_ms)
+                    arm_slow(timeout_ms)
                 } else {
                     Reply::Slow {
                         healthy_before: false,
-                        entered: false,
-                        detect_ms: 0,
-                        removed: false,
-                        timeout_ms,
+                        sleep_ms: 0,
+                        marker_seen: 0,
                         error: Some("slow probe runs in the system hook".to_string()),
                     }
                 };
@@ -206,62 +207,25 @@ fn connect(port: u16) -> Result<TcpStream, String> {
     Err(format!("connect to supervisor: {last}"))
 }
 
-fn run_slow(timeout_ms: u64) -> Reply {
+fn arm_slow(timeout_ms: u64) -> Reply {
     callback::reset_counts();
     if !marker_roundtrip() {
         return Reply::Slow {
             healthy_before: false,
-            entered: false,
-            detect_ms: 0,
-            removed: false,
-            timeout_ms,
+            sleep_ms: 0,
+            marker_seen: 0,
             error: Some("marker was not seen before the slow callback".to_string()),
         };
     }
-    let sleep_ms = timeout_ms.saturating_add(1_500).min(8_000) as u32;
+    let sleep_ms = timeout_ms.saturating_add(1_500).min(8_000);
     callback::SLOW_RETURNED.store(0, Ordering::Relaxed);
     callback::SLOW_ENTERED.store(0, Ordering::Relaxed);
-    callback::SLOW_MS.store(sleep_ms, Ordering::Relaxed);
+    callback::SLOW_MS.store(sleep_ms as u32, Ordering::Relaxed);
     callback::SLOW_ARM.store(true, Ordering::Release);
-    let t_send = Instant::now();
-    let sender = thread::spawn(|| input::send_key_pairs(VK_F24, EXTRA_MARKER, 1));
-    let removal = t_send + Duration::from_millis(timeout_ms);
-    while Instant::now() < removal {
-        thread::sleep(Duration::from_millis(20));
-    }
-    // Win32k removes the hook at the timeout. A short slack lets that complete
-    // before the liveness injection, so SendInput is not still waiting on it.
-    thread::sleep(Duration::from_millis(50));
-    let entered = callback::SLOW_ENTERED.load(Ordering::Relaxed) == 1;
-    let before = callback::MARKER_SEEN.load(Ordering::Relaxed);
-    let _ = input::send_key_pairs(VK_F24, EXTRA_MARKER, 1);
-    // A live hook counts the marker inside SendInput. The short poll only
-    // covers a callback that was already queued; it must stay inside the
-    // 500 ms budget together with the removal slack.
-    let mut saw = callback::MARKER_SEEN.load(Ordering::Relaxed) > before;
-    let poll_start = Instant::now();
-    while !saw && poll_start.elapsed() < Duration::from_millis(40) {
-        thread::sleep(Duration::from_millis(10));
-        saw = callback::MARKER_SEEN.load(Ordering::Relaxed) > before;
-    }
-    let detect_ms = removal.elapsed().as_millis() as u64;
-    let return_deadline = Instant::now() + Duration::from_millis(u64::from(sleep_ms) + 2_000);
-    while callback::SLOW_RETURNED.load(Ordering::Relaxed) == 0 && Instant::now() < return_deadline {
-        thread::sleep(Duration::from_millis(20));
-    }
-    thread::sleep(Duration::from_millis(300));
-    let before_confirm = callback::MARKER_SEEN.load(Ordering::Relaxed);
-    let _ = input::send_key_pairs(VK_F24, EXTRA_MARKER, 1);
-    thread::sleep(Duration::from_millis(250));
-    let still_dead = callback::MARKER_SEEN.load(Ordering::Relaxed) == before_confirm;
-    let _ = sender.join();
-    let returned = callback::SLOW_RETURNED.load(Ordering::Relaxed) == 1;
     Reply::Slow {
         healthy_before: true,
-        entered,
-        detect_ms,
-        removed: entered && !saw && still_dead && returned,
-        timeout_ms,
+        sleep_ms,
+        marker_seen: callback::MARKER_SEEN.load(Ordering::Relaxed),
         error: None,
     }
 }

@@ -127,24 +127,16 @@ fn run_proof(args: &Args) -> Result<i32, String> {
     ));
     let timeout_ms = timeout_for_probe(&peers, own_timeout);
     say(&format!("slow-timeout-ms={timeout_ms}"));
-    let slow = ask(
-        peers.get_mut(ROLE_SYSTEM).ok_or("system hook missing")?,
-        &Command::Slow { timeout_ms },
-    )?;
-    let Reply::Slow {
-        healthy_before,
-        entered,
-        detect_ms,
-        removed,
-        timeout_ms: reported_timeout,
-        error,
-    } = slow
-    else {
-        return Err("system hook did not answer the slow probe".to_string());
-    };
+    let liveness = liveness_phase(&mut peers, timeout_ms)?;
     say(&format!(
-        "slow healthy-before={healthy_before} entered={entered} detect-ms={detect_ms} removed={removed} timeout={reported_timeout} error={}",
-        error.as_deref().unwrap_or("none")
+        "slow healthy-before={} entered={} detect-ms={} removed={} timeout={} blocked-ms={} error={}",
+        liveness.healthy_before,
+        liveness.entered,
+        liveness.detect_ms,
+        liveness.removed,
+        timeout_ms,
+        liveness.blocked_ms,
+        liveness.error.as_deref().unwrap_or("none")
     ));
     quit_all(&mut peers);
     let system = &peers[ROLE_SYSTEM].hello;
@@ -171,11 +163,11 @@ fn run_proof(args: &Args) -> Result<i32, String> {
         load_sent,
         load_seen,
         hook_alive_after_load: alive,
-        slow_entered: entered,
-        liveness_healthy_before: healthy_before,
-        liveness_detect_ms: detect_ms,
-        liveness_removed: removed,
-        timeout_ms: reported_timeout,
+        slow_entered: liveness.entered,
+        liveness_healthy_before: liveness.healthy_before,
+        liveness_detect_ms: liveness.detect_ms,
+        liveness_removed: liveness.removed,
+        timeout_ms,
     };
     let decision = verdict::judge(&sample);
     let report = decision.report(&sample);
@@ -280,23 +272,118 @@ fn read_counts(peers: &mut HashMap<String, Peer>, target: &str) -> Result<PhaseC
     let medium = counts_of(peers, ROLE_MEDIUM)?;
     let elevated = counts_of(peers, ROLE_ELEVATED)?;
     let window = if target == ROLE_MEDIUM {
-        medium.4
+        medium.window_keys
     } else {
-        elevated.4
+        elevated.window_keys
     };
     Ok(PhaseCounts {
-        system: saturate(system.0),
-        injected: saturate(system.1),
-        medium: saturate(medium.0),
-        elevated: saturate(elevated.0),
+        system: saturate(system.vis_seen),
+        injected: saturate(system.vis_injected),
+        medium: saturate(medium.vis_seen),
+        elevated: saturate(elevated.vis_seen),
         window: saturate(window),
     })
 }
 
-fn counts_of(
-    peers: &mut HashMap<String, Peer>,
-    role: &str,
-) -> Result<(u64, u64, u64, u64, u64), String> {
+struct Liveness {
+    healthy_before: bool,
+    entered: bool,
+    detect_ms: u64,
+    removed: bool,
+    blocked_ms: u64,
+    error: Option<String>,
+}
+
+fn liveness_phase(peers: &mut HashMap<String, Peer>, timeout_ms: u64) -> Result<Liveness, String> {
+    let armed = ask(
+        peers.get_mut(ROLE_SYSTEM).ok_or("system hook missing")?,
+        &Command::Slow { timeout_ms },
+    )?;
+    let Reply::Slow {
+        healthy_before,
+        sleep_ms,
+        error,
+        ..
+    } = armed
+    else {
+        return Err("system hook did not arm the slow probe".to_string());
+    };
+    if !healthy_before {
+        return Ok(Liveness {
+            healthy_before: false,
+            entered: false,
+            detect_ms: 0,
+            removed: false,
+            blocked_ms: 0,
+            error,
+        });
+    }
+    // The marker has to come from this process. Injecting it from the hook
+    // process blocks inside the callback and Windows does not remove the hook.
+    let t_send = Instant::now();
+    let sender = thread::spawn(|| {
+        let started = Instant::now();
+        let result = input::send_key_pairs(VK_F24, EXTRA_MARKER, 1);
+        (started.elapsed().as_millis() as u64, result)
+    });
+    let removal = t_send + Duration::from_millis(timeout_ms);
+    while Instant::now() < removal {
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(50));
+    let before = counts_of(peers, ROLE_SYSTEM)?.marker_seen;
+    let _ = input::send_key_pairs(VK_F24, EXTRA_MARKER, 1);
+    let mut saw = counts_of(peers, ROLE_SYSTEM)?.marker_seen > before;
+    let poll_start = Instant::now();
+    while !saw && poll_start.elapsed() < Duration::from_millis(40) {
+        thread::sleep(Duration::from_millis(10));
+        saw = counts_of(peers, ROLE_SYSTEM)?.marker_seen > before;
+    }
+    let detect_ms = removal.elapsed().as_millis() as u64;
+    let return_deadline = Instant::now() + Duration::from_millis(sleep_ms.saturating_add(2_000));
+    let mut entered = false;
+    let mut returned = false;
+    while Instant::now() < return_deadline {
+        let counts = counts_of(peers, ROLE_SYSTEM)?;
+        entered = counts.slow_entered;
+        returned = counts.slow_returned;
+        if returned {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(300));
+    let before_confirm = counts_of(peers, ROLE_SYSTEM)?.marker_seen;
+    let _ = input::send_key_pairs(VK_F24, EXTRA_MARKER, 1);
+    thread::sleep(Duration::from_millis(250));
+    let still_dead = counts_of(peers, ROLE_SYSTEM)?.marker_seen == before_confirm;
+    let (blocked_ms, marker_result) = sender
+        .join()
+        .unwrap_or((0, Err("sender thread panicked".to_string())));
+    if let Err(failure) = &marker_result {
+        say(&format!("slow-marker error={failure}"));
+    }
+    Ok(Liveness {
+        healthy_before: true,
+        entered,
+        detect_ms,
+        removed: entered && !saw && still_dead && returned,
+        blocked_ms,
+        error: None,
+    })
+}
+
+struct HookCounts {
+    vis_seen: u64,
+    vis_injected: u64,
+    load_seen: u64,
+    marker_seen: u64,
+    window_keys: u64,
+    slow_entered: bool,
+    slow_returned: bool,
+}
+
+fn counts_of(peers: &mut HashMap<String, Peer>, role: &str) -> Result<HookCounts, String> {
     let reply = ask(peers.get_mut(role).ok_or("role missing")?, &Command::Counts)?;
     match reply {
         Reply::Counts {
@@ -305,7 +392,17 @@ fn counts_of(
             load_seen,
             marker_seen,
             window_keys,
-        } => Ok((vis_seen, vis_injected, load_seen, marker_seen, window_keys)),
+            slow_entered,
+            slow_returned,
+        } => Ok(HookCounts {
+            vis_seen,
+            vis_injected,
+            load_seen,
+            marker_seen,
+            window_keys,
+            slow_entered,
+            slow_returned,
+        }),
         other => Err(format!("{role} counts reply was {other:?}")),
     }
 }
@@ -317,19 +414,19 @@ fn load_phase(peers: &mut HashMap<String, Peer>) -> Result<(u32, u32, bool), Str
     let start = Instant::now();
     let mut seen = 0u64;
     while start.elapsed() < Duration::from_secs(60) {
-        let (_, _, load_seen, _, _) = counts_of(peers, ROLE_SYSTEM)?;
+        let load_seen = counts_of(peers, ROLE_SYSTEM)?.load_seen;
         seen = load_seen;
         if seen >= u64::from(inserted) {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    let before = counts_of(peers, ROLE_SYSTEM)?.3;
+    let before = counts_of(peers, ROLE_SYSTEM)?.marker_seen;
     let marker_inserted = input::send_key_pairs(VK_F24, EXTRA_MARKER, 1)?;
     let marker_deadline = Instant::now() + Duration::from_millis(500);
     let mut marker = before;
     while Instant::now() < marker_deadline {
-        marker = counts_of(peers, ROLE_SYSTEM)?.3;
+        marker = counts_of(peers, ROLE_SYSTEM)?.marker_seen;
         if marker > before {
             break;
         }

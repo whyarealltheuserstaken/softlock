@@ -31,6 +31,13 @@ pub fn reset_counts() {
     WINDOW_KEYS.store(0, Ordering::Relaxed);
 }
 
+pub fn slow_state() -> (bool, bool) {
+    (
+        SLOW_ENTERED.load(Ordering::Relaxed) == 1,
+        SLOW_RETURNED.load(Ordering::Relaxed) == 1,
+    )
+}
+
 pub fn counts() -> (u64, u64, u64, u64, u64) {
     (
         VIS_SEEN.load(Ordering::Relaxed),

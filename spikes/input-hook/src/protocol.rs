@@ -65,14 +65,17 @@ pub enum Reply {
         load_seen: u64,
         marker_seen: u64,
         window_keys: u64,
+        slow_entered: bool,
+        slow_returned: bool,
     },
+    /// The system hook armed the removal probe. The supervisor injects the
+    /// marker from outside that process; a same-process `SendInput` does not
+    /// trip `LowLevelHooksTimeout`.
     #[serde(rename = "slow")]
     Slow {
         healthy_before: bool,
-        entered: bool,
-        detect_ms: u64,
-        removed: bool,
-        timeout_ms: u64,
+        sleep_ms: u64,
+        marker_seen: u64,
         error: Option<String>,
     },
     #[serde(rename = "bye")]
@@ -142,6 +145,8 @@ mod tests {
             load_seen: 40_000,
             marker_seen: 1,
             window_keys: 20,
+            slow_entered: false,
+            slow_returned: false,
         };
         let mut bytes = Vec::new();
         write_msg(&mut bytes, &reply).unwrap();
