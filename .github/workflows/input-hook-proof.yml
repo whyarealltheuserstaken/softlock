@@ -1,0 +1,64 @@
+name: Input hook proof
+
+# Manual runs, and pull requests that touch the probe, the finding, or this file.
+# No push trigger: a push to main after merge must not install the SYSTEM service.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'spikes/input-hook/**'
+      - 'docs/findings/05-input-hook/**'
+      - '.github/workflows/input-hook-proof.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: input-hook-proof-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proof:
+    name: input hook proof (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: spikes/input-hook -> spikes/input-hook/target
+      - name: Record the runner session
+        shell: powershell
+        continue-on-error: true
+        run: |
+          cmd /c "query user"
+          cmd /c "query session"
+          Write-Output "ImageOS=$env:ImageOS"
+          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' | Select-Object ProductName, DisplayVersion, CurrentBuild, InstallationType, EditionID | Format-List
+          exit 0
+      - name: Format
+        run: cargo fmt --manifest-path spikes/input-hook/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path spikes/input-hook/Cargo.toml --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --manifest-path spikes/input-hook/Cargo.toml
+      - name: Run the input hook proof
+        shell: cmd
+        run: cargo run --release --manifest-path spikes/input-hook/Cargo.toml -- --runner-image ${{ matrix.image }} --output-dir proof-output
+      - name: Remove the throwaway service
+        if: always()
+        shell: powershell
+        run: |
+          $svc = 'InputHookProbe'
+          sc.exe stop $svc
+          sc.exe delete $svc
+          Get-Process -Name 'input-hook' -ErrorAction SilentlyContinue | Stop-Process -Force
+          exit 0
