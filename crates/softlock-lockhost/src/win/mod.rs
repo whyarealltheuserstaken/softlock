@@ -1,4 +1,6 @@
-//! Windows dev launch. Absent from builds that do not enable `dev-launch`.
+//! Windows lock host. The dev-launch path is the in-process session the seam
+//! tests drive. The service spawns the same process and talks to it on the
+//! private channel.
 
 mod failclosed;
 mod guard;
@@ -8,4 +10,4 @@ mod queue;
 mod session;
 
 pub use failclosed::{current_session_id, disconnect_session};
-pub use session::{DevConfig, DevError, DevLock, OVERLAY_MARKER};
+pub use session::{DevConfig, DevError, DevLock, OVERLAY_MARKER, run_service_host};

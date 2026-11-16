@@ -15,6 +15,7 @@ simulated-physical = ["dep:softlock-lockhost", "softlock-lockhost/simulated-phys
 dev-launch = [
     "dep:softlock-lockhost",
     "dep:softlock-core",
+    "dep:softlock-service",
     "softlock-lockhost/dev-launch",
     "softlock-lockhost/simulated-physical",
 ]
@@ -22,6 +23,7 @@ dev-launch = [
 [dependencies]
 softlock-core = { path = "../softlock-core", optional = true }
 softlock-lockhost = { path = "../softlock-lockhost", optional = true }
+softlock-service = { path = "../softlock-service", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

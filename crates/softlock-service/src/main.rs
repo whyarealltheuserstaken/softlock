@@ -1,0 +1,27 @@
+//! Service process. `--print-names` reports the name constants. `--foreground`
+//! serves the pipe in this session. With no flag the process asks the Service
+//! Control Manager to start it.
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("--print-names") => {
+            println!("name={}", softlock_core::SERVICE_NAME);
+            println!("display={}", softlock_core::SERVICE_DISPLAY_NAME);
+            println!("pipe={}", softlock_core::pipe_name());
+        }
+        Some("--foreground") => {
+            let code = softlock_service::run_foreground();
+            std::process::exit(code);
+        }
+        Some("--session-probe") => {
+            let path = args.next().unwrap_or_default();
+            let code = softlock_service::run_session_probe(&path);
+            std::process::exit(code);
+        }
+        _ => {
+            let code = softlock_service::run_service();
+            std::process::exit(code);
+        }
+    }
+}

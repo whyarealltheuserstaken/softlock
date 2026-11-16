@@ -2303,3 +2303,80 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn a_matching_nonce_is_consumed_and_cannot_unlock_again() {
+    let mut controller = locked_started();
+    controller.handle(Event::RequestHello);
+    let nonce = controller.broker_nonce().expect("broker nonce");
+    let replay = LaunchNonce::from_bytes(*nonce.as_bytes());
+    controller.handle(Event::Verified { nonce });
+    assert!(matches!(controller.state(), LockState::Unlocked));
+    assert!(controller.broker_nonce().is_none());
+
+    controller.handle(Event::LockRequested {
+        source: LockSource::Hotkey,
+    });
+    assert!(matches!(controller.state(), LockState::Locked { .. }));
+    controller.handle(Event::Verified { nonce: replay });
+    assert!(
+        matches!(controller.state(), LockState::Locked { .. }),
+        "a consumed nonce unlocked a second time"
+    );
+    assert!(
+        controller
+            .rejection_log()
+            .iter()
+            .any(|rejection| rejection.event == "Verified")
+    );
+}
+
+#[test]
+fn adopt_uses_the_service_nonce_and_a_self_issued_one_is_not_required() {
+    let mut controller = locked_started();
+    let nonce = LaunchNonce::generate().expect("nonce");
+    let bytes = *nonce.as_bytes();
+    controller.handle(Event::AdoptLaunchNonce { nonce });
+    controller.handle(Event::Verified {
+        nonce: LaunchNonce::from_bytes(bytes),
+    });
+    assert!(matches!(controller.state(), LockState::Unlocked));
+    assert!(controller.broker_nonce().is_none());
+}
+
+#[test]
+fn host_loss_while_the_os_lock_is_down_retries_and_never_unlocks() {
+    let mut platform = FakePlatform::new();
+    platform.fail_os_lock(true);
+    let mut controller = started(platform);
+    controller.handle(Event::LockRequested {
+        source: LockSource::LocalApi,
+    });
+    let first = controller.os_lock_attempts();
+    controller.handle(Event::HostExited);
+    assert!(controller.os_lock_unavailable());
+    assert!(controller.recovery_due());
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed {
+            reason: FailReason::HostExited
+        }
+    ));
+    let after_exit = controller.os_lock_attempts();
+    assert!(after_exit > first);
+
+    controller.acknowledge_recovery();
+    assert!(!controller.recovery_due());
+    controller.handle(Event::GuardDown);
+    assert!(controller.recovery_due());
+    assert!(controller.os_lock_attempts() > after_exit);
+    controller.handle(Event::HostSilent);
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed { .. }
+    ));
+    assert!(
+        !controller.returned_to_unlocked(),
+        "host loss while the OS lock is down ended Unlocked"
+    );
+}

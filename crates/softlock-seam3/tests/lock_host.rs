@@ -51,7 +51,7 @@ impl Drop for Nonce {
 
 fn arm(hash: &str, while_arming: Option<Box<dyn FnOnce() + Send>>) -> DevLock {
     DevLock::arm(DevConfig {
-        pin_hash: hash.to_string(),
+        authority: Box::new(softlock_service::PinChecker::issue(hash)),
         while_arming,
     })
     .expect("lock host did not arm")
@@ -251,7 +251,7 @@ fn arming_stays_under_500ms_and_swallows_physical_keys() {
     let (tx, rx) = std::sync::mpsc::channel();
     let started = Instant::now();
     let lock = DevLock::arm(DevConfig {
-        pin_hash: "unused".to_string(),
+        authority: Box::new(softlock_service::PinChecker::issue("unused")),
         while_arming: Some(Box::new(move || {
             let mut sent = 0u32;
             for _ in 0..8 {

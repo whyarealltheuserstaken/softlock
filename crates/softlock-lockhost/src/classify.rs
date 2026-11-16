@@ -67,6 +67,11 @@ impl RunNonce {
         Self(raw)
     }
 
+    /// Rebuilds a nonce the seam passed in. Zero is not a nonce.
+    pub const fn from_extra(raw: u64) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
     pub const fn as_extra_info(self) -> u64 {
         self.0
     }
