@@ -707,7 +707,13 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
     // next PIN reuses this buffer instead of abandoning a copy.
     entry.bytes.zeroize();
     entry.chars = 0;
-    shared.pin_chars.store(0, Ordering::Release);
+    // `pin_chars` stays at the submitted length until the hash and the
+    // controller have finished. Publishing zero first lets the next PIN's
+    // keys queue during Argon2 and then look lost to a short wait.
+    let finish = |shared: &Shared| {
+        shared.pin_chars.store(0, Ordering::Release);
+        overlay::invalidate(shared);
+    };
     // Any PIN, right or wrong, is refused while the controller's backoff is
     // running. `SubmitSecret` is how that refusal is recorded: the controller
     // drops the secret and does not start an unlock.
@@ -716,7 +722,7 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
             method: MethodId::softlock_pin(),
             secret,
         });
-        overlay::invalidate(shared);
+        finish(shared);
         return;
     }
     // Argon2id compare, constant time, spec parameters. `Verdict::Verified`
@@ -725,15 +731,18 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
     if matched && matches!(controller.state(), LockState::Locked { .. }) {
         drop(secret);
         unlock_with_broker_nonce(controller, shared);
+        finish(shared);
         return;
     }
     if matched && shared.os_lock_unavailable.load(Ordering::Acquire) {
         // The controller is `FailingClosed`, so `RequestHello` is refused.
         // A verified PIN is the only release while both OS locks keep failing.
+        // Backoff is clear here: a non-zero delay returned above.
         drop(secret);
         release_session(shared);
         shared.prompt_open.store(false, Ordering::Release);
         shared.locked.store(false, Ordering::Release);
+        finish(shared);
         return;
     }
     // Wrong PIN, or a PIN the controller will not accept. `verify_secret`
@@ -743,7 +752,7 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
         method: MethodId::softlock_pin(),
         secret,
     });
-    overlay::invalidate(shared);
+    finish(shared);
 }
 
 fn unlock_with_broker_nonce(controller: &mut LockController<WinPlatform>, shared: &Shared) {

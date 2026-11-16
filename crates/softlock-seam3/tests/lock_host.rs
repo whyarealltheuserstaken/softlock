@@ -395,7 +395,7 @@ fn submit_pin(lock: &DevLock, bytes: &[u8], extra: u64) {
     type_codes(bytes, extra);
     let count = u32::try_from(bytes.len()).unwrap_or(0);
     assert!(
-        wait_for(Duration::from_secs(3), || lock.pin_chars() == count),
+        wait_for(Duration::from_secs(15), || lock.pin_chars() == count),
         "the pin was not collected"
     );
     send_virtual_key(VK_RETURN, extra).expect("submit");
