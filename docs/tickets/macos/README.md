@@ -8,7 +8,7 @@ Style matches the Windows tickets on the v1 roadmap ([issue 33](https://github.c
 
 - **CI only.** GitHub `macos-latest` (arm64). No Intel Mac.
 - **Henry's Intel Mac.** His machine. A Rosetta run on an arm64 runner does not count.
-- **Apple Silicon only.** Cannot be proven on Intel. The arm64 runners also cannot prove these, because they have no Touch ID sensor.
+- **Apple Silicon only.** No ticket in this set still uses this label. His Intel Mac has Touch ID, so m12 and m19 run there. The arm64 runners still have no Touch ID sensor.
 
 A ticket whose tests are CI and whose checklist line is his Mac is labeled with both.
 
@@ -27,13 +27,13 @@ A ticket whose tests are CI and whose checklist line is his Mac is labeled with 
 | [m09](m09-password-sheet-intel.md) | Kit: `LAContext` password sheet above the overlay | m05 | Henry's Intel Mac |
 | [m10](m10-tcc-prompts-intel.md) | Kit: Accessibility and Input Monitoring, no MDM | m05, D3 | Henry's Intel Mac |
 | [m11](m11-x86-slice-intel.md) | Run the x86_64 slice natively | m01, m02 | Henry's Intel Mac |
-| [m12](m12-touch-id.md) | Kit: Touch ID | m09, an Apple silicon Mac with Touch ID | Apple Silicon only |
+| [m12](m12-touch-id.md) | Kit: Touch ID | m09 | Henry's Intel Mac |
 | [m14](m14-lock-host.md) | Lock Host: block physical input, pass posted input, dev PIN | m01, m03, m04, m05, m06, m10, m11 | CI only and Henry's Intel Mac |
 | [m15](m15-service.md) | Service: LaunchDaemon, LaunchAgent, socket, Broker nonce | m14, m02 | CI only and Henry's Intel Mac |
 | [m16](m16-app-tracer.md) | App hotkey and status, first macOS tracer bullet | m15, m07 | Henry's Intel Mac |
 | [m17](m17-fail-closed.md) | Fail closed on `SACLockScreenImmediate`, then the documented path | m08, m15 | CI and Henry's Intel Mac |
 | [m18](m18-password-unlock.md) | Unlock with the Mac password through the Broker | m09, m15 | Henry's Intel Mac |
-| [m19](m19-touch-id-unlock.md) | Unlock with Touch ID through the same Broker | m12, m18 | Apple Silicon only |
+| [m19](m19-touch-id-unlock.md) | Unlock with Touch ID through the same Broker | m12, m18 | Henry's Intel Mac |
 
 m13 is unused so the tracer bullet can keep the numbers m14, m15, m16 in the same order as the Windows first bullet (lock host, service, app).
 
@@ -50,7 +50,7 @@ m01 and m02, in parallel, after Henry approves this set. They do not wait on his
 5. m14
 6. m15
 7. m16, and in parallel m17 and m18
-8. m12 and m19 when an Apple silicon Mac with Touch ID exists
+8. m12 and m19 on his Intel Mac, which has Touch ID. They stay off the first-demo path
 
 Critical path for the first demo on his Intel Mac, the longest chain in the Blocked-by lines: m02 → m03 → m05 → m10 → m14 → m15 → m16.
 
@@ -89,4 +89,4 @@ m15 --> m18
 m18 --> m19
 ```
 
-D3 is accepted by the lead and does not block m10. Henry decided D1 (Universal 2, macOS 11, his Intel Mac, arm64 on `macos-latest`) and D5 (`SACLockScreenImmediate` via `dlopen`, then the documented screen-saver path). D5 does not block m08. The lead accepted D2, D4, D6, and D7. The lead decided D8: a failure never ends Unlocked. The Intel Mac details in D1 are still open. D6 blocks any ticket that would claim capture exclusion beyond what m04 and m06 measured. D2 blocks a signing ticket, and this set does not contain one.
+D3 is accepted by the lead and does not block m10. Henry decided D1 (Universal 2, macOS 11, his Intel Mac, arm64 on `macos-latest`) and D5 (`SACLockScreenImmediate` via `dlopen`, then the documented screen-saver path). D5 does not block m08. The lead accepted D2, D4, D6, and D7. The lead decided D8: a failure never ends Unlocked. His Intel Mac is recorded in D1 and on [Henry's sheet](henry-sheet.md): MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), macOS Tahoe 26.7.3, laptop, Touch ID, T2. The number of external displays is still open. macOS 11 through 15 are untested. D6 blocks any ticket that would claim capture exclusion beyond what m04 and m06 measured. D2 blocks a signing ticket, and this set does not contain one.

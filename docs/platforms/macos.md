@@ -2,13 +2,13 @@
 
 | | |
 |---|---|
-| **Status** | Planning only. Not approved as a set, and the tickets are not GitHub issues. Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7, and decided D8 (a failure never ends Unlocked). The Intel Mac details in D1 are still open. No product code comes with it. |
+| **Status** | Planning only. Not approved as a set, and the tickets are not GitHub issues. Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7, and decided D8 (a failure never ends Unlocked). His Intel Mac is recorded in D1: MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), macOS Tahoe 26.7.3, laptop, Touch ID, T2. The number of external displays is still open. macOS 11 through 15 are untested. No product code comes with it. |
 | **Date** | 16 November 2026 |
 | **Read against** | `23b5a39bc92c2ee32f470256d78be27d030dc59f` on `main` |
 | **Supersedes** | The macOS bullets that used to live in SPEC.md Implementation Decision 16, and the short phase-2 note that used to be this file |
 | **Does not change** | Windows v1, the lock state machine, the Broker nonce rule, the open-core boundary, or the Linux note |
 
-This is the macOS half of the product, planned in parallel with Windows. Henry decided D1 in [`docs/tickets/macos/decisions.md`](../tickets/macos/decisions.md): Universal 2, macOS 11 or later, his Intel Mac for the Intel slice, and `macos-latest` for arm64. The machine details in that decision are still open.
+This is the macOS half of the product, planned in parallel with Windows. Henry decided D1 in [`docs/tickets/macos/decisions.md`](../tickets/macos/decisions.md): Universal 2, macOS 11 or later, his Intel Mac for the Intel slice, and `macos-latest` for arm64. That Mac is a MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), 2 GHz quad-core Intel Core i5, Intel Iris Plus Graphics, 16 GB LPDDR4X, running macOS Tahoe 26.7.3. It is a laptop, and it has Touch ID and the T2 chip. The number of external displays is still open. macOS 26.7.3 is well above the macOS 11 floor, so arm64 CI on `macos-latest` plus this machine on 26.x leaves macOS 11 through 15 untested.
 
 Every claim below is tagged.
 
@@ -126,7 +126,7 @@ A developer forum thread ([792152](https://developer.apple.com/forums/thread/792
 
 **Spike m07.** Hold `PreventUserIdleSystemSleep` and `PreventUserIdleDisplaySleep` if the SDK still has those names (the spike prints the names that compile). Run a small process that increments a counter on a timer, with the overlay up and with it down, and compare the counts. If the covered process slows, that is a product limit and the wizard says so. `caffeinate` is only a probe. The product calls `IOPMAssertionCreateWithName` so the reason string shows up in `pmset -g assertions`. The spike checks that `caffeinate` exists before using it as a control.
 
-Lid close is forced sleep on the QA1340 page. Phase 2 does not offer lid-close takeover on macOS. That is decision D7, accepted by the lead. If his Intel Mac is a desktop, m07 records "no lid" and the lid case stays unproven on every machine this plan has.
+Lid close is forced sleep on the QA1340 page. Phase 2 does not offer lid-close takeover on macOS. That is decision D7, accepted by the lead. His Intel Mac is a laptop, so m07 records what the lid does. A desktop "no lid" row does not apply to this machine.
 
 ## 4. Fail closed, and FileVault
 
@@ -145,7 +145,7 @@ Fail closed still means the real lock, within about a second, and agents pause u
 
 **Verified from the `fdesetup(8)` manual page** (read from [this mirror](https://keith.github.io/xcode-man-pages/fdesetup.8.html)): `fdesetup` reports whether FileVault is on or off, and some status commands can be run from a non-root session. `fdesetup status` indicates On or Off. `fdesetup isactive` returns `true` or `false`.
 
-**Spike m08.** Run `fdesetup status` and `fdesetup isactive` as the console user, not root, and record the output. The wizard's disk-encryption check uses whichever of those works without an admin password. An Intel Mac without a T2 chip does not prove the Secure Enclave path. GitHub runners are not rebooted into the FileVault prompt, so the pre-boot screen is Henry's checklist line if his disk has FileVault on, and it is unproven if it does not.
+**Spike m08.** Run `fdesetup status` and `fdesetup isactive` as the console user, not root, and record the output. The wizard's disk-encryption check uses whichever of those works without an admin password. This Intel Mac has the T2 chip, so a FileVault-on pre-boot screen is the Secure Enclave path. GitHub runners are not rebooted into the FileVault prompt, so that screen is Henry's checklist line if his disk has FileVault on, and it is unproven if it does not.
 
 **Test, tickets m08 and m17, runs in CI.** The chooser is a pure function of three results: whether `dlsym` returned the symbol, whether that call succeeded, and whether the documented path can require a password with a zero delay. It lives with the macOS `SessionControl` work and the workspace test calls it. The test does not call the live symbol, so the job does not lock the runner. The existing verify job (`cargo test --workspace` on `ubuntu-latest`, `windows-latest`, and `macos-latest` in `.github/workflows/ci.yml`) runs these four rows:
 
@@ -164,7 +164,7 @@ The Lock Host does not decide that the owner authenticated. The Service does, an
 
 **Spike m09, on Henry's Intel Mac.** The system sheet has to appear above the overlay. While it is up, physical keys must not reach other apps. If the sheet's secure input disables the tap, m09 records that, and the guard treats the disable as fail-closed unless the sheet is the only place keys are going. A root daemon calling `evaluatePolicy` is not the documented sample (the sample is an app). The guess is that the Broker has to be a GUI LaunchAgent. m09 confirms or rejects that.
 
-Touch ID is the biometry branch of the same policy. **Spike m12, Apple Silicon only.** GitHub's arm64 runners have no Touch ID sensor. An Intel Mac without a Touch ID sensor cannot run it either. Some 2018–2020 Intel portables have Touch ID through the T2 chip. If Henry's Mac is one of those, m12 moves to his machine and the "Apple Silicon only" label comes off. Apple Watch unlock is not in that bucket: the policy page includes it for macOS generally, and m09 records it if a Watch is paired with his Intel Mac.
+Touch ID is the biometry branch of the same policy. **Spike m12, on Henry's Intel Mac.** GitHub's arm64 runners have no Touch ID sensor. This MacBook Pro has Touch ID and the T2 chip, so m12 and m19 run on his machine. The "Apple Silicon only" label is off. Apple Watch unlock is not in that bucket: the policy page includes it for macOS generally, and m09 records it if a Watch is paired with his Intel Mac.
 
 The dev-PIN tracer (m14, m15, m16) uses the existing Argon2id check in Core, the same shape as Windows ticket 12. The Mac password is m18, after the Broker exists. Touch ID is m19, and it does not block the Intel tracer.
 
@@ -221,5 +221,6 @@ Simulated physical input on a runner is the nonce in `kCGEventSourceUserData`, a
 - That an assertion keeps a Mac awake with the lid shut.
 - That `SACLockScreenImmediate` is a public API.
 - That a missing symbol or a failed call leaves the session unlocked. Both take the documented screen-saver path when that path can require an immediate password. Otherwise D8 refuses to arm, or keeps the guard and the overlay up.
-- That Touch ID can be tested on an Intel Mac that has no sensor, or on a GitHub runner.
+- That Touch ID can be tested on a GitHub runner. His Intel Mac has a sensor, so m12 runs there.
+- That macOS 11 through 15 have been tested. His Mac is on 26.7.3, and arm64 CI is `macos-latest`.
 - That a Rosetta run of the x86_64 slice replaces Henry's Mac.

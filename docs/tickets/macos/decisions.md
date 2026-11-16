@@ -4,7 +4,7 @@ Read against `23b5a39bc92c2ee32f470256d78be27d030dc59f`. The addendum is [`docs/
 
 Each item has a recommendation until someone decides it. Changing an answer rewrites the tickets that name it. It does not rewrite the Windows spec.
 
-Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7 on 16 November 2026, as written. The lead also decided D8 the same day. The Intel Mac details in D1 are still open.
+Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7 on 16 November 2026, as written. The lead also decided D8 the same day. Henry's Intel Mac is recorded in D1. The number of external displays, and whether a second keyboard is available, are still open.
 
 ## D1. Universal 2, macOS 11, his Intel Mac, arm64 on macos-latest
 
@@ -12,7 +12,11 @@ Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7 on 16 November
 
 GitHub `macos-latest` is an arm64 image of macOS 15 or macOS 26 (the runner docs and the runner-images list disagreed on 16 November 2026). It will not boot macOS 11. Ticket m02 records the runner's `sw_vers`.
 
-**Still open, not a product choice:** the model, the macOS version, laptop or desktop, how many displays, whether it has Touch ID, and whether a second keyboard is available. The kits say "if the machine has one."
+**Recorded 16 November 2026, from his About This Mac.** MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports). 2 GHz quad-core Intel Core i5. Intel Iris Plus Graphics. 16 GB LPDDR4X. macOS Tahoe 26.7.3. It is a laptop. It has Touch ID and the T2 chip; that model has both. The hardware tickets' test-machine sections and [Henry's sheet](henry-sheet.md) use this list.
+
+macOS 26.7.3 is well above the macOS 11 floor. Arm64 CI on `macos-latest` plus this Intel machine on 26.x means macOS 11 through 15 are untested. That is a known gap. m02 still prints the runner's `sw_vers`. It does not close the gap.
+
+**Still open:** the number of external displays, and whether a second keyboard is available. The kits say "if the machine has one" only for those two.
 
 ## D2. Developer ID now, or unsigned like Windows
 
@@ -51,7 +55,7 @@ GitHub lists `macos-15-intel` and `macos-26-intel` as well as the arm64 `macos-l
 
 `SACLockScreenImmediate` has no Apple documentation page. It is a private symbol in `login.framework`. The public pages we have do not offer a "lock the screen now" call. The screen-saver-plus-password path is weaker and is the documented lock path.
 
-**Decision, Henry, 16 November 2026:** use `SACLockScreenImmediate`, resolved with `dlopen` and `dlsym`. The binary does not link `login.framework`. If the symbol is missing, or the call fails, use the documented lock path (start the screen saver and require the account password). A missing symbol is not a crash. The login window is not the fallback. When that documented path cannot guarantee a password, D8 applies. The Intel Mac details in D1 are still open.
+**Decision, Henry, 16 November 2026:** use `SACLockScreenImmediate`, resolved with `dlopen` and `dlsym`. The binary does not link `login.framework`. If the symbol is missing, or the call fails, use the documented lock path (start the screen saver and require the account password). A missing symbol is not a crash. The login window is not the fallback. When that documented path cannot guarantee a password, D8 applies. His Intel Mac is the machine in D1. The number of external displays is still open.
 
 ## D6. Capture exclusion may be unprovable
 

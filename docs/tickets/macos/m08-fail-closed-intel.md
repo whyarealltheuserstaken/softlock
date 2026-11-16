@@ -19,9 +19,11 @@ This kit does not install the product service. It measures the two paths D5 alre
 
 **Where:** Henry's Intel Mac for the sheet. CI for the four chooser rows, in the existing verify job. Locking the session is a poor default CI job. A later CI job that locks a runner is allowed only if m02 says the runner comes back after a lock, and it runs in its own workflow. The proof that a path shows a lock screen is his Mac.
 
+**Test machine:** MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports). 2 GHz quad-core Intel Core i5. Intel Iris Plus Graphics. 16 GB LPDDR4X. macOS Tahoe 26.7.3. Laptop, with Touch ID and the T2 chip, so a FileVault-on pre-boot screen is the Secure Enclave path. The number of external displays is still unknown. macOS 11 through 15 are untested: this machine is on 26.x, and arm64 CI is `macos-latest`. Full list: D1 and [Henry's sheet](henry-sheet.md).
+
 **Type:** Hardware kit, plus the chooser test. Deliverable is the sheet under `docs/findings/`, and a green verify job.
 
-**Status:** waiting for Henry's Mac for the sheet. The Intel Mac details in D1 are still open. Not ready-for-agent. Not a GitHub issue.
+**Status:** waiting for Henry to run the sheet. The machine is recorded. The number of external displays is still open. Not ready-for-agent. Not a GitHub issue.
 
 - [ ] Private-call row: reached the real lock and the time, or the error, including a missing symbol when his OS can show one (sheet)
 - [ ] Documented-path row: reached the lock screen and the time, and whether a click or a key reached the desktop without the account password (sheet)
@@ -32,6 +34,6 @@ This kit does not install the product service. It measures the two paths D5 alre
 - [ ] CI: a successful private call does not request the documented path
 - [ ] CI: documented path unavailable or password not required → never Unlocked; refuse to arm
 - [ ] `fdesetup status` and `fdesetup isactive` output as the console user, or the permission error (sheet)
-- [ ] Written finding records both paths and says FileVault pre-boot was or was not observed. An Intel Mac without a T2 chip does not prove the Secure Enclave path
+- [ ] Written finding records both paths and says FileVault pre-boot was or was not observed. This Mac has the T2 chip, so a FileVault-on pre-boot screen is the Secure Enclave path. If FileVault is off, that screen stays unproven
 
 Common to every ticket: red-green TDD at the named seams, CI green, no planned paid or enterprise features (allowlists, rules, fleet management, remote triggers, the CLI, MDM profiles), the product name only via the name constant.
