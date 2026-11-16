@@ -366,6 +366,12 @@ fn accept_roles(
     while peers.len() < 3 && start.elapsed() < timeout {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Windows copies the listener's nonblocking mode onto the
+                // accepted socket. The hello can already be buffered, and the
+                // next reply is not, so a later read returns WSAEWOULDBLOCK.
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|error| format!("blocking socket: {error}"))?;
                 let _ = stream.set_nodelay(true);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(180)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
