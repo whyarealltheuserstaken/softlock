@@ -195,11 +195,15 @@ jobs:
           grep -F "the_heartbeat_watchdog_fires ... ok" target/seam3-lock-host.txt
           grep -F "both_os_lock_paths_failing_keeps_the_guard_and_retries ... ok" target/seam3-lock-host.txt
           grep -F "a_liveness_miss_fail_closes ... ok" target/seam3-lock-host.txt
-          grep -F "a_window_thread_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
+          # The window-thread panic is forwarded, so its message sits between
+          # the test name and `ok`.
+          grep -F -A20 "test a_window_thread_panic_tries_the_os_lock_then_drops_the_hooks" target/seam3-lock-host.txt | grep -E -q "^ok"
           grep -F "failing_closed_wrong_pins_then_a_correct_pin_during_backoff_stays_locked ... ok" target/seam3-lock-host.txt
           grep -F "failing_closed_correct_pin_releases_after_backoff ... ok" target/seam3-lock-host.txt
           grep -F "a_hook_thread_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
-          grep -F "a_liveness_thread_panic_tries_the_os_lock_without_trapping_input ... ok" target/seam3-lock-host.txt
+          # The liveness-thread panic is forwarded, so its message sits between
+          # the test name and `ok`.
+          grep -F -A20 "test a_liveness_thread_panic_tries_the_os_lock_without_trapping_input" target/seam3-lock-host.txt | grep -E -q "^ok"
           grep -F "a_callback_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
       - name: Callback panic loop
         shell: bash
