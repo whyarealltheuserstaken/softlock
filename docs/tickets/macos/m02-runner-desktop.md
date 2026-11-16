@@ -10,12 +10,12 @@
 
 **Type:** Prototype spike. Deliverable is a written finding plus a minimal proof job. The finding names the dependents above and says which later tickets stay on the runner and which move entirely to Henry's Intel Mac.
 
-**Status:** waiting for Henry. Not ready-for-agent. Not a GitHub issue.
+**Status:** runner finding recorded in `docs/findings/m02-macos-runner-desktop.md` ([issue 51](https://github.com/whyarealltheuserstaken/softlock/issues/51)), from run 43970180511 on `17c682c52f5325e986ae5f1ae1f64882ec22ea57`. The proof window became key and received the `CGEventPost` key. The LaunchAgent window was key and did not receive it (`CGPreflightPostEventAccess=false`). Hardware follow-ups are in that finding's section for Henry's Intel Mac.
 
-- [ ] The proof job prints `sw_vers` and `uname -m`, and `uname -m` is `arm64` (job log)
-- [ ] The proof job shows a window and a `CGEventPost` key that the window receives, or a written miss that names the API error (job log)
-- [ ] The proof job attempts `kCGSessionEventTap` and `kCGHIDEventTap` and records `NULL` versus a live tap, including any TCC denial (job log)
-- [ ] The proof job loads and unloads a throwaway LaunchAgent and a throwaway LaunchDaemon, and the job's last step unloads them even when the proof step is cancelled (workflow)
-- [ ] Written finding committed under `docs/findings/`, with the run URL and the head SHA, deciding which of m03, m04, m07, m08, and m15 can stay on the runner
+- [x] The proof job prints `sw_vers` and `uname -m`, and `uname -m` is `arm64` (job log)
+- [x] The proof job shows a window and a `CGEventPost` key that the window receives, or a written miss that names the API error (job log)
+- [x] The proof job attempts `kCGSessionEventTap` and `kCGHIDEventTap` and records `NULL` versus a live tap, including any TCC denial (job log)
+- [x] The proof job loads and unloads a throwaway LaunchAgent and a throwaway LaunchDaemon, and the job's last step unloads them even when the proof step is cancelled (workflow)
+- [x] Written finding committed under `docs/findings/`, with the run URL and the head SHA, deciding which of m03, m04, m07, m08, and m15 can stay on the runner
 
 Common to every ticket: red-green TDD at the named seams, CI green, no planned paid or enterprise features (allowlists, rules, fleet management, remote triggers, the CLI, MDM profiles), the product name only via the name constant.
