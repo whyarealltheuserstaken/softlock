@@ -208,8 +208,9 @@ fn decode_request_json(json: &str) -> Result<DecodedRequest, IpcError> {
         .filter(|key| *key != "v" && *key != "id")
         .cloned()
         .collect();
-    let Value::Object(mut object) = std::mem::replace(&mut value, Value::Null) else {
-        return Err(IpcError::Malformed);
+    // Already matched as an object above, so the move cannot fail.
+    let Value::Object(mut object) = value else {
+        unreachable!("value was matched as an object");
     };
     object.remove("v");
     object.remove("id");

@@ -280,13 +280,11 @@ fn secret_equality_uses_the_constant_time_comparison() {
 
     let source = include_str!("../src/state.rs");
     let eq = function_body_after(source, "impl PartialEq for Secret", "fn eq(");
-    assert!(
-        eq.contains("constant_time_eq(&self.bytes, &other.bytes)"),
-        "Secret equality must call constant_time_eq, body was {eq}"
-    );
-    assert!(
-        !leaves_early(eq),
-        "Secret equality must not return before every byte is mixed in, body was {eq}"
+    // `len == len && constant_time_eq(...)` still skips the walk when the lengths differ.
+    assert_eq!(
+        trimmed_fn_body(eq),
+        "constant_time_eq(&self.bytes, &other.bytes)",
+        "Secret::eq must be only the constant-time call, body was {eq}"
     );
     let ct = function_body(source, "fn constant_time_eq(");
     assert!(
@@ -297,6 +295,14 @@ fn secret_equality_uses_the_constant_time_comparison() {
         ct.contains("diff == 0"),
         "constant_time_eq must decide only after the full walk"
     );
+}
+
+fn trimmed_fn_body(body: &str) -> &str {
+    body.trim()
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(body)
+        .trim()
 }
 
 fn leaves_early(body: &str) -> bool {

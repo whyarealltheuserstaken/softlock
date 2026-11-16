@@ -1,6 +1,12 @@
 //! The PIN in a parsed JSON value has to be wiped on the paths that fail
 //! before `Secret`'s own `Drop` runs. A watcher records heap blocks allocated
 //! during the call and checks they do not still hold the PIN when freed.
+//!
+//! Every test must take `WATCH` (via `assert_pin_is_wiped`). The watch is
+//! process-global, so a second armed test would share the pin and the slot
+//! table. The table stops at 1024 slots because the allocator cannot grow it
+//! without allocating; one request is far smaller, and an overflow fails the
+//! test instead of skipping a block.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::ptr;
