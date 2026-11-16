@@ -6,12 +6,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetStockObject, HBRUSH, WHITE_BRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThread, GetCurrentThreadId, SetThreadPriority,
-    THREAD_PRIORITY_TIME_CRITICAL,
+    AttachThreadInput, GetCurrentThread, GetCurrentThreadId, OpenThread, SetThreadPriority,
+    THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_TIME_CRITICAL, THREAD_SET_INFORMATION,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_F24;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -162,7 +162,7 @@ fn command_loop(
             }
             Command::Slow { timeout_ms } => {
                 let reply = if role == ROLE_SYSTEM {
-                    arm_slow(timeout_ms)
+                    arm_slow(timeout_ms, hook.thread_id)
                 } else {
                     Reply::Slow {
                         healthy_before: false,
@@ -213,7 +213,7 @@ fn connect(port: u16) -> Result<TcpStream, String> {
     Err(format!("connect to supervisor: {last}"))
 }
 
-fn arm_slow(timeout_ms: u64) -> Reply {
+fn arm_slow(timeout_ms: u64, thread_id: u32) -> Reply {
     callback::reset_counts();
     if !marker_roundtrip() {
         return Reply::Slow {
@@ -223,9 +223,12 @@ fn arm_slow(timeout_ms: u64) -> Reply {
             error: Some("marker was not seen before the slow callback".to_string()),
         };
     }
-    // Just past the timeout, so the gap between the timeout and the callback
-    // returning stays inside the 500 ms liveness budget.
-    let sleep_ms = timeout_ms.saturating_add(400).min(1_500);
+    // Time-critical priority can skip the desktop timeout. The load test is
+    // already finished, so the removal probe runs at normal priority.
+    lower_hook_priority(thread_id);
+    // Past the timeout, with the remainder small enough that detecting removal
+    // after the callback returns still fits in 500 ms.
+    let sleep_ms = timeout_ms.saturating_add(600).min(1_200);
     callback::SLOW_RETURNED.store(0, Ordering::Relaxed);
     callback::SLOW_ENTERED.store(0, Ordering::Relaxed);
     callback::SLOW_MS.store(sleep_ms as u32, Ordering::Relaxed);
@@ -235,6 +238,15 @@ fn arm_slow(timeout_ms: u64) -> Reply {
         sleep_ms,
         marker_seen: callback::MARKER_SEEN.load(Ordering::Relaxed),
         error: None,
+    }
+}
+
+fn lower_hook_priority(thread_id: u32) {
+    unsafe {
+        if let Ok(thread) = OpenThread(THREAD_SET_INFORMATION, false, thread_id) {
+            let _ = SetThreadPriority(thread, THREAD_PRIORITY_NORMAL);
+            let _ = CloseHandle(thread);
+        }
     }
 }
 

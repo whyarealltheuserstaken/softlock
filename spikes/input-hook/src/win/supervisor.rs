@@ -342,6 +342,7 @@ fn liveness_phase(peers: &mut HashMap<String, Peer>, timeout_ms: u64) -> Result<
     // One slow callback is passed on. The hook comes out on a later timeout,
     // so repeat the marker until that happens, then probe after the callback
     // has returned and can no longer hide a still-installed hook.
+    say(&format!("slow-sleep-ms={sleep_ms}"));
     let mut strikes = 0u32;
     let mut blocked_ms = 0u64;
     let mut removal = Instant::now();
@@ -353,7 +354,7 @@ fn liveness_phase(peers: &mut HashMap<String, Peer>, timeout_ms: u64) -> Result<
         if let Err(failure) = sent {
             say(&format!("slow-marker index={index} error={failure}"));
         }
-        let timed_out = blocked_ms + 150 < sleep_ms;
+        let timed_out = blocked_ms + 80 < sleep_ms;
         say(&format!(
             "slow-strike index={index} blocked-ms={blocked_ms} timed-out={timed_out}"
         ));
