@@ -371,6 +371,11 @@ struct RestoreHook(Option<PanicHook>);
 
 impl Drop for RestoreHook {
     fn drop(&mut self) {
+        // `set_hook` panics when the thread is already unwinding. That second
+        // panic fail-fasts the process (0xc0000409) and hides the assertion.
+        if std::thread::panicking() {
+            return;
+        }
         if let Some(hook) = self.0.take() {
             std::panic::set_hook(hook);
         }

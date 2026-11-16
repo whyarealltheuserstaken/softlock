@@ -420,10 +420,17 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             break;
         }
         if shared.fail.swap(false, Ordering::AcqRel) {
+            // The attempt counter increments inside the OS-lock call. A waiter
+            // that sees it sends the next key immediately. Take the poisoned
+            // hooks down first, while the session pointer is still installed,
+            // so that key is not swallowed.
+            if shared.hook_poisoned.load(Ordering::Acquire) {
+                guard::disarm_hooks(&shared);
+            }
             report_guard_down(&mut controller, &shared);
             note_controller(&controller, &shared);
             // A poisoned callback cannot take a PIN. If the OS lock did not
-            // engage, drop the hooks the same way a window-thread panic does.
+            // engage, drop the rest the same way a window-thread panic does.
             if shared.hook_poisoned.load(Ordering::Acquire)
                 && shared.os_lock_unavailable.load(Ordering::Acquire)
             {

@@ -201,6 +201,35 @@ jobs:
           grep -F "a_hook_thread_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
           grep -F "a_liveness_thread_panic_tries_the_os_lock_without_trapping_input ... ok" target/seam3-lock-host.txt
           grep -F "a_callback_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
+      - name: Callback panic loop
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p softlock-seam3 --features dev-launch \
+            --target x86_64-pc-windows-msvc --test lock_host --no-run \
+            --message-format=json > target/lock-host-build.json
+          exe_win=$(python -c 'import json
+          exe=""
+          for line in open("target/lock-host-build.json", encoding="utf-8"):
+              line=line.strip()
+              if not line:
+                  continue
+              try:
+                  msg=json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if msg.get("executable"):
+                  exe=msg["executable"]
+          print(exe)')
+          exe=$(cygpath -u "$exe_win")
+          test -f "$exe"
+          passes=0
+          for i in $(seq 1 20); do
+            "$exe" --exact a_callback_panic_tries_the_os_lock_then_drops_the_hooks --test-threads=1 --nocapture
+            passes=$((passes + 1))
+          done
+          echo "callback panic loop: ${passes} passed"
+          test "$passes" -eq 20
       - name: Release build of the Windows target omits the test feature
         shell: bash
         run: |

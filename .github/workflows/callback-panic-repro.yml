@@ -1,10 +1,8 @@
 name: Callback panic repro
 
-# Temporary. Runs the hook-callback panic test in a loop so a fail-fast
-# (0xc0000409) records the panic location and thread. Removed, or left only
-# on workflow_dispatch, once the abort is fixed and the CI gate is in place.
+# Manual only. CI gates the same test at 20 runs on each Windows image.
+# This loop is 50 runs and writes the panic location when SOFTLOCK_PANIC_LOG is set.
 on:
-  pull_request:
   workflow_dispatch:
 
 permissions:

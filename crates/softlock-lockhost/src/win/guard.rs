@@ -11,8 +11,7 @@
 //! integrity and has no linked token. This dev launch installs the hooks in
 //! the calling process. Ticket 13 is the SYSTEM-in-session launch.
 
-use std::io::Write;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -83,7 +82,18 @@ pub(crate) fn install(shared: &Arc<Shared>) -> Result<(), softlock_core::GuardEr
     }
 }
 
+/// Stop the hook and liveness threads. The session pointer stays installed so
+/// a following OS-lock attempt is still counted.
+pub(crate) fn disarm_hooks(shared: &Shared) {
+    stop_workers(shared);
+}
+
 pub(crate) fn remove(shared: &Shared) {
+    stop_workers(shared);
+    SESSION.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+}
+
+fn stop_workers(shared: &Shared) {
     shared
         .stop
         .store(true, std::sync::atomic::Ordering::Release);
@@ -114,7 +124,6 @@ pub(crate) fn remove(shared: &Shared) {
     shared
         .hook_thread_id
         .store(0, std::sync::atomic::Ordering::Release);
-    SESSION.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn liveness(shared: Arc<Shared>) {
@@ -212,7 +221,6 @@ fn key_event(virtual_key: u16, up: bool) -> INPUT {
 }
 
 fn hook_thread(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<u32, ()>>) {
-    open_callback_trace();
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     }
@@ -278,29 +286,35 @@ fn hook_thread(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<u32, (
 
 /// A panic inside either callback is caught here. Unwinding out of
 /// `extern "system"` would abort the process and skip the OS lock. The catch
-/// marks the hook poisoned, asks the window thread to try the OS lock, and
-/// swallows the event. If that lock is unavailable, the window thread takes
-/// the same emergency path as a window-thread panic and drops the hooks. A
-/// broken callback cannot take a PIN.
+/// includes the poisoned path. That path only stores two atomics, so it does
+/// not allocate and does not panic. The window thread then removes the hooks
+/// before it publishes the OS-lock attempt. A broken callback cannot take a PIN.
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    callback_trace(b"kb enter\n");
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        keyboard_event(code, wparam, lparam)
+    catch_hook(|| unsafe { keyboard_event(code, wparam, lparam) })
+}
+
+fn catch_hook(run: impl FnOnce() -> LRESULT) -> LRESULT {
+    let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+            Ok(result) => result,
+            Err(payload) => {
+                // Dropping the payload can panic. That second panic stays
+                // inside `outer` and must not leave this function.
+                drop(payload);
+                poisoned_hook()
+            }
+        }
     }));
-    callback_trace(match &caught {
-        Ok(_) => b"kb caught-ok\n",
-        Err(_) => b"kb caught-err\n",
-    });
-    let result = match caught {
+    match outer {
         Ok(result) => result,
-        Err(_) => poisoned_hook(),
-    };
-    callback_trace(b"kb leave\n");
-    result
+        Err(payload) => {
+            std::mem::forget(payload);
+            poisoned_hook()
+        }
+    }
 }
 
 fn poisoned_hook() -> LRESULT {
-    callback_trace(b"poison enter\n");
     if let Some(shared) = session_ptr() {
         shared
             .hook_poisoned
@@ -309,7 +323,6 @@ fn poisoned_hook() -> LRESULT {
             .fail
             .store(true, std::sync::atomic::Ordering::Release);
     }
-    callback_trace(b"poison leave\n");
     LRESULT(1)
 }
 
@@ -326,7 +339,6 @@ unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             .panic_in_callback
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            callback_trace(b"kb about-to-panic\n");
             panic!("lock host hook callback");
         }
         let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
@@ -370,20 +382,7 @@ unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
 }
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    callback_trace(b"ms enter\n");
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        mouse_event(code, wparam, lparam)
-    }));
-    callback_trace(match &caught {
-        Ok(_) => b"ms caught-ok\n",
-        Err(_) => b"ms caught-err\n",
-    });
-    let result = match caught {
-        Ok(result) => result,
-        Err(_) => poisoned_hook(),
-    };
-    callback_trace(b"ms leave\n");
-    result
+    catch_hook(|| unsafe { mouse_event(code, wparam, lparam) })
 }
 
 unsafe fn mouse_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -399,7 +398,6 @@ unsafe fn mouse_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             .panic_in_callback
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            callback_trace(b"ms about-to-panic\n");
             panic!("lock host hook callback");
         }
         let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
@@ -542,34 +540,4 @@ pub(crate) fn session_ptr() -> Option<&'static Shared> {
 fn module_instance() -> HINSTANCE {
     let module = unsafe { GetModuleHandleW(PCWSTR::null()) }.unwrap_or(HMODULE::default());
     HINSTANCE(module.0)
-}
-
-/// Reproduction trace for a hook-callback abort. Opened only when
-/// `SOFTLOCK_PANIC_LOG` is set. The callback writes fixed bytes and does not
-/// allocate. Absent from release builds, which do not include this module.
-static CALLBACK_TRACE: OnceLock<std::fs::File> = OnceLock::new();
-
-fn open_callback_trace() {
-    let Ok(path) = std::env::var("SOFTLOCK_PANIC_LOG") else {
-        return;
-    };
-    if path.is_empty() {
-        return;
-    }
-    if let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = CALLBACK_TRACE.set(file);
-    }
-}
-
-fn callback_trace(label: &[u8]) {
-    let Some(file) = CALLBACK_TRACE.get() else {
-        return;
-    };
-    let mut file = file;
-    let _ = file.write_all(label);
-    let _ = file.flush();
 }
