@@ -2,6 +2,12 @@
 /// Rename this constant and the string resources together.
 pub const PRODUCT_DISPLAY_NAME: &str = "SoftLock";
 
+/// Bundle id for the settings app. This is the product, not the background service.
+pub const APP_BUNDLE_ID: &str = "com.softlock.app";
+
+/// npm package name of the settings app. The package is private.
+pub const APP_PACKAGE_NAME: &str = "softlock";
+
 /// Display name of the background service.
 pub const SERVICE_DISPLAY_NAME: &str = "SoftLock Agent";
 

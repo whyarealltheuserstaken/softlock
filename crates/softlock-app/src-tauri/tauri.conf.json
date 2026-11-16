@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "SoftLock",
   "version": "0.1.0",
-  "identifier": "com.softlock.agent",
+  "identifier": "com.softlock.app",
   "build": {
     "beforeDevCommand": {
       "script": "npm run dev",

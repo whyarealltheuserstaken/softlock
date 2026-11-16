@@ -35,21 +35,23 @@ fn workspace_crates_are_not_published() {
 }
 
 #[test]
-fn bundle_identity_uses_the_internal_id() {
+fn settings_app_bundle_id_is_the_product_id() {
     let path = common::repo_root().join("crates/softlock-app/src-tauri/tauri.conf.json");
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("missing {}: {error}", path.display()));
     let value: serde_json::Value = serde_json::from_str(&text).expect("tauri config");
+    assert_eq!(softlock_core::APP_BUNDLE_ID, "com.softlock.app");
     assert_eq!(value["productName"], "SoftLock");
-    assert_eq!(value["identifier"], "com.softlock.agent");
+    assert_eq!(value["identifier"], "com.softlock.app");
 }
 
 #[test]
-fn npm_package_is_private_and_uses_the_internal_id() {
+fn settings_app_package_is_private_and_named_for_the_product() {
     let path = common::repo_root().join("crates/softlock-app/package.json");
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("missing {}: {error}", path.display()));
     let value: serde_json::Value = serde_json::from_str(&text).expect("package.json");
+    assert_eq!(softlock_core::APP_PACKAGE_NAME, "softlock");
     assert_eq!(value["private"], true);
-    assert_eq!(value["name"], "softlock-agent");
+    assert_eq!(value["name"], "softlock");
 }

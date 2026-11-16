@@ -16,7 +16,7 @@ If SoftLock fails while locked, it switches to the real Windows lock, and your a
 - `crates/softlock-app` — Tauri 2 and Svelte 5 shell
 - `docs/SPEC.md` — the approved product spec
 
-Crates and the npm package are not published. The name on screen lives in one Rust constant, `PRODUCT_DISPLAY_NAME`, and in the app string resources. The background service is shown as "SoftLock Agent". Its service name and registry subkey are `SoftLockAgent`, and its named pipe uses `softlock-agent`. Those ids live next to the product-name constant.
+Crates and the npm package are not published. The name on screen lives in one Rust constant, `PRODUCT_DISPLAY_NAME`, and in the app string resources. The settings app package is named `softlock` and its bundle id is `com.softlock.app`. The background service is shown as "SoftLock Agent". Its service name and registry subkey are `SoftLockAgent`, and its named pipe uses `softlock-agent`. Those ids live next to the product-name constant.
 
 ## Develop
 
