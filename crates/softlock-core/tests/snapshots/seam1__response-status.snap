@@ -1,0 +1,21 @@
+---
+source: crates/softlock-core/tests/seam1.rs
+expression: value
+---
+{
+  "guard": {
+    "hook_alive": true,
+    "last_physical_input_ms": null
+  },
+  "id": 11,
+  "kind": "Status",
+  "last_fallback": null,
+  "lock_source": "Hotkey",
+  "overlay": {
+    "capture_excluded": true,
+    "covered_monitors": 1,
+    "topmost": true
+  },
+  "state": "Locked",
+  "v": 1
+}

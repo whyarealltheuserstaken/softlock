@@ -1,0 +1,31 @@
+# Linux backend (phase 3)
+
+The Linux crate compiles and links today. It does not lock the machine. Every platform capability reports Unsupported, and the settings app shows "This platform isn't supported yet".
+
+Phase 3 targets mainstream distributions under Wayland and X11. The shape below is the spec's decision, recorded so the core does not have to change when the backend is written.
+
+## Processes
+
+A root daemon plus a session client.
+
+## Input guard
+
+The leading design is an evdev exclusive grab (`EVIOCGRAB`) of physical input devices. Virtual `uinput` devices used by agents stay ungrabbed. The daemon reads the grabbed devices for the unlock prompt. This works under both Wayland and X11.
+
+`ext-session-lock-v1` was evaluated for the lock surface. Compositors route all input to the lock client, including `uinput` devices, and may stop presenting other surfaces. That likely conflicts with agent passthrough, so the protocol may serve only "lock for real".
+
+## Overlay
+
+A `wlr-layer-shell` overlay where the compositor provides it, with an X11 override-redirect window as the fallback.
+
+## Unlock
+
+PAM.
+
+## Open risks
+
+- Capture exclusion has no portable Wayland mechanism.
+- `ext-session-lock-v1` conflicts with letting agent input through.
+- An evdev grab has to keep `uinput` devices ungrabbed or agents stop.
+
+No lock behavior belongs in this crate until those risks have a tested answer.

@@ -19,3 +19,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 softlock-core = { path = "../../softlock-core" }
 tauri = { version = "2", features = [] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+softlock-linux = { path = "../../softlock-linux" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+softlock-macos = { path = "../../softlock-macos" }

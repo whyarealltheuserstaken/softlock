@@ -1,0 +1,12 @@
+---
+source: crates/softlock-core/tests/seam1.rs
+expression: value
+---
+{
+  "errors": [
+    "empty config"
+  ],
+  "id": 11,
+  "kind": "Invalid",
+  "v": 1
+}

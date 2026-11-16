@@ -3,6 +3,8 @@ resolver = "3"
 members = [
     "crates/softlock-core",
     "crates/softlock-windows",
+    "crates/softlock-macos",
+    "crates/softlock-linux",
     "crates/softlock-service",
     "crates/softlock-lockhost",
     "crates/softlock-broker",

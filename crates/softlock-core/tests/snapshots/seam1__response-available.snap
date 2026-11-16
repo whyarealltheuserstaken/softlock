@@ -1,0 +1,11 @@
+---
+source: crates/softlock-core/tests/seam1.rs
+expression: value
+---
+{
+  "id": 11,
+  "kind": "Available",
+  "notes": "notes",
+  "v": 1,
+  "version": "0.2.0"
+}

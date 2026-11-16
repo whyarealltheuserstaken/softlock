@@ -1,0 +1,11 @@
+---
+source: crates/softlock-core/tests/seam1.rs
+expression: value
+---
+{
+  "id": 11,
+  "kind": "Lock",
+  "note": "agent",
+  "source": "Hotkey",
+  "v": 1
+}
