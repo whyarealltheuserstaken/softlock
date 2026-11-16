@@ -1,0 +1,21 @@
+[package]
+name = "softlock-app"
+description = "Desktop shell."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# The lib name has to differ from the package name or Windows links the
+# library and the binary to the same file.
+[lib]
+name = "softlock_app_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+softlock-core = { path = "../../softlock-core" }
+tauri = { version = "2", features = [] }

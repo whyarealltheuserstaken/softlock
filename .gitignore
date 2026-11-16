@@ -1,0 +1,12 @@
+/target
+**/target
+**/node_modules/
+**/dist/
+**/dist-ssr/
+**/test-results/
+**/playwright-report/
+**/blob-report/
+**/playwright/.cache/
+**/src-tauri/gen/
+.DS_Store
+*.log

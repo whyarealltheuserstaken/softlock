@@ -1,0 +1,11 @@
+[package]
+name = "softlock-core"
+description = "Shared lock logic with no operating-system calls."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
