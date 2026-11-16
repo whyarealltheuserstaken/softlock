@@ -371,16 +371,100 @@ struct RestoreHook(Option<PanicHook>);
 
 impl Drop for RestoreHook {
     fn drop(&mut self) {
-        if let Some(hook) = self.0.take() {
-            std::panic::set_hook(hook);
+        // `set_hook` panics when the calling thread is already unwinding.
+        // That second panic fail-fasts the process (0xc0000409) and hides
+        // the assertion. A failed test still has to put the previous hook
+        // back, so the restore runs on a thread that is not unwinding.
+        let Some(hook) = self.0.take() else {
+            return;
+        };
+        if std::thread::panicking() {
+            if let Ok(worker) = thread::Builder::new()
+                .name("restore-panic-hook".to_string())
+                .spawn(move || std::panic::set_hook(hook))
+            {
+                let _ = worker.join();
+            }
+            return;
         }
+        std::panic::set_hook(hook);
     }
 }
 
-fn quiet_hook() -> RestoreHook {
+/// Silences panics on the lock-host hook thread and forwards every other
+/// panic to the hook that was installed before. Restored when dropped,
+/// including after a test failure.
+fn filter_lock_host_hook_panics() -> RestoreHook {
     let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    RestoreHook(Some(previous))
+    let forward = std::sync::Arc::new(previous);
+    let call = std::sync::Arc::clone(&forward);
+    std::panic::set_hook(Box::new(move |info| {
+        record_panic(info);
+        if thread::current().name() == Some("lock-host-hook") {
+            return;
+        }
+        call(info);
+    }));
+    RestoreHook(Some(Box::new(move |info| forward(info))))
+}
+
+fn record_panic(info: &std::panic::PanicHookInfo) {
+    if panic_log_path().is_none() {
+        return;
+    }
+    let payload = info.payload();
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string payload");
+    let location = info
+        .location()
+        .map(|place| place.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let thread = thread::current();
+    let name = thread.name().unwrap_or("");
+    panic_line(&format!(
+        "panic thread={thread:?} name={name} loc={location} msg={message}"
+    ));
+}
+
+fn panic_log_path() -> Option<&'static std::ffi::OsStr> {
+    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("SOFTLOCK_PANIC_LOG"))
+        .as_ref()
+        .map(std::ffi::OsString::as_os_str)
+}
+
+fn panic_note(message: &str) {
+    if panic_log_path().is_none() {
+        return;
+    }
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("");
+    panic_line(&format!("note thread={thread:?} name={name} {message}"));
+}
+
+fn panic_line(text: &str) {
+    let Some(path) = panic_log_path() else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    use std::io::Write;
+    let _ = file.write_all(text.as_bytes());
+    let _ = file.write_all(b"\n");
+    let _ = file.flush();
+    let _ = file.sync_all();
 }
 
 fn wake(lock: &DevLock, extra: u64) {
@@ -593,8 +677,8 @@ fn a_window_thread_panic_tries_the_os_lock_then_drops_the_hooks() {
     let extra = nonce.extra();
     let lock = arm("unused", None);
     lock.stub_os_lock_unavailable();
-    // The panic is caught. A quiet hook keeps the test line as `... ok`.
-    let _quiet = quiet_hook();
+    // This panic is on the window thread, so the filter forwards it.
+    let _hook = filter_lock_host_hook_panics();
     lock.panic_window_thread();
     assert!(
         wait_for(Duration::from_secs(3), || {
@@ -691,7 +775,7 @@ fn a_hook_thread_panic_tries_the_os_lock_then_drops_the_hooks() {
     let extra = nonce.extra();
     let lock = arm("unused", None);
     lock.stub_os_lock_unavailable();
-    let _quiet = quiet_hook();
+    let _hook = filter_lock_host_hook_panics();
     lock.panic_hook_thread();
     assert!(
         wait_for(Duration::from_secs(3), || lock.os_lock_attempts() >= 1),
@@ -712,7 +796,7 @@ fn a_liveness_thread_panic_tries_the_os_lock_without_trapping_input() {
     let extra = nonce.extra();
     let lock = arm("unused", None);
     lock.stub_os_lock_unavailable();
-    let _quiet = quiet_hook();
+    let _hook = filter_lock_host_hook_panics();
     lock.panic_liveness_thread();
     assert!(
         wait_for(Duration::from_secs(3), || {
@@ -735,21 +819,35 @@ fn a_liveness_thread_panic_tries_the_os_lock_without_trapping_input() {
 #[test]
 fn a_callback_panic_tries_the_os_lock_then_drops_the_hooks() {
     let _guard = gate();
+    // Silences the caught callback panic. When SOFTLOCK_PANIC_LOG is set,
+    // the same hook still writes every panic's location and thread.
+    let _hook = filter_lock_host_hook_panics();
+    panic_note("test-start");
     let probe = Probe::open().expect("probe");
     probe.claim_focus();
     let nonce = Nonce::install();
     let extra = nonce.extra();
+    panic_note("before-arm");
     let lock = arm("unused", None);
+    panic_note("armed");
     lock.stub_os_lock_unavailable();
-    let _quiet = quiet_hook();
     lock.panic_in_callback();
+    panic_note("flag-set");
     send_virtual_key(VK_F13, extra).expect("callback panic");
+    panic_note("send-returned");
     assert!(
         wait_for(Duration::from_secs(3), || lock.os_lock_attempts() >= 1),
         "a callback panic did not try the OS lock"
     );
+    panic_note("os-lock-seen");
+    assert!(
+        wait_for(Duration::from_secs(3), || lock.hooks_removed()),
+        "the poisoned hooks were still installed when the next key was sent"
+    );
+    panic_note("hooks-removed");
     send_virtual_key(VK_F14, extra).expect("after callback panic");
     probe
         .wait_for_key(VK_F14, Duration::from_secs(3))
         .expect("input stayed trapped after the hook callback panicked");
+    panic_note("test-end");
 }

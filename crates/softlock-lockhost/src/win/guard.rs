@@ -51,7 +51,10 @@ pub(crate) fn install(shared: &Arc<Shared>) -> Result<(), softlock_core::GuardEr
     );
     let (tx, rx) = std::sync::mpsc::channel();
     let worker_shared = Arc::clone(shared);
-    let worker = thread::spawn(move || hook_thread(worker_shared, tx));
+    let worker = thread::Builder::new()
+        .name("lock-host-hook".to_string())
+        .spawn(move || hook_thread(worker_shared, tx))
+        .expect("lock host hook thread");
     match rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(thread_id)) => {
             shared
@@ -273,17 +276,31 @@ fn hook_thread(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<u32, (
 
 /// A panic inside either callback is caught here. Unwinding out of
 /// `extern "system"` would abort the process and skip the OS lock. The catch
-/// marks the hook poisoned, asks the window thread to try the OS lock, and
-/// swallows the event. If that lock is unavailable, the window thread takes
-/// the same emergency path as a window-thread panic and drops the hooks. A
-/// broken callback cannot take a PIN.
+/// includes the poisoned path. That path only stores two atomics, so it does
+/// not allocate and does not panic. The window thread tries the OS lock
+/// first and drops these hooks only when that lock is unavailable.
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        keyboard_event(code, wparam, lparam)
+    catch_hook(|| unsafe { keyboard_event(code, wparam, lparam) })
+}
+
+fn catch_hook(run: impl FnOnce() -> LRESULT) -> LRESULT {
+    let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+            Ok(result) => result,
+            Err(payload) => {
+                // Dropping the payload can panic. That second panic stays
+                // inside `outer` and must not leave this function.
+                drop(payload);
+                poisoned_hook()
+            }
+        }
     }));
-    match caught {
+    match outer {
         Ok(result) => result,
-        Err(_) => poisoned_hook(),
+        Err(payload) => {
+            std::mem::forget(payload);
+            poisoned_hook()
+        }
     }
 }
 
@@ -355,13 +372,7 @@ unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
 }
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        mouse_event(code, wparam, lparam)
-    }));
-    match caught {
-        Ok(result) => result,
-        Err(_) => poisoned_hook(),
-    }
+    catch_hook(|| unsafe { mouse_event(code, wparam, lparam) })
 }
 
 unsafe fn mouse_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
