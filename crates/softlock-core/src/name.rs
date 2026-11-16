@@ -13,22 +13,17 @@ pub const SERVICE_DISPLAY_NAME: &str = "SoftLock Agent";
 
 const SERVICE_DISPLAY_BYTES: &[u8] = SERVICE_DISPLAY_NAME.as_bytes();
 const SERVICE_ID_LEN: usize = SERVICE_DISPLAY_BYTES.len();
-const SERVICE_ID_PASCAL_LEN: usize = SERVICE_ID_LEN - count_spaces(SERVICE_DISPLAY_BYTES);
+const SERVICE_NAME_LEN: usize = SERVICE_ID_LEN - count_spaces(SERVICE_DISPLAY_BYTES);
 
 const SERVICE_ID_BYTES: [u8; SERVICE_ID_LEN] = kebab_case(SERVICE_DISPLAY_BYTES);
-const SERVICE_ID_PASCAL_BYTES: [u8; SERVICE_ID_PASCAL_LEN] = without_spaces(SERVICE_DISPLAY_BYTES);
+const SERVICE_NAME_BYTES: [u8; SERVICE_NAME_LEN] = without_spaces(SERVICE_DISPLAY_BYTES);
 
 /// Hyphenated id computed from [`SERVICE_DISPLAY_NAME`]. Named pipes use this form.
 pub const SERVICE_ID: &str = utf8(&SERVICE_ID_BYTES);
 
-/// PascalCase id computed from [`SERVICE_DISPLAY_NAME`].
-/// The Windows service name and registry subkey use this form.
-pub const SERVICE_ID_PASCAL: &str = utf8(&SERVICE_ID_PASCAL_BYTES);
-
-/// Windows service name.
-pub fn service_name() -> &'static str {
-    SERVICE_ID_PASCAL
-}
+/// Windows service name, computed from [`SERVICE_DISPLAY_NAME`] by dropping spaces.
+/// The registry subkey uses this form too.
+pub const SERVICE_NAME: &str = utf8(&SERVICE_NAME_BYTES);
 
 /// Named-pipe path.
 pub fn pipe_name() -> String {
@@ -37,7 +32,7 @@ pub fn pipe_name() -> String {
 
 /// Registry subkey under HKLM or HKCU.
 pub fn registry_key() -> String {
-    format!(r"Software\{SERVICE_ID_PASCAL}")
+    format!(r"Software\{SERVICE_NAME}")
 }
 
 const fn count_spaces(bytes: &[u8]) -> usize {
@@ -69,8 +64,8 @@ const fn kebab_case(bytes: &[u8]) -> [u8; SERVICE_ID_LEN] {
 }
 
 /// Drop spaces, keeping the original letter case.
-const fn without_spaces(bytes: &[u8]) -> [u8; SERVICE_ID_PASCAL_LEN] {
-    let mut out = [0; SERVICE_ID_PASCAL_LEN];
+const fn without_spaces(bytes: &[u8]) -> [u8; SERVICE_NAME_LEN] {
+    let mut out = [0; SERVICE_NAME_LEN];
     let mut index = 0;
     let mut written = 0;
     while index < bytes.len() {

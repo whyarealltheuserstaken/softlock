@@ -1,9 +1,11 @@
-//! Workspace crates set `publish = false`. The npm package is private.
+//! Workspace crates set `publish = false`. The settings app is private.
 
 mod common;
 
-use std::fs;
 use std::process::Command;
+
+const CONTENT_SECURITY_POLICY: &str =
+    "default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost";
 
 #[test]
 fn workspace_crates_are_not_published() {
@@ -36,22 +38,27 @@ fn workspace_crates_are_not_published() {
 
 #[test]
 fn settings_app_bundle_id_is_the_product_id() {
-    let path = common::repo_root().join("crates/softlock-app/src-tauri/tauri.conf.json");
-    let text = fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("missing {}: {error}", path.display()));
-    let value: serde_json::Value = serde_json::from_str(&text).expect("tauri config");
+    let value = common::read_json("crates/softlock-app/src-tauri/tauri.conf.json");
     assert_eq!(softlock_core::APP_BUNDLE_ID, "com.softlock.app");
-    assert_eq!(value["productName"], "SoftLock");
-    assert_eq!(value["identifier"], "com.softlock.app");
+    assert_eq!(value["productName"], softlock_core::PRODUCT_DISPLAY_NAME);
+    assert_eq!(value["identifier"], softlock_core::APP_BUNDLE_ID);
+    assert!(value["app"]["windows"][0].get("title").is_none());
+    assert_eq!(value["app"]["security"]["csp"], CONTENT_SECURITY_POLICY);
 }
 
 #[test]
 fn settings_app_package_is_private_and_named_for_the_product() {
-    let path = common::repo_root().join("crates/softlock-app/package.json");
-    let text = fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("missing {}: {error}", path.display()));
-    let value: serde_json::Value = serde_json::from_str(&text).expect("package.json");
+    let value = common::read_json("crates/softlock-app/package.json");
     assert_eq!(softlock_core::APP_PACKAGE_NAME, "softlock");
     assert_eq!(value["private"], true);
-    assert_eq!(value["name"], "softlock");
+    assert_eq!(value["name"], softlock_core::APP_PACKAGE_NAME);
+}
+
+#[test]
+fn dev_server_port_is_shared_with_tauri() {
+    let dev = common::read_json("crates/softlock-app/dev-server.json");
+    let host = dev["host"].as_str().expect("dev server host");
+    let port = dev["port"].as_u64().expect("dev server port");
+    let tauri = common::read_json("crates/softlock-app/src-tauri/tauri.conf.json");
+    assert_eq!(tauri["build"]["devUrl"], format!("http://{host}:{port}"));
 }

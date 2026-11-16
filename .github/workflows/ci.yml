@@ -20,12 +20,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
         with:
+          toolchain: 1.100.0
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -51,10 +52,11 @@ jobs:
     name: licenses and advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install cargo-deny 0.19.5
         run: |
           curl -fsSL -o cargo-deny.tar.gz https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.5/cargo-deny-0.19.5-x86_64-unknown-linux-musl.tar.gz
+          echo "5ea64ae09959b5fe1072d898f95caaa89b374678ba6728d5e9ed1366745479b0  cargo-deny.tar.gz" | sha256sum -c
           tar -xzf cargo-deny.tar.gz
           sudo mv cargo-deny-0.19.5-x86_64-unknown-linux-musl/cargo-deny /usr/local/bin/cargo-deny
       - name: Licenses, advisories, and sources
@@ -64,8 +66,8 @@ jobs:
     name: seam 4
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm

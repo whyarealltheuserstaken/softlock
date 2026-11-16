@@ -19,13 +19,12 @@
     "windows": [
       {
         "label": "main",
-        "title": "SoftLock",
         "width": 800,
         "height": 600
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {

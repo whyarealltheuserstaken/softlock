@@ -1,4 +1,9 @@
-export type IpcBridgeKind = "fake" | "tauri";
+const IPC_BRIDGES = ["fake", "tauri"] as const;
+
+export type IpcBridgeKind = (typeof IPC_BRIDGES)[number];
+
+const FAKE_BRIDGE: IpcBridgeKind = IPC_BRIDGES[0];
+const TAURI_BRIDGE: IpcBridgeKind = IPC_BRIDGES[1];
 
 /** Stand-in for the service pipe. No commands exist yet. */
 export interface IpcBridge {
@@ -6,6 +11,7 @@ export interface IpcBridge {
 }
 
 export function createIpcBridge(): IpcBridge {
-  const kind = import.meta.env.VITE_IPC_BRIDGE === "fake" ? "fake" : "tauri";
+  const kind =
+    import.meta.env.VITE_IPC_BRIDGE === FAKE_BRIDGE ? FAKE_BRIDGE : TAURI_BRIDGE;
   return { kind };
 }

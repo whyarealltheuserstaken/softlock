@@ -26,7 +26,7 @@ Install the Rust toolchain in `rust-toolchain.toml` and Node.js 22.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
-cargo deny check licenses advisories
+cargo deny check licenses advisories sources
 ```
 
 Seam 4 runs the Tauri front end against an empty fake IPC bridge:
