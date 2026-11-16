@@ -133,6 +133,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Tauri's own default is 10.13, which would lower only the x86_64 slice.
+          # minimumSystemVersion in tauri.conf.json is 11.0.
           npm run tauri build -- --target universal-apple-darwin
           cd "${GITHUB_WORKSPACE}"
           . "${GITHUB_WORKSPACE}/.github/universal-scan.sh"
