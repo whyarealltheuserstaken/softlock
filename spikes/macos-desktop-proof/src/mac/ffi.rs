@@ -344,6 +344,7 @@ fn zero_active() -> ActiveOut {
         created: 0,
         deleted: -1,
         listen_saw: -1,
+        control_saw: -1,
         accessibility_trusted: -1,
         listen_preflight: -1,
         prompt: 0,
