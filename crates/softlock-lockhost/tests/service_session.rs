@@ -424,11 +424,12 @@ fn emergency_after_both_os_locks_fail_is_closed_by_the_service() {
     let probe = Probe::open().expect("probe");
     probe.claim_focus();
     session.lock().expect("lock");
-    // The hook callback panics on the next physical key. Both OS locks are
-    // stubbed, so the window thread runs emergency() and drops the hooks.
+    // F13 panics the hook callback. Both OS locks are stubbed, so the window
+    // thread runs emergency() and the process exits. The service log records
+    // that loss even when the replacement host is armed before the next poll.
     let _ = send_virtual_key(VK_F13, session.extra);
     let mut saw_unlocked = false;
-    let dropped = wait_for(Duration::from_secs(8), || {
+    let lost = wait_for(Duration::from_secs(8), || {
         if session
             .status()
             .ok()
@@ -436,13 +437,18 @@ fn emergency_after_both_os_locks_fail_is_closed_by_the_service() {
         {
             saw_unlocked = true;
         }
-        !physical_is_blocked(&probe, session.extra)
+        fs::read_to_string(&session.log)
+            .unwrap_or_default()
+            .contains("host-lost")
     });
     assert!(
         !saw_unlocked,
         "the service reported Unlocked after emergency()"
     );
-    assert!(dropped, "emergency() did not drop the hooks");
+    assert!(
+        lost,
+        "emergency() did not look like a lost host to the service"
+    );
     let recovered = wait_for(Duration::from_secs(20), || {
         if session
             .status()

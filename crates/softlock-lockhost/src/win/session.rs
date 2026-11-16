@@ -456,19 +456,18 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
         return;
     }
     shared.locked.store(true, Ordering::Release);
+    // Before Ready. Lock returns only after Ready, and the test then sends
+    // F13. Liveness and mouse input do not trip this flag.
+    #[cfg(feature = "simulated-physical")]
+    if std::env::var("SOFTLOCK_PANIC").ok().as_deref() == Some("callback") {
+        shared.panic_callback_on_f13.store(true, Ordering::Release);
+    }
     publish(
         &shared,
         PipeReport::Ready {
             monitors: shared.monitors.load(Ordering::Acquire),
         },
     );
-    // After Ready, so the service has a locked host to watch. The next hook
-    // callback panics. With the OS lock stubbed, this thread then runs
-    // `emergency()` and drops the hooks.
-    #[cfg(feature = "simulated-physical")]
-    if std::env::var("SOFTLOCK_PANIC").ok().as_deref() == Some("callback") {
-        shared.panic_callback_on_f13.store(true, Ordering::Release);
-    }
     if ready.send(Ok(elapsed)).is_err() {
         shutdown(&shared);
         return;
