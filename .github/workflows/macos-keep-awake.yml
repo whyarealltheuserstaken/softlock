@@ -1,0 +1,47 @@
+name: macOS keep-awake kit
+
+# Runner slice only: assertions, pmset reason, caffeinate control, short timer.
+# No lid, no power key, no launchd.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'spikes/macos-keep-awake/**'
+      - '.github/workflows/macos-keep-awake.yml'
+      - 'docs/findings/m07-keep-awake/**'
+      - 'crates/softlock-core/tests/macos_keep_awake_isolation.rs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-keep-awake-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kit:
+    name: macos keep-awake runner
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: spikes/macos-keep-awake -> spikes/macos-keep-awake/target
+      - name: Record the runner
+        run: |
+          sw_vers
+          uname -m
+          echo "uid=$(id -u) user=$(whoami)"
+      - name: Format
+        run: cargo fmt --manifest-path spikes/macos-keep-awake/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path spikes/macos-keep-awake/Cargo.toml --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --manifest-path spikes/macos-keep-awake/Cargo.toml
+      - name: Runner slice
+        run: cargo run --release --manifest-path spikes/macos-keep-awake/Cargo.toml -- --runner --output-dir proof-output
