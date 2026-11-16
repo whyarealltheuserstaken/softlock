@@ -18,20 +18,24 @@ While that window is up, which of these draw above it, and which of the four swi
 - A full-screen exclusive window
 - A monitor plugged in while the overlay is up
 
+Whether those surfaces can still be clicked is the input guard's job (ticket #30). This overlay is click-through, so this spike does not judge that.
+
 ## What the proof is
 
 `spikes/overlay` is an unsigned proof. It is not installed, and no product crate depends on it. `SHIPS_IN_RELEASE` is false.
 
 The window uses topmost, layered, click-through, no-activate, and tool-window styles, plus `WDA_EXCLUDEFROMCAPTURE`. It covers every monitor. It does not block typing or clicking. It closes on Ctrl+Alt+Shift+Q and after a timeout (5 minutes unless the command says otherwise).
 
+The 5-minute stop is an in-process thread. Killing the process also removes the windows. The green full-screen child stops itself within 30 seconds.
+
 The switches, each off unless named on the command line:
 
 - `--reassert-timer` puts the window back on top every 250 ms
 - `--reassert-pos` puts it back on top when its position changes
-- `--close-shell` closes Start, Task View, the notification center, Quick Settings, and the Project menu when those windows belong to the Windows shell
-- `--suppress-toasts` turns toast banners off for the current user and writes the old values back on exit. A crash leaves a sentinel. The next run, or `restore-toasts`, puts the old values back
+- `--close-shell` dismisses Start, Task View, the notification center, Quick settings, and the Project menu by sending Escape, or by sending the same chord again. It does not post a close message to Explorer or any other shell host. If the shell gets stuck, open Task Manager and restart Windows Explorer, or sign out and back in
+- `--suppress-toasts` writes only the current user's `ToastEnabled` setting. It does not write a policy value. If a toast policy value already exists, it refuses and says `school IT controls this, skip`. Before it changes the setting it writes a RunOnce entry, `"<exe>" restore-toasts`, so a crash, a kill, or a reboot runs the copied exe and puts toasts back. After a restore it deletes that entry and the empty sentinel key
 
-`spikes/overlay/open-surfaces.ps1` injects the keys for the seven surfaces. The User Account Control step launches `cmd.exe /c exit` and never sends an accept key. The full-screen step is a green Direct3D window that leaves exclusive mode on Esc and never stays up longer than 30 seconds.
+`spikes/overlay/open-surfaces.ps1` injects the keys for the seven surfaces. It looks for `spike-overlay.exe` in the same folder first, so the school PC does not need Rust. The User Account Control step launches `cmd.exe /c exit` and never sends an accept key. The full-screen step is a green Direct3D window that leaves exclusive mode on Esc and never stays up longer than 30 seconds. The tour refuses to run elevated unless `--allow-admin` is passed.
 
 ## Results
 
@@ -48,7 +52,7 @@ Copy the filled table from `docs/findings/07-overlay/CHECKLIST.md` after both co
 | Project menu (Win+P) | | | | |
 | Monitor plugged in on the school PC | | | | |
 
-Allowed words, same as the checklist: `covered`, `visible-but-not-interactive`, `mitigated by X`.
+Allowed words, same as the checklist: `covered`, `drawn above`, `mitigated by X`.
 
 ### Did capture exclusion survive the User Account Control dim?
 
@@ -76,7 +80,7 @@ Allowed words, same as the checklist: `covered`, `visible-but-not-interactive`, 
 
 ## Limitations to document
 
-#30 writes the user guide, including what can still appear above the overlay. Leave these blank until the photos exist.
+#30 writes the user guide, including what can still appear above the overlay, and the input guard that decides whether a bystander can use what they see. Leave these blank until the photos exist.
 
 - Surfaces that can show above the overlay:
 - User Account Control dim screen:
@@ -89,5 +93,5 @@ Allowed words, same as the checklist: `covered`, `visible-but-not-interactive`, 
 These are Henry's checks. Leave them unchecked in this file.
 
 - [ ] Proof overlay build plus an injected-input script that opens each surface; Henry photographs each case (manual, Henry's hardware, photos attached)
-- [ ] Each surface marked: covered / visible-but-not-interactive / mitigated by X (manual, Henry's hardware)
+- [ ] Each surface marked: covered / drawn above / mitigated by X (manual, Henry's hardware)
 - [ ] Written finding states the mitigations to build and the limitations to document, and names dependents 18 and 30

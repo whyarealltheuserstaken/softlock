@@ -1,4 +1,4 @@
-//! Which top-level windows are shell surfaces the mitigation may close.
+//! Which top-level windows are shell surfaces. They are dismissed with Escape, never closed with a posted message.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellSurface {
@@ -9,26 +9,22 @@ pub enum ShellSurface {
     Project,
 }
 
-/// `exe` may be a full path. `extra_exe` is the spike itself, and only the
-/// smoke fixture sets it, so a test window can prove the closer without
-/// touching the real shell.
-pub fn should_close(
-    class: &str,
-    title: &str,
-    exe: &str,
-    extra_exe: Option<&str>,
-) -> Option<ShellSurface> {
+/// A real shell host owns this window. The spike never posts a close message
+/// to one of these. It dismisses the surface with Escape instead.
+/// StartMenuExperienceHost is the Start menu even when its title is blank.
+pub fn identify(class: &str, title: &str, exe: &str) -> Option<ShellSurface> {
     let class_l = class.trim().to_ascii_lowercase();
     let title_l = title.trim().to_ascii_lowercase();
     let exe_l = file_name(exe).to_ascii_lowercase();
+    if exe_l == "startmenuexperiencehost.exe" && is_shell_class(&class_l) {
+        return Some(ShellSurface::Start);
+    }
     let kind = kind_of(&class_l, &title_l)?;
     if exe_allowed(&exe_l, kind) {
-        return Some(kind);
+        Some(kind)
+    } else {
+        None
     }
-    if extra_exe.is_some_and(|extra| file_name(extra).eq_ignore_ascii_case(&exe_l)) {
-        return Some(kind);
-    }
-    None
 }
 
 fn kind_of(class: &str, title: &str) -> Option<ShellSurface> {
@@ -39,7 +35,7 @@ fn kind_of(class: &str, title: &str) -> Option<ShellSurface> {
         return None;
     }
     match title {
-        "start" => Some(ShellSurface::Start),
+        "start" | "start menu" | "search" => Some(ShellSurface::Start),
         "task view" => Some(ShellSurface::TaskView),
         "notification center" | "action center" | "action centre" => {
             Some(ShellSurface::NotificationCenter)
@@ -138,7 +134,7 @@ mod tests {
         ];
         for (class, title, exe, expected) in cases {
             assert_eq!(
-                should_close(class, title, exe, None),
+                identify(class, title, exe),
                 Some(expected),
                 "{class} / {title} / {exe}"
             );
@@ -148,41 +144,38 @@ mod tests {
     #[test]
     fn ordinary_windows_and_the_overlay_itself_are_left_alone() {
         assert_eq!(
-            should_close("Notepad", "Start", r"C:\Windows\notepad.exe", None),
+            identify("Notepad", "Start", r"C:\Windows\notepad.exe"),
             None
         );
         assert_eq!(
-            should_close(
+            identify(
                 "spike-overlay-window",
                 "overlay",
-                r"C:\work\spike-overlay.exe",
-                None
+                r"C:\work\spike-overlay.exe"
             ),
             None
         );
         assert_eq!(
-            should_close(
+            identify(
                 "Windows.UI.Core.CoreWindow",
                 "Start",
-                r"C:\work\spike-overlay.exe",
-                None
+                r"C:\work\spike-overlay.exe"
             ),
             None
         );
         assert_eq!(
-            should_close("Chrome_WidgetWin_1", "Inbox", r"C:\chrome.exe", None),
+            identify("Chrome_WidgetWin_1", "Inbox", r"C:\chrome.exe"),
             None
         );
     }
 
     #[test]
-    fn the_smoke_fixture_may_close_only_its_own_extra_exe() {
+    fn a_blank_start_host_window_is_still_the_start_menu() {
         assert_eq!(
-            should_close(
+            identify(
                 "Windows.UI.Core.CoreWindow",
-                "Start",
-                r"C:\work\spike-overlay.exe",
-                Some("spike-overlay.exe")
+                "",
+                r"C:\Windows\SystemApps\StartMenuExperienceHost.exe"
             ),
             Some(ShellSurface::Start)
         );

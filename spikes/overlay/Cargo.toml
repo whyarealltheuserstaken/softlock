@@ -11,7 +11,7 @@ rust-version.workspace = true
 softlock-core = { path = "../../crates/softlock-core" }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61.3", features = [
+windows = { version = "0.62.2", features = [
     "Data_Xml_Dom",
     "UI_Notifications",
     "Win32_Foundation",

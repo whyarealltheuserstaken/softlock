@@ -45,10 +45,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-use crate::config::{Command, Config, HOTKEY_LABEL, REASSERT_INTERVAL_MS};
+use crate::config::{self, Command, Config, HOTKEY_LABEL, REASSERT_INTERVAL_MS};
 use crate::coverage::{MonitorRect, windows_for};
 use crate::safety::{CAPTURE_EXCLUDED, EX_OVERLAY, HIT_TRANSPARENT, overlay_lines};
-use crate::tour::{self, Action, Step};
+use crate::shell::ShellSurface;
+use crate::tour::{self, Action, Step, SurfaceId};
 
 const HOTKEY_ID: i32 = 1;
 const TIMER_ID: usize = 1;
@@ -62,8 +63,20 @@ static REASSERTING: AtomicBool = AtomicBool::new(false);
 static PROBE_SAW_F13: AtomicBool = AtomicBool::new(false);
 static FULLSCREEN_CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
 static CLEANUP_ONCE: Once = Once::new();
-static STATUS: Mutex<String> = Mutex::new(String::new());
+static STATUS: Mutex<OverlayNote> = Mutex::new(OverlayNote::Intro);
 static HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+static TOUR_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+enum OverlayNote {
+    Intro,
+    Step {
+        number: usize,
+        title: &'static str,
+        look_for: &'static str,
+    },
+    ClickNo,
+}
 
 thread_local! {
     static GUI: RefCell<Option<Gui>> = const { RefCell::new(None) };
@@ -79,7 +92,6 @@ struct Gui {
     reassert_timer: bool,
     reassert_pos: bool,
     close_shell: bool,
-    extra_exe: Option<String>,
     quitting: bool,
     alpha: u8,
 }
@@ -99,11 +111,16 @@ impl Drop for Cleanup {
 
 pub fn run(config: Config) -> Result<(), String> {
     if config.command == Command::RestoreToasts {
+        toast::remove_shortcut();
         println!("{}", registry::restore()?);
         return Ok(());
     }
     if config.command == Command::Fullscreen {
         return fullscreen::run(config.fullscreen_secs);
+    }
+    if config.command == Command::Tour {
+        let elevated = unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool();
+        config::tour_allowed(elevated, config.allow_admin)?;
     }
     config.ensure_timeout_covers_tour()?;
     if config.command == Command::Tour
@@ -119,10 +136,14 @@ pub fn run(config: Config) -> Result<(), String> {
     }
 
     let _cleanup = Cleanup;
+    toast::remove_shortcut();
     let _ = registry::restore();
     if config.suppress_toasts {
-        registry::suppress()?;
-        println!("Toast banners are off until this program exits.");
+        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+        registry::suppress(&exe.to_string_lossy())?;
+        println!(
+            "Toast banners are off until this program exits. If a banner still appears, the setting may apply after you sign out."
+        );
     }
     let exit_code = if config.command == Command::Smoke {
         1
@@ -135,26 +156,36 @@ pub fn run(config: Config) -> Result<(), String> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    if config.command == Command::Tour {
+    let ready = if config.command == Command::Tour {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let tour_config = config.clone();
         thread::spawn(move || {
             if ready_rx.recv().is_err() {
                 return;
             }
-            if let Err(error) = run_tour(&tour_config) {
-                eprintln!("{error}");
+            if let Err(error) = run_tour(&tour_config)
+                && let Ok(mut slot) = TOUR_ERROR.lock()
+            {
+                *slot = Some(error);
             }
             request_quit();
         });
-    }
+        Some(ready_tx)
+    } else {
+        None
+    };
 
-    let result = show_and_pump(&config);
-    let _ = ready_tx.send(());
+    let result = show_and_pump(&config, ready);
+    if let Some(error) = TOUR_ERROR.lock().ok().and_then(|slot| slot.clone()) {
+        return Err(error);
+    }
     result
 }
 
-fn show_and_pump(config: &Config) -> Result<(), String> {
+fn show_and_pump(
+    config: &Config,
+    ready: Option<std::sync::mpsc::Sender<()>>,
+) -> Result<(), String> {
     GUI_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
     let monitors = enum_monitors()?;
     let rects = windows_for(&monitors)?;
@@ -204,7 +235,6 @@ fn show_and_pump(config: &Config) -> Result<(), String> {
             return Err("could not register the overlay window class".into());
         }
     }
-    let extra_exe = config.shell_fixture.then(current_exe_name);
     let lines = overlay_lines(config);
     GUI.with(|slot| {
         *slot.borrow_mut() = Some(Gui {
@@ -217,7 +247,6 @@ fn show_and_pump(config: &Config) -> Result<(), String> {
             reassert_timer: config.reassert_timer,
             reassert_pos: config.reassert_on_pos_change,
             close_shell: config.close_shell_surfaces,
-            extra_exe,
             quitting: false,
             alpha: config.alpha,
         });
@@ -248,13 +277,6 @@ fn show_and_pump(config: &Config) -> Result<(), String> {
             eprintln!(
                 "Hotkey {HOTKEY_LABEL} is unavailable ({error}). Ctrl+C in this window still closes it, and it still closes itself."
             );
-        } else {
-            GUI.with(|slot| {
-                if let Some(gui) = slot.borrow_mut().as_mut() {
-                    let _ = hwnd;
-                    gui.quitting = false;
-                }
-            });
         }
         if config.reassert_timer || config.close_shell_surfaces {
             unsafe {
@@ -268,14 +290,14 @@ fn show_and_pump(config: &Config) -> Result<(), String> {
         }
     }
     remember_hwnds();
-    set_status(
-        "The pink layer is up. Clicking and typing still work. The current step is written here."
-            .to_string(),
-    );
+    set_note(OverlayNote::Intro);
     println!(
         "Pink overlay is up on {} monitor(s). Exit: {HOTKEY_LABEL}.",
         rects.len()
     );
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
     if config.command == Command::Smoke {
         let report = smoke_report(config);
         println!("{}", report.json());
@@ -409,9 +431,9 @@ fn destroy_windows() {
     });
 }
 
-fn set_status(text: String) {
+fn set_note(note: OverlayNote) {
     if let Ok(mut slot) = STATUS.lock() {
-        *slot = text;
+        *slot = note;
     }
     let hwnds = HWNDS.lock().map(|slot| slot.clone()).unwrap_or_default();
     for bits in hwnds {
@@ -455,34 +477,33 @@ fn request_quit() {
 fn arm_timeout(timeout: Duration, exit_code: i32) {
     thread::spawn(move || {
         thread::sleep(timeout);
-        if FINISHED.swap(true, Ordering::SeqCst) {
+        if FINISHED.load(Ordering::SeqCst) {
             return;
         }
-        let _ = registry::restore();
-        kill_fullscreen_child();
+        cleanup_all();
         request_quit();
         thread::sleep(Duration::from_secs(2));
         std::process::exit(exit_code);
     });
 }
 
-fn finish() {
+fn cleanup_all() {
     CLEANUP_ONCE.call_once(|| {
-        if !FINISHED.swap(true, Ordering::SeqCst) {
-            let _ = registry::restore();
-            kill_fullscreen_child();
-            toast::remove_shortcut();
-        }
+        FINISHED.store(true, Ordering::SeqCst);
+        let _ = registry::restore();
+        kill_fullscreen_child();
+        toast::remove_shortcut();
     });
+}
+
+fn finish() {
+    cleanup_all();
 }
 
 fn install_ctrl_c() {
     unsafe extern "system" fn handler(ctrl: u32) -> windows::core::BOOL {
         if ctrl == CTRL_C_EVENT || ctrl == CTRL_BREAK_EVENT {
-            let _ = registry::restore();
-            kill_fullscreen_child();
-            toast::remove_shortcut();
-            FINISHED.store(true, Ordering::SeqCst);
+            cleanup_all();
             std::process::exit(0);
         }
         windows::Win32::Foundation::FALSE
@@ -497,7 +518,7 @@ fn run_tour(config: &Config) -> Result<(), String> {
     println!("Windows build {build}.");
     if unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool() {
         println!(
-            "This window is already running as admin, so Windows may not show a UAC prompt. Start a normal PowerShell and run it again."
+            "This window is running as admin, so Windows may not show a User Account Control prompt. That is expected when you passed --allow-admin."
         );
     }
     let fullscreen_secs = config.pause.as_secs().min(config.fullscreen_secs);
@@ -509,20 +530,21 @@ fn run_tour(config: &Config) -> Result<(), String> {
         println!("=== Step {}: {} ===", index + 1, step.id.title());
         println!("{}", step.look_for);
         println!("Take a phone photo now.");
-        set_status(format!(
-            "Step {} of the tour: {}.\n{}",
-            index + 1,
-            step.id.title(),
-            step.look_for
-        ));
+        set_note(OverlayNote::Step {
+            number: index + 1,
+            title: step.id.title(),
+            look_for: step.look_for,
+        });
         let _ = std::io::Write::flush(&mut std::io::stdout());
+        let before = shell::visible_surfaces();
         if let Err(error) = perform(step, build) {
             eprintln!("This surface did not open: {error}");
             eprintln!("Write that in the notes. The tour continues.");
         }
+        confirm_overlay(step, &before)?;
         if !matches!(step.action, Action::Fullscreen { .. }) {
             thread::sleep(tour::step_wait(config.pause, step.id, fullscreen_secs));
-            dismiss(step, build);
+            dismiss(step, config);
         }
     }
     println!();
@@ -548,18 +570,71 @@ fn perform(step: &Step, _build: u32) -> Result<(), String> {
     }
 }
 
-fn dismiss(step: &Step, _build: u32) {
+fn confirm_overlay(step: &Step, before: &[ShellSurface]) -> Result<(), String> {
+    if !overlay_is_up() {
+        println!("surface_opened_while_overlay: overlay-closed");
+        return Err("the tour ran after the overlay closed".into());
+    }
+    let Some(kind) = shell_surface_for(step.id) else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut found = false;
+    loop {
+        if !overlay_is_up() {
+            println!("surface_opened_while_overlay: overlay-closed");
+            return Err("the tour ran after the overlay closed".into());
+        }
+        let now = shell::visible_surfaces();
+        if now.contains(&kind) && !before.contains(&kind) {
+            found = true;
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if found {
+        println!("surface_opened_while_overlay: {}", step.id.title());
+    } else {
+        println!(
+            "surface_opened_while_overlay: not-found {}",
+            step.id.title()
+        );
+    }
+    Ok(())
+}
+
+fn shell_surface_for(id: SurfaceId) -> Option<ShellSurface> {
+    match id {
+        SurfaceId::Start => Some(ShellSurface::Start),
+        SurfaceId::TaskView => Some(ShellSurface::TaskView),
+        SurfaceId::NotificationCenter => Some(ShellSurface::NotificationCenter),
+        SurfaceId::MonitorPlugIn => Some(ShellSurface::Project),
+        _ => None,
+    }
+}
+
+fn overlay_is_up() -> bool {
+    let hwnds = HWNDS.lock().map(|slot| slot.clone()).unwrap_or_default();
+    hwnds
+        .iter()
+        .any(|bits| unsafe { IsWindow(Some(HWND(*bits as *mut core::ffi::c_void))).as_bool() })
+}
+
+fn dismiss(step: &Step, config: &Config) {
     match step.dismiss {
         tour::Dismiss::RepeatChord => {
-            if let Action::Chord(chord) = step.action {
+            if config.close_shell_surfaces {
+                let _ = input::escape();
+            } else if let Action::Chord(chord) = step.action {
                 let _ = input::chord(chord);
             }
         }
         tour::Dismiss::ClickNo => {
             println!("If the User Account Control prompt is still up, click No. Do not click Yes.");
-            set_status(
-                "If User Account Control is still up, click No. Never click Yes.".to_string(),
-            );
+            set_note(OverlayNote::ClickNo);
         }
         tour::Dismiss::ExitsItself | tour::Dismiss::Expires => {}
     }
@@ -662,6 +737,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             WM_HOTKEY => {
+                cleanup_all();
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -720,12 +796,12 @@ fn paint(hwnd: HWND) {
             bottom: client.bottom - 48,
         };
         let mut block = String::new();
-        if let Ok(status) = STATUS.lock()
-            && !status.is_empty()
-        {
-            block.push_str(&status);
-            block.push_str("\n\n");
-        }
+        let note = STATUS
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or(OverlayNote::Intro);
+        block.push_str(&note_text(note));
+        block.push_str("\n\n");
         for line in &lines {
             block.push_str(line);
             block.push('\n');
@@ -780,18 +856,34 @@ fn reassert_on_pos(hwnd: HWND, lparam: LPARAM) {
     REASSERTING.store(false, Ordering::SeqCst);
 }
 
+fn note_text(note: OverlayNote) -> String {
+    match note {
+        OverlayNote::Intro => {
+            "The pink layer is up. Clicking and typing still work. The current step is written here."
+                .into()
+        }
+        OverlayNote::Step {
+            number,
+            title,
+            look_for,
+        } => format!("Step {number}: {title}.\n{look_for}"),
+        OverlayNote::ClickNo => {
+            "If User Account Control is still up, click No. Never click Yes.".into()
+        }
+    }
+}
+
 fn on_timer() {
-    let (reassert, close, extra) = GUI
+    let (reassert, close) = GUI
         .with(|slot| {
             slot.borrow().as_ref().map(|gui| {
                 (
                     gui.reassert_timer && !gui.quitting,
                     gui.close_shell && !gui.quitting,
-                    gui.extra_exe.clone(),
                 )
             })
         })
-        .unwrap_or((false, false, None));
+        .unwrap_or((false, false));
     if reassert {
         let hwnds = GUI.with(|slot| {
             slot.borrow()
@@ -819,7 +911,7 @@ fn on_timer() {
         }
     }
     if close {
-        shell::close_matching(extra.as_deref());
+        shell::dismiss_visible();
     }
 }
 
@@ -919,7 +1011,15 @@ fn smoke_report(config: &Config) -> SmokeReport {
     let windows = GUI.with(|slot| {
         slot.borrow()
             .as_ref()
-            .map(|gui| gui.clone_refs())
+            .map(|gui| {
+                gui.windows
+                    .iter()
+                    .map(|window| LiveWindow {
+                        hwnd: window.hwnd,
+                        rect: window.rect,
+                    })
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default()
     });
     let monitors = enum_monitors().unwrap_or_default();
@@ -992,7 +1092,7 @@ fn smoke_report(config: &Config) -> SmokeReport {
     };
     let shell_fixture = if config.shell_fixture && config.close_shell_surfaces {
         if shell_fixture_check() {
-            "closed"
+            "left-open"
         } else {
             "failed"
         }
@@ -1022,22 +1122,6 @@ fn smoke_report(config: &Config) -> SmokeReport {
         reassert_pos,
         reassert_timer,
         shell_fixture,
-    }
-}
-
-trait CloneRefs {
-    fn clone_refs(&self) -> Vec<LiveWindow>;
-}
-
-impl CloneRefs for Gui {
-    fn clone_refs(&self) -> Vec<LiveWindow> {
-        self.windows
-            .iter()
-            .map(|window| LiveWindow {
-                hwnd: window.hwnd,
-                rect: window.rect,
-            })
-            .collect()
     }
 }
 
@@ -1278,8 +1362,7 @@ fn shell_fixture_check() -> bool {
     let Ok(hwnd) = create_fixture() else {
         return false;
     };
-    let extra = current_exe_name();
-    shell::close_matching(Some(&extra));
+    shell::dismiss_visible();
     pump_for(Duration::from_millis(200));
     let open = unsafe { IsWindow(Some(hwnd)).as_bool() };
     if open {
@@ -1287,7 +1370,7 @@ fn shell_fixture_check() -> bool {
             let _ = DestroyWindow(hwnd);
         }
     }
-    !open
+    open
 }
 
 fn create_fixture() -> Result<HWND, String> {
@@ -1326,16 +1409,6 @@ fn pack_point(x: i32, y: i32) -> LPARAM {
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn current_exe_name() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "spike-overlay.exe".into())
 }
 
 #[cfg(test)]

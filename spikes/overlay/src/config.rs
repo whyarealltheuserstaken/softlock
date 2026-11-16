@@ -43,8 +43,10 @@ pub struct Config {
     pub only: Option<SurfaceId>,
     /// Wait for Enter before the tour shows the overlay.
     pub prompt: bool,
-    /// Smoke-only: a fake shell window this process is allowed to close.
+    /// Smoke-only: prove a shell-looking window this process owns is not closed.
     pub shell_fixture: bool,
+    /// The tour refuses to run elevated unless this is set.
+    pub allow_admin: bool,
     pub fullscreen_secs: u64,
     timeout_set: bool,
 }
@@ -66,6 +68,7 @@ impl Config {
         let mut only = None;
         let mut prompt = true;
         let mut shell_fixture = false;
+        let mut allow_admin = false;
         let mut fullscreen_secs = None;
         let mut index = 0;
         while index < args.len() {
@@ -84,6 +87,7 @@ impl Config {
                 "--suppress-toasts" => suppress_toasts = true,
                 "--no-prompt" => prompt = false,
                 "--shell-fixture" => shell_fixture = true,
+                "--allow-admin" => allow_admin = true,
                 "--timeout-secs" => {
                     timeout_secs = Some(parse_secs(take_value(&args, &mut index, arg)?)?);
                 }
@@ -132,6 +136,7 @@ impl Config {
             only,
             prompt,
             shell_fixture,
+            allow_admin,
             fullscreen_secs,
             timeout_set,
         })
@@ -163,6 +168,16 @@ impl Config {
 
     pub fn timeout_was_set(&self) -> bool {
         self.timeout_set
+    }
+}
+
+/// An elevated tour is refused unless the operator passed `--allow-admin`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn tour_allowed(elevated: bool, allow_admin: bool) -> Result<(), String> {
+    if elevated && !allow_admin {
+        Err("this tour is running as admin. Start it by double-clicking the program. Pass --allow-admin only if school IT told you to.".into())
+    } else {
+        Ok(())
     }
 }
 
@@ -230,10 +245,11 @@ Flags:
   --pause-secs N       seconds to look at each surface, default {DEFAULT_PAUSE_SECS}
   --reassert-timer     keep the overlay topmost on a timer
   --reassert-pos       keep the overlay topmost when its position changes
-  --close-shell        close Start, Task View, and the notification center
-  --suppress-toasts    turn toast banners off, and restore them on exit
+  --close-shell        dismiss Start, Task View, and the notification center with Escape. It does not close Explorer
+  --suppress-toasts    turn the user toast setting off, and restore it on exit
   --only Surface       tour one surface
   --no-prompt          do not wait for Enter
+  --allow-admin        run the tour even when this window is already admin
   --alpha N            1 to 255, default {DEFAULT_ALPHA}
 "
     )
@@ -252,6 +268,7 @@ mod tests {
         assert!(config.mitigations_off());
         assert!(config.prompt);
         assert!(!config.shell_fixture);
+        assert!(!config.allow_admin);
         assert_eq!(config.alpha, DEFAULT_ALPHA);
     }
 
@@ -304,6 +321,16 @@ mod tests {
     #[test]
     fn unknown_flag_is_an_error() {
         assert!(Config::parse(["--reaassert-timer"]).is_err());
+    }
+
+    #[test]
+    fn an_elevated_tour_needs_allow_admin() {
+        assert!(tour_allowed(false, false).is_ok());
+        assert!(tour_allowed(true, true).is_ok());
+        let error = tour_allowed(true, false).unwrap_err();
+        assert!(error.contains("--allow-admin"), "{error}");
+        let config = Config::parse(["tour", "--allow-admin"]).unwrap();
+        assert!(config.allow_admin);
     }
 
     #[test]

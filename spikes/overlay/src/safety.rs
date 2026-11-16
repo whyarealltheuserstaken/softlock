@@ -13,18 +13,26 @@ pub const SHIPS_IN_RELEASE: bool = false;
 
 pub use crate::config::REASSERT_INTERVAL_MS;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const EX_TOPMOST: u32 = 0x0000_0008;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const EX_TRANSPARENT: u32 = 0x0000_0020;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const EX_TOOLWINDOW: u32 = 0x0000_0080;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const EX_LAYERED: u32 = 0x0008_0000;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const EX_NOACTIVATE: u32 = 0x0800_0000;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const EX_OVERLAY: u32 =
     EX_TOPMOST | EX_TRANSPARENT | EX_TOOLWINDOW | EX_LAYERED | EX_NOACTIVATE;
 
 /// `WDA_EXCLUDEFROMCAPTURE`.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const CAPTURE_EXCLUDED: u32 = 0x11;
 
 /// `HTTRANSPARENT`.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const HIT_TRANSPARENT: isize = -1;
 
 pub fn overlay_lines(config: &Config) -> Vec<String> {
@@ -197,10 +205,24 @@ mod tests {
         assert!(checklist.contains("ThinkStation"));
         assert!(checklist.contains("laptop"));
         assert!(checklist.contains("covered"));
-        assert!(checklist.contains("visible-but-not-interactive"));
+        assert!(checklist.contains("drawn above"));
+        assert!(!checklist.contains("visible-but-not-interactive"));
         assert!(checklist.contains("mitigated by"));
+        assert!(checklist.contains("school IT"));
+        assert!(checklist.contains("If you get stuck"));
+        assert!(checklist.contains("restore-toasts"));
+        assert!(checklist.contains("1.100.0"));
         assert!(checklist.to_ascii_lowercase().contains("phone"));
         assert!(checklist.contains("Never click Yes"));
+        assert!(finding.contains("input guard"));
+        assert!(finding.contains("drawn above"));
+        assert!(!finding.contains("visible-but-not-interactive"));
+        assert!(finding.contains("in-process"));
+        let shell_src = std::fs::read_to_string(root.join("src/win/shell.rs")).unwrap();
+        assert!(
+            !shell_src.contains(&format!("{}{}", "WM_", "CLOSE")),
+            "close-shell posts a close message to a window"
+        );
     }
 
     fn collect_text(dir: &std::path::Path, out: &mut String) {

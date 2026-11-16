@@ -6,7 +6,7 @@ use std::time::Duration;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_LWIN,
+    KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_ESCAPE, VK_LWIN,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -30,6 +30,11 @@ pub fn chord(chord: Chord) -> Result<(), String> {
         key(VK_LWIN, true, true)?;
     }
     Ok(())
+}
+
+pub fn escape() -> Result<(), String> {
+    key(VK_ESCAPE, false, false)?;
+    key(VK_ESCAPE, true, false)
 }
 
 pub fn key(vk: VIRTUAL_KEY, up: bool, extended: bool) -> Result<(), String> {

@@ -40,24 +40,32 @@ pub fn show() -> Result<(), String> {
     Ok(())
 }
 
-pub fn remove_shortcut() {
-    if let Ok(mut slot) = SHORTCUT.lock()
-        && let Some(path) = slot.take()
-    {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-fn register_shortcut() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let appdata = std::env::var("APPDATA").map_err(|_| "APPDATA is not set".to_string())?;
+pub fn shortcut_path() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var("APPDATA").ok()?;
     let mut path = std::path::PathBuf::from(appdata);
     path.push("Microsoft");
     path.push("Windows");
     path.push("Start Menu");
     path.push("Programs");
-    std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
     path.push("spike-overlay.lnk");
+    Some(path)
+}
+
+pub fn remove_shortcut() {
+    if let Some(path) = shortcut_path() {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Ok(mut slot) = SHORTCUT.lock() {
+        *slot = None;
+    }
+}
+
+fn register_shortcut() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let path = shortcut_path().ok_or_else(|| "APPDATA is not set".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
     let exe_w = wide(&exe.to_string_lossy());
     let link_w = wide(&path.to_string_lossy());
     let aumid = wide(AUMID);

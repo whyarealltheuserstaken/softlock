@@ -252,6 +252,7 @@ fn describe(step: &Step) -> String {
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn toast_xml(product: &str) -> String {
     format!(
         "<toast duration=\"short\"><visual><binding template=\"ToastGeneric\"><text>{}</text><text>Photograph this banner with your phone. Does it sit above the pink layer?</text></binding></visual></toast>",
@@ -259,6 +260,7 @@ pub fn toast_xml(product: &str) -> String {
     )
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")

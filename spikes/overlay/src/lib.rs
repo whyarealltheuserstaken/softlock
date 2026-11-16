@@ -23,17 +23,14 @@ pub use config::{
 };
 pub use coverage::{MonitorRect, reconcile, windows_for};
 pub use safety::{REASSERT_INTERVAL_MS, SHIPS_IN_RELEASE, overlay_lines};
-pub use shell::{ShellSurface, should_close};
+pub use shell::{ShellSurface, identify};
 pub use softlock_core::PRODUCT_DISPLAY_NAME;
-pub use toast_plan::{DISABLED_TOASTS, POLICY_SUPPRESSED, Restore, restore_of};
+pub use toast_plan::{DISABLED_TOASTS, Restore, restore_of, run_once_command, suppression_blocked};
 pub use tour::{Action, Confirm, Step, SurfaceId, steps, tour_duration};
 
 /// Run the spike command. `print-plan` works on every OS. Showing a window
 /// requires Windows.
 pub fn run(config: Config) -> Result<(), String> {
-    // The Windows backend is the production user of these values. Referencing
-    // them here keeps that contract compiling on every OS.
-    let _ = portable_contract();
     match config.command {
         Command::PrintPlan => {
             print!("{}", tour::plan_text());
@@ -52,23 +49,4 @@ fn dispatch(config: Config) -> Result<(), String> {
 fn dispatch(config: Config) -> Result<(), String> {
     let _ = config;
     Err("this spike shows a window on Windows only".into())
-}
-
-fn portable_contract() -> u32 {
-    let _ = tour::toast_xml(softlock_core::PRODUCT_DISPLAY_NAME);
-    let _ = safety::HIT_TRANSPARENT;
-    safety::EX_OVERLAY
-        ^ safety::EX_TOPMOST
-        ^ safety::EX_TRANSPARENT
-        ^ safety::EX_TOOLWINDOW
-        ^ safety::EX_LAYERED
-        ^ safety::EX_NOACTIVATE
-        ^ safety::CAPTURE_EXCLUDED
-        ^ toast_plan::TOAST_ENABLED_SUBKEY.len() as u32
-        ^ toast_plan::TOAST_ENABLED_VALUE.len() as u32
-        ^ toast_plan::POLICY_SUBKEY.len() as u32
-        ^ toast_plan::POLICY_VALUE.len() as u32
-        ^ toast_plan::SENTINEL_SUBKEY.len() as u32
-        ^ toast_plan::DISABLED_TOASTS
-        ^ toast_plan::POLICY_SUPPRESSED
 }

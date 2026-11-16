@@ -3,6 +3,11 @@
 # Exit the pink layer with Ctrl+Alt+Shift+Q.
 # It also closes itself after the timeout (default 5 minutes).
 #
+# Put spike-overlay.exe in the same folder as this script. That is how it
+# runs on the school PC, where Rust is not installed. If the exe is not
+# beside the script, the script looks in target\release and then target\debug
+# of this repo.
+#
 # Surfaces, in order:
 #   Start                 injected Win key
 #   TaskView              injected Win+Tab
@@ -20,14 +25,25 @@ param(
     [switch]$ReassertPos,
     [switch]$CloseShell,
     [switch]$SuppressToasts,
+    [switch]$AllowAdmin,
     [string]$Only = ""
 )
 
 $ErrorActionPreference = "Stop"
-$root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
-$exe = Join-Path $root "target\debug\spike-overlay.exe"
-if (-not (Test-Path $exe)) {
-    Write-Error "Build it first: cargo build -p softlock-spike-overlay"
+$beside = Join-Path $PSScriptRoot "spike-overlay.exe"
+if (Test-Path $beside) {
+    $exe = $beside
+} else {
+    $repo = Join-Path $PSScriptRoot "..\.."
+    $release = Join-Path $repo "target\release\spike-overlay.exe"
+    $debug = Join-Path $repo "target\debug\spike-overlay.exe"
+    if (Test-Path $release) {
+        $exe = $release
+    } elseif (Test-Path $debug) {
+        $exe = $debug
+    } else {
+        Write-Error "Copy spike-overlay.exe into the same folder as this script. On the laptop, build it with: cargo build --release -p softlock-spike-overlay"
+    }
 }
 
 $tour = @(
@@ -39,6 +55,7 @@ if ($ReassertTimer) { $tour += "--reassert-timer" }
 if ($ReassertPos) { $tour += "--reassert-pos" }
 if ($CloseShell) { $tour += "--close-shell" }
 if ($SuppressToasts) { $tour += "--suppress-toasts" }
+if ($AllowAdmin) { $tour += "--allow-admin" }
 if ($Only -ne "") { $tour += @("--only", $Only) }
 
 & $exe @tour
