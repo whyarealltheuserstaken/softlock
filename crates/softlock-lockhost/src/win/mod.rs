@@ -8,4 +8,5 @@ mod queue;
 mod session;
 
 pub use failclosed::{current_session_id, disconnect_session};
+pub use guard::{MouseHookSample, last_mouse_hook_sample};
 pub use session::{DevConfig, DevError, DevLock, OVERLAY_MARKER};
