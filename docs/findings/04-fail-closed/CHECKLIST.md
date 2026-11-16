@@ -23,7 +23,7 @@ Do not use `main`. Check out this program commit. A commit cannot contain its ow
 ```
 git clone https://github.com/whyarealltheuserstaken/softlock.git
 cd softlock
-git checkout 81d8366560b3532d23e4a33a2b9e660096a042a4
+git checkout bad7658e1f29a93f04d771a3d048489246aae7b3
 ```
 
 `git status` should say `HEAD detached at` that commit.
