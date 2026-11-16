@@ -38,3 +38,6 @@ name = "name_guard"
 
 [[test]]
 name = "publish_guard"
+
+[[test]]
+name = "spike_isolation"
