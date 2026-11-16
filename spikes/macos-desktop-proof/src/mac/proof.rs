@@ -1,9 +1,9 @@
 //! Orchestrator, launchd child, and the root tap child.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,11 +12,13 @@ use serde::Serialize;
 
 use crate::args::{Args, Mode};
 use crate::guard::service_install_allowed;
+use crate::labels::CAPTURE_APIS;
 use crate::mac::{ffi, launchd};
 use crate::png::png_size;
 use crate::report::{
-    CaptureReport, JobMarker, ProofReport, TapReport, VersionReport, WindowPlan,
-    capture_unavailable, failure_reasons, job_window_plan, render, tap_sudo_failed,
+    CaptureReport, JobMarker, ProofReport, TapReport, VersionReport, WindowPlan, WindowReport,
+    capture_unavailable, failure_reasons, job_window_plan, render, tap_process_miss,
+    tap_sudo_failed, window_process_miss,
 };
 use crate::version::parse_sw_vers;
 
@@ -30,6 +32,8 @@ pub fn dispatch(args: Args) -> i32 {
     match args.mode {
         Mode::Job => run_job(&args),
         Mode::TapOnly => run_tap(&args),
+        Mode::WindowOnly => run_window(&args),
+        Mode::CaptureOnly => run_capture(&args),
         Mode::Orchestrator => run_orchestrator(&args),
     }
 }
@@ -51,11 +55,6 @@ fn run_orchestrator(args: &Args) -> i32 {
         return 1;
     }
     let version = read_version();
-    eprintln!("macos desktop proof: window");
-    let window = ffi::prove_window();
-    eprintln!("macos desktop proof: event taps");
-    let session = ffi::prove_tap("kCGSessionEventTap", "user");
-    let hid_user = ffi::prove_tap("kCGHIDEventTap", "user");
     let exe = match current_exe() {
         Ok(exe) => exe,
         Err(error) => {
@@ -63,14 +62,17 @@ fn run_orchestrator(args: &Args) -> i32 {
             return 1;
         }
     };
+    eprintln!("macos desktop proof: window");
+    let window = child_window(&exe, &args.output_dir);
+    eprintln!("macos desktop proof: event taps");
+    let session = child_tap(&exe, &args.output_dir, "kCGSessionEventTap", "user");
+    let hid_user = child_tap(&exe, &args.output_dir, "kCGHIDEventTap", "user");
     let hid_root = root_hid_tap(&exe, &args.output_dir);
     eprintln!("macos desktop proof: capture");
-    let captures = vec![
-        ffi::prove_cg_window_list(),
-        ffi::prove_cg_display(),
-        prove_screencapture(&args.output_dir),
-        ffi::prove_screen_capture_kit(),
-    ];
+    let mut captures = Vec::new();
+    for api in CAPTURE_APIS {
+        captures.push(child_capture(&exe, &args.output_dir, api));
+    }
     eprintln!("macos desktop proof: launchd");
     let jobs = launchd::exercise(&exe, &args.output_dir);
     let report = ProofReport {
@@ -103,14 +105,12 @@ fn run_job(args: &Args) -> i32 {
     let uid = unsafe { libc::getuid() };
     let pid = std::process::id();
     let graphic = info.status == 0 && info.graphic;
-    let (window_ordered_front, window_error) = match job_window_plan(graphic, info.status) {
-        WindowPlan::Skip { error } => (false, Some(error)),
-        WindowPlan::Prove => {
-            let window = ffi::prove_window();
-            (window.ordered_front, window.error)
-        }
+    let plan = job_window_plan(graphic, info.status);
+    let (window_ordered_front, window_error) = match &plan {
+        WindowPlan::Skip { error } => (false, Some(error.clone())),
+        WindowPlan::Prove => (false, Some("NSWindow proof started".to_string())),
     };
-    let marker = JobMarker {
+    let mut marker = JobMarker {
         pid,
         uid,
         graphic_session: graphic,
@@ -122,8 +122,164 @@ fn run_job(args: &Args) -> i32 {
         eprintln!("{error}");
         return 1;
     }
+    if matches!(plan, WindowPlan::Prove) {
+        eprintln!("stage=NSWindow");
+        let window = ffi::prove_window();
+        marker.window_ordered_front = window.ordered_front;
+        marker.window_error = window.error;
+        if let Err(error) = write_json(&path, &marker) {
+            eprintln!("{error}");
+            return 1;
+        }
+    }
     wait_for_stop();
     0
+}
+
+fn run_window(args: &Args) -> i32 {
+    eprintln!("stage=NSWindow");
+    let window = ffi::prove_window();
+    let path = args.output_dir.join("window.json");
+    if let Err(error) = write_json(&path, &window) {
+        eprintln!("{error}");
+        return 1;
+    }
+    0
+}
+
+fn run_capture(args: &Args) -> i32 {
+    let Some(api) = args.capture_api.as_deref() else {
+        eprintln!("--capture-only needs a value");
+        return 2;
+    };
+    eprintln!("stage={api}");
+    let report = match api {
+        "CGWindowListCreateImage" => ffi::prove_cg_window_list(),
+        "CGDisplayCreateImage" => ffi::prove_cg_display(),
+        "screencapture" => prove_screencapture(&args.output_dir),
+        "ScreenCaptureKit" => ffi::prove_screen_capture_kit(),
+        other => capture_unavailable(other, "unknown capture api"),
+    };
+    let path = args.output_dir.join(format!("capture-{api}.json"));
+    if let Err(error) = write_json(&path, &report) {
+        eprintln!("{error}");
+        return 1;
+    }
+    0
+}
+
+fn child_window(exe: &Path, output_dir: &Path) -> WindowReport {
+    let path = output_dir.join("window.json");
+    let _ = fs::remove_file(&path);
+    let dir = path_arg(output_dir);
+    let outcome = run_limited(exe, &["--window-only", "--output-dir", &dir], 25);
+    if outcome.success
+        && let Some(window) = read_json::<WindowReport>(&path)
+    {
+        return window;
+    }
+    window_process_miss(outcome.code, &outcome.stderr)
+}
+
+fn child_tap(exe: &Path, output_dir: &Path, location: &str, privilege: &str) -> TapReport {
+    let path = output_dir.join(format!("tap-{location}.json"));
+    let _ = fs::remove_file(&path);
+    let dir = path_arg(output_dir);
+    let outcome = run_limited(exe, &["--tap-only", location, "--output-dir", &dir], 20);
+    if outcome.success
+        && let Some(mut tap) = read_json::<TapReport>(&path)
+    {
+        tap.location = location.to_string();
+        tap.privilege = privilege.to_string();
+        return tap;
+    }
+    tap_process_miss(location, privilege, outcome.code, &outcome.stderr)
+}
+
+fn child_capture(exe: &Path, output_dir: &Path, api: &str) -> CaptureReport {
+    let path = output_dir.join(format!("capture-{api}.json"));
+    let _ = fs::remove_file(&path);
+    let dir = path_arg(output_dir);
+    let outcome = run_limited(exe, &["--capture-only", api, "--output-dir", &dir], 25);
+    if outcome.success
+        && let Some(report) = read_json::<CaptureReport>(&path)
+    {
+        return report;
+    }
+    capture_unavailable(
+        api,
+        &format!("process exited {}: {}", outcome.code, outcome.stderr),
+    )
+}
+
+struct ChildOutcome {
+    code: i32,
+    success: bool,
+    stderr: String,
+}
+
+fn run_limited(exe: &Path, args: &[&str], seconds: u64) -> ChildOutcome {
+    let mut child = match Command::new(exe)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return ChildOutcome {
+                code: -1,
+                success: false,
+                stderr: error.to_string(),
+            };
+        }
+    };
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                if let Some(mut pipe) = child.stdout.take() {
+                    let mut stdout = String::new();
+                    let _ = pipe.read_to_string(&mut stdout);
+                }
+                return ChildOutcome {
+                    code: status.code().unwrap_or(139),
+                    success: status.success(),
+                    stderr,
+                };
+            }
+            Ok(None) if start.elapsed() >= Duration::from_secs(seconds) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ChildOutcome {
+                    code: 124,
+                    success: false,
+                    stderr: "timed out".to_string(),
+                };
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                return ChildOutcome {
+                    code: -1,
+                    success: false,
+                    stderr: error.to_string(),
+                };
+            }
+        }
+    }
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn path_arg(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 fn run_tap(args: &Args) -> i32 {
@@ -136,8 +292,9 @@ fn run_tap(args: &Args) -> i32 {
     } else {
         "user"
     };
+    eprintln!("stage=CGEventTapCreate {location}");
     let tap = ffi::prove_tap(location, privilege);
-    let path = args.output_dir.join("root-tap.json");
+    let path = args.output_dir.join(format!("tap-{location}.json"));
     if let Err(error) = write_json(&path, &tap) {
         eprintln!("{error}");
         return 1;
@@ -146,7 +303,11 @@ fn run_tap(args: &Args) -> i32 {
 }
 
 fn root_hid_tap(exe: &Path, output_dir: &Path) -> TapReport {
-    let destination = output_dir.join("root-tap.json");
+    let root_dir = output_dir.join("root-tap");
+    if let Err(error) = fs::create_dir_all(&root_dir) {
+        return tap_sudo_failed("kCGHIDEventTap", &format!("output dir: {error}"));
+    }
+    let destination = root_dir.join("tap-kCGHIDEventTap.json");
     let _ = fs::remove_file(&destination);
     let output = Command::new("sudo")
         .arg("-n")
@@ -154,7 +315,7 @@ fn root_hid_tap(exe: &Path, output_dir: &Path) -> TapReport {
         .arg("--tap-only")
         .arg("kCGHIDEventTap")
         .arg("--output-dir")
-        .arg(output_dir)
+        .arg(&root_dir)
         .output();
     match output {
         Err(error) => tap_sudo_failed("kCGHIDEventTap", &error.to_string()),
@@ -164,7 +325,12 @@ fn root_hid_tap(exe: &Path, output_dir: &Path) -> TapReport {
                 String::from_utf8_lossy(&output.stderr),
                 String::from_utf8_lossy(&output.stdout)
             );
-            tap_sudo_failed("kCGHIDEventTap", &detail)
+            let code = output.status.code().unwrap_or(139);
+            if output.status.code().is_none() || code == 139 || code == 134 || code == 126 {
+                tap_process_miss("kCGHIDEventTap", "root", code, &detail)
+            } else {
+                tap_sudo_failed("kCGHIDEventTap", &detail)
+            }
         }
         Ok(_) => match fs::read_to_string(&destination) {
             Ok(text) => match serde_json::from_str::<TapReport>(&text) {

@@ -2,11 +2,15 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::labels::CAPTURE_APIS;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Orchestrator,
     Job,
     TapOnly,
+    WindowOnly,
+    CaptureOnly,
 }
 
 impl Mode {
@@ -23,6 +27,7 @@ pub struct Args {
     pub mode: Mode,
     pub job_kind: Option<String>,
     pub tap_location: Option<String>,
+    pub capture_api: Option<String>,
 }
 
 pub fn parse_env() -> Result<Args, String> {
@@ -38,6 +43,8 @@ where
     let mut output_dir = PathBuf::from("proof-output");
     let mut job_kind = None;
     let mut tap_location = None;
+    let mut window_only = false;
+    let mut capture_api = None;
     let mut tokens = tokens.into_iter();
     while let Some(token) = tokens.next() {
         match token.as_str() {
@@ -65,16 +72,37 @@ where
                 }
                 tap_location = Some(location);
             }
+            "--window-only" => window_only = true,
+            "--capture-only" => {
+                let api = tokens.next().ok_or("--capture-only needs a value")?;
+                if !CAPTURE_APIS.contains(&api.as_str()) {
+                    return Err(format!("unknown capture api {api}"));
+                }
+                capture_api = Some(api);
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if job_kind.is_some() && tap_location.is_some() {
-        return Err("job and tap-only are different processes".to_string());
+    let selected = [
+        job_kind.is_some(),
+        tap_location.is_some(),
+        window_only,
+        capture_api.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+    if selected > 1 {
+        return Err("job, tap, window, and capture are different processes".to_string());
     }
     let mode = if job_kind.is_some() {
         Mode::Job
     } else if tap_location.is_some() {
         Mode::TapOnly
+    } else if window_only {
+        Mode::WindowOnly
+    } else if capture_api.is_some() {
+        Mode::CaptureOnly
     } else {
         Mode::Orchestrator
     };
@@ -85,6 +113,7 @@ where
         mode,
         job_kind,
         tap_location,
+        capture_api,
     })
 }
 
@@ -144,6 +173,14 @@ mod tests {
             ]))
             .is_err()
         );
+        let window = parse(tokens(&["--window-only"])).unwrap();
+        assert_eq!(window.mode, Mode::WindowOnly);
+        assert!(!window.mode.installs_daemon());
+        let capture = parse(tokens(&["--capture-only", "screencapture"])).unwrap();
+        assert_eq!(capture.mode, Mode::CaptureOnly);
+        assert_eq!(capture.capture_api.as_deref(), Some("screencapture"));
+        assert!(parse(tokens(&["--capture-only", "camera"])).is_err());
+        assert!(parse(tokens(&["--window-only", "--tap-only", "kCGHIDEventTap"])).is_err());
         assert!(parse(tokens(&["--elsewhere"])).is_err());
         assert!(parse(tokens(&["--output-dir"])).is_err());
     }

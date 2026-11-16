@@ -165,6 +165,36 @@ pub fn tap_from_bits(location: &str, privilege: &str, bits: TapBits) -> TapRepor
     }
 }
 
+pub fn window_process_miss(code: i32, stderr: &str) -> WindowReport {
+    WindowReport {
+        ordered_front: false,
+        key_window: false,
+        key_received: false,
+        post_location: String::new(),
+        error: Some(format!(
+            "NSWindow proof process exited {code}: {}",
+            one_line(stderr)
+        )),
+    }
+}
+
+pub fn tap_process_miss(location: &str, privilege: &str, code: i32, stderr: &str) -> TapReport {
+    TapReport {
+        location: location.to_string(),
+        privilege: privilege.to_string(),
+        created: false,
+        callback_fired: false,
+        tcc: "null".to_string(),
+        accessibility_trusted: None,
+        listen_preflight: None,
+        prompt_owner: None,
+        error: Some(format!(
+            "CGEventTapCreate process exited {code}; TCC result was not written: {}",
+            one_line(stderr)
+        )),
+    }
+}
+
 pub fn tap_sudo_failed(location: &str, detail: &str) -> TapReport {
     TapReport {
         location: location.to_string(),
@@ -791,6 +821,12 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("no API error"))
         );
+
+        report.window = Some(window_process_miss(139, "stage=NSWindow"));
+        assert!(failure_reasons(&report).is_empty());
+        report.taps[0] =
+            tap_process_miss("kCGSessionEventTap", "user", 139, "stage=CGEventTapCreate");
+        assert!(failure_reasons(&report).is_empty());
     }
 
     #[test]
