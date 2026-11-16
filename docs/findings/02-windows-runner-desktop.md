@@ -1,11 +1,13 @@
 # 02: GitHub-hosted Windows runners can host the desktop tests
 
-Measured on 16 November 2026 UTC (15 November 2026 in Pacific time) by the workspace-excluded probe `spikes/desktop-proof`, workflow [Desktop proof run 43805604323](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604323).
+Measured on 16 November 2026 UTC (15 November 2026 in Pacific time) by the workspace-excluded probe `spikes/desktop-proof`.
 
-- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604323/job/133095547751)
-- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604323/job/133095547957)
+The review follow-up is [Desktop proof run 43807392388](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43807392388). Both images printed `result=pass`.
 
-Both jobs printed `result=pass`. The product CI run on the same commit also passed: [CI run 43805604226](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604226).
+- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43807392388/job/133101188841)
+- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43807392388/job/133101188609)
+
+The first green measurement, before the marker was moved, is [Desktop proof run 43805604323](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604323) ([windows-2022](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604323/job/133095547751), [windows-2025](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604323/job/133095547957)). Product CI on that commit passed: [CI run 43805604226](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43805604226).
 
 ## Decision for seam 3
 
@@ -27,13 +29,30 @@ In that child:
 
 - `WH_KEYBOARD_LL` and `WH_MOUSE_LL` installed.
 - `SendInput` inserted 5 events. The hook saw F13 (`vk=124`) key-down and left-button down (`message=513`), both with the injected flag.
-- A topmost tool window painted the marker colour (180x180, 32400 pixels) over a control-coloured window.
-- With capture exclusion off, GDI `BitBlt`, DXGI Desktop Duplication, and Windows.Graphics.Capture all reported the marker present and the control colour present.
-- With `WDA_EXCLUDEFROMCAPTURE` on the marker only, all three captures reported the marker absent (0 pixels) and the control colour still present.
+- A topmost marker (140x140, 19600 pixels) sits on a topmost control window (320x320) at the bottom-right of the 1024x768 screen, away from the runner console.
+- `topmost=true` is the `WS_EX_TOPMOST` style. `topmost-hit=true` means `WindowFromPoint` at the marker centre returned the marker. `adjacent-hit=true` means `WindowFromPoint` on the strip to the right of the marker returned the control window.
+- `GetWindow` with `GW_HWNDPREV` reported `topmost-above=IME` on both images. That IME window is above the marker in z-order and does not cover it: the point test still hit the marker, and the marker rectangle contained exactly 19600 marker pixels.
+- With capture exclusion off, GDI `BitBlt`, DXGI Desktop Duplication, and Windows.Graphics.Capture each saw 19600 marker pixels in the marker rectangle and 25200 control pixels in the adjacent strip (180x140). Global control pixels were 82800, which is the 320x320 window minus the marker.
+- With `WDA_EXCLUDEFROMCAPTURE` on the marker only, all three captures reported 0 marker pixels. The marker rectangle then contained 19600 control pixels, so the colour under the marker is the control window, not the runner console. Global control pixels were the full 102400.
 
-The first measurement placed a non-topmost control window at the top-left. Its global control-pixel counts were about 25k–29k, not the full window, which fits the runner console covering part of that window. The marker was topmost and fully visible (exactly 32400 pixels), so the marker count was not the console. The follow-up probe moves both windows to the bottom-right, makes the control window topmost as well, counts marker pixels inside the marker rectangle, and requires the control colour in the strip immediately to the right of the marker. `topmost=` is still the style flag. `topmost-hit=` is `WindowFromPoint` at the marker centre, and `adjacent-hit=` is `WindowFromPoint` on that strip. The window above the marker in z-order is logged as `topmost-above=`.
+The first measurement had placed a non-topmost control window at the top-left. Its global control counts were about 25k–29k rather than the full window, which fits the runner console covering part of that window. The marker itself was topmost and fully visible (exactly 180x180 = 32400 pixels). Those first-run lines are below. They are not the check the probe uses now.
 
-### windows-2022
+Both images printed the same capture lines on the follow-up run. windows-2022 child pid 724. windows-2025 child pid 5052.
+
+```
+topmost=true
+topmost-hit=true
+adjacent-hit=true
+topmost-above=IME
+gdi-exclusion-off=marker-present control-present marker-pixels=19600 control-pixels=82800 marker-region=19600 adjacent-control=25200 under-marker-control=0
+gdi-exclusion-on=marker-absent control-present marker-pixels=0 control-pixels=102400 marker-region=0 adjacent-control=25200 under-marker-control=19600
+dxgi-exclusion-off=marker-present control-present marker-pixels=19600 control-pixels=82800 marker-region=19600 adjacent-control=25200 under-marker-control=0
+dxgi-exclusion-on=marker-absent control-present marker-pixels=0 control-pixels=102400 marker-region=0 adjacent-control=25200 under-marker-control=19600
+wgc-exclusion-off=marker-present control-present marker-pixels=19600 control-pixels=82800 marker-region=19600 adjacent-control=25200 under-marker-control=0
+wgc-exclusion-on=marker-absent control-present marker-pixels=0 control-pixels=102400 marker-region=0 adjacent-control=25200 under-marker-control=19600
+```
+
+### windows-2022, first measurement
 
 `ImageOS=win22`. Windows Server 2022 Datacenter, 21H2, build 20348, installation type Server. Child pid 4640.
 
@@ -46,7 +65,7 @@ wgc-exclusion-off=marker-present control-present marker-pixels=32400 control-pix
 wgc-exclusion-on=marker-absent control-present marker-pixels=0 control-pixels=25320
 ```
 
-### windows-2025
+### windows-2025, first measurement
 
 `ImageOS=win25-vs2026`. Windows Server 2025 Datacenter, 24H2, build 26100, installation type Server. Child pid 1472.
 
@@ -65,7 +84,7 @@ Nothing in the measured set failed on either image.
 
 These hosted images do not cover the client-only checks the spec already keeps on the manual list: the Ctrl+Alt+Del screen, Windows Hello, Modern Standby, and the lid. The desktop is one 1024x768 monitor, so multi-monitor layout is not shown. The probe does not send input at an elevated window, so the integrity-level half of spike 05 is still open. It does not take the fail-closed path, because that would end the session.
 
-The measured run's "Record the runner session" step printed `query user` and `query session`, then reported exit code 1. That is PowerShell keeping the native exit code from `query session`. The step is `continue-on-error` and is not a desktop failure. The workflow now exits 0 after printing that table.
+The first run's "Record the runner session" step printed `query user` and `query session`, then reported exit code 1. That is PowerShell keeping the native exit code from `query session`. The step is `continue-on-error` and is not a desktop failure. The workflow now exits 0 after printing that table, and the follow-up run's session step completed without that annotation.
 
 Seam 3 tests must not assume the interactive session id is 1. On these runners it was 2. A service that needs the desktop has to launch into the console session; code running as the service itself stays on the disconnected Services desktop.
 

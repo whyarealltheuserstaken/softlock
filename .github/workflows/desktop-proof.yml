@@ -1,5 +1,7 @@
 name: Desktop proof
 
+# Review follow-up measurement: https://github.com/whyarealltheuserstaken/softlock/actions/runs/43807392388
+
 # Manual runs, and pull requests that touch the probe or this file.
 # No push trigger: a push to main after merge must not install the SYSTEM service.
 on:
