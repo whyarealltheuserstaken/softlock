@@ -20,6 +20,16 @@ Date:
 - Ticket 21: Unlock with the Windows account password, with backoff. It needs the offline network-logon result.
 - Ticket 22: Unlock with Windows Hello through the Broker. It needs the dialog, passthrough, and chord results.
 
+## How this run differs from the product
+
+The spike runs in one medium-integrity process. The product plan is a SYSTEM Lock Host plus a Broker in the user session. This run does not prove that split.
+
+Passthrough identity limits for ticket 22:
+
+- Any foreground window of an allowed signed binary passes. The check is the process image, not one dialog window.
+- The accepted or rejected result is cached for that process id until the dialog ends.
+- The foreground check runs on a 50 ms poll, so a window can be in front for a short gap before the check catches it.
+
 ## Results
 
 Write what happened. Leave a line as `(blank)` if that run was not done.
@@ -70,6 +80,10 @@ Write what happened. Leave a line as `(blank)` if that run was not done.
 
 ### Password offline, Microsoft account
 
+Skipped: (blank)
+
+Logon form tried: (blank)
+
 Account kind: (blank)
 
 Result: (blank)
@@ -78,11 +92,17 @@ Win32 error: (blank)
 
 ### Password offline, local account
 
+Skipped: (blank)
+
+Logon form tried: (blank)
+
 Account kind: (blank)
 
 Result: (blank)
 
 Win32 error: (blank)
+
+Leftover `C:\Users\slp6test` folder: (blank)
 
 ### Account lockout
 

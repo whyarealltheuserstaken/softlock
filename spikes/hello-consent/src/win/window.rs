@@ -5,20 +5,21 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DT_NOPREFIX, DT_WORDBREAK, DeleteObject, DrawTextW, EndPaint,
-    FillRect, HBRUSH, PAINTSTRUCT, SetBkMode, SetTextColor, TRANSPARENT,
+    FillRect, HBRUSH, HGDIOBJ, PAINTSTRUCT, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow, GetSystemMetrics,
-    HICON, HWND_TOPMOST, LWA_ALPHA, MSG, PM_REMOVE, PeekMessageW, RegisterClassW,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOW,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
-    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_DESTROY, WM_KEYDOWN, WM_PAINT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA, GetForegroundWindow,
+    GetSystemMetrics, GetWindowLongPtrW, HICON, HWND_TOPMOST, LWA_ALPHA, MSG, PM_REMOVE,
+    PeekMessageW, RegisterClassW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_KEYDOWN, WM_PAINT,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -58,7 +59,6 @@ Escape: hold Ctrl, Alt, and Shift, then press Q.";
 
 static HWND_SLOT: AtomicIsize = AtomicIsize::new(0);
 static PROBE_SAW: AtomicBool = AtomicBool::new(false);
-static BRUSH: AtomicIsize = AtomicIsize::new(0);
 
 struct UiText {
     text: std::cell::UnsafeCell<Vec<u16>>,
@@ -190,11 +190,11 @@ fn create_window(
     place: (i32, i32, i32, i32),
 ) -> windows::core::Result<HWND> {
     // SAFETY: registering a private window class for this process.
-    let hwnd = unsafe {
+    // The brush is stored on the window and deleted in WM_DESTROY.
+    unsafe {
         let module = GetModuleHandleW(PCWSTR::null())?;
         let instance = windows::Win32::Foundation::HINSTANCE(module.0);
         let brush = CreateSolidBrush(COLORREF(0x00301814));
-        BRUSH.store(brush.0 as isize, Ordering::SeqCst);
         let class = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance,
@@ -205,7 +205,7 @@ fn create_window(
             ..WNDCLASSW::default()
         };
         RegisterClassW(&class);
-        CreateWindowExW(
+        let hwnd = match CreateWindowExW(
             ex_style,
             class_name,
             title,
@@ -218,10 +218,17 @@ fn create_window(
             None,
             Some(instance),
             None,
-        )?
-    };
-    HWND_SLOT.store(hwnd.0 as isize, Ordering::SeqCst);
-    Ok(hwnd)
+        ) {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                let _ = DeleteObject(HGDIOBJ(brush.0));
+                return Err(error);
+            }
+        };
+        let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, brush.0 as isize);
+        HWND_SLOT.store(hwnd.0 as isize, Ordering::SeqCst);
+        Ok(hwnd)
+    }
 }
 
 fn virtual_origin() -> (i32, i32, i32, i32) {
@@ -250,11 +257,12 @@ unsafe extern "system" fn wnd_proc(
         return LRESULT(0);
     }
     if msg == WM_DESTROY {
-        let brush = BRUSH.swap(0, Ordering::SeqCst);
-        if brush != 0 {
-            // SAFETY: the brush was created for this window and is deleted once.
-            unsafe {
-                let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush as *mut _));
+        // SAFETY: the brush was stored on this window and is deleted once.
+        unsafe {
+            let brush = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if brush != 0 {
+                let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                let _ = DeleteObject(HGDIOBJ(brush as *mut _));
             }
         }
     }
@@ -272,7 +280,7 @@ fn paint(hwnd: HWND) {
         }
         let mut rect = RECT::default();
         let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
-        let brush = BRUSH.load(Ordering::SeqCst);
+        let brush = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
         if brush != 0 {
             let _ = FillRect(dc, &rect, HBRUSH(brush as *mut _));
         }

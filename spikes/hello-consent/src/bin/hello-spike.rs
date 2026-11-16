@@ -10,11 +10,10 @@ fn main() {
     #[cfg(windows)]
     {
         let code = win::run();
-        std::process::exit(code);
+        win::halt(code as u32);
     }
     #[cfg(not(windows))]
     {
-        let _ = std::env::args().len();
         eprintln!("hello-spike runs on Windows only");
         std::process::exit(2);
     }

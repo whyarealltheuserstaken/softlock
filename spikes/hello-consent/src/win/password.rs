@@ -3,6 +3,7 @@
 
 use std::io::{self, Write};
 
+use softlock_hello_spike::{LogonAccount, parse_explicit_account, session_logon};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows::Win32::Security::Authentication::Identity::{
     EXTENDED_NAME_FORMAT, GetUserNameExW, NameSamCompatible, NameUserPrincipal,
@@ -13,14 +14,23 @@ use windows::Win32::System::Console::{
     SetConsoleMode,
 };
 use windows::core::{PCWSTR, PWSTR};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
-pub fn run() -> i32 {
-    println!("Password check for the account you are signed in as.");
-    println!("This uses a Windows network logon and then closes the token.");
+pub fn run(explicit: Option<&str>) -> i32 {
+    let account = match resolve_account(explicit) {
+        Ok(account) => account,
+        Err(error) => {
+            eprintln!("{error}");
+            return 2;
+        }
+    };
+    println!("Password check. This uses a Windows network logon and then closes the token.");
     println!("A wrong password counts toward the Windows account-lockout counter.");
     println!("Use the correct password. If you try a wrong one on purpose, do it once, then stop.");
     println!("If the result says the account is locked, do not try again.");
+    println!("account kind: {}", account.kind.label());
+    println!("logon form tried: {}", account.form);
+    println!("logon type: network (LOGON32_LOGON_NETWORK = 3)");
     println!("Type yes to continue.");
     let _ = io::stdout().flush();
     let mut answer = String::new();
@@ -28,22 +38,10 @@ pub fn run() -> i32 {
         println!("cancelled");
         return 1;
     }
-
-    let account = match session_account() {
-        Some(account) => account,
-        None => {
-            eprintln!("could not read the signed-in account name");
-            return 2;
-        }
-    };
-    println!("account kind: {}", account.kind);
-    println!("logon domain: {}", account.domain_display);
-    println!("logon user: {}", account.user_display);
-    println!("logon type: network (LOGON32_LOGON_NETWORK = 3)");
     println!("Type the password and press Enter. It will not be shown.");
     let _ = io::stdout().flush();
 
-    let mut password = match read_hidden_password() {
+    let password = match read_hidden_password() {
         Ok(password) => password,
         Err(error) => {
             eprintln!("{error}");
@@ -51,25 +49,26 @@ pub fn run() -> i32 {
         }
     };
     if password.len() <= 1 {
-        password.zeroize();
         println!("empty password was not sent");
         return 1;
     }
 
+    let domain = wide(&account.domain);
+    let user = wide(&account.user);
     let mut token = HANDLE::default();
     // SAFETY: the password buffer is a null-terminated wide string and is wiped
-    // after the call. A token, if one is returned, is closed immediately.
+    // when `password` drops. A token, if one is returned, is closed immediately.
     let logged_on = unsafe {
         LogonUserW(
-            PCWSTR(account.user.as_ptr()),
-            PCWSTR(account.domain.as_ptr()),
+            PCWSTR(user.as_ptr()),
+            PCWSTR(domain.as_ptr()),
             PCWSTR(password.as_ptr()),
             LOGON32_LOGON_NETWORK,
             LOGON32_PROVIDER_DEFAULT,
             &mut token,
         )
     };
-    password.zeroize();
+    drop(password);
 
     match logged_on {
         Ok(()) => {
@@ -94,51 +93,15 @@ pub fn run() -> i32 {
     }
 }
 
-struct SessionAccount {
-    kind: &'static str,
-    domain_display: String,
-    user_display: String,
-    domain: Vec<u16>,
-    user: Vec<u16>,
-}
-
-fn session_account() -> Option<SessionAccount> {
+fn resolve_account(explicit: Option<&str>) -> Result<LogonAccount, String> {
+    if let Some(raw) = explicit {
+        return parse_explicit_account(raw);
+    }
     let upn = lookup_name(NameUserPrincipal);
-    let sam = lookup_name(NameSamCompatible)?;
-    let (sam_domain, sam_user) = split_sam(&sam)?;
-    if let Some(email) = upn.filter(|value| value.contains('@')) {
-        return Some(SessionAccount {
-            kind: "microsoft",
-            domain_display: "MicrosoftAccount".to_string(),
-            user_display: email.clone(),
-            domain: wide("MicrosoftAccount"),
-            user: wide(&email),
-        });
-    }
-    if sam_domain.eq_ignore_ascii_case("MicrosoftAccount") {
-        return Some(SessionAccount {
-            kind: "microsoft",
-            domain_display: sam_domain.clone(),
-            user_display: sam_user.clone(),
-            domain: wide(&sam_domain),
-            user: wide(&sam_user),
-        });
-    }
-    Some(SessionAccount {
-        kind: "local",
-        domain_display: sam_domain.clone(),
-        user_display: sam_user.clone(),
-        domain: wide(&sam_domain),
-        user: wide(&sam_user),
-    })
-}
-
-fn split_sam(sam: &str) -> Option<(String, String)> {
-    let (domain, user) = sam.split_once('\\')?;
-    if domain.is_empty() || user.is_empty() {
-        return None;
-    }
-    Some((domain.to_string(), user.to_string()))
+    let sam = lookup_name(NameSamCompatible)
+        .ok_or_else(|| "could not read the signed-in account name".to_string())?;
+    session_logon(upn.as_deref(), &sam)
+        .ok_or_else(|| "could not read the signed-in account name".to_string())
 }
 
 fn lookup_name(format: EXTENDED_NAME_FORMAT) -> Option<String> {
@@ -161,8 +124,9 @@ fn lookup_name(format: EXTENDED_NAME_FORMAT) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-fn read_hidden_password() -> Result<Vec<u16>, String> {
+fn read_hidden_password() -> Result<Zeroizing<Vec<u16>>, String> {
     // SAFETY: the console mode is restored before this function returns.
+    // The stack buffer is wiped on every return, including a failed read.
     unsafe {
         let input = GetStdHandle(STD_INPUT_HANDLE).map_err(|error| error.to_string())?;
         let mut mode = CONSOLE_MODE::default();
@@ -170,7 +134,7 @@ fn read_hidden_password() -> Result<Vec<u16>, String> {
             .map_err(|_| "this prompt needs a console, so the password is not shown".to_string())?;
         let hidden = CONSOLE_MODE(mode.0 & !ENABLE_ECHO_INPUT.0);
         SetConsoleMode(input, hidden).map_err(|error| error.to_string())?;
-        let mut buf = [0u16; 512];
+        let mut buf = Zeroizing::new([0u16; 512]);
         let mut read = 0u32;
         let result = ReadConsoleW(
             input,
@@ -180,15 +144,19 @@ fn read_hidden_password() -> Result<Vec<u16>, String> {
             None,
         );
         let _ = SetConsoleMode(input, mode);
-        result.map_err(|error| error.to_string())?;
-        let end = read as usize;
-        let mut password: Vec<u16> = buf[..end]
-            .iter()
-            .copied()
-            .filter(|ch| *ch != u16::from(b'\r') && *ch != u16::from(b'\n'))
-            .collect();
+        if let Err(error) = result {
+            return Err(error.to_string());
+        }
+        let end = (read as usize).min(buf.len());
+        // Capacity covers every kept character plus the trailing NUL, so the
+        // pushes below do not reallocate.
+        let mut password = Zeroizing::new(Vec::with_capacity(end + 1));
+        for &ch in &buf[..end] {
+            if ch != u16::from(b'\r') && ch != u16::from(b'\n') {
+                password.push(ch);
+            }
+        }
         password.push(0);
-        buf.zeroize();
         Ok(password)
     }
 }

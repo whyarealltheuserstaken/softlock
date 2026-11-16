@@ -13,7 +13,8 @@ use windows::Win32::System::Diagnostics::Debug::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+    GetCurrentProcess, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+    TerminateProcess,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, HHOOK, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, SetWindowsHookExW, UnhookWindowsHookEx,
@@ -107,8 +108,19 @@ pub fn watchdog(limit: Duration) {
         STOP.store(true, Ordering::SeqCst);
         thread::sleep(Duration::from_secs(2));
         eprintln!("deadline backstop; exiting");
-        std::process::exit(3);
+        halt(3);
     });
+}
+
+pub fn halt(code: u32) -> ! {
+    // SAFETY: this kills the current process after the hook has been removed.
+    // It does not run destructors, which is the point of the backstop.
+    unsafe {
+        let _ = TerminateProcess(GetCurrentProcess(), code);
+    }
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
 }
 
 pub fn install_crash_handlers() {

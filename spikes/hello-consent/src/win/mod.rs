@@ -29,16 +29,22 @@ pub fn run() -> i32 {
             0
         }
         Command::Hello => hello_session(),
-        Command::Password => password::run(),
+        Command::Password { account } => password::run(account.as_deref()),
         Command::Smoke => smoke_session(),
+        Command::Usage => 2,
     }
+}
+
+pub fn halt(code: u32) -> ! {
+    hooks::halt(code);
 }
 
 enum Command {
     Help,
     Hello,
-    Password,
+    Password { account: Option<String> },
     Smoke,
+    Usage,
 }
 
 fn parse_args() -> Command {
@@ -46,11 +52,34 @@ fn parse_args() -> Command {
     match args.next().as_deref() {
         None | Some("help") | Some("--help") | Some("-h") => Command::Help,
         Some("hello") => Command::Hello,
-        Some("password") => Command::Password,
+        Some("password") => password_command(args),
         Some("smoke") => Command::Smoke,
         Some(other) => {
             eprintln!("unknown command: {other}");
-            Command::Help
+            Command::Usage
+        }
+    }
+}
+
+fn password_command(mut args: impl Iterator<Item = String>) -> Command {
+    match args.next().as_deref() {
+        None => Command::Password { account: None },
+        Some("--account") => match args.next() {
+            Some(name) if args.next().is_none() => Command::Password {
+                account: Some(name),
+            },
+            Some(_) => {
+                eprintln!("password takes only --account <name>");
+                Command::Usage
+            }
+            None => {
+                eprintln!("--account needs a name");
+                Command::Usage
+            }
+        },
+        Some(other) => {
+            eprintln!("unknown password option: {other}");
+            Command::Usage
         }
     }
 }
@@ -62,12 +91,13 @@ hello-spike hello
     Block physical keys and the mouse, show a topmost overlay, and call
     the Windows Hello consent verifier. Removes the block by itself.
 
-hello-spike password
-    Check the signed-in account's password with a network logon.
+hello-spike password [--account NAME]
+    Check a password with a network logon. NAME is MicrosoftAccount\\email,
+    .\\user, or MACHINE\\user. Without it, the signed-in account is used.
     Does not block the keyboard. Wrong attempts count toward lockout.
 
 hello-spike smoke
-    CI only. Injected input, a few seconds, then exit.
+    CI only. Signature gate, then injected input, a few seconds, then exit.
 
 Escape while blocked: hold Ctrl, Alt, and Shift, then press Q.
 Ctrl+Alt+Del still works. The block never lasts more than 3 minutes."
@@ -176,6 +206,9 @@ fn hello_session() -> i32 {
 }
 
 fn smoke_session() -> i32 {
+    if signature_smoke() != 0 {
+        return 4;
+    }
     println!(
         "smoke: injected input only, limit {} seconds",
         SMOKE_LIMIT.as_secs()
@@ -244,6 +277,50 @@ fn smoke_session() -> i32 {
     }
     println!("smoke ok");
     0
+}
+
+fn signature_smoke() -> i32 {
+    println!("signature smoke: catalog gate");
+    let broker = r"C:\Windows\System32\CredentialUIBroker.exe";
+    if !std::path::Path::new(broker).is_file() {
+        eprintln!("signature smoke: missing {broker}");
+        return 4;
+    }
+    if !foreground::microsoft_signed(broker) {
+        eprintln!("signature smoke: rejected {broker}");
+        return 4;
+    }
+    let notepad = r"C:\Windows\System32\notepad.exe";
+    if std::path::Path::new(notepad).is_file() {
+        if !foreground::microsoft_signed(notepad) {
+            eprintln!("signature smoke: rejected {notepad}");
+            return 4;
+        }
+    } else {
+        println!("signature smoke: {notepad} not present, skipped");
+    }
+    let unsigned = match unsigned_temp_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("signature smoke: could not write an unsigned exe: {error}");
+            return 4;
+        }
+    };
+    let accepted = foreground::microsoft_signed(&unsigned);
+    let _ = std::fs::remove_file(&unsigned);
+    if accepted {
+        eprintln!("signature smoke: accepted the unsigned temp exe");
+        return 4;
+    }
+    println!("signature smoke ok");
+    0
+}
+
+fn unsigned_temp_exe() -> std::io::Result<String> {
+    let src = std::env::current_exe()?;
+    let dest = std::env::temp_dir().join("hello-spike-unsigned-smoke.exe");
+    std::fs::copy(&src, &dest)?;
+    Ok(dest.display().to_string())
 }
 
 fn arm(limit: Duration) -> windows::core::Result<HookGuard> {

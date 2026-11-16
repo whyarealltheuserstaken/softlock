@@ -136,14 +136,10 @@ impl PassthroughWindow {
         Self::new(PASSTHROUGH_TIMEOUT)
     }
 
-    /// `dialog_alive` is true until the consent request finishes.
     /// `foreground_ok` is true when the foreground window passed the
-    /// image-path and signature check.
-    pub fn poll(&mut self, now: Duration, dialog_alive: bool, foreground_ok: bool) -> bool {
-        if !dialog_alive {
-            self.started = None;
-            return false;
-        }
+    /// image-path and signature check. Call [`Self::close`] when the dialog
+    /// ends so the next dialog gets a new window.
+    pub fn poll(&mut self, now: Duration, foreground_ok: bool) -> bool {
         if foreground_ok && self.started.is_none() {
             self.started = Some(now);
         }
@@ -151,6 +147,10 @@ impl PassthroughWindow {
             self.started,
             Some(start) if foreground_ok && now.saturating_sub(start) < self.timeout
         )
+    }
+
+    pub fn close(&mut self) {
+        self.started = None;
     }
 }
 
@@ -360,40 +360,42 @@ mod tests {
     #[test]
     fn passthrough_ends_at_sixty_seconds_and_when_the_dialog_closes() {
         let mut clock = PassthroughWindow::spec();
-        assert!(!clock.poll(Duration::ZERO, true, false));
-        assert!(clock.poll(Duration::from_secs(1), true, true));
-        assert!(clock.poll(Duration::from_secs(60), true, true));
-        assert!(!clock.poll(Duration::from_secs(61), true, true));
+        assert!(!clock.poll(Duration::ZERO, false));
+        assert!(clock.poll(Duration::from_secs(1), true));
+        assert!(clock.poll(Duration::from_secs(60), true));
+        assert!(!clock.poll(Duration::from_secs(61), true));
 
         let mut fresh = PassthroughWindow::spec();
-        assert!(fresh.poll(Duration::ZERO, true, true));
-        assert!(!fresh.poll(Duration::from_secs(10), true, false));
-        assert!(fresh.poll(Duration::from_secs(59), true, true));
-        assert!(!fresh.poll(Duration::from_secs(60), true, true));
+        assert!(fresh.poll(Duration::ZERO, true));
+        assert!(!fresh.poll(Duration::from_secs(10), false));
+        assert!(fresh.poll(Duration::from_secs(59), true));
+        assert!(!fresh.poll(Duration::from_secs(60), true));
 
         let mut closed = PassthroughWindow::spec();
-        assert!(closed.poll(Duration::from_secs(5), true, true));
-        assert!(!closed.poll(Duration::from_secs(6), false, true));
-        assert!(closed.poll(Duration::from_secs(70), true, true));
+        assert!(closed.poll(Duration::from_secs(5), true));
+        closed.close();
+        assert!(!closed.poll(Duration::from_secs(6), false));
+        assert!(closed.poll(Duration::from_secs(70), true));
     }
 
     #[test]
     fn a_key_after_the_timeout_or_dialog_close_reaches_nothing() {
         let mut clock = PassthroughWindow::new(Duration::from_millis(200));
         let mut mods = ModifierKeys::new();
-        assert!(clock.poll(Duration::from_millis(0), true, true));
+        assert!(clock.poll(Duration::from_millis(0), true));
         assert_eq!(
             press(&mut mods, true, vk::DIGIT_1),
             Action::Pass,
             "inside the open window"
         );
-        let allow = clock.poll(Duration::from_millis(200), true, true);
+        let allow = clock.poll(Duration::from_millis(200), true);
         assert!(!allow);
         assert_eq!(press(&mut mods, allow, vk::DIGIT_1), Action::Swallow);
 
         let mut closed = PassthroughWindow::new(Duration::from_secs(60));
-        assert!(closed.poll(Duration::from_secs(1), true, true));
-        let allow = closed.poll(Duration::from_secs(2), false, false);
+        assert!(closed.poll(Duration::from_secs(1), true));
+        closed.close();
+        let allow = closed.poll(Duration::from_secs(2), false);
         assert_eq!(
             press(&mut ModifierKeys::new(), allow, vk::A),
             Action::Swallow

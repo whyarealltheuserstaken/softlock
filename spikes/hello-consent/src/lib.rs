@@ -3,10 +3,12 @@
 //! No operating-system calls. The Windows binary applies these decisions.
 //! This crate is not a product dependency and must not ship in a release.
 
+mod account;
 mod identity;
 mod limit;
 mod passthrough;
 
+pub use account::{AccountKind, LogonAccount, parse_explicit_account, session_logon};
 pub use identity::{
     CREDENTIAL_UI_RELATIVE_PATHS, DialogGate, ImageFact, SignatureCheck,
     foreground_is_credential_ui, path_is_system_credential_ui,

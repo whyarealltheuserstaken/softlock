@@ -90,6 +90,7 @@ impl DialogGate {
 
     /// Whether `pid` is an accepted credential UI process.
     /// `inspect` runs at most once per pid until [`Self::end_dialog`].
+    /// The spike calls `end_dialog` when its one dialog ends.
     pub fn foreground_allowed(
         &mut self,
         pid: Option<u32>,
@@ -244,7 +245,7 @@ mod tests {
             path: r"C:\Windows\System32\notepad.exe".into(),
             signature: SignatureCheck::Trusted,
         });
-        let allow = clock.poll(Duration::ZERO, true, notepad);
+        let allow = clock.poll(Duration::ZERO, notepad);
         assert_eq!(
             on_key(&mut mods, allow, InputOrigin::Physical, vk::DIGIT_1, true),
             Action::Swallow
@@ -254,7 +255,7 @@ mod tests {
             path: BROKER.into(),
             signature: SignatureCheck::Trusted,
         });
-        let allow = clock.poll(Duration::from_secs(1), true, broker);
+        let allow = clock.poll(Duration::from_secs(1), broker);
         assert!(allow);
         assert_eq!(
             on_key(&mut mods, allow, InputOrigin::Physical, vk::DIGIT_1, true),
@@ -271,7 +272,7 @@ mod tests {
         );
 
         let mut mods = ModifierKeys::new();
-        let allow = clock.poll(Duration::from_secs(61), true, broker);
+        let allow = clock.poll(Duration::from_secs(61), broker);
         assert!(!allow, "60 s from the first accepted foreground");
         assert_eq!(
             on_key(&mut mods, allow, InputOrigin::Physical, vk::DIGIT_1, true),
@@ -279,7 +280,8 @@ mod tests {
         );
 
         gate.end_dialog();
-        let allow = clock.poll(Duration::from_secs(62), false, false);
+        clock.close();
+        let allow = clock.poll(Duration::from_secs(62), false);
         assert!(!allow);
         assert_eq!(
             on_key(
