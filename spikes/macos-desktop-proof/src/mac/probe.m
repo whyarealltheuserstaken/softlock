@@ -222,8 +222,8 @@ int macos_prove_window(WindowOut *out) {
         @try {
             activate_app();
             NSScreen *screen = [NSScreen mainScreen];
-            NSRect visible = screen != nil ? screen.visibleFrame : NSMakeRect(0, 0, 800, 600);
-            NSRect frame = NSMakeRect(NSMidX(visible) - 160, NSMidY(visible) - 120, 320, 240);
+            NSRect frame_rect = screen != nil ? screen.visibleFrame : NSMakeRect(0, 0, 800, 600);
+            NSRect frame = NSMakeRect(NSMidX(frame_rect) - 160, NSMidY(frame_rect) - 120, 320, 240);
             ProbeWindow *window = [[ProbeWindow alloc] initWithContentRect:frame
                                                                   styleMask:NSWindowStyleMaskBorderless
                                                                     backing:NSBackingStoreBuffered
@@ -242,9 +242,9 @@ int macos_prove_window(WindowOut *out) {
             [window makeKeyAndOrderFront:nil];
             pump(0.3);
 
-            BOOL visible = window.isVisible && window.screen != nil;
+            BOOL on_screen = window.isVisible && window.screen != nil;
             BOOL unoccluded = (window.occlusionState & NSWindowOcclusionStateVisible) != 0;
-            out->ordered_front = (visible && unoccluded) ? 1 : 0;
+            out->ordered_front = (on_screen && unoccluded) ? 1 : 0;
             out->key_window = window.isKeyWindow ? 1 : 0;
             if (window.screen == nil) {
                 snprintf(out->error, sizeof out->error, "NSWindow screen is nil (no Aqua session)");
@@ -405,7 +405,13 @@ int macos_prove_cg_display(CaptureOut *out) {
         return 1;
     }
     memset(out, 0, sizeof *out);
-    CGImageRef image = CGDisplayCreateImage(CGMainDisplayID());
+    typedef CGImageRef (*CreateDisplayFn)(CGDirectDisplayID);
+    CreateDisplayFn create = (CreateDisplayFn)dlsym(RTLD_DEFAULT, "CGDisplayCreateImage");
+    if (create == NULL) {
+        snprintf(out->detail, sizeof out->detail, "symbol missing; obsoleted in macOS 15");
+        return 0;
+    }
+    CGImageRef image = create(CGMainDisplayID());
     capture_from_image(image, out, "returned NULL");
     return 0;
 }
