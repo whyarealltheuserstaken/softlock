@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime};
 
 use crate::error::Error;
-use crate::journal::{Journal, JournalStore, MemoryJournal, deadline_millis, time_from_millis};
+use crate::journal::{Journal, JournalStore, deadline_millis, time_from_millis};
 use crate::policy::PolicyId;
 use crate::value::RecordedValue;
 
@@ -12,6 +12,16 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub trait PolicyStore {
     fn read(&self, policy: PolicyId) -> Result<RecordedValue, Error>;
     fn apply(&mut self, policy: PolicyId, value: &RecordedValue) -> Result<(), Error>;
+
+    /// The key id when that policy's key is not there yet.
+    fn missing_key_id(&self, _policy: PolicyId) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
+
+    /// Deletes a key this program created, and only when the key is empty.
+    fn delete_key_if_empty(&mut self, _key_id: &str) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// Extra safety net armed after the journal is flushed and before the registry changes.
@@ -160,21 +170,10 @@ where
 
         let mut reports = Vec::with_capacity(state.entries.len());
         for entry in &state.entries {
-            self.store.apply(entry.policy, &entry.previous)?;
-            let actual = self.store.read(entry.policy)?;
-            if actual != entry.previous {
-                return Err(Error::new(format!(
-                    "Could not put {} back. Expected {}, read back {}. Run restore again.",
-                    entry.policy, entry.previous, actual
-                )));
-            }
-            reports.push(ReadBack {
-                policy: entry.policy,
-                previous: entry.previous.clone(),
-                expected: entry.previous.clone(),
-                actual,
-                warnings: Vec::new(),
-            });
+            reports.push(confirm_write(self.store, entry.policy, &entry.previous)?);
+        }
+        for key_id in &state.created_keys {
+            self.store.delete_key_if_empty(key_id)?;
         }
 
         self.journal_store.remove()?;
@@ -215,6 +214,15 @@ where
                 previous,
                 applied: new_value.clone(),
             });
+        }
+        if !matches!(new_value, RecordedValue::Absent)
+            && let Some(key_id) = self.store.missing_key_id(policy)?
+            && !state
+                .created_keys
+                .iter()
+                .any(|existing| existing == &key_id)
+        {
+            state.created_keys.push(key_id);
         }
         state.deadline_unix_ms = deadline_millis(now, self.timeout)?;
         state.timeout_secs = self.timeout.as_secs();
@@ -268,186 +276,35 @@ pub fn snapshot<S: PolicyStore>(store: &S) -> Result<Vec<(PolicyId, RecordedValu
         .collect()
 }
 
+/// Writes one value and reads it back.
+pub fn confirm_write<S: PolicyStore>(
+    store: &mut S,
+    policy: PolicyId,
+    value: &RecordedValue,
+) -> Result<ReadBack, Error> {
+    store.apply(policy, value)?;
+    let actual = store.read(policy)?;
+    if actual != *value {
+        return Err(Error::new(format!(
+            "Could not put {policy} back. Expected {value}, read back {actual}. Run restore again."
+        )));
+    }
+    Ok(ReadBack {
+        policy,
+        previous: value.clone(),
+        expected: value.clone(),
+        actual,
+        warnings: Vec::new(),
+    })
+}
+
 /// Writes a snapshot back and reads each value to confirm it.
 pub fn restore_snapshot<S: PolicyStore>(
     store: &mut S,
     values: &[(PolicyId, RecordedValue)],
 ) -> Result<(), Error> {
     for (policy, value) in values {
-        store.apply(*policy, value)?;
-        let actual = store.read(*policy)?;
-        if actual != *value {
-            return Err(Error::new(format!(
-                "Could not put {policy} back. Expected {value}, read back {actual}."
-            )));
-        }
+        confirm_write(store, *policy, value)?;
     }
     Ok(())
-}
-
-/// Sets, clears, and restores every policy, then checks the read-back.
-///
-/// The store is returned to the values it had when this function started.
-pub fn prove_exact_restore<S: PolicyStore>(store: &mut S) -> Result<(), Error> {
-    let originals = snapshot(store)?;
-    let result = run_proof(store);
-    restore_snapshot(store, &originals)?;
-    let after = snapshot(store)?;
-    if after != originals {
-        return Err(Error::new(
-            "After the proof, a read-back did not match the saved values.",
-        ));
-    }
-    result
-}
-
-fn run_proof<S: PolicyStore>(store: &mut S) -> Result<(), Error> {
-    for policy in PolicyId::ALL {
-        prove_absent(store, policy)?;
-        prove_dword_round_trip(store, policy, 0)?;
-        prove_dword_round_trip(store, policy, 7)?;
-        prove_raw_round_trip(store, policy, &RecordedValue::reg_sz("keep"))?;
-    }
-    prove_restore_everything(store)?;
-    Ok(())
-}
-
-fn prove_absent<S: PolicyStore>(store: &mut S, policy: PolicyId) -> Result<(), Error> {
-    store.apply(policy, &RecordedValue::Absent)?;
-    let now = proof_now();
-    let restored = {
-        let mut session = Session::open(store, MemoryJournal::new(), NoSafety, DEFAULT_TIMEOUT)?;
-        let applied = expect_applied(session.set(policy, now)?)?;
-        expect_readback(&applied, &RecordedValue::dword(1))?;
-        session.restore_all()?
-    };
-    expect_one(&restored, policy, &RecordedValue::Absent)?;
-    expect_value(store, policy, &RecordedValue::Absent)
-}
-
-fn prove_dword_round_trip<S: PolicyStore>(
-    store: &mut S,
-    policy: PolicyId,
-    previous: u32,
-) -> Result<(), Error> {
-    let planted = RecordedValue::dword(previous);
-    store.apply(policy, &planted)?;
-    let now = proof_now();
-    let restored = {
-        let mut session = Session::open(store, MemoryJournal::new(), NoSafety, DEFAULT_TIMEOUT)?;
-        let applied = expect_applied(session.set(policy, now)?)?;
-        expect_readback(&applied, &RecordedValue::dword(1))?;
-        if previous == 0 {
-            let cleared = expect_applied(session.clear(policy, now)?)?;
-            expect_readback(&cleared, &RecordedValue::Absent)?;
-            if cleared.previous != planted {
-                return Err(Error::new(format!(
-                    "{policy}: clear forgot the saved value {}.",
-                    cleared.previous
-                )));
-            }
-        }
-        session.restore_all()?
-    };
-    expect_one(&restored, policy, &planted)?;
-    expect_value(store, policy, &planted)
-}
-
-fn prove_raw_round_trip<S: PolicyStore>(
-    store: &mut S,
-    policy: PolicyId,
-    planted: &RecordedValue,
-) -> Result<(), Error> {
-    store.apply(policy, planted)?;
-    let now = proof_now();
-    let restored = {
-        let mut session = Session::open(store, MemoryJournal::new(), NoSafety, DEFAULT_TIMEOUT)?;
-        let applied = expect_applied(session.set(policy, now)?)?;
-        expect_readback(&applied, &RecordedValue::dword(1))?;
-        session.restore_all()?
-    };
-    expect_one(&restored, policy, planted)?;
-    expect_value(store, policy, planted)
-}
-
-fn prove_restore_everything<S: PolicyStore>(store: &mut S) -> Result<(), Error> {
-    let planted = [
-        RecordedValue::Absent,
-        RecordedValue::dword(0),
-        RecordedValue::dword(4),
-        RecordedValue::reg_sz("switch"),
-        RecordedValue::dword(2),
-        RecordedValue::Absent,
-    ];
-    for (policy, value) in PolicyId::ALL.into_iter().zip(planted.iter()) {
-        store.apply(policy, value)?;
-    }
-    let now = proof_now();
-    let restored = {
-        let mut session = Session::open(store, MemoryJournal::new(), NoSafety, DEFAULT_TIMEOUT)?;
-        for policy in PolicyId::ALL {
-            let applied = expect_applied(session.set(policy, now)?)?;
-            expect_readback(&applied, &RecordedValue::dword(1))?;
-        }
-        session.restore_all()?
-    };
-    if restored.len() != PolicyId::ALL.len() {
-        return Err(Error::new(
-            "restore everything did not report every setting.",
-        ));
-    }
-    for (policy, value) in PolicyId::ALL.into_iter().zip(planted.iter()) {
-        expect_value(store, policy, value)?;
-    }
-    Ok(())
-}
-
-fn proof_now() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
-}
-
-fn expect_applied(mutation: Mutation) -> Result<ReadBack, Error> {
-    match mutation {
-        Mutation::Applied(report) => Ok(report),
-        Mutation::ExpiredAndRestored(_) => Err(Error::new(
-            "The safety timer fired before the proof finished.",
-        )),
-    }
-}
-
-fn expect_readback(report: &ReadBack, expected: &RecordedValue) -> Result<(), Error> {
-    if report.matches() && report.actual == *expected {
-        Ok(())
-    } else {
-        Err(Error::new(format!(
-            "{}: expected {expected}, read back {}.",
-            report.policy, report.actual
-        )))
-    }
-}
-
-fn expect_one(
-    reports: &[ReadBack],
-    policy: PolicyId,
-    expected: &RecordedValue,
-) -> Result<(), Error> {
-    let Some(report) = reports.iter().find(|report| report.policy == policy) else {
-        return Err(Error::new(format!("{policy}: restore did not report it.")));
-    };
-    expect_readback(report, expected)
-}
-
-fn expect_value<S: PolicyStore>(
-    store: &S,
-    policy: PolicyId,
-    expected: &RecordedValue,
-) -> Result<(), Error> {
-    let actual = store.read(policy)?;
-    if actual == *expected {
-        Ok(())
-    } else {
-        Err(Error::new(format!(
-            "{policy}: expected {expected} after restore, read back {actual}."
-        )))
-    }
 }

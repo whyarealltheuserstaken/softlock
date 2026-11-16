@@ -20,6 +20,20 @@ impl Hive {
             Self::LocalMachine => "HKLM",
         }
     }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "HKCU" => Some(Self::CurrentUser),
+            "HKLM" => Some(Self::LocalMachine),
+            _ => None,
+        }
+    }
+}
+
+/// `HKCU\...` or `HKLM\...` for one policy key.
+pub fn split_key_id(key_id: &str) -> Option<(Hive, &str)> {
+    let (label, path) = key_id.split_once('\\')?;
+    Some((Hive::from_label(label)?, path))
 }
 
 /// One Ctrl+Alt+Del policy value from the spike.

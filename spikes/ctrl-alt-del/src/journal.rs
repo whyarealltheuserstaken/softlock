@@ -2,7 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +11,9 @@ use crate::policy::PolicyId;
 use crate::value::RecordedValue;
 
 pub const JOURNAL_FILE: &str = "journal.json";
+pub const JOURNAL_ENV: &str = "SPIKE_CTRL_ALT_DEL_JOURNAL";
+pub const WATCHER_LOG: &str = "watcher.log";
+pub const RESTORE_RESULT: &str = "restore-result.txt";
 const JOURNAL_TMP: &str = "journal.json.tmp";
 const LOCK_FILE: &str = "lock";
 
@@ -21,6 +24,9 @@ pub struct Journal {
     pub deadline_unix_ms: u64,
     pub timeout_secs: u64,
     pub entries: Vec<JournalEntry>,
+    /// Policy keys this program created. Restore deletes one only when it is empty.
+    #[serde(default)]
+    pub created_keys: Vec<String>,
 }
 
 /// The value that was there before the first change, and the value written last.
@@ -38,6 +44,7 @@ impl Journal {
             deadline_unix_ms: deadline_millis(now, timeout)?,
             timeout_secs: timeout.as_secs(),
             entries: Vec::new(),
+            created_keys: Vec::new(),
         })
     }
 
@@ -170,6 +177,16 @@ fn read_journal(path: &Path) -> Result<Option<Journal>, Error> {
 }
 
 /// Folder for the saved values on a real machine.
+/// Journal folder for the detached watcher. A person always uses the default folder.
+pub fn watcher_journal_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(JOURNAL_ENV)
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    default_journal_dir()
+}
+
 pub fn default_journal_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PROGRAMDATA") {
         return PathBuf::from(dir).join("spike-ctrl-alt-del");
@@ -189,23 +206,15 @@ impl FileLock {
     pub fn acquire(directory: &Path) -> Result<Self, Error> {
         fs::create_dir_all(directory)?;
         let path = directory.join(LOCK_FILE);
-        let started = Instant::now();
         loop {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut file) => {
-                    writeln!(
-                        file,
-                        "{}",
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                    )?;
+                    writeln!(file, "{}", std::process::id())?;
                     file.sync_all()?;
                     return Ok(Self { path });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if started.elapsed() > Duration::from_secs(30) || lock_is_stale(&path) {
+                    if !lock_owner_alive(&path) {
                         let _ = fs::remove_file(&path);
                         continue;
                     }
@@ -223,14 +232,21 @@ impl Drop for FileLock {
     }
 }
 
-fn lock_is_stale(path: &Path) -> bool {
-    let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) else {
-        return true;
-    };
-    let Ok(age) = SystemTime::now().duration_since(modified) else {
+/// A lock is free to take when its owner process is gone. A live owner is never stolen.
+fn lock_owner_alive(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
         return false;
     };
-    age > Duration::from_secs(60)
+    let Some(pid) = text.trim().parse::<u32>().ok() else {
+        return false;
+    };
+    crate::process::process_is_running(pid)
+}
+
+/// Delay before another restore attempt. The delay grows and then stays at 30 seconds.
+pub fn retry_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    Duration::from_secs((1_u64 << shift).min(30))
 }
 
 pub fn deadline_millis(now: SystemTime, timeout: Duration) -> Result<u64, Error> {

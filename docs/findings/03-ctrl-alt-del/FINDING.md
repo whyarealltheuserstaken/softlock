@@ -2,6 +2,8 @@
 
 **Status:** not run. The tables below are blank on purpose. Fill them from [CHECKLIST.md](CHECKLIST.md) after the test on each computer. Do not guess.
 
+Photos stay on the computer. They can be attached to a comment on issue 3. Do not commit them.
+
 This spike asks two questions:
 
 1. Does each option disappear the next time Ctrl+Alt+Del is pressed, with no sign-out, and does clearing the setting bring it back immediately?

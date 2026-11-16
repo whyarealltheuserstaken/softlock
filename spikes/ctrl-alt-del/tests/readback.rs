@@ -9,10 +9,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use spike_ctrl_alt_del::{
-    Command as ToolCommand, DEFAULT_TIMEOUT, EXPLORER_KEY, Error, FileJournal, FileLock, Hive,
-    JournalStore, MemoryJournal, MemoryStore, Mutation, NoSafety, PolicyId, PolicyStore,
+    Account, Command as ToolCommand, DEFAULT_TIMEOUT, EXPLORER_KEY, Error, FileJournal, FileLock,
+    Hive, JournalStore, MemoryJournal, MemoryStore, Mutation, NoSafety, PolicyId, PolicyStore,
     RecordedValue, SYSTEM_KEY, Session, parse_args, prove_exact_restore, quote_windows_arg,
-    run_once_command,
+    run_once_command, same_account,
 };
 
 #[test]
@@ -440,6 +440,70 @@ fn restore_command_quotes_the_program_path() {
         quote_windows_arg(r"C:\Program Files\tool.exe"),
         r#""C:\Program Files\tool.exe""#
     );
+    assert_eq!(
+        quote_windows_arg(r"C:\Program Files\"),
+        "\"C:\\Program Files\\\\\""
+    );
+    assert_eq!(quote_windows_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
+}
+
+#[test]
+fn minutes_flag_is_capped_and_journal_is_not_a_flag() {
+    match parse_args(["set", "all", "--minutes", "20"]).unwrap() {
+        ToolCommand::Set { timeout, .. } => assert_eq!(timeout, Duration::from_secs(20 * 60)),
+        other => panic!("expected set, got {other:?}"),
+    }
+    let too_long = parse_args(["set", "all", "--minutes", "31"]).unwrap_err();
+    assert!(too_long.to_string().contains("30"));
+    let journal = parse_args(["restore", "--journal", r"C:\other"]).unwrap_err();
+    assert!(journal.to_string().contains("Unknown option"));
+}
+
+#[test]
+fn a_different_account_is_refused() {
+    let henry = Account {
+        sid: "S-1-5-21-1".to_string(),
+        name: "LAPTOP\\Henry".to_string(),
+    };
+    let admin = Account {
+        sid: "S-1-5-21-2".to_string(),
+        name: "SCHOOL\\Admin".to_string(),
+    };
+    assert!(same_account(&henry, Some(&henry)).is_ok());
+    assert!(same_account(&henry, None).is_ok());
+    let error = same_account(&admin, Some(&henry)).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("Nothing was changed"));
+    assert!(text.contains("password"));
+}
+
+#[test]
+fn restore_retry_delay_grows_and_then_stops_at_thirty_seconds() {
+    use spike_ctrl_alt_del::retry_delay;
+    assert_eq!(retry_delay(1), Duration::from_secs(1));
+    assert_eq!(retry_delay(2), Duration::from_secs(2));
+    assert_eq!(retry_delay(3), Duration::from_secs(4));
+    assert_eq!(retry_delay(6), Duration::from_secs(30));
+    assert_eq!(retry_delay(9), Duration::from_secs(30));
+}
+
+#[test]
+fn file_lock_is_taken_when_the_owner_is_gone() {
+    let dir = temp_dir("lock-dead");
+    let mut child = Command::new(env!("CARGO"))
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("cargo --version");
+    let pid = child.id();
+    child.wait().expect("cargo exits");
+    fs::write(dir.join("lock"), format!("{pid}\n")).unwrap();
+    let started = Instant::now();
+    let lock = FileLock::acquire(&dir).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    drop(lock);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 fn expect_policy(policy: PolicyId, hive: Hive, key_path: &str, screen_label: &str) {

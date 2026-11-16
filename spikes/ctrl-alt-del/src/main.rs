@@ -4,8 +4,6 @@ use std::process::ExitCode;
 use std::time::SystemTime;
 
 use spike_ctrl_alt_del::{Command, Error, parse_args};
-#[cfg(windows)]
-use spike_ctrl_alt_del::{JournalStore, PolicyStore};
 
 fn main() -> ExitCode {
     match run() {
@@ -34,7 +32,7 @@ fn print_help() {
 Turns six Ctrl+Alt+Del settings on and off for a short test, then puts them back.
 
 Commands:
-  status                  Show the six settings and any saved values
+  status                  Show the six settings, the account, and any saved values
   set <name|all>          Turn a setting on
   clear <name|all>        Remove a setting
   restore                 Put every saved setting back
@@ -44,19 +42,20 @@ Names:
   DisableTaskMgr            Task Manager
   NoLogoff                  Sign out
   DisableChangePassword     Change a password
-  HideFastUserSwitching     Switch user
+  HideFastUserSwitching     Switch user (this one is for every account on the computer)
   DisableLockWorkstation    Lock
   NoClose                   Power
 
 Options:
-  --timeout-minutes <1-120>   Safety timer. The default is 10.
-  --journal <folder>          Where the saved values are stored
+  --minutes <1-30>        Safety timer. The default is 10. 30 is the longest.
 
-Run this from an Administrator terminal.
+Run this from an Administrator terminal on your own account.
+If Windows asks for a password instead of just Yes, stop.
 The safety timer puts every setting back 10 minutes after the last change.
 Closing the window does not cancel the timer.
-If the computer restarts first, the next sign-in asks to put the settings back.
-To put them back immediately, run: spike-ctrl-alt-del restore
+If the computer restarts first, the settings stay on until restore runs.
+The next sign-in asks to put the settings back. If you click No, run restore yourself.
+Saved settings are kept in the default folder. To put them back now, run: spike-ctrl-alt-del restore
 "#
     );
 }
@@ -72,27 +71,39 @@ fn dispatch(_command: Command) -> Result<(), Error> {
 fn dispatch(command: Command) -> Result<(), Error> {
     match command {
         Command::Help => Ok(()),
-        Command::Status { journal } => cmd_status(&journal),
-        Command::Set {
-            policies,
-            timeout,
-            journal,
-        } => change(&policies, timeout, &journal, false),
-        Command::Clear {
-            policies,
-            timeout,
-            journal,
-        } => change(&policies, timeout, &journal, true),
-        Command::Restore { journal } => cmd_restore(&journal),
+        Command::Status => cmd_status(),
+        Command::Set { policies, timeout } => change(&policies, timeout, false),
+        Command::Clear { policies, timeout } => change(&policies, timeout, true),
+        Command::Restore => cmd_restore(),
         Command::Check => cmd_check(),
-        Command::Watch { journal } => cmd_watch(&journal),
+        Command::Watch => cmd_watch(),
     }
 }
 
 #[cfg(windows)]
-fn cmd_status(dir: &std::path::Path) -> Result<(), Error> {
-    use spike_ctrl_alt_del::{FileJournal, PolicyId, WindowsStore, remaining, time_from_millis};
+fn journal_dir() -> std::path::PathBuf {
+    spike_ctrl_alt_del::default_journal_dir()
+}
 
+#[cfg(windows)]
+fn cmd_status() -> Result<(), Error> {
+    use spike_ctrl_alt_del::{
+        FileJournal, JournalStore, PolicyId, PolicyStore, WindowsStore, console_account,
+        current_account, remaining, time_from_millis,
+    };
+
+    match current_account() {
+        Ok(account) => println!("This window would change settings for {account}."),
+        Err(err) => println!("Could not read this window's account: {err}"),
+    }
+    match console_account() {
+        Some(account) => println!("The person at the keyboard is {account}."),
+        None => println!(
+            "Could not see who is at the keyboard. If Windows asks for a password instead of just Yes, stop."
+        ),
+    }
+
+    let dir = journal_dir();
     let store = WindowsStore;
     println!("Current settings:");
     for policy in PolicyId::ALL {
@@ -106,7 +117,8 @@ fn cmd_status(dir: &std::path::Path) -> Result<(), Error> {
             info.key_path
         );
     }
-    match FileJournal::new(dir).load()? {
+    println!("HideFastUserSwitching is HKLM. It affects every account on this computer.");
+    match FileJournal::new(&dir).load()? {
         None => println!("Nothing is waiting to be put back."),
         Some(journal) => {
             println!("Saved values that restore will put back:");
@@ -133,7 +145,6 @@ fn cmd_status(dir: &std::path::Path) -> Result<(), Error> {
 fn change(
     policies: &[spike_ctrl_alt_del::PolicyId],
     timeout: std::time::Duration,
-    dir: &std::path::Path,
     clear: bool,
 ) -> Result<(), Error> {
     use spike_ctrl_alt_del::{
@@ -141,12 +152,14 @@ fn change(
     };
 
     ensure_elevated()?;
-    std::fs::create_dir_all(dir)?;
+    ensure_account()?;
+    let dir = journal_dir();
+    prepare_dir(&dir)?;
     let deadline = {
-        let _lock = FileLock::acquire(dir)?;
+        let _lock = FileLock::acquire(&dir)?;
         let mut store = WindowsStore;
         let safety = RunOnceSafety::for_current_exe()?;
-        let mut session = Session::open(&mut store, FileJournal::new(dir), safety, timeout)?;
+        let mut session = Session::open(&mut store, FileJournal::new(&dir), safety, timeout)?;
         let now = SystemTime::now();
         for policy in policies {
             let mutation = if clear {
@@ -167,7 +180,7 @@ fn change(
         session.deadline()
     };
     print_timer(deadline);
-    if let Err(err) = spawn_watcher(dir) {
+    if let Err(err) = spawn_watcher(&dir) {
         println!("Warning: the safety timer did not start ({err}).");
         println!(
             "Run {} yourself when you are done. Do not wait.",
@@ -178,27 +191,42 @@ fn change(
 }
 
 #[cfg(windows)]
-fn cmd_restore(dir: &std::path::Path) -> Result<(), Error> {
+fn cmd_restore() -> Result<(), Error> {
     use spike_ctrl_alt_del::{
         DEFAULT_TIMEOUT, FileJournal, FileLock, RunOnceSafety, Session, WindowsStore,
     };
 
     ensure_elevated()?;
-    if !dir.exists() {
-        println!("Nothing to put back.");
-        return Ok(());
-    }
-    let _lock = FileLock::acquire(dir)?;
-    let mut store = WindowsStore;
-    let safety = RunOnceSafety::for_current_exe()?;
-    let mut session = Session::open(&mut store, FileJournal::new(dir), safety, DEFAULT_TIMEOUT)?;
-    let reports = session.restore_all()?;
-    if reports.is_empty() {
-        println!("Nothing to put back.");
-        return Ok(());
-    }
-    print_restored(&reports);
-    println!("Read-back matched the saved values, including any that were absent.");
+    ensure_account()?;
+    let dir = journal_dir();
+    let outcome = if !dir.exists() {
+        "Nothing to put back.".to_string()
+    } else {
+        let _lock = FileLock::acquire(&dir)?;
+        let mut store = WindowsStore;
+        let safety = RunOnceSafety::for_current_exe()?;
+        let mut session =
+            Session::open(&mut store, FileJournal::new(&dir), safety, DEFAULT_TIMEOUT)?;
+        let reports = session.restore_all()?;
+        let _ = std::fs::remove_file(dir.join(spike_ctrl_alt_del::WATCHER_LOG));
+        if reports.is_empty() {
+            "Nothing to put back.".to_string()
+        } else {
+            let mut text = String::new();
+            for report in &reports {
+                text.push_str(&format!(
+                    "Put {} back to {}.\n",
+                    report.policy, report.actual
+                ));
+                for warning in &report.warnings {
+                    text.push_str(&format!("Warning: {warning}\n"));
+                }
+            }
+            text.push_str("Read-back matched the saved values, including any that were absent.\n");
+            text
+        }
+    };
+    show_and_pause(&dir, &outcome)?;
     Ok(())
 }
 
@@ -207,7 +235,7 @@ fn cmd_check() -> Result<(), Error> {
     use std::time::Duration;
 
     use spike_ctrl_alt_del::{
-        FileJournal, FileLock, Mutation, NoSafety, PolicyId, Session, WindowsStore,
+        FileJournal, FileLock, Mutation, NoSafety, PolicyId, PolicyStore, Session, WindowsStore,
         can_write_machine_policy, prove_exact_restore, restore_snapshot, snapshot,
     };
 
@@ -216,6 +244,7 @@ fn cmd_check() -> Result<(), Error> {
             "This check needs an Administrator terminal. Nothing was changed.",
         ));
     }
+    ensure_account()?;
     let mut store = WindowsStore;
     let originals = snapshot(&store)?;
     let journal_dir =
@@ -227,7 +256,7 @@ fn cmd_check() -> Result<(), Error> {
     };
     prove_exact_restore(&mut store)?;
 
-    std::fs::create_dir_all(&journal_dir)?;
+    prepare_dir(&journal_dir)?;
     {
         let _lock = FileLock::acquire(&journal_dir)?;
         let mut session = Session::open(
@@ -262,7 +291,7 @@ fn cmd_check() -> Result<(), Error> {
                 "The safety timer did not restore the values within 20 seconds.",
             ));
         }
-        let journal_gone = !journal_dir.join("journal.json").exists();
+        let journal_gone = !journal_dir.join(spike_ctrl_alt_del::JOURNAL_FILE).exists();
         let mut all_match = true;
         for (policy, expected) in &originals {
             if store.read(*policy)? != *expected {
@@ -294,7 +323,7 @@ struct RestoreGuard {
 #[cfg(windows)]
 impl Drop for RestoreGuard {
     fn drop(&mut self) {
-        use spike_ctrl_alt_del::{FileJournal, WindowsStore, restore_snapshot};
+        use spike_ctrl_alt_del::{FileJournal, JournalStore, WindowsStore, restore_snapshot};
 
         let mut store = WindowsStore;
         if let Err(err) = restore_snapshot(&mut store, &self.originals) {
@@ -307,33 +336,150 @@ impl Drop for RestoreGuard {
 }
 
 #[cfg(windows)]
-fn cmd_watch(dir: &std::path::Path) -> Result<(), Error> {
+fn cmd_watch() -> Result<(), Error> {
     use spike_ctrl_alt_del::{
-        DEFAULT_TIMEOUT, FileJournal, FileLock, RunOnceSafety, Session, WindowsStore,
+        DEFAULT_TIMEOUT, FileJournal, FileLock, JOURNAL_FILE, JournalStore, RunOnceSafety, Session,
+        WATCHER_LOG, WindowsStore, retry_delay, watcher_journal_dir,
     };
 
-    std::fs::create_dir_all(dir)?;
+    let dir = watcher_journal_dir();
+    prepare_dir(&dir)?;
     let pid_path = dir.join("watcher.pid");
     std::fs::write(&pid_path, std::process::id().to_string())?;
     let _pid = PidGuard(pid_path);
+    append_log(&dir, "watcher started");
+
+    let mut seen: Option<FileStamp> = None;
+    let mut deadline_ms: Option<u64> = None;
+    let mut failures = 0u32;
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let done = {
-            let _lock = FileLock::acquire(dir)?;
-            let mut store = WindowsStore;
-            let safety = RunOnceSafety::for_current_exe()?;
-            let mut session =
-                Session::open(&mut store, FileJournal::new(dir), safety, DEFAULT_TIMEOUT)?;
-            if session.restore_if_due(SystemTime::now())?.is_some() {
-                true
-            } else {
-                !session.has_journal()
+        let path = dir.join(JOURNAL_FILE);
+        match file_stamp(&path) {
+            None => {
+                if seen.is_some() {
+                    let _ = std::fs::remove_file(dir.join(WATCHER_LOG));
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+            Some(stamp) => {
+                if seen.as_ref() != Some(&stamp) {
+                    match FileJournal::new(&dir).load() {
+                        Ok(Some(journal)) => {
+                            deadline_ms = Some(journal.deadline_unix_ms);
+                            seen = Some(stamp);
+                        }
+                        Ok(None) => {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            continue;
+                        }
+                        Err(err) => {
+                            failures += 1;
+                            append_log(&dir, &format!("could not read the saved settings: {err}"));
+                            std::thread::sleep(retry_delay(failures));
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some(deadline) = deadline_ms else {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            continue;
+        };
+        let now = match spike_ctrl_alt_del::unix_millis(SystemTime::now()) {
+            Ok(now) => now,
+            Err(err) => {
+                failures += 1;
+                append_log(&dir, &err.to_string());
+                std::thread::sleep(retry_delay(failures));
+                continue;
             }
         };
-        if done {
+        if now < deadline {
+            let wait = (deadline - now).min(1_000);
+            std::thread::sleep(std::time::Duration::from_millis(wait));
+            continue;
+        }
+
+        let restored = {
+            let _lock = match FileLock::acquire(&dir) {
+                Ok(lock) => lock,
+                Err(err) => {
+                    failures += 1;
+                    append_log(&dir, &format!("could not lock the saved settings: {err}"));
+                    std::thread::sleep(retry_delay(failures));
+                    continue;
+                }
+            };
+            let mut store = WindowsStore;
+            let safety = match RunOnceSafety::for_current_exe() {
+                Ok(safety) => safety,
+                Err(err) => {
+                    failures += 1;
+                    append_log(&dir, &err.to_string());
+                    std::thread::sleep(retry_delay(failures));
+                    continue;
+                }
+            };
+            let mut session =
+                match Session::open(&mut store, FileJournal::new(&dir), safety, DEFAULT_TIMEOUT) {
+                    Ok(session) => session,
+                    Err(err) => {
+                        failures += 1;
+                        append_log(&dir, &err.to_string());
+                        std::thread::sleep(retry_delay(failures));
+                        continue;
+                    }
+                };
+            match session.restore_if_due(SystemTime::now()) {
+                Ok(restored) => restored,
+                Err(err) => {
+                    failures += 1;
+                    append_log(&dir, &format!("restore failed, trying again: {err}"));
+                    std::thread::sleep(retry_delay(failures));
+                    continue;
+                }
+            }
+        };
+        if restored.is_some() {
+            let _ = std::fs::remove_file(dir.join(WATCHER_LOG));
             return Ok(());
         }
+        seen = None;
+        failures = 0;
     }
+}
+
+#[cfg(windows)]
+#[derive(PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+#[cfg(windows)]
+fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+    })
+}
+
+#[cfg(windows)]
+fn append_log(dir: &std::path::Path, line: &str) {
+    use std::io::Write;
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(spike_ctrl_alt_del::WATCHER_LOG))
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
 }
 
 #[cfg(windows)]
@@ -344,14 +490,28 @@ fn ensure_elevated() -> Result<(), Error> {
         return Ok(());
     }
     println!("This needs an Administrator window. Click Yes if Windows asks for permission.");
+    println!("If Windows asks for a password instead of just Yes, click No and stop.");
     relaunch_elevated()?;
     std::process::exit(0);
+}
+
+#[cfg(windows)]
+fn ensure_account() -> Result<(), Error> {
+    spike_ctrl_alt_del::ensure_interactive_account()
+}
+
+#[cfg(windows)]
+fn prepare_dir(dir: &std::path::Path) -> Result<(), Error> {
+    std::fs::create_dir_all(dir)?;
+    spike_ctrl_alt_del::lock_down_directory(dir)
 }
 
 #[cfg(windows)]
 fn spawn_watcher(dir: &std::path::Path) -> Result<(), Error> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
+
+    use spike_ctrl_alt_del::{JOURNAL_ENV, default_journal_dir};
 
     if watcher_running(dir) {
         return Ok(());
@@ -361,19 +521,11 @@ fn spawn_watcher(dir: &std::path::Path) -> Result<(), Error> {
     let mut command = Command::new(exe);
     command
         .arg("watch")
-        .arg("--journal")
-        .arg(dir)
-        .stdin(Stdio::null());
-    if let Ok(log) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("watcher.log"))
-    {
-        if let Ok(err_log) = log.try_clone() {
-            command.stdout(log).stderr(err_log);
-        }
-    } else {
-        command.stdout(Stdio::null()).stderr(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if dir != default_journal_dir() {
+        command.env(JOURNAL_ENV, dir);
     }
 
     const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
@@ -472,6 +624,23 @@ fn print_timer(deadline: Option<SystemTime>) {
     );
     println!("Closing this window does not cancel that.");
     println!("To put every setting back now, run: {}", restore_hint());
+}
+
+#[cfg(windows)]
+fn show_and_pause(dir: &std::path::Path, text: &str) -> Result<(), Error> {
+    use spike_ctrl_alt_del::RESTORE_RESULT;
+
+    let _ = std::fs::create_dir_all(dir);
+    let path = dir.join(RESTORE_RESULT);
+    std::fs::write(&path, text)?;
+    println!("{text}");
+    println!("A copy of this result is in {}", path.display());
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        println!("Press Enter to close this window.");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

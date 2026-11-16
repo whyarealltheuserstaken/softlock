@@ -1,35 +1,29 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::journal::default_journal_dir;
 use crate::policy::PolicyId;
 use crate::session::DEFAULT_TIMEOUT;
+
+/// Longest safety timer a person can ask for. The icon step uses 20.
+pub const MAX_TIMEOUT_MINUTES: u64 = 30;
 
 /// One invocation of the proof tool.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Help,
-    Status {
-        journal: PathBuf,
-    },
+    Status,
     Set {
         policies: Vec<PolicyId>,
         timeout: Duration,
-        journal: PathBuf,
     },
     Clear {
         policies: Vec<PolicyId>,
         timeout: Duration,
-        journal: PathBuf,
     },
-    Restore {
-        journal: PathBuf,
-    },
+    Restore,
     Check,
-    Watch {
-        journal: PathBuf,
-    },
+    Watch,
 }
 
 pub fn parse_args<I, T>(args: I) -> Result<Command, Error>
@@ -46,29 +40,16 @@ where
     }
 
     let mut timeout = DEFAULT_TIMEOUT;
-    let mut journal = None;
     let mut positionals = Vec::new();
     let mut rest = args.into_iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "help" => return Ok(Command::Help),
-            "--timeout-minutes" => {
-                let value = rest.next().ok_or_else(|| {
-                    Error::new("Add the number of minutes after --timeout-minutes.")
-                })?;
-                let minutes: u64 = value
-                    .parse()
-                    .map_err(|_| Error::new("The timeout must be a whole number of minutes."))?;
-                if !(1..=120).contains(&minutes) {
-                    return Err(Error::new("The timeout must be between 1 and 120 minutes."));
-                }
-                timeout = Duration::from_secs(minutes * 60);
-            }
-            "--journal" => {
+            "--minutes" | "--timeout-minutes" => {
                 let value = rest
                     .next()
-                    .ok_or_else(|| Error::new("Add the folder after --journal."))?;
-                journal = Some(PathBuf::from(value));
+                    .ok_or_else(|| Error::new("Add the number of minutes after --minutes."))?;
+                timeout = parse_minutes(&value)?;
             }
             other if other.starts_with('-') => {
                 return Err(Error::new(format!(
@@ -79,16 +60,15 @@ where
         }
     }
 
-    let journal = journal.unwrap_or_else(default_journal_dir);
     let command = positionals.first().map(String::as_str).unwrap_or("help");
     match command {
         "status" => {
             require_len(&positionals, 1, "status does not take a setting name.")?;
-            Ok(Command::Status { journal })
+            Ok(Command::Status)
         }
         "restore" => {
             require_len(&positionals, 1, "restore does not take a setting name.")?;
-            Ok(Command::Restore { journal })
+            Ok(Command::Restore)
         }
         "check" => {
             require_len(&positionals, 1, "check does not take a setting name.")?;
@@ -99,22 +79,32 @@ where
         }
         "watch" => {
             require_len(&positionals, 1, "watch does not take a setting name.")?;
-            Ok(Command::Watch { journal })
+            Ok(Command::Watch)
         }
         "set" => Ok(Command::Set {
             policies: one_policy(&positionals)?,
             timeout,
-            journal,
         }),
         "clear" => Ok(Command::Clear {
             policies: one_policy(&positionals)?,
             timeout,
-            journal,
         }),
         other => Err(Error::new(format!(
             "Unknown command {other}. Run spike-ctrl-alt-del help."
         ))),
     }
+}
+
+fn parse_minutes(value: &str) -> Result<Duration, Error> {
+    let minutes: u64 = value
+        .parse()
+        .map_err(|_| Error::new("The timeout must be a whole number of minutes."))?;
+    if !(1..=MAX_TIMEOUT_MINUTES).contains(&minutes) {
+        return Err(Error::new(format!(
+            "The timeout must be between 1 and {MAX_TIMEOUT_MINUTES} minutes."
+        )));
+    }
+    Ok(Duration::from_secs(minutes * 60))
 }
 
 fn require_len(positionals: &[String], len: usize, message: &str) -> Result<(), Error> {
@@ -142,26 +132,37 @@ fn one_policy(positionals: &[String]) -> Result<Vec<PolicyId>, Error> {
     Ok(vec![PolicyId::parse(name)?])
 }
 
-/// Command stored for the next sign-in, with the program path in quotes.
+/// Command stored for the next sign-in. It always restores the default folder.
 pub fn run_once_command(exe: &Path) -> String {
-    format!("\"{}\" restore", exe.display())
+    format!("{} restore", quote_windows_arg(&exe.display().to_string()))
 }
 
 /// Quote one Windows command-line argument.
+///
+/// Backslashes are doubled when they sit in front of a quote, including the
+/// closing quote. `CommandLineToArgvW` treats a backslash as an escape only then.
 pub fn quote_windows_arg(arg: &str) -> String {
-    if arg.is_empty() {
-        return "\"\"".to_string();
-    }
-    if !arg.contains(' ') && !arg.contains('"') {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) && !arg.ends_with('\\') {
         return arg.to_string();
     }
     let mut out = String::from("\"");
+    let mut backslashes = 0;
     for ch in arg.chars() {
-        if ch == '"' {
-            out.push('\\');
+        if ch == '\\' {
+            backslashes += 1;
+            continue;
         }
+        if ch == '"' {
+            out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+            out.push('"');
+            backslashes = 0;
+            continue;
+        }
+        out.extend(std::iter::repeat_n('\\', backslashes));
+        backslashes = 0;
         out.push(ch);
     }
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
     out.push('"');
     out
 }

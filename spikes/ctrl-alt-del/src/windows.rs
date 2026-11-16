@@ -1,5 +1,8 @@
+use std::path::Path;
+
+use crate::account::Account;
 use crate::error::Error;
-use crate::policy::{Hive, PolicyId, SYSTEM_KEY};
+use crate::policy::{Hive, PolicyId, SYSTEM_KEY, split_key_id};
 use crate::session::{PolicyStore, SafetyNet};
 use crate::value::RecordedValue;
 
@@ -25,6 +28,28 @@ impl PolicyStore for WindowsStore {
             value,
             policy.name(),
         )
+    }
+
+    fn missing_key_id(&self, policy: PolicyId) -> Result<Option<String>, Error> {
+        let info = policy.info();
+        match open_existing(info.hive, info.key_path, KEY_READ, policy.name())? {
+            Some(_) => Ok(None),
+            None => Ok(Some(format!("{}\\{}", info.hive.label(), info.key_path))),
+        }
+    }
+
+    fn delete_key_if_empty(&mut self, key_id: &str) -> Result<(), Error> {
+        let Some((hive, path)) = split_key_id(key_id) else {
+            return Err(Error::new(format!("Unknown policy key {key_id}.")));
+        };
+        let Some(opened) = open_existing(hive, path, KEY_READ, key_id)? else {
+            return Ok(());
+        };
+        if !key_is_empty(&opened, key_id)? {
+            return Ok(());
+        }
+        drop(opened);
+        delete_key(hive, path, key_id)
     }
 }
 
@@ -66,26 +91,6 @@ impl SafetyNet for RunOnceSafety {
 
 pub fn can_write_machine_policy() -> bool {
     create_key(Hive::LocalMachine, SYSTEM_KEY, "machine policy").is_ok()
-}
-
-pub fn process_is_running(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return false;
-        }
-        let mut code = 0u32;
-        let ok = GetExitCodeProcess(handle, &mut code);
-        CloseHandle(handle);
-        ok != 0 && code == STILL_ACTIVE as u32
-    }
 }
 
 pub fn relaunch_elevated() -> Result<(), Error> {
@@ -331,3 +336,305 @@ const ERROR_SUCCESS: u32 = windows_sys::Win32::Foundation::ERROR_SUCCESS;
 const ERROR_FILE_NOT_FOUND: u32 = windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 const ERROR_MORE_DATA: u32 = windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 const ERROR_ACCESS_DENIED: u32 = windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+fn key_is_empty(key: &OpenKey, label: &str) -> Result<bool, Error> {
+    use windows_sys::Win32::System::Registry::RegQueryInfoKeyW;
+
+    let mut subkeys = 0u32;
+    let mut values = 0u32;
+    let code = unsafe {
+        RegQueryInfoKeyW(
+            key.0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &mut subkeys,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut values,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if code != ERROR_SUCCESS {
+        return Err(win_error(code, "read", label));
+    }
+    Ok(subkeys == 0 && values == 0)
+}
+
+fn delete_key(hive: Hive, path: &str, label: &str) -> Result<(), Error> {
+    use windows_sys::Win32::System::Registry::RegDeleteKeyExW;
+
+    let wide_path = wide(path);
+    let code =
+        unsafe { RegDeleteKeyExW(hive_handle(hive), wide_path.as_ptr(), KEY_WOW64_64KEY, 0) };
+    if code == ERROR_SUCCESS || code == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(win_error(code, "remove", label))
+    }
+}
+
+/// The account of this process. Its HKCU hive is the one a change would write.
+pub fn current_account() -> Result<Account, Error> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(Error::new("Could not read this window's account."));
+        }
+        let account = account_from_token(token);
+        CloseHandle(token);
+        account
+    }
+}
+
+/// The person at the keyboard, when Windows will say who that is.
+pub fn console_account() -> Option<Account> {
+    use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+
+    let session = unsafe { WTSGetActiveConsoleSessionId() };
+    if session == 0 || session == u32::MAX {
+        return None;
+    }
+    account_from_session_token(session).or_else(|| account_from_explorer(session))
+}
+
+/// Refuse to change settings when this window is a different account.
+pub fn ensure_interactive_account() -> Result<(), Error> {
+    crate::account::same_account(&current_account()?, console_account().as_ref())
+}
+
+/// Limit the saved-settings folder to Administrators and SYSTEM.
+pub fn lock_down_directory(path: &Path) -> Result<(), Error> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut path_wide = wide(&absolute.display().to_string());
+    let descriptor = wide("D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)");
+    unsafe {
+        let mut security = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor.as_ptr(),
+            SDDL_REVISION_1,
+            &mut security,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(folder_lock_error());
+        }
+        let mut present = 0i32;
+        let mut dacl = std::ptr::null_mut();
+        let mut defaulted = 0i32;
+        let got = GetSecurityDescriptorDacl(security, &mut present, &mut dacl, &mut defaulted);
+        if got == 0 || present == 0 || dacl.is_null() {
+            LocalFree(security.cast());
+            return Err(folder_lock_error());
+        }
+        let code = SetNamedSecurityInfoW(
+            path_wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null(),
+        );
+        LocalFree(security.cast());
+        if code != ERROR_SUCCESS {
+            return Err(win_error(code, "lock", "the saved-settings folder"));
+        }
+    }
+    Ok(())
+}
+
+fn folder_lock_error() -> Error {
+    Error::new(
+        "Could not lock the saved-settings folder. Copy the program to C:\\Temp\\softlock-spike and run it from there. Nothing was changed.",
+    )
+}
+
+fn account_from_session_token(session: u32) -> Option<Account> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::RemoteDesktop::WTSQueryUserToken;
+
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if WTSQueryUserToken(session, &mut token) == 0 {
+            return None;
+        }
+        let account = account_from_token(token).ok();
+        CloseHandle(token);
+        account
+    }
+}
+
+fn account_from_explorer(session: u32) -> Option<Account> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..PROCESSENTRY32W::default()
+        };
+        let mut found = None;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                if exe_name(&entry.szExeFile).eq_ignore_ascii_case("explorer.exe") {
+                    let mut process_session = 0u32;
+                    let same_session =
+                        ProcessIdToSessionId(entry.th32ProcessID, &mut process_session) != 0
+                            && process_session == session;
+                    if same_session {
+                        let process =
+                            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID);
+                        if !process.is_null() {
+                            found = account_of_process(process);
+                            CloseHandle(process);
+                            if found.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
+fn account_of_process(process: windows_sys::Win32::Foundation::HANDLE) -> Option<Account> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let account = account_from_token(token).ok();
+        CloseHandle(token);
+        account
+    }
+}
+
+fn account_from_token(token: windows_sys::Win32::Foundation::HANDLE) -> Result<Account, Error> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
+
+    unsafe {
+        let mut needed = 0u32;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            return Err(Error::new("Could not read the account id."));
+        }
+        let mut buffer = vec![0u8; needed as usize];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        ) == 0
+        {
+            return Err(Error::new("Could not read the account id."));
+        }
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let mut text = std::ptr::null_mut();
+        if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 || text.is_null() {
+            return Err(Error::new("Could not read the account id."));
+        }
+        let sid = utf16_ptr(text);
+        LocalFree(text.cast());
+        let name = lookup_account_name(user.User.Sid).unwrap_or_else(|| sid.clone());
+        Ok(Account { sid, name })
+    }
+}
+
+fn lookup_account_name(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+    use windows_sys::Win32::Security::LookupAccountSidW;
+
+    unsafe {
+        let mut name_len = 0u32;
+        let mut domain_len = 0u32;
+        let mut use_name = 0;
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            std::ptr::null_mut(),
+            &mut name_len,
+            std::ptr::null_mut(),
+            &mut domain_len,
+            &mut use_name,
+        );
+        if name_len == 0 {
+            return None;
+        }
+        let mut name = vec![0u16; name_len as usize];
+        let mut domain = vec![0u16; domain_len.max(1) as usize];
+        if LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut name_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut use_name,
+        ) == 0
+        {
+            return None;
+        }
+        let name = trim_wide(&name);
+        let domain = trim_wide(&domain);
+        if domain.is_empty() {
+            Some(name)
+        } else {
+            Some(format!("{domain}\\{name}"))
+        }
+    }
+}
+
+fn exe_name(raw: &[u16]) -> String {
+    trim_wide(raw)
+}
+
+fn trim_wide(raw: &[u16]) -> String {
+    let end = raw.iter().position(|unit| *unit == 0).unwrap_or(raw.len());
+    String::from_utf16_lossy(&raw[..end])
+}
+
+unsafe fn utf16_ptr(ptr: *const u16) -> String {
+    let mut len = 0usize;
+    while unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
