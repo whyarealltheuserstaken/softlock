@@ -38,6 +38,7 @@ jobs:
           cmd /c "query session"
           Write-Output "ImageOS=$env:ImageOS"
           Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' | Select-Object ProductName, DisplayVersion, CurrentBuild, InstallationType, EditionID | Format-List
+          exit 0
       - name: Format
         run: cargo fmt --manifest-path spikes/desktop-proof/Cargo.toml -- --check
       - name: Clippy
