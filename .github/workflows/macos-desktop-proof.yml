@@ -1,0 +1,56 @@
+name: macOS desktop proof
+
+# CI only. No push trigger: a push to main after merge must not install the LaunchDaemon.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'spikes/macos-desktop-proof/**'
+      - '.github/workflows/macos-desktop-proof.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-desktop-proof-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proof:
+    name: macos desktop proof
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: spikes/macos-desktop-proof -> spikes/macos-desktop-proof/target
+      - name: Record the runner
+        run: |
+          sw_vers
+          uname -m
+          echo "uid=$(id -u) user=$(whoami)"
+      - name: Format
+        run: cargo fmt --manifest-path spikes/macos-desktop-proof/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path spikes/macos-desktop-proof/Cargo.toml --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --manifest-path spikes/macos-desktop-proof/Cargo.toml
+      - name: Run the desktop proof
+        run: cargo run --release --manifest-path spikes/macos-desktop-proof/Cargo.toml -- --runner-image macos-latest --output-dir proof-output
+      - name: Unload the throwaway jobs
+        if: always()
+        run: |
+          set +e
+          uid="$(id -u)"
+          launchctl bootout "gui/${uid}/com.runner.macosproof.agent"
+          launchctl unload "${HOME}/Library/LaunchAgents/com.runner.macosproof.agent.plist"
+          rm -f "${HOME}/Library/LaunchAgents/com.runner.macosproof.agent.plist"
+          sudo -n launchctl bootout system/com.runner.macosproof.daemon
+          sudo -n launchctl unload /Library/LaunchDaemons/com.runner.macosproof.daemon.plist
+          sudo -n rm -f /Library/LaunchDaemons/com.runner.macosproof.daemon.plist
+          exit 0
