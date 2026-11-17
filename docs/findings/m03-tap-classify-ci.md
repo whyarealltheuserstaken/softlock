@@ -19,13 +19,15 @@ post source=kCGEventSourceStateHIDSystemState poster=second-process poster-pid=2
 post source=kCGEventSourceStateHIDSystemState poster=same-process poster-pid=2214 state-id=1 state-name=kCGEventSourceStateHIDSystemState state-matches=true source-pid=2214 tap-saw=true window-received=true draft=software error=none
 ```
 
-The header value of `kCGEventSourceStatePrivate` is -1. This log did not read -1. The private posts came back as `1102520059` and `2044897763` on every passing run. Combined session was 0 and HID system was 1, which matches the header. Every source pid was the posting process, never 0. The tap saw every post in this log. Before the retry, a single second-process post was missed (`tap-saw=false` for combined session on [run 44013354296](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44013354296) and [run 44013940136](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44013940136)). The probe now repeats a second-process post up to five times and records the attempt the tap saw. A row that is still `tap-saw=false` fails the run. The target window received all six posts in this log.
+The header value of `kCGEventSourceStatePrivate` is -1. This log did not read -1. The private posts came back as `1102520059` and `2044897763` on every passing run. Combined session was 0 and HID system was 1, which matches the header. Every source pid was the posting process, never 0. The tap saw every post in this log. Before the retry, a single second-process post was missed (`tap-saw=false` for combined session on [run 44013354296](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44013354296) and [run 44013940136](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44013940136)). The probe now repeats a second-process post up to five times and records the attempt the tap saw. Any of the six rows with `tap-saw=false`, including a same-process row, fails the run. The target window received all six posts in this log.
 
 The draft rule stands for these posts. All six are software. HID state did not mean physical. The rule is not replaced. It is also not proved for a finger on a key, because this runner never sent one.
 
 `window-received` is not stable across runs of this same probe. [Run 43982973565](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43982973565) on `1fc8dc6` and [run 44012605913](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44012605913) on `4428903` printed `window-received=true` for all six posts. [Run 44009469018](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44009469018) on `3ef5a4f` printed `window-received=false` for the private post from the tap's own process. [Run 44014598395](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44014598395) on `eb9d689` printed `window-received=false` for both combined-session posts and for the HID post from the tap's own process.
 
-`draft=software` means the event is not physical. It does not mean the event is allowed through. Remote-tool input, including Screen Sharing and VNC, is in the same posted-event class. It stays blocked until the remote pass. That pass is [m21](../tickets/macos/m21-capture-remote-spike.md) and [m22](../tickets/macos/m22-remote-session-lock.md), and SPEC.md Implementation Decision 20.
+`draft=software` means the event is not physical. It does not mean the event is allowed through. Remote-tool input, including Screen Sharing and VNC, is in the same posted-event class. It stays blocked until the remote pass.
+
+SPEC.md Implementation Decision 20 says: "A remote viewer sees the SoftLock lock screen. That viewer sees the real screen only after authenticating with a configurable pass." It fails closed. The same decision says v1 includes "the fail-closed path so a remote session cannot end unlocked." A reported remote session can never end unlocked. It also says "v1 frameworks remote display and does not ship it" and "v1 does not implement, test, or ship that behavior as a feature." v1 only builds that framework. That pass is [m21](../tickets/macos/m21-capture-remote-spike.md) and [m22](../tickets/macos/m22-remote-session-lock.md).
 
 ## Slow callback
 
@@ -46,7 +48,7 @@ The marker is a key the callback returns unchanged. With the tap off the run loo
 marker dead-ms=851 dead-misses=3 healthy-ms=0 healthy-seen=true dead-within-1s=true healthy-within-heartbeat=true reenabled=false error=none
 ```
 
-Across passing runs, `dead-ms` has been 829–942 and `healthy-ms` has been 0–3. The dead row is the probe's own timer. It is not the operating system removing the tap.
+Across passing runs, `dead-ms` has been 829–942 and `healthy-ms` has been 0–3. The low end is [run 43981349784](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43981349784) on `beb281c` (`dead-ms=829`). The high end is [run 43980478472](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43980478472) on `9f895b6` (`dead-ms=942`). The dead row is the probe's own timer. It is not the operating system removing the tap.
 
 ## What m05 still has to measure
 

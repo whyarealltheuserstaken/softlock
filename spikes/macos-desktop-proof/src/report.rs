@@ -545,10 +545,16 @@ fn classify_failures(classify: &ClassifyReport) -> Vec<String> {
                     reasons.push(format!(
                         "m03 post {source} did not record a state id and source pid"
                     ));
-                } else if !post.tap_saw {
-                    reasons.push(format!("m03 post {source} tap-saw=false"));
                 }
             }
+        }
+    }
+    for post in &classify.posts {
+        if !post.tap_saw {
+            reasons.push(format!(
+                "m03 post {} {} tap-saw=false",
+                post.source, post.poster
+            ));
         }
     }
     if classify.slow.reenabled || classify.marker.reenabled {
@@ -1211,6 +1217,28 @@ mod tests {
             reasons
                 .iter()
                 .any(|reason| reason.contains("tap-saw=false"))
+        );
+    }
+
+    #[test]
+    fn a_same_process_post_the_tap_did_not_see_fails() {
+        let mut classify = passing_classify();
+        classify.posts.push(PostedObservation {
+            source: "kCGEventSourceStatePrivate".to_string(),
+            poster: "same-process".to_string(),
+            poster_pid: 7,
+            state_id: -1,
+            source_pid: 7,
+            fields_read: true,
+            tap_saw: false,
+            window_received: false,
+            error: None,
+        });
+        let reasons = classify_failures(&classify);
+        assert!(
+            reasons.iter().any(|reason| {
+                reason.contains("same-process") && reason.contains("tap-saw=false")
+            })
         );
     }
 

@@ -56,6 +56,8 @@ jobs:
           grep -E '^marker .* dead-within-1s=true healthy-within-heartbeat=true reenabled=false error=none$' "$log"
           grep -E '^fail-closed=Locked$' "$log"
           grep -E '^result=pass$' "$log"
+          test "$(grep -cE '^post .* tap-saw=true .* error=none$' "$log")" -eq 6
+          ! grep -E 'tap-saw=false|^m03=no-tap' "$log"
       - name: Unload the throwaway jobs
         if: always()
         run: |
