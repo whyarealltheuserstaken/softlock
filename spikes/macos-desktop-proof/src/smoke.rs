@@ -126,6 +126,10 @@ pub fn render(
             lines.push(format!("fat-error={error}"));
         }
     }
+    for error in framework_failures(framework) {
+        ok = false;
+        lines.push(format!("framework-error={error}"));
+    }
     if ok {
         lines.push("smoke=pass".to_string());
     } else {
@@ -164,6 +168,51 @@ pub fn run(args: &Args) -> i32 {
     println!("{text}");
     println!("runner-image={}", args.runner_image);
     if ok { 0 } else { 1 }
+}
+
+fn framework_failures(framework: &FrameworkReport) -> Vec<String> {
+    let mut errors = Vec::new();
+    if framework.display_id == "0" {
+        errors.push("cg-main-display-id is 0".to_string());
+    }
+    match parse_bounds(&framework.bounds) {
+        Ok((width, height)) => {
+            if width == 0.0 {
+                errors.push("cg-main-display-bounds width is 0".to_string());
+            }
+            if height == 0.0 {
+                errors.push("cg-main-display-bounds height is 0".to_string());
+            }
+        }
+        Err(error) => errors.push(error),
+    }
+    if framework.session_dictionary != "non-null" {
+        errors.push(format!(
+            "cg-session-dictionary is {}, expected non-null",
+            display(&framework.session_dictionary)
+        ));
+    }
+    if framework.sac_lock_symbol != "resolved" {
+        errors.push(format!(
+            "sac-lock-symbol is {}, expected resolved",
+            display(&framework.sac_lock_symbol)
+        ));
+    }
+    errors
+}
+
+fn parse_bounds(bounds: &str) -> Result<(f64, f64), String> {
+    let parts: Vec<&str> = bounds.split(',').collect();
+    if parts.len() != 4 {
+        return Err(format!("cg-main-display-bounds is {bounds}"));
+    }
+    let width = parts[2]
+        .parse::<f64>()
+        .map_err(|_| format!("cg-main-display-bounds width is {}", parts[2]))?;
+    let height = parts[3]
+        .parse::<f64>()
+        .map_err(|_| format!("cg-main-display-bounds height is {}", parts[3]))?;
+    Ok((width, height))
 }
 
 fn display(value: &str) -> String {
@@ -376,6 +425,70 @@ mod tests {
         assert!(text.contains("sac-lock-symbol=resolved"));
         assert!(text.contains("sac-lock-called=false"));
         assert!(text.contains("smoke=pass"));
+        assert!(!text.contains("framework-error="));
+    }
+
+    fn render_framework(report: FrameworkReport) -> (String, bool) {
+        let info = "Architectures in the fat file: macos-desktop-proof are: x86_64 arm64";
+        let archs = "x86_64 arm64";
+        render(
+            &intel(),
+            info,
+            archs,
+            native_intel(&intel()),
+            fat_universal(info, archs),
+            &report,
+        )
+    }
+
+    #[test]
+    fn smoke_fails_when_the_display_id_is_zero() {
+        let mut report = framework();
+        report.display_id = "0".to_string();
+        let (text, ok) = render_framework(report);
+        assert!(!ok);
+        assert!(text.contains("framework-error=cg-main-display-id is 0"));
+        assert!(text.contains("smoke=fail"));
+    }
+
+    #[test]
+    fn smoke_fails_when_the_display_width_is_zero() {
+        let mut report = framework();
+        report.bounds = "0,0,0,768".to_string();
+        let (text, ok) = render_framework(report);
+        assert!(!ok);
+        assert!(text.contains("framework-error=cg-main-display-bounds width is 0"));
+        assert!(text.contains("smoke=fail"));
+    }
+
+    #[test]
+    fn smoke_fails_when_the_display_height_is_zero() {
+        let mut report = framework();
+        report.bounds = "0,0,1024,0".to_string();
+        let (text, ok) = render_framework(report);
+        assert!(!ok);
+        assert!(text.contains("framework-error=cg-main-display-bounds height is 0"));
+        assert!(text.contains("smoke=fail"));
+    }
+
+    #[test]
+    fn smoke_fails_when_the_session_dictionary_is_null() {
+        let mut report = framework();
+        report.session_dictionary = "null".to_string();
+        let (text, ok) = render_framework(report);
+        assert!(!ok);
+        assert!(text.contains("framework-error=cg-session-dictionary is null, expected non-null"));
+        assert!(text.contains("smoke=fail"));
+    }
+
+    #[test]
+    fn smoke_fails_when_the_lock_symbol_is_missing() {
+        let mut report = framework();
+        report.sac_lock_symbol = "missing".to_string();
+        let (text, ok) = render_framework(report);
+        assert!(!ok);
+        assert!(text.contains("framework-error=sac-lock-symbol is missing, expected resolved"));
+        assert!(text.contains("smoke=fail"));
     }
 
     #[test]

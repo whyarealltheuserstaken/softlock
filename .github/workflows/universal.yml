@@ -315,6 +315,24 @@ jobs:
           echo "=== lipo -archs ${fat} ==="
           lipo -archs "${fat}"
 
+      - name: Hash the fat files in the artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target/universal
+          for rel in fat/softlock-app tauri/softlock-app probe/macos-desktop-proof; do
+            if [ ! -f "${rel}" ]; then
+              echo "missing ${rel} before hashing"
+              exit 1
+            fi
+          done
+          shasum -a 256 \
+            fat/softlock-app \
+            tauri/softlock-app \
+            probe/macos-desktop-proof \
+            > sha256.txt
+          cat sha256.txt
+
       - name: Upload fat product binaries and the fat probe
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -323,6 +341,7 @@ jobs:
             target/universal/fat
             target/universal/tauri
             target/universal/probe
+            target/universal/sha256.txt
           if-no-files-found: error
 
   native_x86:
@@ -390,6 +409,24 @@ jobs:
         run: |
           set -euo pipefail
 
+          required=(
+            fat/softlock-app
+            tauri/softlock-app
+            probe/macos-desktop-proof
+          )
+          for rel in "${required[@]}"; do
+            if [ ! -f "m01-fat/${rel}" ]; then
+              echo "m01 artifact is missing ${rel}"
+              exit 1
+            fi
+          done
+          if [ ! -f m01-fat/sha256.txt ]; then
+            echo "m01 artifact is missing sha256.txt"
+            exit 1
+          fi
+          echo "=== sha256 before codesign ==="
+          (cd m01-fat && shasum -a 256 -c sha256.txt)
+
           require_fat() {
             path="$1"
             echo "=== lipo -info ${path} ==="
@@ -427,11 +464,20 @@ jobs:
             kill "${parent}" 2>/dev/null || true
           }
 
-          smoke_launch() {
+          ensure_signature() {
             path="$1"
             chmod +x "${path}"
-            # Ad-hoc signature. Decision D2.
-            codesign --force --sign - "${path}"
+            if codesign --verify "${path}" >/dev/null 2>&1; then
+              echo "codesign already valid: ${path}"
+            else
+              # Ad-hoc signature. Decision D2.
+              codesign --force --sign - "${path}"
+            fi
+          }
+
+          smoke_launch() {
+            path="$1"
+            ensure_signature "${path}"
             log="m01-fat/smoke-$(basename "${path}").log"
             "${path}" >"${log}" 2>&1 &
             pid=$!
@@ -456,20 +502,11 @@ jobs:
           }
 
           launched=0
-          probe_smoked=0
-          shopt -s nullglob
-          for path in m01-fat/fat/* m01-fat/tauri/* m01-fat/probe/*; do
-            if [ ! -f "${path}" ]; then
-              continue
-            fi
-            if ! lipo -info "${path}" >/dev/null 2>&1; then
-              continue
-            fi
+          for rel in "${required[@]}"; do
+            path="m01-fat/${rel}"
             require_fat "${path}"
-            name="$(basename "${path}")"
-            if [ "${name}" = "macos-desktop-proof" ]; then
-              chmod +x "${path}"
-              codesign --force --sign - "${path}"
+            if [ "${rel}" = "probe/macos-desktop-proof" ]; then
+              ensure_signature "${path}"
               "${path}" --smoke --runner-image "${{ matrix.image }}" --output-dir proof-output \
                 | tee m01-fat/probe-smoke.txt
               grep -F "uname -m" m01-fat/probe-smoke.txt
@@ -480,22 +517,13 @@ jobs:
               grep -F "rosetta=false" m01-fat/probe-smoke.txt
               grep -F "cg-main-display-id=" m01-fat/probe-smoke.txt
               grep -F "cg-main-display-bounds=" m01-fat/probe-smoke.txt
-              grep -F "cg-session-dictionary=" m01-fat/probe-smoke.txt
-              grep -F "sac-lock-symbol=" m01-fat/probe-smoke.txt
+              grep -Fx "cg-session-dictionary=non-null" m01-fat/probe-smoke.txt
+              grep -Fx "sac-lock-symbol=resolved" m01-fat/probe-smoke.txt
               grep -F "sac-lock-called=false" m01-fat/probe-smoke.txt
-              grep -F "smoke=pass" m01-fat/probe-smoke.txt
-              probe_smoked=$((probe_smoked + 1))
+              grep -Fx "smoke=pass" m01-fat/probe-smoke.txt
             else
               smoke_launch "${path}"
             fi
             launched=$((launched + 1))
           done
-          if [ "${launched}" -lt 1 ]; then
-            echo "no fat binary to launch"
-            exit 1
-          fi
-          if [ "${probe_smoked}" -lt 1 ]; then
-            echo "m01 artifact is missing the fat probe"
-            exit 1
-          fi
           echo "smoked ${launched} fat binaries on native x86_64"

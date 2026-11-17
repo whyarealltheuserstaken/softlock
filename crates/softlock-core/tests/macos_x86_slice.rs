@@ -47,10 +47,17 @@ fn native_job_downloads_m01_fat_artifacts_on_github_intel() {
     assert!(native.contains("rosetta=false"));
     assert!(native.contains("cg-main-display-id="));
     assert!(native.contains("sac-lock-called=false"));
-    assert!(native.contains("smoke=pass"));
-    assert!(native.contains("m01-fat/fat/*"));
-    assert!(native.contains("m01-fat/tauri/*"));
-    assert!(native.contains("m01-fat/probe/*"));
+    assert!(native.contains("grep -Fx \"sac-lock-symbol=resolved\""));
+    assert!(native.contains("grep -Fx \"cg-session-dictionary=non-null\""));
+    assert!(native.contains("grep -Fx \"smoke=pass\""));
+    assert!(native.contains("fat/softlock-app"));
+    assert!(native.contains("tauri/softlock-app"));
+    assert!(native.contains("probe/macos-desktop-proof"));
+    assert!(native.contains("m01-fat/${rel}"));
+    assert!(native.contains("shasum -a 256 -c sha256.txt"));
+    assert!(native.contains("codesign --verify"));
+    assert!(build.contains("shasum -a 256"));
+    assert!(build.contains("sha256.txt"));
     assert!(build.contains("target/universal/probe"));
     assert!(build.contains(SPIKE));
     assert!(build.contains("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"));
@@ -114,6 +121,11 @@ fn ticket_keeps_henrys_mac_as_an_optional_kit_checkbox() {
     assert!(text.contains("optional"));
     assert!(text.contains("macos-15-intel"));
     assert!(text.contains("--smoke"));
+    assert!(
+        text.contains("paragraph in D1"),
+        "Test machine keeps main's D1 pointer"
+    );
+    assert!(text.contains("decisions.md"));
 }
 
 fn workflow() -> String {
