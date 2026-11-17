@@ -902,7 +902,7 @@ typedef struct {
     int dead_misses;
     int reenabled;
     int healthy_seen;
-    int pad2;
+    int no_tap;
     char disable_event[64];
     char slow_error[256];
     char marker_error[256];
@@ -1338,6 +1338,7 @@ static void run_slow(const char *dir, M03Out *out) {
     CFMachPortRef port = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask,
                                           slow_callback, NULL);
     if (port == NULL) {
+        out->no_tap = 1;
         snprintf(out->slow_error, sizeof out->slow_error, "CGEventTapCreate returned NULL");
         snprintf(out->disable_event, sizeof out->disable_event, "none");
         return;
@@ -1418,6 +1419,7 @@ static void run_marker(M03Out *out) {
     CFMachPortRef port = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly, mask,
                                           marker_callback, NULL);
     if (port == NULL) {
+        out->no_tap = 1;
         snprintf(out->marker_error, sizeof out->marker_error, "CGEventTapCreate returned NULL");
         return;
     }
@@ -1503,6 +1505,7 @@ int macos_prove_m03(const char *exe, const char *dir, M03Out *out) {
                                             mask, field_callback, NULL);
     CFRunLoopSourceRef listen_source = NULL;
     if (listen == NULL) {
+        out->no_tap = 1;
         snprintf(out->error, sizeof out->error, "CGEventTapCreate returned NULL");
     } else {
         listen_source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, listen, 0);

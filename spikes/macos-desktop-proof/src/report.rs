@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::classify::{
     self, POST_SOURCES, dead_callback_reported_in_time, draft_name, expected_state_id,
-    fail_closed_end, failure_ends_unlocked, healthy_callback_within_one_heartbeat, state_name,
+    fail_closed_end, healthy_callback_within_one_heartbeat, state_name,
 };
 use crate::labels::{AGENT_LABEL, CAPTURE_APIS, DAEMON_LABEL, REQUIRED_TAPS};
 use crate::launchctl::PrintState;
@@ -139,6 +139,8 @@ pub struct ClassifyReport {
     pub marker: MarkerObservation,
     /// Always `Locked` when a measurement is a guard failure. Never `Unlocked`.
     pub end_state: String,
+    /// `created` when every m03 tap was created, `no-tap` when `CGEventTapCreate` returned NULL.
+    pub tap_status: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -518,11 +520,14 @@ pub fn render(report: &ProofReport) -> String {
 
 fn classify_failures(classify: &ClassifyReport) -> Vec<String> {
     let mut reasons = Vec::new();
-    if failure_ends_unlocked(&classify.end_state) || classify.end_state != fail_closed_end() {
+    if classify.end_state != fail_closed_end() {
         reasons.push(format!(
             "m03 failure ended {}; fail-closed ends Locked",
             display_text(&classify.end_state)
         ));
+    }
+    if classify.tap_status == "no-tap" {
+        reasons.push("m03=no-tap".to_string());
     }
     for source in POST_SOURCES {
         match classify
@@ -540,6 +545,8 @@ fn classify_failures(classify: &ClassifyReport) -> Vec<String> {
                     reasons.push(format!(
                         "m03 post {source} did not record a state id and source pid"
                     ));
+                } else if !post.tap_saw {
+                    reasons.push(format!("m03 post {source} tap-saw=false"));
                 }
             }
         }
@@ -549,11 +556,8 @@ fn classify_failures(classify: &ClassifyReport) -> Vec<String> {
     }
     if probe_crashed(classify.slow.error.as_deref()) {
         reasons.push("m03 slow callback crashed in the probe".to_string());
-    } else if classify.slow.sleep_ms <= 0 {
-        let error = classify.slow.error.as_deref().unwrap_or("");
-        if !error.contains("CGEventTapCreate") {
-            reasons.push("m03 slow callback did not run".to_string());
-        }
+    } else if classify.tap_status != "no-tap" && classify.slow.sleep_ms <= 0 {
+        reasons.push("m03 slow callback did not run".to_string());
     }
     let known = matches!(
         classify.slow.disable_event.as_str(),
@@ -567,14 +571,11 @@ fn classify_failures(classify: &ClassifyReport) -> Vec<String> {
     }
     if probe_crashed(classify.marker.error.as_deref()) {
         reasons.push("m03 marker check crashed in the probe".to_string());
-    } else if !marker_bounds_met(&classify.marker) {
-        let error = classify.marker.error.as_deref().unwrap_or("");
-        if !error.contains("CGEventTapCreate") {
-            reasons.push(format!(
-                "m03 marker dead-ms={} healthy-ms={} is outside the heartbeat bound",
-                classify.marker.dead_ms, classify.marker.healthy_ms
-            ));
-        }
+    } else if classify.tap_status != "no-tap" && !marker_bounds_met(&classify.marker) {
+        reasons.push(format!(
+            "m03 marker dead-ms={} healthy-ms={} is outside the heartbeat bound",
+            classify.marker.dead_ms, classify.marker.healthy_ms
+        ));
     }
     reasons
 }
@@ -640,6 +641,9 @@ fn classify_lines(report: &ProofReport) -> Vec<String> {
         classify.marker.error.as_deref().unwrap_or("none"),
     ));
     lines.push(format!("fail-closed={}", classify.end_state));
+    if classify.tap_status == "no-tap" {
+        lines.push("m03=no-tap".to_string());
+    }
     lines
 }
 
@@ -1078,6 +1082,7 @@ fn passing_classify() -> ClassifyReport {
             error: None,
         },
         end_state: fail_closed_end().to_string(),
+        tap_status: "created".to_string(),
     }
 }
 
@@ -1170,6 +1175,31 @@ mod tests {
         let back: ProofReport =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).expect("json");
         assert_eq!(report, back);
+    }
+
+    #[test]
+    fn a_missing_tap_emits_m03_no_tap_and_fails_the_run() {
+        let mut classify = passing_classify();
+        classify.tap_status = "no-tap".to_string();
+        classify.slow.sleep_ms = 0;
+        classify.marker.dead_ms = 0;
+        classify.marker.healthy_seen = false;
+        let reasons = classify_failures(&classify);
+        assert!(reasons.iter().any(|reason| reason == "m03=no-tap"));
+        assert!(reasons.iter().all(|reason| !reason.contains("slow callback")));
+        assert!(reasons.iter().all(|reason| !reason.contains("marker")));
+        let mut report = passing_fixture();
+        report.classify = Some(classify);
+        assert!(render(&report).contains("m03=no-tap"));
+        assert!(failure_reasons(&report).iter().any(|reason| reason == "m03=no-tap"));
+    }
+
+    #[test]
+    fn a_second_process_post_the_tap_did_not_see_fails() {
+        let mut classify = passing_classify();
+        classify.posts[0].tap_saw = false;
+        let reasons = classify_failures(&classify);
+        assert!(reasons.iter().any(|reason| reason.contains("tap-saw=false")));
     }
 
     #[test]

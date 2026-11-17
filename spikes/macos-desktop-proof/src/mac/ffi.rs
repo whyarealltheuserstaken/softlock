@@ -90,7 +90,7 @@ struct M03Out {
     dead_misses: i32,
     reenabled: i32,
     healthy_seen: i32,
-    pad2: i32,
+    no_tap: i32,
     disable_event: [u8; 64],
     slow_error: [u8; 256],
     marker_error: [u8; 256],
@@ -448,6 +448,7 @@ pub fn prove_m03(exe: &std::path::Path, dir: &std::path::Path) -> ClassifyReport
             },
         },
         end_state: fail_closed_end().to_string(),
+        tap_status: if out.no_tap != 0 { "no-tap".to_string() } else { "created".to_string() },
     }
 }
 
@@ -481,7 +482,7 @@ fn zero_m03() -> M03Out {
         dead_misses: 0,
         reenabled: 0,
         healthy_seen: 0,
-        pad2: 0,
+        no_tap: 0,
         disable_event: [0; 64],
         slow_error: [0; 256],
         marker_error: [0; 256],

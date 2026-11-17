@@ -474,6 +474,7 @@ fn child_m03(exe: &Path, output_dir: &Path) -> (ClassifyReport, Option<String>) 
                 error: Some(format!("m03 process exited {}", outcome.code)),
             },
             end_state: crate::classify::fail_closed_end().to_string(),
+            tap_status: "missing".to_string(),
         },
         Some(format!("m03 process exited {}", outcome.code)),
     )
