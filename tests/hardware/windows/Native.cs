@@ -27,6 +27,8 @@ namespace SoftLock.Hardware
         const uint WmWtsSessionChange = 0x02B1;
         const int WtsSessionLock = 0x7;
         const int WtsSessionUnlock = 0x8;
+        const int PbtApmQuerySuspend = 0x0000;
+        const int BroadcastQueryDeny = 0x424D5144;
         const int PbtApmSuspend = 0x0004;
         const int PbtApmResumeSuspend = 0x0007;
         const int PbtApmResumeAutomatic = 0x0012;
@@ -45,7 +47,9 @@ namespace SoftLock.Hardware
         static uint listenerThreadId;
         static readonly ManualResetEvent ListenerReady = new ManualResetEvent(false);
         static int suspends;
+        static int querySuspends;
         static int resumes;
+        static bool inhibitSleep;
         static int lidCloses;
         static int lidOpens;
         static int displayOff;
@@ -253,6 +257,11 @@ namespace SoftLock.Hardware
             }
         }
 
+        public static void SetInhibit(bool on)
+        {
+            inhibitSleep = on;
+        }
+
         public static void ReleaseKeepAwake()
         {
             if (powerRequest != IntPtr.Zero)
@@ -288,6 +297,7 @@ namespace SoftLock.Hardware
             lock (Gate)
             {
                 return "{\"suspend\":" + suspends
+                    + ",\"query_suspend\":" + querySuspends
                     + ",\"resume\":" + resumes
                     + ",\"lid_close\":" + lidCloses
                     + ",\"lid_open\":" + lidOpens
@@ -423,6 +433,11 @@ namespace SoftLock.Hardware
             if (message == WmPowerBroadcast)
             {
                 int kind = wParam.ToInt32();
+                if (kind == PbtApmQuerySuspend && inhibitSleep)
+                {
+                    lock (Gate) { querySuspends++; }
+                    return new IntPtr(BroadcastQueryDeny);
+                }
                 if (kind == PbtApmSuspend)
                 {
                     lock (Gate) { suspends++; }

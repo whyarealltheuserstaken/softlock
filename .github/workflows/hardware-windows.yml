@@ -30,4 +30,17 @@ jobs:
         shell: powershell
         run: |
           powershell -ExecutionPolicy Bypass -File tests\hardware\windows\run.ps1 --ci
-          exit $LASTEXITCODE
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = "target\release\softlock-win-hwsuite.exe"
+          $files = @(Get-ChildItem -Path suite-output -Recurse -Filter result.json)
+          if ($files.Count -lt 1) { Write-Error "result.json was not written"; exit 1 }
+          foreach ($file in $files) {
+            & $exe conform --file $file.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          if (Test-Path "tests\hardware\check-schema.py") {
+            $py = "python"
+            if (-not (Get-Command python -ErrorAction SilentlyContinue)) { $py = "python3" }
+            & $py tests\hardware\check-schema.py $files[0].FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

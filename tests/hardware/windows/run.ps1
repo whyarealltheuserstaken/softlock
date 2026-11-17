@@ -25,6 +25,8 @@ $started = [DateTime]::UtcNow
 $budgetMs = 300000
 $script:Armed = $false
 $script:SawLock = $false
+$script:LeftLocked = $false
+$script:Interrupted = $false
 $script:Changes = New-Object System.Collections.Generic.List[object]
 $script:Restored = $false
 $pendingDir = Join-Path $env:LOCALAPPDATA 'softlock-hwsuite'
@@ -147,42 +149,97 @@ function Restore-Suite {
 
 function Read-Answer([string]$prompt, [int]$seconds) {
     Write-Host $prompt
-    if ($ci -or [Console]::IsInputRedirected) {
-        return 'skip'
+    $redirected = $false
+    try { $redirected = [Console]::IsInputRedirected } catch { $redirected = $true }
+    if ($redirected) { return 'eof' }
+    $previous = $false
+    try {
+        $previous = [Console]::TreatControlCAsInput
+        [Console]::TreatControlCAsInput = $true
+    } catch {
     }
     $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
     $buf = New-Object System.Text.StringBuilder
+    $kind = 'timeout'
     while ([DateTime]::UtcNow -lt $deadline) {
-        if ((Elapsed-Ms) -gt $budgetMs) { return 'skip' }
-        if ([Console]::KeyAvailable) {
-            $key = [Console]::ReadKey($true)
-            if ($key.Key -eq 'Enter') {
-                return $buf.ToString().Trim()
-            }
-            if ($key.Key -eq 'Backspace') {
-                if ($buf.Length -gt 0) { $buf.Length = $buf.Length - 1 }
+        if ((Elapsed-Ms) -gt $budgetMs) { $kind = 'budget'; break }
+        try {
+            if (-not [Console]::KeyAvailable) {
+                Start-Sleep -Milliseconds 50
                 continue
             }
-            if ($key.KeyChar -ne 0) { [void]$buf.Append($key.KeyChar) }
-        } else {
-            Start-Sleep -Milliseconds 50
+            $key = [Console]::ReadKey($true)
+        } catch {
+            $kind = 'eof'
+            break
         }
+        $controlC = ($key.KeyChar -eq 3) -or ($key.Key -eq 'C' -and ($key.Modifiers -band [ConsoleModifiers]::Control))
+        if ($controlC) {
+            $script:Interrupted = $true
+            $kind = 'interrupt'
+            break
+        }
+        if ($key.Key -eq 'Enter') {
+            $text = $buf.ToString().Trim().ToLowerInvariant()
+            if ($text -eq '' -or $text -eq 'y' -or $text -eq 'yes' -or $text -eq 'ok' -or $text -eq 'go') {
+                $kind = 'go'
+            } elseif ($text -eq 'skip' -or $text -eq 's' -or $text -eq 'n' -or $text -eq 'no') {
+                $kind = 'operator'
+            } else {
+                Write-Host 'Press Enter, or type skip.'
+                $buf.Length = 0
+                continue
+            }
+            break
+        }
+        if ($key.Key -eq 'Backspace') {
+            if ($buf.Length -gt 0) { $buf.Length = $buf.Length - 1 }
+            continue
+        }
+        if ($key.KeyChar -ne 0) { [void]$buf.Append($key.KeyChar) }
     }
-    return 'skip'
+    try { [Console]::TreatControlCAsInput = $previous } catch { }
+    return $kind
 }
 
-function Power-Delta([datetime]$since) {
+function Power-Since([int64]$afterRecord) {
     $sleep = 0
     $wake = 0
     try {
-        $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; StartTime = $since.ToLocalTime() } -ErrorAction Stop)
+        $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power' } -MaxEvents 40 -ErrorAction Stop)
         foreach ($event in $events) {
+            if ([int64]$event.RecordId -le $afterRecord) { continue }
             if ($event.Id -eq 42) { $sleep++ }
             if ($event.Id -eq 107 -or $event.Id -eq 507) { $wake++ }
         }
     } catch {
     }
     return [pscustomobject]@{ sleep = $sleep; wake = $wake }
+}
+
+function Latest-PowerRecord {
+    try {
+        $event = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power' } -MaxEvents 1 -ErrorAction Stop
+        return [int64]$event.RecordId
+    } catch {
+        return [int64]0
+    }
+}
+
+function Probe-Error($probe) {
+    if ($null -eq $probe) { return '' }
+    if ($probe.PSObject.Properties.Name -contains 'error') { return [string]$probe.error }
+    return ''
+}
+
+function Enable-Inhibit {
+    $native::SetInhibit($true)
+    return $native::KeepAwakeJson() | ConvertFrom-Json
+}
+
+function Disable-Inhibit {
+    try { $native::SetInhibit($false) } catch { }
+    try { $native::ReleaseKeepAwake() } catch { }
 }
 
 function Restore-Changes {
@@ -231,11 +288,6 @@ function ConvertTo-ResultJson {
         $rows += '{"id":"' + $row.id + '","status":"' + $row.status + '","reason":"' + $reason + '","measurements":{' + ($bits -join ',') + '}}'
     }
     return '[' + ($rows -join ',') + ']'
-}
-
-trap {
-    Restore-Suite
-    break
 }
 
 try {
@@ -349,7 +401,7 @@ try {
                 if ($null -ne $policy -and $policy.ValueCount -gt 0) { $blocked = $true }
                 if ($null -ne $policy) { $policy.Close() }
                 if ($blocked) {
-                    Add-Result $row.id 'skip' 'school IT controls this' @{}
+                    Add-Result $row.id 'skip' 'not-applicable' @{}
                 } else {
                     $sub = 'Software\Microsoft\Windows\CurrentVersion\PushNotifications'
                     Remember-Dword 'HKCU' $sub 'ToastEnabled'
@@ -361,14 +413,20 @@ try {
             'input-hook-injected' {
                 $probe = $native::HookJson() | ConvertFrom-Json
                 $ok = $probe.ok -and $probe.installed -and ($probe.injected_seen -ge 1)
-                Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{
-                    injected_seen = [int]$probe.injected_seen
+                $reason = ''
+                $extra = @{ injected_seen = [int]$probe.injected_seen }
+                if (-not $ok) {
+                    $reason = 'hook was not installed'
+                    $extra.stderr = Probe-Error $probe
                 }
+                Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) $reason $extra
             }
             'keep-awake-request' {
                 $probe = $native::KeepAwakeJson() | ConvertFrom-Json
                 Start-Sleep -Milliseconds 400
-                $requests = & powercfg.exe /requests 2>&1 | Out-String
+                $merged = @( & powercfg.exe /requests 2>&1 )
+                $stderr = (@($merged | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) | ForEach-Object { "$_" }) -join ' '
+                $requests = ($merged | ForEach-Object { "$_" }) -join "`n"
                 $requestFile = Join-Path $env:TEMP ("softlock-hw-requests-{0}.txt" -f $PID)
                 Write-Utf8 $requestFile $requests
                 $seenRaw = & $exe requests --text $requestFile --needle 'SoftLock hardware suite'
@@ -376,10 +434,16 @@ try {
                 $seen = $seenRaw | ConvertFrom-Json
                 Remove-Item -LiteralPath $requestFile -Force -ErrorAction SilentlyContinue
                 $ok = $probe.api -and $seen.system -and $seen.display
-                Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{
+                $reason = ''
+                $extra = @{
                     system = [bool]$seen.system
                     display = [bool]$seen.display
                 }
+                if (-not $ok) {
+                    $reason = 'keep-awake request was refused'
+                    $extra.stderr = ((Probe-Error $probe) + ' ' + $stderr).Trim()
+                }
+                Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) $reason $extra
             }
             'cad-hkcu-readback' {
                 $pairs = @(
@@ -406,21 +470,26 @@ try {
                     Restore-Changes
                     Add-Result $row.id $(if ($read -eq 1) { 'pass' } else { 'fail' }) '' @{ value = $read }
                 } catch {
-                    Add-Result $row.id 'skip' 'HKLM write was refused' @{}
+                    Add-Result $row.id 'fail' 'HKLM write was refused' @{ stderr = $_.Exception.Message }
                 }
             }
             'fail-closed-blocked' {
                 if ($row.action -eq 'skip') { continue }
+                $script:Armed = $true
                 $sub = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'
                 Remember-Dword 'HKCU' $sub 'DisableLockWorkstation'
                 Set-SuiteDword 'HKCU' $sub 'DisableLockWorkstation' 1 | Out-Null
                 $probe = $native::MeasureLockJson() | ConvertFrom-Json
                 Restore-Changes
-                if ($probe.locked) {
-                    $script:Armed = $true
-                    $script:SawLock = $true
-                    Add-Result $row.id 'fail' 'the session locked while the policy was set' @{ elapsed_ms = [int]$probe.elapsed_ms }
+                if ($probe.locked -or -not $probe.api) {
+                    $script:SawLock = [bool]$probe.locked
+                    $script:LeftLocked = $true
+                    Add-Result $row.id 'fail' 'the session was not held unlocked' @{
+                        elapsed_ms = [int]$probe.elapsed_ms
+                        stderr = Probe-Error $probe
+                    }
                 } else {
+                    $script:Armed = $false
                     Add-Result $row.id 'pass' '' @{ locked = $false }
                 }
             }
@@ -432,53 +501,104 @@ try {
             'display-hotplug' {
                 if ($row.action -eq 'skip') { continue }
                 $before = [int]($native::DetectJson() | ConvertFrom-Json).monitors
-                $skipped = $false
-                $ok = $true
+                $held = $null
+                $missed = $false
                 $prompts = @($row.prompts)
                 foreach ($prompt in $prompts) {
                     $answer = Read-Answer $prompt 25
-                    if ($answer -eq 'skip') { $skipped = $true; break }
+                    if ($answer -eq 'interrupt') { break }
+                    if ($answer -ne 'go') { $held = $answer; break }
                     $now = [int]($native::DetectJson() | ConvertFrom-Json).monitors
-                    if ($prompt.StartsWith('Plug') -and $now -le $before) { $ok = $false }
-                    if ($prompt.StartsWith('Unplug') -and $now -ge $before) { $ok = $false }
+                    $rose = $prompt.StartsWith('Plug') -and $now -gt $before
+                    $fell = $prompt.StartsWith('Unplug') -and $now -lt $before
+                    if (-not $rose -and -not $fell) { $missed = $true }
                     $before = $now
                 }
-                if ($skipped) { Add-Result $row.id 'skip' 'skipped' @{} }
-                else { Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{ displays = $before } }
+                if ($script:Interrupted) {
+                } elseif ($missed) {
+                    Add-Result $row.id 'fail' 'not detected' @{ displays = $before }
+                } elseif ($held -eq 'budget') {
+                    Add-Result $row.id 'skip' 'budget' @{}
+                } elseif ($held -eq 'operator') {
+                    Add-Result $row.id 'skip' 'operator' @{}
+                } elseif ($null -ne $held) {
+                    Add-Result $row.id 'skip' 'no-input' @{}
+                } else {
+                    Add-Result $row.id 'pass' '' @{ displays = $before }
+                }
             }
             'lid-cycle' {
                 if ($row.action -eq 'skip') { continue }
-                $before = $native::SnapshotJson() | ConvertFrom-Json
-                $mark = [DateTime]::UtcNow
-                $answer = Read-Answer @($row.prompts)[0] 25
-                if ($answer -eq 'skip') {
-                    Add-Result $row.id 'skip' 'skipped' @{}
+                $held = Enable-Inhibit
+                if (-not $held.api) {
+                    Disable-Inhibit
+                    Add-Result $row.id 'fail' 'inhibit failed' @{ stderr = Probe-Error $held }
                 } else {
+                    $before = $native::SnapshotJson() | ConvertFrom-Json
+                    $record = Latest-PowerRecord
+                    $answer = Read-Answer @($row.prompts)[0] 25
                     $after = $native::SnapshotJson() | ConvertFrom-Json
-                    $power = Power-Delta $mark
-                    $moved = ($after.lid_close -gt $before.lid_close) -or ($after.suspend -gt $before.suspend) -or ($after.display_off -gt $before.display_off) -or ($power.sleep -gt 0)
-                    Add-Result $row.id $(if ($moved) { 'pass' } else { 'fail' }) '' @{ seen = [bool]$moved }
+                    $power = Power-Since $record
+                    Disable-Inhibit
+                    $slept = ($power.sleep -gt 0) -or ($after.suspend -gt $before.suspend)
+                    $moved = ($after.lid_close -gt $before.lid_close) -and ($after.lid_open -gt $before.lid_open)
+                    if ($script:Interrupted) {
+                    } elseif ($slept) {
+                        Add-Result $row.id 'fail' 'sleep was not held off' @{ slept = $true }
+                    } elseif ($answer -eq 'budget') {
+                        Add-Result $row.id 'skip' 'budget' @{}
+                    } elseif ($answer -eq 'operator') {
+                        Add-Result $row.id 'skip' 'operator' @{}
+                    } elseif ($answer -ne 'go') {
+                        Add-Result $row.id 'skip' 'no-input' @{}
+                    } elseif ($moved) {
+                        Add-Result $row.id 'pass' '' @{ seen = $true }
+                    } else {
+                        Add-Result $row.id 'fail' 'not detected' @{ seen = $false }
+                    }
                 }
             }
             'power-key' {
                 if ($row.action -eq 'skip') { continue }
-                $before = $native::SnapshotJson() | ConvertFrom-Json
-                $mark = [DateTime]::UtcNow
-                $answer = Read-Answer @($row.prompts)[0] 25
-                if ($answer -eq 'skip') {
-                    Add-Result $row.id 'skip' 'skipped' @{}
+                $held = Enable-Inhibit
+                if (-not $held.api) {
+                    Disable-Inhibit
+                    Add-Result $row.id 'fail' 'inhibit failed' @{ stderr = Probe-Error $held }
                 } else {
+                    $before = $native::SnapshotJson() | ConvertFrom-Json
+                    $record = Latest-PowerRecord
+                    $answer = Read-Answer @($row.prompts)[0] 25
                     $after = $native::SnapshotJson() | ConvertFrom-Json
-                    $power = Power-Delta $mark
-                    $moved = ($after.suspend -gt $before.suspend) -or ($after.resume -gt $before.resume) -or ($power.sleep -gt 0) -or ($power.wake -gt 0)
-                    Add-Result $row.id $(if ($moved) { 'pass' } else { 'fail' }) '' @{ seen = [bool]$moved }
+                    $power = Power-Since $record
+                    Disable-Inhibit
+                    $slept = ($power.sleep -gt 0) -or ($after.suspend -gt $before.suspend)
+                    $tapped = ($after.query_suspend -gt $before.query_suspend)
+                    if ($script:Interrupted) {
+                    } elseif ($slept) {
+                        Add-Result $row.id 'fail' 'sleep was not held off' @{ slept = $true }
+                    } elseif ($answer -eq 'budget') {
+                        Add-Result $row.id 'skip' 'budget' @{}
+                    } elseif ($answer -eq 'operator') {
+                        Add-Result $row.id 'skip' 'operator' @{}
+                    } elseif ($answer -ne 'go') {
+                        Add-Result $row.id 'skip' 'no-input' @{}
+                    } elseif ($tapped) {
+                        Add-Result $row.id 'pass' '' @{ seen = $true }
+                    } else {
+                        Add-Result $row.id 'fail' 'not detected' @{ seen = $false }
+                    }
                 }
             }
             'session-lock' {
                 if ($row.action -eq 'skip') { continue }
                 $answer = Read-Answer @($row.prompts)[0] 20
-                if ($answer -eq 'skip') {
-                    Add-Result $row.id 'skip' 'skipped' @{}
+                if ($script:Interrupted) {
+                } elseif ($answer -eq 'budget') {
+                    Add-Result $row.id 'skip' 'budget' @{}
+                } elseif ($answer -eq 'operator') {
+                    Add-Result $row.id 'skip' 'operator' @{}
+                } elseif ($answer -ne 'go') {
+                    Add-Result $row.id 'skip' 'no-input' @{}
                 } else {
                     $script:Armed = $true
                     $probe = $native::MeasureLockJson() | ConvertFrom-Json
@@ -487,10 +607,17 @@ try {
                     if ($probe.locked) {
                         $unlocked = $native::WaitForUnlock(40000)
                     }
-                    $ok = $probe.locked -and $unlocked -and ($probe.elapsed_ms -lt 1000)
-                    Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{
-                        locked = [bool]$probe.locked
-                        elapsed_ms = [int]$probe.elapsed_ms
+                    $ok = $probe.api -and $probe.locked -and $unlocked -and ($probe.elapsed_ms -lt 1000)
+                    if ($ok) {
+                        $script:Armed = $false
+                        Add-Result $row.id 'pass' '' @{ locked = $true; elapsed_ms = [int]$probe.elapsed_ms }
+                    } else {
+                        $script:LeftLocked = $true
+                        Add-Result $row.id 'fail' 'not detected' @{
+                            locked = [bool]$probe.locked
+                            elapsed_ms = [int]$probe.elapsed_ms
+                            stderr = Probe-Error $probe
+                        }
                     }
                 }
             }
@@ -498,18 +625,38 @@ try {
         }
         } catch {
             if ($results.Count -eq $beforeCount) {
-                Add-Result $row.id 'fail' 'row failed' @{}
+                $message = ''
+                if ($null -ne $_.Exception) { $message = $_.Exception.Message }
+                Add-Result $row.id 'fail' 'setting failed' @{ stderr = $message }
             }
+            if ($row.blocks_input) { $script:LeftLocked = $true }
+        }
+        if ($script:Interrupted) { break }
+    }
+
+    if ($script:Interrupted) {
+        foreach ($row in @($plan.rows)) {
+            if ($row.action -eq 'record' -or $row.action -eq 'skip') { continue }
+            $have = $false
+            foreach ($got in $results) {
+                if ($got.id -eq $row.id) { $have = $true }
+            }
+            if (-not $have) { Add-Result $row.id 'skip' 'interrupted' @{} }
         }
     }
 
     $bundlePath = Join-Path $env:TEMP ("softlock-hw-bundle-{0}.json" -f $PID)
     $stamp = $started.ToString('yyyyMMdd-HHmmss')
     $outDir = Join-Path $root "suite-output\$stamp"
-    $bundle = '{"facts":' + $facts + ',"elapsed_ms":' + (Elapsed-Ms) + ',"rows":' + (ConvertTo-ResultJson) + '}'
+    $lockedBit = if ($script:LeftLocked) { 'true' } else { 'false' }
+    $interruptedBit = if ($script:Interrupted) { 'true' } else { 'false' }
+    $startedUtc = $started.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
+    $finishedUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
+    $bundle = '{"facts":' + $facts + ',"elapsed_ms":' + (Elapsed-Ms) + ',"rows":' + (ConvertTo-ResultJson) + ',"started_utc":"' + $startedUtc + '","finished_utc":"' + $finishedUtc + '","interrupted":' + $interruptedBit + ',"restored":true,"locked":' + $lockedBit + '}'
     Write-Utf8 $bundlePath $bundle
     & $exe report --bundle $bundlePath --out-dir $outDir
     $code = $LASTEXITCODE
+    if ($script:Interrupted) { $code = 130 }
     Remove-Item -LiteralPath $factsPath, $planPath, $bundlePath, $powerFile -Force -ErrorAction SilentlyContinue
     exit $code
 } finally {

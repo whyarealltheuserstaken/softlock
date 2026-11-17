@@ -9,8 +9,10 @@ pub const BUDGET_MS: u64 = 300_000;
 pub const PROMPT_PLUG: &str = "Plug in a monitor, then press Enter. Type skip to skip.";
 pub const PROMPT_UNPLUG: &str = "Unplug that monitor, then press Enter. Type skip to skip.";
 pub const PROMPT_REPLUG: &str = "Plug that monitor back in, then press Enter. Type skip to skip.";
-pub const PROMPT_LID: &str = "Close the lid, then open it, then press Enter. Type skip to skip.";
-pub const PROMPT_POWER: &str = "Tap the power button, wake, then press Enter. Type skip to skip.";
+pub const PROMPT_LID: &str =
+    "Close the lid, then open it. Sleep stays off. Then press Enter. Type skip to skip.";
+pub const PROMPT_POWER: &str =
+    "Tap the power button once. Sleep stays off. Then press Enter. Type skip to skip.";
 pub const PROMPT_LOCK: &str =
     "Press Enter to lock Windows, then sign in with PIN or password. Type skip to skip.";
 
@@ -46,7 +48,11 @@ pub struct Planned {
     pub id: &'static str,
     pub action: Action,
     pub reason: String,
+    pub detail: String,
     pub prompts: Vec<&'static str>,
+    pub physical: bool,
+    pub needs_admin: bool,
+    pub blocks_input: bool,
 }
 
 pub fn plan(machine: &Machine, flags: &Flags) -> Vec<Planned> {
@@ -67,7 +73,6 @@ pub fn plan(machine: &Machine, flags: &Flags) -> Vec<Planned> {
         power_key(machine, flags),
         session_lock(machine, flags),
         record("ci-probes-stayed-off"),
-        record("budget"),
     ]
 }
 
@@ -88,36 +93,59 @@ fn is_service_probe(id: &str) -> bool {
     id == "desktop-proof-service" || id == "input-hook-service"
 }
 
-fn run(id: &'static str) -> Planned {
+#[allow(clippy::too_many_arguments)]
+fn row(
+    id: &'static str,
+    action: Action,
+    reason: &str,
+    detail: &str,
+    prompts: Vec<&'static str>,
+    physical: bool,
+    needs_admin: bool,
+    blocks_input: bool,
+) -> Planned {
     Planned {
         id,
-        action: Action::Run,
-        reason: String::new(),
-        prompts: Vec::new(),
+        action,
+        reason: reason.to_string(),
+        detail: detail.to_string(),
+        prompts,
+        physical,
+        needs_admin,
+        blocks_input,
     }
+}
+
+fn run(id: &'static str) -> Planned {
+    row(id, Action::Run, "", "", Vec::new(), false, false, false)
 }
 
 fn record(id: &'static str) -> Planned {
-    Planned {
-        id,
-        action: Action::Record,
-        reason: String::new(),
-        prompts: Vec::new(),
-    }
+    row(id, Action::Record, "", "", Vec::new(), false, false, false)
 }
 
-fn skip(id: &'static str, reason: &str) -> Planned {
-    Planned {
+fn skip(
+    id: &'static str,
+    reason: &str,
+    detail: &str,
+    physical: bool,
+    needs_admin: bool,
+) -> Planned {
+    row(
         id,
-        action: Action::Skip,
-        reason: reason.to_string(),
-        prompts: Vec::new(),
-    }
+        Action::Skip,
+        reason,
+        detail,
+        Vec::new(),
+        physical,
+        needs_admin,
+        false,
+    )
 }
 
 fn overlay(id: &'static str, machine: &Machine) -> Planned {
     if machine.displays == 0 {
-        skip(id, "no display")
+        skip(id, "not-applicable", "no display", false, false)
     } else {
         run(id)
     }
@@ -125,7 +153,7 @@ fn overlay(id: &'static str, machine: &Machine) -> Planned {
 
 fn display_enum(machine: &Machine) -> Planned {
     if machine.displays == 0 {
-        skip("display-enum", "no display")
+        skip("display-enum", "not-applicable", "no display", false, false)
     } else {
         run("display-enum")
     }
@@ -133,25 +161,46 @@ fn display_enum(machine: &Machine) -> Planned {
 
 fn hklm(id: &'static str, flags: &Flags) -> Planned {
     if !flags.admin && !flags.ci {
-        return skip(id, "needs --admin");
+        return skip(id, "needs-admin", "needs --admin", false, true);
     }
     if !flags.elevated {
-        return skip(id, "needs an elevated prompt");
+        return skip(id, "needs-admin", "needs an elevated prompt", false, true);
     }
-    run(id)
+    row(id, Action::Run, "", "", Vec::new(), false, true, false)
 }
 
 fn fail_closed(flags: &Flags) -> Planned {
     if flags.ci {
-        return skip("fail-closed-blocked", "not run in --ci");
+        return skip("fail-closed-blocked", "ci", "not run in --ci", false, true);
     }
     if !flags.admin {
-        return skip("fail-closed-blocked", "needs --admin");
+        return skip(
+            "fail-closed-blocked",
+            "needs-admin",
+            "needs --admin",
+            false,
+            true,
+        );
     }
     if !flags.elevated {
-        return skip("fail-closed-blocked", "needs an elevated prompt");
+        return skip(
+            "fail-closed-blocked",
+            "needs-admin",
+            "needs an elevated prompt",
+            false,
+            true,
+        );
     }
-    run("fail-closed-blocked")
+    row(
+        "fail-closed-blocked",
+        Action::Run,
+        "",
+        "",
+        Vec::new(),
+        false,
+        true,
+        true,
+    )
 }
 
 fn physical(
@@ -161,22 +210,24 @@ fn physical(
     prompts: Vec<&'static str>,
 ) -> Planned {
     if flags.ci {
-        return skip(id, "physical step");
+        return skip(id, "ci", "physical step", true, false);
     }
     if machine.session == SessionKind::Remote {
-        return skip(id, "remote session");
+        return skip(id, "not-applicable", "remote session", true, false);
     }
-    Planned {
-        id,
-        action: Action::Prompt,
-        reason: String::new(),
-        prompts,
-    }
+    let blocks = id == "session-lock";
+    row(id, Action::Prompt, "", "", prompts, true, false, blocks)
 }
 
 fn hotplug(machine: &Machine, flags: &Flags) -> Planned {
     if machine.displays == 0 {
-        return skip("display-hotplug", "no display");
+        return skip(
+            "display-hotplug",
+            "not-applicable",
+            "no display",
+            true,
+            false,
+        );
     }
     let prompts = if machine.displays >= 2 {
         vec![PROMPT_UNPLUG, PROMPT_REPLUG]
@@ -188,35 +239,35 @@ fn hotplug(machine: &Machine, flags: &Flags) -> Planned {
 
 fn lid(machine: &Machine, flags: &Flags) -> Planned {
     if flags.ci {
-        return skip("lid-cycle", "physical step");
+        return skip("lid-cycle", "ci", "physical step", true, false);
     }
     if machine.session == SessionKind::Remote {
-        return skip("lid-cycle", "remote session");
+        return skip("lid-cycle", "not-applicable", "remote session", true, false);
     }
     if machine.lid == "absent" {
-        return skip("lid-cycle", "no lid");
-    }
-    if !machine.power.known {
-        return skip("lid-cycle", "could not read powercfg /a");
-    }
-    if !machine.power.any_sleep() {
-        return skip("lid-cycle", "no sleep state");
+        return skip("lid-cycle", "not-applicable", "no lid", true, false);
     }
     physical("lid-cycle", flags, machine, vec![PROMPT_LID])
 }
 
 fn power_key(machine: &Machine, flags: &Flags) -> Planned {
     if flags.ci {
-        return skip("power-key", "physical step");
+        return skip("power-key", "ci", "physical step", true, false);
     }
     if machine.session == SessionKind::Remote {
-        return skip("power-key", "remote session");
+        return skip("power-key", "not-applicable", "remote session", true, false);
     }
     if !machine.power.known {
-        return skip("power-key", "could not read powercfg /a");
+        return skip(
+            "power-key",
+            "not-applicable",
+            "could not read powercfg /a",
+            true,
+            false,
+        );
     }
     if !machine.power.any_sleep() {
-        return skip("power-key", "no sleep state");
+        return skip("power-key", "not-applicable", "no sleep state", true, false);
     }
     physical("power-key", flags, machine, vec![PROMPT_POWER])
 }
@@ -271,8 +322,13 @@ mod tests {
     fn the_school_profile_skips_hklm_and_keeps_physical_prompts() {
         let rows = plan(&machine(), &flags(false, false, false));
         assert_eq!(row(&rows, "cad-hklm-readback").action, Action::Skip);
-        assert_eq!(row(&rows, "cad-hklm-readback").reason, "needs --admin");
-        assert_eq!(row(&rows, "fail-closed-blocked").reason, "needs --admin");
+        assert_eq!(row(&rows, "cad-hklm-readback").reason, "needs-admin");
+        assert_eq!(row(&rows, "fail-closed-blocked").reason, "needs-admin");
+        assert!(
+            row(&rows, "fail-closed-blocked").blocks_input
+                || row(&rows, "session-lock").blocks_input
+        );
+        assert!(row(&rows, "session-lock").blocks_input);
         assert_eq!(row(&rows, "cad-hkcu-readback").action, Action::Run);
         assert_eq!(row(&rows, "display-hotplug").action, Action::Prompt);
         assert_eq!(
@@ -289,18 +345,12 @@ mod tests {
     #[test]
     fn ci_skips_physical_rows_and_runs_hklm_only_when_already_elevated() {
         let skipped = plan(&machine(), &flags(true, false, false));
-        assert_eq!(row(&skipped, "display-hotplug").reason, "physical step");
-        assert_eq!(row(&skipped, "lid-cycle").reason, "physical step");
-        assert_eq!(row(&skipped, "power-key").reason, "physical step");
-        assert_eq!(row(&skipped, "session-lock").reason, "physical step");
-        assert_eq!(
-            row(&skipped, "fail-closed-blocked").reason,
-            "not run in --ci"
-        );
-        assert_eq!(
-            row(&skipped, "cad-hklm-readback").reason,
-            "needs an elevated prompt"
-        );
+        assert_eq!(row(&skipped, "display-hotplug").reason, "ci");
+        assert_eq!(row(&skipped, "lid-cycle").reason, "ci");
+        assert_eq!(row(&skipped, "power-key").reason, "ci");
+        assert_eq!(row(&skipped, "session-lock").reason, "ci");
+        assert_eq!(row(&skipped, "fail-closed-blocked").reason, "ci");
+        assert_eq!(row(&skipped, "cad-hklm-readback").reason, "needs-admin");
         assert_eq!(row(&skipped, "overlay-topmost").action, Action::Run);
 
         let elevated = plan(&machine(), &flags(true, false, true));
@@ -311,17 +361,16 @@ mod tests {
     #[test]
     fn admin_without_elevation_does_not_prompt_for_uac() {
         let rows = plan(&machine(), &flags(false, true, false));
+        assert_eq!(row(&rows, "cad-hklm-readback").reason, "needs-admin");
         assert_eq!(
-            row(&rows, "cad-hklm-readback").reason,
+            row(&rows, "cad-hklm-readback").detail,
             "needs an elevated prompt"
         );
-        assert_eq!(
-            row(&rows, "fail-closed-blocked").reason,
-            "needs an elevated prompt"
-        );
+        assert_eq!(row(&rows, "fail-closed-blocked").reason, "needs-admin");
         let elevated = plan(&machine(), &flags(false, true, true));
         assert_eq!(row(&elevated, "cad-hklm-readback").action, Action::Run);
         assert_eq!(row(&elevated, "fail-closed-blocked").action, Action::Run);
+        assert!(row(&elevated, "fail-closed-blocked").blocks_input);
     }
 
     #[test]
@@ -334,8 +383,10 @@ mod tests {
         desktop.power.hibernate = false;
         desktop.displays = 2;
         let rows = plan(&desktop, &flags(false, false, false));
-        assert_eq!(row(&rows, "lid-cycle").reason, "no lid");
-        assert_eq!(row(&rows, "power-key").reason, "no sleep state");
+        assert_eq!(row(&rows, "lid-cycle").reason, "not-applicable");
+        assert_eq!(row(&rows, "lid-cycle").detail, "no lid");
+        assert_eq!(row(&rows, "power-key").reason, "not-applicable");
+        assert_eq!(row(&rows, "power-key").detail, "no sleep state");
         assert_eq!(
             row(&rows, "display-hotplug").prompts,
             vec![PROMPT_UNPLUG, PROMPT_REPLUG]
@@ -347,9 +398,10 @@ mod tests {
         let mut remote = machine();
         remote.session = SessionKind::Remote;
         let rows = plan(&remote, &flags(false, false, false));
-        assert_eq!(row(&rows, "display-hotplug").reason, "remote session");
-        assert_eq!(row(&rows, "lid-cycle").reason, "remote session");
-        assert_eq!(row(&rows, "session-lock").reason, "remote session");
+        assert_eq!(row(&rows, "display-hotplug").reason, "not-applicable");
+        assert_eq!(row(&rows, "lid-cycle").reason, "not-applicable");
+        assert_eq!(row(&rows, "session-lock").reason, "not-applicable");
+        assert_eq!(row(&rows, "display-hotplug").action, Action::Skip);
         assert_eq!(row(&rows, "keep-awake-request").action, Action::Run);
     }
 }

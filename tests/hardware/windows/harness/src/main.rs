@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use serde_json::Value;
-use softlock_win_hwsuite::{Flags, Report, plan_value, render, section_contains};
+use softlock_win_hwsuite::{Flags, Outcome, Report, conform, plan_value, render, section_contains};
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -16,8 +16,9 @@ fn main() -> ExitCode {
         "plan" => finish(plan_main(&rest)),
         "report" => finish(report_main(&rest)),
         "requests" => finish(requests_main(&rest)),
+        "conform" => finish(conform_main(&rest)),
         _ => {
-            eprintln!("usage: softlock-win-hwsuite plan|report|requests");
+            eprintln!("usage: softlock-win-hwsuite plan|report|requests|conform");
             ExitCode::from(2)
         }
     }
@@ -45,7 +46,11 @@ fn plan_main(args: &[String]) -> Result<ExitCode, String> {
             "id": row.id,
             "action": row.action.as_str(),
             "reason": row.reason,
+            "detail": row.detail,
             "prompts": row.prompts,
+            "physical": row.physical,
+            "needs_admin": row.needs_admin,
+            "blocks_input": row.blocks_input,
         })).collect::<Vec<_>>(),
     });
     println!("{body}");
@@ -71,13 +76,22 @@ fn report_main(args: &[String]) -> Result<ExitCode, String> {
         .cloned()
         .unwrap_or_default();
     let (machine, _) = plan_value(&facts, &flags)?;
-    let report = render(&machine, &flags, elapsed_ms, &supplied);
-    write_report(Path::new(out_dir), &report)?;
+    let outcome = Outcome {
+        started_utc: text_field(&bundle, "started_utc"),
+        finished_utc: text_field(&bundle, "finished_utc"),
+        interrupted: flag_or(&bundle, "interrupted", false),
+        restored: flag_or(&bundle, "restored", true),
+        locked: flag_or(&bundle, "locked", false),
+    };
+    let report = render(&machine, &flags, elapsed_ms, &supplied, &outcome);
+    let body = report.to_json();
+    conform(&body)?;
+    write_report(Path::new(out_dir), &report, &body)?;
     print!("{}", report.to_text());
-    if report.result == "pass" {
-        Ok(ExitCode::SUCCESS)
-    } else {
+    if report.outcome.interrupted || report.result != "pass" {
         Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
     }
 }
 
@@ -93,13 +107,34 @@ fn requests_main(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn write_report(dir: &Path, report: &Report) -> Result<(), String> {
+fn conform_main(args: &[String]) -> Result<ExitCode, String> {
+    let path = required(args, "--file")?;
+    let value = read_json(path)?;
+    conform(&value)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn write_report(dir: &Path, report: &Report, body: &serde_json::Value) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    let json =
-        serde_json::to_string_pretty(&report.to_json()).map_err(|error| error.to_string())?;
+    let json = serde_json::to_string_pretty(body).map_err(|error| error.to_string())?;
     fs::write(dir.join("result.json"), json + "\n").map_err(|error| error.to_string())?;
     fs::write(dir.join("result.txt"), report.to_text()).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn flag_or(value: &Value, name: &str, default: bool) -> bool {
+    match value.get(name) {
+        Some(Value::Bool(flag)) => *flag,
+        _ => default,
+    }
+}
+
+fn text_field(value: &Value, name: &str) -> String {
+    value
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn flags_from(facts: &Value) -> Result<Flags, String> {

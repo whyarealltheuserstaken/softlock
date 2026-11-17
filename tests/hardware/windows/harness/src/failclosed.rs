@@ -12,6 +12,16 @@ pub fn lock_blocked(saw_lock: bool, session_locked: Option<bool>) -> bool {
     !saw_lock && session_locked != Some(true)
 }
 
+/// A row that can swallow input is armed first. A failure while armed ends
+/// with the workstation locked. The suite never calls an unlock API.
+pub fn finish_state(armed: bool, failed: bool) -> &'static str {
+    if armed && failed {
+        "os-locked"
+    } else {
+        "never-unlocked"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28,5 +38,12 @@ mod tests {
         assert!(lock_blocked(false, None));
         assert!(!lock_blocked(true, Some(false)));
         assert!(!lock_blocked(false, Some(true)));
+    }
+
+    #[test]
+    fn a_forced_failure_while_armed_ends_locked() {
+        assert_eq!(finish_state(true, true), "os-locked");
+        assert_eq!(finish_state(false, true), "never-unlocked");
+        assert_eq!(finish_state(true, false), "never-unlocked");
     }
 }
