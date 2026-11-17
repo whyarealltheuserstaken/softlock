@@ -1073,10 +1073,10 @@ fn spawn_standard_user(
     );
     let mut command_w = wide_chars(&command);
     let env = plant_environment(mode, dir, bait, report, done);
-    let mut desktop = wide_chars(r"winsta0\default");
+    // A desktop name hangs the new logon session: it never reaches main,
+    // so the report file stays missing and the process is still active.
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        lpDesktop: PWSTR(desktop.as_mut_ptr()),
         ..STARTUPINFOW::default()
     };
     let mut info = PROCESS_INFORMATION::default();
