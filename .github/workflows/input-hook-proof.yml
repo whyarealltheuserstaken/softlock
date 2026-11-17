@@ -14,8 +14,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: input-hook-proof-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   proof:
@@ -34,6 +34,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          shared-key: input-hook-proof-${{ matrix.image }}
           workspaces: spikes/input-hook -> spikes/input-hook/target
       - name: Record the runner session
         shell: powershell
