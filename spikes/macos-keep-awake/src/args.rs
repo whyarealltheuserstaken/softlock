@@ -29,6 +29,7 @@ pub struct Args {
     pub mode: Mode,
     pub output_dir: PathBuf,
     pub sample_ms: u64,
+    pub down_ms: Option<u64>,
     pub interval_ms: u64,
     pub lid_on_power: Option<String>,
     pub lid_external: Option<String>,
@@ -50,6 +51,7 @@ where
     let mut role = None;
     let mut output_dir = PathBuf::from(DEFAULT_OUTPUT_DIR);
     let mut sample_ms = None;
+    let mut down_ms = None;
     let mut interval_ms = DEFAULT_INTERVAL_MS;
     let mut lid_on_power = None;
     let mut lid_external = None;
@@ -75,6 +77,12 @@ where
                 sample_ms = Some(parse_ms(
                     &tokens.next().ok_or("--sample-ms needs a value")?,
                     "--sample-ms",
+                )?);
+            }
+            "--down-ms" => {
+                down_ms = Some(parse_ms(
+                    &tokens.next().ok_or("--down-ms needs a value")?,
+                    "--down-ms",
                 )?);
             }
             "--interval-ms" => {
@@ -141,6 +149,7 @@ where
         mode,
         output_dir: absolute_dir(&output_dir),
         sample_ms,
+        down_ms,
         interval_ms,
         lid_on_power,
         lid_external,

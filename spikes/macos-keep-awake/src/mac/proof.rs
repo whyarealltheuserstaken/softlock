@@ -90,11 +90,12 @@ fn run_orchestrator(args: &Args) -> i32 {
     let mut interrupted = stop_requested();
     let mut no_input = false;
     let exe = current_exe().ok();
+    let down_ms = args.down_ms.unwrap_or(args.sample_ms);
     let down_child = if interrupted {
         None
     } else {
         exe.as_ref()
-            .and_then(|exe| start_child_timer(exe, args, "timer-down.json").ok())
+            .and_then(|exe| start_child_timer(exe, args, "timer-down.json", down_ms).ok())
     };
     let caffeinate = caffeinate_control(pid);
     interrupted = interrupted || stop_requested();
@@ -239,10 +240,11 @@ fn skipped_hardware(
 
 fn sample_timers(args: &Args, down_child: Option<Child>) -> Result<TimerReport, String> {
     let exe = current_exe()?;
+    let down_ms = args.down_ms.unwrap_or(args.sample_ms);
     let down = if let Some(child) = down_child {
-        finish_child_timer(child, args, "timer-down.json")?
+        finish_child_timer(child, args, "timer-down.json", down_ms)?
     } else {
-        run_child_timer(&exe, args, "timer-down.json")?
+        run_child_timer(&exe, args, "timer-down.json", down_ms)?
     };
     if stop_requested() {
         return Err("interrupted".to_string());
@@ -267,11 +269,7 @@ fn sample_timers(args: &Args, down_child: Option<Child>) -> Result<TimerReport, 
         .drift
         .clone()
         .unwrap_or_else(|| stats_from_gaps(up.ticks.unwrap_or(0), expected, &[], &[]));
-    let sample_for_nap = if args.mode == Mode::Kit {
-        args.sample_ms.max(APP_NAP_SAMPLE_MS)
-    } else {
-        args.sample_ms
-    };
+    let sample_for_nap = args.sample_ms;
     let verdict = nap_verdict(&stats, sample_for_nap);
     let app_nap_ran = args.mode == Mode::Kit && !stop_requested();
     Ok(TimerReport {
@@ -326,9 +324,14 @@ struct OverlayState {
     display_count: i32,
 }
 
-fn start_child_timer(exe: &Path, args: &Args, count_file: &str) -> Result<Child, String> {
+fn start_child_timer(
+    exe: &Path,
+    args: &Args,
+    count_file: &str,
+    sample_ms: u64,
+) -> Result<Child, String> {
     let out = args.output_dir.to_str().unwrap_or(".").to_string();
-    let sample = args.sample_ms.to_string();
+    let sample = sample_ms.to_string();
     let interval = args.interval_ms.to_string();
     spawn_role(
         exe,
@@ -351,6 +354,7 @@ fn finish_child_timer(
     mut child: Child,
     args: &Args,
     count_file: &str,
+    sample_ms: u64,
 ) -> Result<CountFile, String> {
     let status = wait_child(&mut child)?;
     if !status.success() {
@@ -358,13 +362,18 @@ fn finish_child_timer(
     }
     read_count(
         &args.output_dir.join(count_file),
-        expected_ticks(args.sample_ms, args.interval_ms),
+        expected_ticks(sample_ms, args.interval_ms),
     )
 }
 
-fn run_child_timer(exe: &Path, args: &Args, count_file: &str) -> Result<CountFile, String> {
-    let child = start_child_timer(exe, args, count_file)?;
-    finish_child_timer(child, args, count_file)
+fn run_child_timer(
+    exe: &Path,
+    args: &Args,
+    count_file: &str,
+    sample_ms: u64,
+) -> Result<CountFile, String> {
+    let child = start_child_timer(exe, args, count_file, sample_ms)?;
+    finish_child_timer(child, args, count_file, sample_ms)
 }
 
 struct OverlayChild {
@@ -612,7 +621,7 @@ fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareR
             parse: laptop_lid_row,
             allowed: &["slept", "awake", "skip"],
             held,
-            timeout: Duration::from_secs(90),
+            timeout: Duration::from_secs(25),
             kind: LidKind::OnPower,
         },
     );
@@ -634,7 +643,7 @@ fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareR
             parse: lid_external_row,
             allowed: &["slept", "awake", "no-external-display", "skip"],
             held: lid.assertion_held,
-            timeout: Duration::from_secs(90),
+            timeout: Duration::from_secs(25),
             kind: LidKind::External,
         },
     );
@@ -656,7 +665,7 @@ fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareR
             parse: power_key_row,
             allowed: &["slept", "restart-panel", "nothing", "skip"],
             held: external.assertion_held,
-            timeout: Duration::from_secs(20),
+            timeout: Duration::from_secs(12),
             kind: LidKind::PowerKey,
         },
     );

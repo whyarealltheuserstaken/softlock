@@ -39,6 +39,7 @@ impl Mode {
 pub struct Args {
     pub output_dir: PathBuf,
     pub mode: Mode,
+    pub auto_observe: bool,
 }
 
 pub fn parse_env() -> Result<Args, String> {
@@ -54,11 +55,13 @@ where
     let mut exercise = None;
     let mut acknowledged = false;
     let mut helper = None;
+    let mut auto_observe = false;
     let mut tokens = tokens.into_iter();
     while let Some(token) = tokens.next() {
         match token.as_str() {
             "--read-only" => read_only = true,
             "--i-will-unlock" => acknowledged = true,
+            "--auto-observe" => auto_observe = true,
             "--output-dir" => {
                 output_dir = PathBuf::from(tokens.next().ok_or("--output-dir needs a value")?);
             }
@@ -94,6 +97,9 @@ where
     if acknowledged && exercise.is_none() {
         return Err("--i-will-unlock is only valid with --exercise".to_string());
     }
+    if auto_observe && exercise.is_none() {
+        return Err("--auto-observe is only valid with --exercise".to_string());
+    }
     let mode = if let Some(action) = helper {
         Mode::Helper(action)
     } else if let Some(which) = exercise {
@@ -107,6 +113,7 @@ where
     Ok(Args {
         output_dir: absolute_dir(&output_dir),
         mode,
+        auto_observe,
     })
 }
 
@@ -160,6 +167,15 @@ mod tests {
         assert!(parse(tokens(&["--i-will-unlock"])).is_err());
         assert!(parse(tokens(&["--read-only", "--exercise", "private"])).is_err());
         assert!(parse(tokens(&["--exercise", "loginwindow"])).is_err());
+        assert!(parse(tokens(&["--auto-observe"])).is_err());
+        let auto = parse(tokens(&[
+            "--exercise",
+            "private",
+            "--i-will-unlock",
+            "--auto-observe",
+        ]))
+        .unwrap();
+        assert!(auto.auto_observe);
         assert!(parse(tokens(&["--helper"])).is_err());
         let helper = parse(tokens(&["--helper", "none"])).unwrap();
         assert_eq!(helper.mode, Mode::Helper(crate::helper::HelperAction::None));

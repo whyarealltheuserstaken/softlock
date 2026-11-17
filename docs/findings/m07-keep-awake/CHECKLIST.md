@@ -1,11 +1,11 @@
-# m07 kit checklist (Henry's Intel Mac)
+# m07 checklist
+
+Run the whole macOS v1 suite. One command, about 4 minutes after the first build:
 
 ```bash
-cargo run --locked --release --manifest-path spikes/macos-keep-awake/Cargo.toml -- --kit
+./tests/hardware/macos/run.sh
 ```
 
-Stay at the Mac. The first three lines say what will happen. The screen goes black for about 60 seconds; that is expected. Close the lid on power, then with a display if you have one, then tap Touch ID once. Enter skips a step. The kit measures App Nap, throttling, and sleep itself.
+The screen goes black for about 60 seconds. Then close the lid on power, plug a display and close the lid, and tap Touch ID. Enter skips a step. The Mac may lock; unlock with your password.
 
-Send `keep-awake-output/result.json` and `keep-awake-output/result.txt`. Do not send a serial number or a full `pmset` dump.
-
-The GitHub job is `--runner` only.
+Send `suite-output/<timestamp>/result.json` and `result.txt`.

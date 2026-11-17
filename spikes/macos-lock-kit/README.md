@@ -1,6 +1,14 @@
 # macOS lock kit
 
-Henry runs this on his Intel Mac, from Terminal.app. Close or save anything important first. The kit has no unlock command. His normal login password is what unlocks the Mac.
+Henry runs this from the hardware suite, not as separate exercises:
+
+```bash
+./tests/hardware/macos/run.sh
+```
+
+The suite runs the read-only check, then the private and documented lock exercises. Each exercise locks the Mac. Unlock with your password. The kit reads the session and does not ask three questions. It has no unlock command. A failure leaves the Mac locked.
+
+The read-only command does not lock the Mac. An exercise refuses to run on a GitHub runner and refuses to run as root.
 
 The default command is read-only. It does not lock the Mac, and it does not change FileVault or the screen lock setting. An exercise command does lock the Mac. It refuses to run on a GitHub runner and refuses to run as root. It does not use sudo.
 
@@ -34,13 +42,7 @@ Run every command below from that build, as yourself, not as root. Each step has
 
    The kit calls the symbol on a worker thread. If the call is still running after the wait, the result says `private-call=still-running` and the kit tries the next path. After the call returns, it polls the session for about two seconds. `ms-until-locked` is how long until the session reported locked. `private-call-returned-ms` is only how long the function took to return. If the session dictionary says it is not locked, the call counts as failed and the kit falls back when that is still safe. If the dictionary cannot be read, the result says `lock-check=unavailable`. That is not a failed call, and the kit still tries the next path.
 
-   After the lock, unlock with your normal login password first. Then answer the three questions in Terminal. The kit stays armed while it waits: the helper is still running, and `complete` is not written until the answers are in.
-
-   - Did the real lock screen appear? `yes` or `no`.
-   - Did a click or a key reach the desktop without the account password? `yes` or `no`.
-   - With the external display attached, did the lock cover both screens? `yes`, `no`, or `none` when no external display is attached. That answer is `external-display-covered`.
-
-   Ctrl-C at one of these questions locks the Mac again. The kit does not unlock it. The helper is already in its own session, so the question is abandoned and the helper locks.
+   The suite passes `--auto-observe`. Unlock with your password. The kit watches `CGSSessionScreenIsLocked` and does not ask whether the lock appeared or whether input reached the desktop. One display records `external-display-covered=none`. Two displays ask one line: yes, no, or skip. Ctrl-C leaves the Mac locked.
 
 4. The kit does not unlock anything. If you press Ctrl-C, close Terminal, or the parent is killed before a question, the helper still tries to leave the Mac locked. Unlock that lock with your normal login password.
 
@@ -52,7 +54,7 @@ Run every command below from that build, as yourself, not as root. Each step has
 
    If the setting is unknown, off, or the delay is not zero, the kit refuses to arm, leaves the session as it was, and records `state=never-unlocked`. The message in the result says how to turn the setting on. The kit does not change the setting for you.
 
-   While the screen saver is up, try one click and one key. `documented-started-ms` is how long the kit waited until the screen-saver process was running. Unlock with your normal login password first, then answer the same three questions as step 3 in Terminal, including whether the lock covered both screens. The kit stays armed while it waits. Ctrl-C at a question locks the Mac again.
+   Unlock with your password. The same session watch records the lock. If the setting cannot require an immediate password, the exercise is skipped and the session is left as it was. Ctrl-C leaves the Mac locked.
 
 6. If Ctrl-C locked the Mac again, unlock with your normal login password. The kit does not unlock it.
 
