@@ -179,6 +179,22 @@ fn stop_handler_covers_hangup_and_the_overlay_follows_its_parent() {
     assert!(proof.contains("SIGHUP"));
     assert!(proof.contains("parent_alive(parent)"));
     assert!(proof.contains("timer-pid="));
+    assert!(proof.contains("wait_for_app_nap_ready"));
+    assert!(proof.contains("APP_NAP_READY_PROMPT"));
+    let report =
+        fs::read_to_string(root.join("spikes/macos-keep-awake/src/report.rs")).expect("report");
+    assert!(report.contains("Press Return when Activity Monitor shows the App Nap column"));
+    let timer = proof
+        .split("fn run_timer")
+        .nth(1)
+        .expect("run_timer")
+        .split("fn run_overlay")
+        .next()
+        .expect("timer body");
+    assert!(
+        timer.contains("parent_alive(parent)"),
+        "timer child must exit when its parent dies"
+    );
 }
 
 #[test]

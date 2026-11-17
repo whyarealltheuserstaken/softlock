@@ -62,8 +62,7 @@ fn run_orchestrator(args: &Args) -> i32 {
     ] {
         let _ = fs::remove_file(args.output_dir.join(name));
     }
-    println!("{}", crate::report::instructions(kit));
-    let _ = io::stdout().flush();
+    crate::report::write_stdout(crate::report::instructions(kit));
 
     let version = read_version();
     let display_count = ffi::display_count();
@@ -134,8 +133,7 @@ fn run_orchestrator(args: &Args) -> i32 {
         probe_crash: None,
     };
     let text = render(&report);
-    println!("{text}");
-    let _ = io::stdout().flush();
+    crate::report::write_stdout(&text);
     let path = args.output_dir.join("m07.json");
     if let Err(error) = write_json(&path, &report) {
         eprintln!("{error}");
@@ -218,10 +216,12 @@ fn sample_timers(args: &Args) -> Result<TimerReport, String> {
     let mut app_nap_occlusion = None;
     let mut app_nap_ran = false;
     if args.mode == Mode::Kit && !stop_requested() {
-        println!(
-            "STEP hands-off App Nap: before this step, open Activity Monitor and add the App Nap column (View → Columns), then keep your hands off. --kit covers only the timer window for 300 s (the overlay-down/up pair is 60 s each). All three processes are named macos-keep-awake; find the timer by the printed timer-pid=. Control-C ends it any time."
+        crate::report::write_stdout(
+            "STEP hands-off App Nap: the 300 s sample covers only the timer window (the overlay-down/up pair is 60 s each). All three processes are named macos-keep-awake; find the timer by the printed timer-pid=. Keep your hands off after you press Return. Control-C ends it any time.",
         );
-        let _ = io::stdout().flush();
+        if let Err(error) = wait_for_app_nap_ready() {
+            return Err(error);
+        }
         let nap = run_app_nap_timer(&exe, args, "timer-app-nap.json", APP_NAP_SAMPLE_MS)?;
         app_nap_count = nap.0.ticks;
         app_nap_occlusion = nap.0.occlusion_visible;
@@ -387,8 +387,7 @@ fn run_app_nap_timer(
             count_file,
         ],
     )?;
-    println!("timer-pid={}", timer.id());
-    let _ = io::stdout().flush();
+    crate::report::write_stdout(&format!("timer-pid={}", timer.id()));
     let frame = match wait_for_frame(&frame_path) {
         Ok(frame) => frame,
         Err(error) => {
@@ -487,12 +486,13 @@ fn run_timer(args: &Args) -> i32 {
         eprintln!("{error}");
         return 1;
     }
+    let parent = unsafe { libc::getppid() };
     let started = Instant::now();
     let limit = Duration::from_millis(args.sample_ms);
     let step = Duration::from_millis(args.interval_ms.max(1));
     let mut ticks = 0_u64;
     let mut occlusion_visible = true;
-    while started.elapsed() < limit && !stop_requested() {
+    while started.elapsed() < limit && !stop_requested() && parent_alive(parent) {
         match ffi::TimerWindow::tick() {
             Ok((value, visible)) => {
                 ticks = value;
@@ -661,9 +661,8 @@ fn record_lid(
     held: bool,
 ) -> HardwareRow {
     for step in steps {
-        println!("{step}");
+        crate::report::write_stdout(step);
     }
-    let _ = io::stdout().flush();
     if stop_requested() {
         return hardware_row(
             "interrupted".to_string(),
@@ -734,9 +733,8 @@ fn record_choice(
     held: bool,
 ) -> HardwareRow {
     for step in steps {
-        println!("{step}");
+        crate::report::write_stdout(step);
     }
-    let _ = io::stdout().flush();
     if stop_requested() {
         return hardware_row(
             "interrupted".to_string(),
@@ -772,7 +770,7 @@ fn read_choice(allowed: &[&str]) -> String {
     if !stdin_is_terminal() {
         return "needs-terminal".to_string();
     }
-    print!("> ");
+    let _ = write!(io::stdout(), "> ");
     let _ = io::stdout().flush();
     let mut line = String::new();
     loop {
@@ -795,6 +793,30 @@ fn read_choice(allowed: &[&str]) -> String {
                 line.clear();
             }
             Err(_) => return "skip".to_string(),
+        }
+    }
+}
+
+fn wait_for_app_nap_ready() -> Result<(), String> {
+    crate::report::write_stdout(crate::report::APP_NAP_READY_PROMPT);
+    if stop_requested() {
+        return Err("interrupted".to_string());
+    }
+    let mut line = String::new();
+    loop {
+        if stop_requested() {
+            return Err("interrupted".to_string());
+        }
+        match io::stdin().lock().read_line(&mut line) {
+            Ok(0) => return Err("interrupted".to_string()),
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {
+                if stop_requested() {
+                    return Err("interrupted".to_string());
+                }
+                line.clear();
+            }
+            Err(_) => return Err("interrupted".to_string()),
         }
     }
 }

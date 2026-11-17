@@ -1,6 +1,21 @@
 //! Kit report. The log is rendered from this, and the exit code follows it.
 
+use std::io::{self, Write};
+
 use serde::{Deserialize, Serialize};
+
+pub const APP_NAP_READY_PROMPT: &str =
+    "Press Return when Activity Monitor shows the App Nap column";
+
+/// `println!` panics on EPIPE after Terminal closes. This does not.
+pub fn write_line(mut out: impl Write, line: &str) {
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+pub fn write_stdout(line: &str) {
+    write_line(io::stdout(), line);
+}
 
 #[cfg(test)]
 use crate::args::{APP_NAP_SAMPLE_MS, DEFAULT_INTERVAL_MS, REASON_PREFIX, RUNNER_SAMPLE_MS};
@@ -256,7 +271,7 @@ pub fn instructions(kit: bool) -> &'static str {
         "step=1 Stay at the Mac. This kit does not lock it and does not swallow the keyboard. Control-C ends it any time; Terminal still has keyboard focus behind the black screen.\n\
          step=2 It holds both IOPMAssertionCreateWithName idle-system and idle-display assertions through the lid and power-key steps (QA1340). They are released afterwards.\n\
          step=3 A timer process ticks for 60 s with the overlay down, then 60 s covering that window. The overlay is fully opaque, ignores the mouse, and does not become key. Escape ends it early only if Terminal has Accessibility permission; otherwise it closes by itself after about 60 s. Control-C ends it any time; Terminal still has keyboard focus behind the black screen.\n\
-         step=4 Before this step, open Activity Monitor and add the App Nap column (View → Columns), then keep your hands off. --kit covers only the timer window for 300 s. All three processes are named macos-keep-awake; find the timer by the printed timer-pid=. Control-C ends it any time.\n\
+         step=4 Press Return when Activity Monitor shows the App Nap column. The 300 s sample starts only after that, covering only the timer window. All three processes are named macos-keep-awake; find the timer by the printed timer-pid=. Then keep your hands off. Control-C ends it any time.\n\
          step=5 Lid closed on power, no external display if you can unplug it. Stay next to the machine. After about 20 seconds, open the lid. Type slept, awake, or skip. \"no lid\" is not a row on this laptop. Both assertions stay held.\n\
          step=6 If you use an external display, plug it in, wait until it shows the desktop, close the lid, wait, open the lid. Type slept, awake, no-external-display, or skip. Both assertions stay held.\n\
          step=7 On this 2020 MacBook Pro the power key is the Touch ID button. A tap may sleep the display or lock the screen: unlock with Touch ID or your password, then answer. Type slept, restart-panel, nothing, or skip. Both assertions are still held for this row (assertion-held=true). They are released after this step. Nothing is left armed. Paste the filtered JSON onto the sheet."
@@ -328,6 +343,12 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
     }
     if !report.timer.overlay_opaque {
         reasons.push("overlay-opaque is not true".to_string());
+    }
+    if report.mode == "kit"
+        && report.timer.app_nap_ran
+        && report.timer.app_nap_occlusion_visible != Some(false)
+    {
+        reasons.push("app-nap occlusion is not false".to_string());
     }
     if !report.timer.overlay_ordered_front {
         reasons.push("overlay did not order front over the timer window".to_string());
@@ -538,6 +559,10 @@ pub fn render(report: &KitReport) -> String {
             "app-nap-count={}\n",
             fmt_count(report.timer.app_nap_count)
         ));
+        out.push_str(&format!(
+            "app-nap-occlusion-visible={}\n",
+            fmt_flag(report.timer.app_nap_occlusion_visible)
+        ));
     }
     out.push_str(&format!(
         "lid-on-power={}\n",
@@ -741,6 +766,7 @@ mod tests {
         report.mode = "kit".to_string();
         report.timer.app_nap_ran = true;
         report.timer.app_nap_count = Some(400);
+        report.timer.app_nap_occlusion_visible = Some(false);
         report.timer.app_nap_ms = APP_NAP_SAMPLE_MS;
         report.lid_on_power = recorded("slept");
         report.lid_external = recorded("no-external-display");
@@ -907,6 +933,8 @@ mod tests {
         assert!(incomplete_reasons(&ok).is_empty());
         assert!(render(&ok).contains("result=pass"));
         assert!(render(&ok).contains("app-nap-count=400"));
+        assert!(render(&ok).contains("app-nap-occlusion-visible=false"));
+        assert!(instructions(true).contains(APP_NAP_READY_PROMPT));
         assert!(!render(&ok).contains("app-nap=not-run-on-runner"));
 
         let mut no_nap = passing_kit_fixture();
@@ -958,6 +986,47 @@ mod tests {
                 .any(|reason| reason.contains("power-key"))
         );
         assert!(exit_nonzero(&power));
+    }
+
+    #[test]
+    fn app_nap_occlusion_must_be_false() {
+        let mut visible = passing_kit_fixture();
+        visible.timer.app_nap_occlusion_visible = Some(true);
+        assert!(
+            failure_reasons(&visible)
+                .iter()
+                .any(|reason| reason.contains("app-nap occlusion"))
+        );
+        assert!(render(&visible).contains("result=fail"));
+
+        let mut missing = passing_kit_fixture();
+        missing.timer.app_nap_occlusion_visible = None;
+        assert!(
+            failure_reasons(&missing)
+                .iter()
+                .any(|reason| reason.contains("app-nap occlusion"))
+        );
+
+        let runner = passing_runner_fixture();
+        assert!(
+            !failure_reasons(&runner)
+                .iter()
+                .any(|reason| reason.contains("app-nap occlusion"))
+        );
+    }
+
+    #[test]
+    fn a_closed_stdout_does_not_panic() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "epipe"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "epipe"))
+            }
+        }
+        write_line(Closed, "report after Terminal closed");
     }
 
     #[test]
