@@ -1106,7 +1106,9 @@ fn remember_sddl(text: &str) {
 }
 
 fn armed_descriptor() -> Option<PSECURITY_DESCRIPTOR> {
-    let sddl: Vec<u16> = "D:P(A;;FA;;;SY)"
+    // O:SY is explicit. LocalSystem's default owner is Administrators, and a
+    // non-SYSTEM caller cannot create an object with this owner.
+    let sddl: Vec<u16> = "O:SYD:P(A;;FA;;;SY)"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -1178,11 +1180,13 @@ mod sddl_tests {
         assert!(sddl_is_system_only("O:SYD:P(A;;0x1F0003;;;SY)"));
         assert!(sddl_is_system_only("O:SYD:P(A;;0x1f0003;;;SY)"));
         assert!(sddl_is_system_only("O:SYG:SYD:P(A;;0x1F01FF;;;SY)"));
+        assert!(sddl_is_system_only("O:SYD:P(A;;0x1f0003;;;SY)"));
     }
 
     #[test]
     fn a_second_ace_or_another_owner_is_rejected() {
         assert!(!sddl_is_system_only("O:BAD:P(A;;FA;;;SY)"));
+        assert!(!sddl_is_system_only("O:BAD:P(A;;0x1f0003;;;SY)"));
         assert!(!sddl_is_system_only("O:SYD:P(A;;FA;;;SY)(A;;FA;;;WD)"));
         assert!(!sddl_is_system_only("O:SYD:(A;;FA;;;SY)"));
         assert!(!sddl_is_system_only("O:SYD:P(A;;0x1;;;SY)"));
