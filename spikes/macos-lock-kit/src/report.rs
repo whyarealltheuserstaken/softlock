@@ -2,9 +2,9 @@
 
 use serde::Serialize;
 use softlock_macos::{
-    CommandText, LockArm, choose, console_filevault, disk_label, interpret_isactive,
-    interpret_status, parse_defaults_value, password_after_screensaver, preference_label,
-    refuse_to_arm_message,
+    CommandText, LockArm, LockSetting, choose, combine_lock_setting, console_filevault, disk_label,
+    interpret_isactive, interpret_screen_lock_status, interpret_status, parse_defaults_value,
+    password_after_screensaver, preference_label, refuse_to_arm_message,
 };
 
 use crate::redact::{contains_marker, leaks_personal, model_identifier, numeric_uid, sanitize};
@@ -23,6 +23,7 @@ pub struct Facts {
     pub ask_user: String,
     pub delay_host: String,
     pub delay_user: String,
+    pub screen_lock: CommandText,
     pub status: CommandText,
     pub isactive: CommandText,
     pub symbol_present: bool,
@@ -40,7 +41,9 @@ pub struct ExerciseRecord {
     pub private_call_returned_ms: Option<u64>,
     pub documented_path: String,
     pub documented_started_ms: Option<u64>,
+    pub ms_until_locked: Option<u64>,
     pub lock_screen_appeared: String,
+    pub external_display_covered: String,
     pub input_reached_desktop_without_password: String,
     pub state: String,
     pub result: String,
@@ -56,7 +59,9 @@ impl ExerciseRecord {
             private_call_returned_ms: None,
             documented_path: "not-started".to_string(),
             documented_started_ms: None,
+            ms_until_locked: None,
             lock_screen_appeared: "not-asked".to_string(),
+            external_display_covered: "not-asked".to_string(),
             input_reached_desktop_without_password: "not-asked".to_string(),
             state: "never-unlocked".to_string(),
             result: "recorded-miss".to_string(),
@@ -83,6 +88,9 @@ pub struct KitReport {
     pub immediate_password: bool,
     pub ask_for_password: String,
     pub ask_for_password_delay: String,
+    pub screen_lock_status: String,
+    pub screen_lock_detail: String,
+    pub screen_lock_disagreement: bool,
     pub arm: String,
     pub chooser_if_symbol_missing: String,
     pub chooser_if_call_failed: String,
@@ -107,7 +115,9 @@ pub struct KitReport {
     pub build_version: String,
     pub uname_m: String,
     pub hw_model: String,
+    pub ms_until_locked: Option<u64>,
     pub lock_screen_appeared: String,
+    pub external_display_covered: String,
     pub input_reached_desktop_without_password: String,
     pub fail_closed: String,
     pub missing_symbol_ci_test: String,
@@ -122,7 +132,9 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
         parse_defaults_value(&facts.delay_host),
         parse_defaults_value(&facts.delay_user),
     );
-    let immediate = ask.can_require_immediate_password();
+    let screen = interpret_screen_lock_status(&facts.screen_lock.stdout, &facts.screen_lock.stderr);
+    let setting = combine_lock_setting(ask, screen);
+    let immediate = setting.setting == LockSetting::Immediate;
     let symbol = facts.symbol_present;
     let status = interpret_status(&facts.status);
     let isactive = interpret_isactive(&facts.isactive);
@@ -147,6 +159,8 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
         fail_closed,
         detail,
         arm,
+        until_locked,
+        external_display,
     ) = match exercise {
         None => (
             "read-only".to_string(),
@@ -161,6 +175,8 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
             "not-needed".to_string(),
             String::new(),
             "not-applied".to_string(),
+            None,
+            "not-asked".to_string(),
         ),
         Some(record) => (
             format!("exercise-{}", record.which),
@@ -175,6 +191,8 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
             record.fail_closed.clone(),
             sanitize(&record.detail),
             exercise_arm(record, symbol, immediate),
+            record.ms_until_locked,
+            record.external_display_covered.clone(),
         ),
     };
     KitReport {
@@ -196,6 +214,9 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
         immediate_password: immediate,
         ask_for_password: preference_label(ask.ask),
         ask_for_password_delay: preference_label(ask.delay_seconds),
+        screen_lock_status: screen.as_str().to_string(),
+        screen_lock_detail: command_body(&facts.screen_lock),
+        screen_lock_disagreement: setting.disagreement,
         arm,
         chooser_if_symbol_missing: choose(false, false, immediate).as_str().to_string(),
         chooser_if_call_failed: choose(symbol, false, immediate).as_str().to_string(),
@@ -220,7 +241,9 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
         build_version: version.2,
         uname_m: sanitize(facts.uname_m.trim()),
         hw_model: model_identifier(&facts.hw_model),
+        ms_until_locked: until_locked,
         lock_screen_appeared: appeared,
+        external_display_covered: external_display,
         input_reached_desktop_without_password: input,
         fail_closed,
         missing_symbol_ci_test: MISSING_SYMBOL_CI_TEST.to_string(),
@@ -320,6 +343,13 @@ pub fn render(report: &KitReport) -> String {
         "ask-for-password-delay",
         &report.ask_for_password_delay,
     );
+    push(&mut lines, "screen-lock-status", &report.screen_lock_status);
+    push(&mut lines, "screen-lock-detail", &report.screen_lock_detail);
+    push_bool(
+        &mut lines,
+        "screen-lock-disagreement",
+        report.screen_lock_disagreement,
+    );
     push(&mut lines, "arm", &report.arm);
     push(
         &mut lines,
@@ -378,10 +408,16 @@ pub fn render(report: &KitReport) -> String {
     push(&mut lines, "build-version", &report.build_version);
     push(&mut lines, "uname-m", &report.uname_m);
     push(&mut lines, "hw-model", &report.hw_model);
+    push_opt(&mut lines, "ms-until-locked", report.ms_until_locked);
     push(
         &mut lines,
         "lock-screen-appeared",
         &report.lock_screen_appeared,
+    );
+    push(
+        &mut lines,
+        "external-display-covered",
+        &report.external_display_covered,
     );
     push(
         &mut lines,
@@ -415,6 +451,8 @@ fn serial_in_facts(facts: &Facts) -> bool {
         facts.ask_user.as_str(),
         facts.delay_host.as_str(),
         facts.delay_user.as_str(),
+        facts.screen_lock.stdout.as_str(),
+        facts.screen_lock.stderr.as_str(),
         facts.status.stdout.as_str(),
         facts.status.stderr.as_str(),
         facts.isactive.stdout.as_str(),
@@ -492,6 +530,7 @@ mod tests {
             ask_user: "1\n".to_string(),
             delay_host: "0\n".to_string(),
             delay_user: "0\n".to_string(),
+            screen_lock: CommandText::new(0, "screenLock delay is immediate\n", ""),
             status: CommandText::new(0, "FileVault is On.\n", ""),
             isactive: CommandText::new(0, "true\n", ""),
             symbol_present: true,
@@ -524,6 +563,10 @@ mod tests {
         assert!(text.contains("filevault-pre-boot-observed=false\n"));
         assert!(text.contains("filevault=on\n"));
         assert!(text.contains("immediate-password=true\n"));
+        assert!(text.contains("screen-lock-status=immediate\n"));
+        assert!(text.contains("screen-lock-disagreement=false\n"));
+        assert!(text.contains("external-display-covered=not-asked\n"));
+        assert!(!text.contains("ms-until-locked="));
         assert!(text.contains("chooser-if-symbol-missing=documented\n"));
         assert!(text.contains("chooser-if-call-failed=documented\n"));
         assert!(text.contains("chooser-if-call-succeeded=private\n"));
@@ -539,6 +582,8 @@ mod tests {
     fn password_off_refuses_and_a_serial_fails_closed_without_printing_it() {
         let mut facts = sample();
         facts.ask_host = "0\n".to_string();
+        facts.ask_user = "0\n".to_string();
+        facts.screen_lock = CommandText::new(0, "screenLock delay is off\n", "");
         facts.symbol_present = false;
         facts.status = CommandText::new(1, "", "You need to be root to run this tool.\n");
         facts.isactive = CommandText::new(1, "", "permission denied\n");
@@ -600,7 +645,9 @@ mod tests {
             private_call_returned_ms: None,
             documented_path: "not-started".to_string(),
             documented_started_ms: None,
+            ms_until_locked: None,
             lock_screen_appeared: "not-asked".to_string(),
+            external_display_covered: "not-asked".to_string(),
             input_reached_desktop_without_password: "not-asked".to_string(),
             state: "unlocked".to_string(),
             result: "pass".to_string(),

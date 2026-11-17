@@ -41,6 +41,7 @@ pub fn read_only_argv_allowed(program: &str, args: &[&str]) -> bool {
             )
             | ("/usr/bin/fdesetup", ["status"])
             | ("/usr/bin/fdesetup", ["isactive"])
+            | ("/usr/sbin/sysadminctl", ["-screenLock", "status"])
     ) || otool_dash_l(program, args)
 }
 
@@ -80,6 +81,10 @@ mod tests {
             "/usr/bin/otool",
             &["-L", "/tmp/macos-lock-kit"]
         ));
+        assert!(read_only_argv_allowed(
+            "/usr/sbin/sysadminctl",
+            &["-screenLock", "status"]
+        ));
     }
 
     #[test]
@@ -102,6 +107,15 @@ mod tests {
         ));
         assert!(!read_only_argv_allowed("/usr/sbin/sysctl", &["-a"]));
         assert!(!read_only_argv_allowed("/bin/sh", &["-c", "true"]));
+        assert!(!read_only_argv_allowed(
+            "/usr/sbin/sysadminctl",
+            &["-screenLock", "immediate"]
+        ));
+        assert!(!read_only_argv_allowed(
+            "/usr/sbin/sysadminctl",
+            &["-screenLock", "off"]
+        ));
+        assert!(!read_only_argv_allowed("/usr/bin/sudo", &["-n", "true"]));
         assert!(!engine_path_allowed("/usr/bin/fdesetup"));
         assert!(engine_path_allowed(SCREEN_SAVER_ENGINE_CANDIDATES[0]));
         assert!(!observation_argv_allowed(

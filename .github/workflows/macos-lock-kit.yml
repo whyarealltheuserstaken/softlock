@@ -64,9 +64,9 @@ jobs:
           grep -E "private-symbol=(present|missing)" lock-kit-output/stdout.txt
           grep -E "^fdesetup-status=" lock-kit-output/stdout.txt
           grep -E "^fdesetup-isactive=" lock-kit-output/stdout.txt
-          grep -E "chooser-if-symbol-missing=(documented|refuse)" lock-kit-output/stdout.txt
-          grep -E "chooser-if-call-failed=(documented|refuse)" lock-kit-output/stdout.txt
-          grep -E "chooser-if-call-succeeded=(private|refuse)" lock-kit-output/stdout.txt
+          grep -E "^screen-lock-status=(immediate|off|delayed|unavailable)$" lock-kit-output/stdout.txt
+          grep -E "^screen-lock-disagreement=(true|false)$" lock-kit-output/stdout.txt
+          grep -F "external-display-covered=not-asked" lock-kit-output/stdout.txt
           if grep -E "private-call=(returned|failed|still-running)" lock-kit-output/stdout.txt; then
             echo "read-only run invoked the private call"
             exit 1
@@ -95,6 +95,20 @@ jobs:
           assert report["filevault-pre-boot-observed"] is False
           assert report["uname-m"] == "arm64"
           assert report["result"] == "pass"
+          assert report["external-display-covered"] == "not-asked"
+          assert report["ms-until-locked"] is None
+          assert report["screen-lock-status"] in {"immediate", "off", "delayed", "unavailable"}
+          symbol = report["private-symbol"] == "present"
+          immediate = report["immediate-password"] is True
+          def choose(symbol_present, call_succeeded, immediate_password):
+              if call_succeeded:
+                  return "private" if symbol_present else "refuse"
+              return "documented" if immediate_password else "refuse"
+          assert report["chooser-if-symbol-missing"] == choose(False, False, immediate)
+          assert report["chooser-if-call-failed"] == choose(symbol, False, immediate)
+          assert report["chooser-if-call-succeeded"] == choose(symbol, True, immediate)
+          if report["screen-lock-disagreement"]:
+              assert report["immediate-password"] is False
           text = Path("lock-kit-output/stdout.txt").read_text()
           body = text + Path("lock-kit-output/result.json").read_text()
           for banned in (

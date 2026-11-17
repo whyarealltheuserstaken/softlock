@@ -15,7 +15,7 @@ These tests run under `cargo test --workspace` on `ubuntu-latest`, `windows-late
 | Call succeeded | `a_successful_private_call_does_not_request_the_documented_path` | Documented path is not requested |
 | Documented path unavailable, or password not required | `documented_path_unavailable_or_password_not_required_refuses_to_arm` | Refuse to arm. Not Unlocked. The message tells the owner to turn on "Require password after screen saver begins or display is turned off" and set the delay to zero |
 
-`fail_closed_after_error` is the exercise rule for a later error: lock by the private call if that call has not already failed, otherwise the documented path if it can require an immediate password, otherwise `never-unlocked`. None of those ends are Unlocked. `permit` refuses an exercise on a GitHub runner and refuses every mode as root. A read-only run stays allowed on the runner.
+`fail_closed_after_error` is the exercise rule for a later error: lock by the private call if that call has not already failed, otherwise the documented path if it can require an immediate password, otherwise `never-unlocked`. None of those ends are Unlocked. `permit` in `spikes/macos-lock-kit/src/kit_gate.rs` refuses an exercise on a GitHub runner and refuses every mode as root. A read-only run stays allowed on the runner. The product crate keeps `choose`, `fail_closed_after_error`, and the parsers. It does not keep the kit's run gate.
 
 The product crate does not spawn `fdesetup` and does not call `dlopen`. Parsing the status text is separate from running the tool. A non-zero exit, a permission error, or On and Off disagreeing becomes Unknown, not Off.
 
@@ -25,54 +25,7 @@ The job is the `macOS lock kit` workflow. It prints `mode=read-only`, `private-c
 
 That FileVault reading is the runner's disk, as the console user. It is not Henry's Mac. The job does not reboot, so a FileVault pre-boot screen was not observed. `uname -m` has to be `arm64`. A missing symbol on that OS is recorded and is not a crash. Forcing the symbol to be missing is not part of the job. The first chooser row is the proof of that branch.
 
-The lines below are the read-only job on `ba6fbab` ([run 43981784644](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43981784644)). The symbol was present, so the missing-symbol row is the CI test, not this runner. FileVault on this disk is off. `fdesetup isactive` printed `false` and exited 1; that exit is not itself a successful Off reading. `fdesetup status` exited 0 with `FileVault is Off.`, and the combined label is `filevault=off`. The screen-saver delay key was missing, so the chooser refuses to arm. The Actions log masked two lines whose keys contain `password=`. The delay line and the refuse rows are the measurement of that setting. No pre-boot screen was observed. The result has no account name, home directory, serial, or other device.
-
-```text
-ProductName:		macOS
-ProductVersion:		26.7.2
-BuildVersion:		25G332
-arm64
-uid=501
-mode=read-only
-result=pass
-state=never-unlocked
-private-symbol=present
-private-symbol-detail=resolved
-private-call=not-called
-documented-path=not-started
-documented-engine=/System/Library/CoreServices/ScreenSaverEngine.app/Contents/MacOS/ScreenSaverEngine
-screen-saver-engine-present=true
-immediate-password=(Actions masked this line)
-ask-for-password=(Actions masked this line)
-ask-for-password-delay=missing
-arm=not-applied
-chooser-if-symbol-missing=refuse
-chooser-if-call-failed=refuse
-chooser-if-call-succeeded=private
-fdesetup-status=FileVault is Off.
-fdesetup-status-exit=0
-fdesetup-isactive=false
-fdesetup-isactive-exit=1
-filevault=off
-filevault-pre-boot-observed=false
-settings-changed=false
-filevault-changed=false
-serial-collected=false
-linked-login-framework=false
-otool-checked=true
-uid=501
-uid-is-root=false
-runner-lock-allowed=false
-product-name=macOS
-product-version=26.7.2
-build-version=25G332
-uname-m=arm64
-hw-model=VirtualMac2,1
-lock-screen-appeared=not-asked
-input-reached-desktop-without-password=not-asked
-fail-closed=not-needed
-missing-symbol-ci-test=symbol_missing_requests_the_documented_path
-```
+The lines from the read-only job on this head are filled in after that job finishes. Until that block replaces this sentence, there is no measurement for this commit.
 
 ## What only hardware proves
 
@@ -80,9 +33,10 @@ Henry's Intel Mac is the only proof of the rest. The machine is the one in [Henr
 
 Only that Mac can show:
 
-- The private call reached the real lock screen, and how long that took to appear. `private-call-returned-ms` is how long the function took to return. It is not that observation.
+- The private call reached the real lock screen. `ms-until-locked` is how long until the session reported locked. `private-call-returned-ms` is only how long the function took to return.
 - The documented path reached a lock screen, and whether one click or one key reached the desktop without the account password.
-- His password-after-screensaver setting and the delay.
+- Whether the lock covered both screens when an external display was attached. The kit records that answer as `external-display-covered`.
+- His password-after-screensaver keys and `sysadminctl -screenLock status`. A disagreement, or both readings missing, refuses to arm. The kit does not write the setting and does not use sudo.
 - `fdesetup status` and `fdesetup isactive` as his console user.
 - Whether a FileVault-on pre-boot screen appeared. The T2 chip means that screen is the Secure Enclave path. If FileVault is off, it stays unproven. The kit does not reboot and does not change FileVault.
 
@@ -94,7 +48,8 @@ Instructions: [spikes/macos-lock-kit/README.md](../../spikes/macos-lock-kit/READ
 |---|---|
 | Private call: lock screen and time, or the error, including a missing symbol | Unproven. Henry's Mac. |
 | Documented path: lock screen, time, and whether a click or a key reached the desktop without the account password | Unproven. Henry's Mac. |
-| Password-after-screensaver setting and delay | Unproven. Henry's Mac. The kit reads the keys and does not write them. |
+| Password-after-screensaver setting and delay | Unproven. Henry's Mac. The kit reads the defaults keys and `sysadminctl -screenLock status`. It does not write them. |
+| External display covered by the lock | Unproven. Henry's Mac. `external-display-covered` is `yes`, `no`, or `none`. |
 | Missing symbol cannot be forced | If his OS has the symbol, say so. The CI row is `symbol_missing_requests_the_documented_path`. |
 | `fdesetup status` and `fdesetup isactive` as the console user | Unproven. Henry's Mac. Paste the kit's lines, or the permission error. |
 | FileVault pre-boot | Not observed. Unproven until he reboots a FileVault-on disk. The kit writes `filevault-pre-boot-observed=false`. |

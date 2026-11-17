@@ -6,14 +6,23 @@
 mod args;
 mod commands;
 mod helper;
+mod kit_gate;
+mod lock_attempt;
 mod redact;
 mod report;
 mod text;
+
+#[cfg(unix)]
+mod signals;
 
 #[cfg(target_os = "macos")]
 mod mac;
 
 fn main() {
+    #[cfg(unix)]
+    if let Some(code) = signals::simulate_from_env() {
+        std::process::exit(code);
+    }
     std::process::exit(dispatch());
 }
 

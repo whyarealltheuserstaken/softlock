@@ -5,27 +5,24 @@
 //!
 //! The lock-path chooser, the FileVault text parser, and the screen-saver
 //! password check are pure. They do not call `SACLockScreenImmediate`, start
-//! the screen saver, or change FileVault.
+//! the screen saver, or change FileVault. The kit's run gate lives in the
+//! spike, not in this crate.
 
 mod filevault;
-mod kit_gate;
 mod lock_choice;
 mod screensaver;
 
 pub use filevault::{
     CommandText, FileVaultRead, console_filevault, disk_label, interpret_isactive, interpret_status,
 };
-pub use kit_gate::{
-    ACK_REFUSAL, HELPER_REFUSAL, KitInvocation, KitPermission, ROOT_REFUSAL, RUNNER_LOCK_REFUSAL,
-    may_lock, permit,
-};
 pub use lock_choice::{
     FailClosedEnd, LOGIN_FRAMEWORK_IMAGE, LockArm, PRIVATE_LOCK_SYMBOL,
     SCREEN_SAVER_ENGINE_CANDIDATES, choose, fail_closed_after_error, refuse_to_arm_message,
 };
 pub use screensaver::{
-    PasswordAfterScreensaver, parse_defaults_value, password_after_screensaver, preference_label,
-    resolve_preference,
+    LockSetting, LockSettingReport, PasswordAfterScreensaver, ScreenLockRead, combine_lock_setting,
+    interpret_screen_lock_status, parse_defaults_value, password_after_screensaver,
+    preference_label, resolve_preference,
 };
 pub use softlock_core::CapabilityReport;
 pub use softlock_core::UnsupportedPlatform as MacosBackend;
