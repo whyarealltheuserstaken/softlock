@@ -679,9 +679,12 @@ fn impostor_case_system(case: &str, expect: &str, spawn_user_copy: bool) {
         "the host never judged the impostor"
     );
     if case == "reuse" {
+        // One second for a late reopen to rewrite the witness. The host
+        // rewrites on every poll, and std::fs::write truncates first, so a
+        // single read can observe an empty file. Empty is not a verdict.
         thread::sleep(Duration::from_secs(1));
     }
-    let decision = fs::read_to_string(&witness).unwrap_or_default();
+    let decision = non_empty_witness(&witness);
     assert_eq!(decision, expect, "impostor case {case} released the guard");
     thread::sleep(Duration::from_secs(1));
     assert!(
@@ -1374,6 +1377,19 @@ fn physical_is_blocked(probe: &Probe, extra: u64) -> bool {
         .filter(|input| input.virtual_key == VK_F14)
         .count();
     after == before
+}
+
+/// First non-empty snapshot. A rewrite can truncate the file for an instant.
+/// An empty result after the deadline is still a failure for the caller.
+fn non_empty_witness(path: &std::path::Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        if !text.is_empty() || Instant::now() >= deadline {
+            return text;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn wait_for(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {

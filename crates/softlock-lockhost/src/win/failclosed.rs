@@ -632,6 +632,7 @@ fn judge_impostor_pid(spawn_other_path: bool) -> bool {
     let mut creator: Option<HANDLE> = None;
     let pid = if spawn_other_path {
         let Some((process, pid)) = other_path_process() else {
+            drop_path_dir();
             note_impostor("reason=setup");
             return false;
         };
@@ -653,6 +654,7 @@ fn judge_impostor_pid(spawn_other_path: bool) -> bool {
     let decision = trust_new_process(pid, nonce, false);
     if let Some(process) = creator {
         terminate_handle(process);
+        drop_path_dir();
     }
     let reason = match decision {
         Ok(()) => "released".to_string(),
@@ -790,6 +792,35 @@ fn note_reuse_file(text: &str) {
     let _ = std::fs::write(path, text);
 }
 
+/// Removes the copied lock-host directory when dropped, including on the
+/// way out of the path seam and when this static is dropped at process exit.
+#[cfg(feature = "simulated-physical")]
+struct RemoveDir(std::path::PathBuf);
+
+#[cfg(feature = "simulated-physical")]
+impl Drop for RemoveDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(feature = "simulated-physical")]
+static PATH_DIR: std::sync::Mutex<Option<RemoveDir>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "simulated-physical")]
+fn remember_path_dir(dir: std::path::PathBuf) {
+    if let Ok(mut slot) = PATH_DIR.lock() {
+        *slot = Some(RemoveDir(dir));
+    }
+}
+
+#[cfg(feature = "simulated-physical")]
+fn drop_path_dir() {
+    if let Ok(mut slot) = PATH_DIR.lock() {
+        slot.take();
+    }
+}
+
 #[cfg(feature = "simulated-physical")]
 fn other_path_process() -> Option<(HANDLE, u32)> {
     static PID: AtomicU32 = AtomicU32::new(0);
@@ -803,6 +834,7 @@ fn other_path_process() -> Option<(HANDLE, u32)> {
     }
     let dir = std::env::temp_dir().join(format!("softlock-path-{}", current_pid()));
     std::fs::create_dir_all(&dir).ok()?;
+    remember_path_dir(dir.clone());
     let dest = dir.join("other-lockhost.exe");
     std::fs::copy(&source, &dest).ok()?;
     let spawned = spawn_suspended_image(&dest)?;
