@@ -40,8 +40,24 @@ jobs:
         run: cargo clippy --manifest-path spikes/macos-desktop-proof/Cargo.toml --all-targets -- -D warnings
       - name: Unit tests
         run: cargo test --manifest-path spikes/macos-desktop-proof/Cargo.toml
+      - name: Simulated-physical seam
+        run: cargo test --manifest-path spikes/macos-desktop-proof/Cargo.toml --features simulated-physical
       - name: Run the desktop proof
-        run: cargo run --release --manifest-path spikes/macos-desktop-proof/Cargo.toml -- --runner-image macos-latest --output-dir proof-output
+        run: |
+          set -o pipefail
+          mkdir -p proof-output
+          cargo run --release --manifest-path spikes/macos-desktop-proof/Cargo.toml -- --runner-image macos-latest --output-dir proof-output | tee proof-output/proof.log
+          log=proof-output/proof.log
+          test "$(grep -cE '^post source=.* poster=second-process ' "$log")" -eq 3
+          grep -E '^post source=kCGEventSourceStatePrivate poster=second-process ' "$log"
+          grep -E '^post source=kCGEventSourceStateCombinedSessionState poster=second-process ' "$log"
+          grep -E '^post source=kCGEventSourceStateHIDSystemState poster=second-process ' "$log"
+          grep -E '^slow .* reenabled=false error=none$' "$log"
+          grep -E '^marker .* dead-within-1s=true healthy-within-heartbeat=true reenabled=false error=none$' "$log"
+          grep -E '^fail-closed=Locked$' "$log"
+          grep -E '^result=pass$' "$log"
+          test "$(grep -cE '^post .* tap-saw=true .* error=none$' "$log")" -eq 6
+          ! grep -E 'tap-saw=false|^m03=no-tap' "$log"
       - name: Unload the throwaway jobs
         if: always()
         run: |

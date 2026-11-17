@@ -16,8 +16,8 @@ use crate::labels::CAPTURE_APIS;
 use crate::mac::{ffi, launchd};
 use crate::png::png_size;
 use crate::report::{
-    CaptureReport, JobMarker, ProofReport, TapReport, VersionReport, WindowPlan, WindowReport,
-    capture_unavailable, failure_reasons, job_window_plan, render, tap_process_miss,
+    CaptureReport, ClassifyReport, JobMarker, ProofReport, TapReport, VersionReport, WindowPlan,
+    WindowReport, capture_unavailable, failure_reasons, job_window_plan, render, tap_process_miss,
     tap_sudo_failed, window_process_miss,
 };
 use crate::text::one_line;
@@ -36,6 +36,15 @@ pub fn dispatch(args: Args) -> i32 {
         Mode::WindowOnly => run_window(&args),
         Mode::CaptureOnly => run_capture(&args),
         Mode::ActiveTap => run_active(&args),
+        Mode::M03 => run_m03(&args),
+        Mode::ClassifyTarget => ffi::classify_target(&args.output_dir),
+        Mode::ClassifyPost => {
+            let Some(source) = args.post_source.as_deref() else {
+                eprintln!("--classify-post needs a value");
+                return 2;
+            };
+            ffi::classify_post(source, &args.output_dir)
+        }
         Mode::Orchestrator => run_orchestrator(&args),
     }
 }
@@ -72,6 +81,8 @@ fn run_orchestrator(args: &Args) -> i32 {
     let (hid_root, root_crash) = root_hid_tap(&exe, &args.output_dir);
     eprintln!("macos desktop proof: active tap");
     let (active, active_crash) = child_active(&exe, &args.output_dir);
+    eprintln!("macos desktop proof: posted events, tap disable, marker");
+    let (classify, classify_crash) = child_m03(&exe, &args.output_dir);
     eprintln!("macos desktop proof: launchd");
     let jobs = launchd::exercise(&exe, &args.output_dir);
     let mut crashes = Vec::new();
@@ -81,6 +92,7 @@ fn run_orchestrator(args: &Args) -> i32 {
         hid_crash,
         root_crash,
         active_crash,
+        classify_crash,
     ]
     .into_iter()
     .flatten()
@@ -94,6 +106,7 @@ fn run_orchestrator(args: &Args) -> i32 {
         taps: vec![session, hid_user, hid_root, active],
         captures: desktop.captures,
         jobs,
+        classify: Some(classify),
         probe_crash: if crashes.is_empty() {
             None
         } else {
@@ -406,6 +419,65 @@ fn run_tap(args: &Args) -> i32 {
         return 1;
     }
     0
+}
+
+fn run_m03(args: &Args) -> i32 {
+    let exe = match current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    eprintln!("stage=m03");
+    let classify = ffi::prove_m03(&exe, &args.output_dir);
+    let path = args.output_dir.join("m03.json");
+    if let Err(error) = write_json(&path, &classify) {
+        eprintln!("{error}");
+        return 1;
+    }
+    0
+}
+
+fn child_m03(exe: &Path, output_dir: &Path) -> (ClassifyReport, Option<String>) {
+    let path = output_dir.join("m03.json");
+    let dir = path_arg(output_dir);
+    let outcome = run_limited(exe, &["--m03", "--output-dir", &dir], 45);
+    show_stderr(&outcome.stderr);
+    if outcome.success
+        && let Some(classify) = read_json::<ClassifyReport>(&path)
+    {
+        return (classify, None);
+    }
+    (
+        ClassifyReport {
+            posts: Vec::new(),
+            slow: crate::report::SlowObservation {
+                disable_event: "none".to_string(),
+                sleep_ms: 0,
+                disable_wait_ms: 0,
+                key_reached_during: false,
+                key_reached_after: false,
+                reenabled: false,
+                error: Some(format!(
+                    "m03 process exited {}: {}",
+                    outcome.code,
+                    one_line(&outcome.stderr)
+                )),
+            },
+            marker: crate::report::MarkerObservation {
+                dead_ms: 0,
+                dead_misses: 0,
+                healthy_ms: 0,
+                healthy_seen: false,
+                reenabled: false,
+                error: Some(format!("m03 process exited {}", outcome.code)),
+            },
+            end_state: crate::classify::fail_closed_end().to_string(),
+            tap_status: "missing".to_string(),
+        },
+        Some(format!("m03 process exited {}", outcome.code)),
+    )
 }
 
 fn run_active(args: &Args) -> i32 {
