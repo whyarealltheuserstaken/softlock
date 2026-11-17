@@ -434,10 +434,10 @@ fn wait_for_frame(path: &Path) -> Result<(i32, i32, i32, i32), String> {
         if stop_requested() {
             return Err("interrupted".to_string());
         }
-        if let Ok(text) = fs::read_to_string(path) {
-            if let Ok(file) = serde_json::from_str::<FrameFile>(&text) {
-                return Ok((file.x as i32, file.y as i32, file.w as i32, file.h as i32));
-            }
+        if let Ok(text) = fs::read_to_string(path)
+            && let Ok(file) = serde_json::from_str::<FrameFile>(&text)
+        {
+            return Ok((file.x as i32, file.y as i32, file.w as i32, file.h as i32));
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -607,7 +607,6 @@ fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareR
         ],
         laptop_lid_row,
         &["slept", "awake", "skip"],
-        900_000,
         held,
     );
     lid.assertion_held = measure_held(pid, reason);
@@ -628,7 +627,6 @@ fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareR
         ],
         lid_external_row,
         &["slept", "awake", "no-external-display", "skip"],
-        900_000,
         lid.assertion_held,
     );
     external.assertion_held = measure_held(pid, reason);
@@ -661,7 +659,6 @@ fn record_lid(
     steps: &[&str],
     parse: fn(&str) -> Result<String, String>,
     allowed: &[&str],
-    wait_ms: u64,
     held: bool,
 ) -> HardwareRow {
     for step in steps {
@@ -692,7 +689,7 @@ fn record_lid(
         .arg("--output-dir")
         .arg(&args.output_dir)
         .arg("--sample-ms")
-        .arg(wait_ms.to_string())
+        .arg("900000")
         .arg("--count-file")
         .arg(&beat_name)
         .stdout(Stdio::null())

@@ -113,10 +113,6 @@ impl HeldAssertions {
         }
     }
 
-    pub fn is_held(&self) -> bool {
-        self.created && !self.released && (self.system_id != 0 || self.display_id != 0)
-    }
-
     pub fn release(&mut self) {
         if self.system_id == 0 && self.display_id == 0 {
             self.released = true;
@@ -145,10 +141,6 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    pub fn open() -> Self {
-        Overlay::open_rect(None)
-    }
-
     pub fn open_rect(frame: Option<(i32, i32, i32, i32)>) -> Self {
         let mut out = WindowOut {
             ordered_front: 0,
