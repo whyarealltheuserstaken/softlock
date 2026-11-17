@@ -82,6 +82,8 @@ fn report_main(args: &[String]) -> Result<ExitCode, String> {
         interrupted: flag_or(&bundle, "interrupted", false),
         restored: flag_or(&bundle, "restored", true),
         locked: flag_or(&bundle, "locked", false),
+        fail_closed: flag_or(&bundle, "fail_closed", false),
+        hklm_command: text_field(&bundle, "hklm_command"),
     };
     let report = render(&machine, &flags, elapsed_ms, &supplied, &outcome);
     let body = report.to_json();

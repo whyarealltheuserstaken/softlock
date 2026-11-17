@@ -18,6 +18,10 @@ foreach ($arg in $args) {
         }
     }
 }
+if ($ci -and $env:GITHUB_ACTIONS -ne 'true') {
+    Write-Host '--ci applies only when GITHUB_ACTIONS=true; ignoring --ci'
+    $ci = $false
+}
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 Set-Location -LiteralPath $root
@@ -26,9 +30,31 @@ $budgetMs = 300000
 $script:Armed = $false
 $script:SawLock = $false
 $script:LeftLocked = $false
+$script:Failed = $false
+$script:LockFired = $false
+$script:Locking = $false
+$script:LockError = ''
 $script:Interrupted = $false
 $script:Changes = New-Object System.Collections.Generic.List[object]
+$script:Power = New-Object System.Collections.Generic.List[object]
 $script:Restored = $false
+$script:HklmCommand = ''
+$script:ExitCode = 1
+$script:ReportWritten = $false
+$plan = $null
+$facts = ''
+$exe = $null
+$factsPath = $null
+$planPath = $null
+$script:RestoreErrors = @()
+$script:SuiteError = ''
+try {
+    [Console]::add_CancelKeyPress({
+        param($sender, $event)
+        $event.Cancel = $true
+        $script:Interrupted = $true
+    })
+} catch { }
 $pendingDir = Join-Path $env:LOCALAPPDATA 'softlock-hwsuite'
 $pendingPath = Join-Path $pendingDir 'pending.json'
 $restoreScript = Join-Path $PSScriptRoot 'restore.ps1'
@@ -51,10 +77,14 @@ function Save-Pending {
     $parts = @()
     foreach ($entry in $script:Changes) {
         $present = if ($entry.present) { 'true' } else { 'false' }
-        $sub = ([string]$entry.subkey).Replace('\', '\\')
-        $parts += '{"hive":"' + $entry.hive + '","subkey":"' + $sub + '","name":"' + $entry.name + '","present":' + $present + ',"data":' + [int]$entry.data + '}'
+        $kind = if ($entry.PSObject.Properties.Name -contains 'kind') { [string]$entry.kind } else { 'DWord' }
+        $parts += '{"hive":"' + $entry.hive + '","subkey":"' + (Escape-JsonString ([string]$entry.subkey)) + '","name":"' + (Escape-JsonString ([string]$entry.name)) + '","present":' + $present + ',"kind":"' + (Escape-JsonString $kind) + '","data":"' + (Escape-JsonString ([string]$entry.data)) + '"}'
     }
-    $json = '{"values":[' + ($parts -join ',') + ']}'
+    $power = @()
+    foreach ($entry in $script:Power) {
+        $power += '{"setting":"' + (Escape-JsonString ([string]$entry.setting)) + '","ac":' + [int]$entry.ac + ',"dc":' + [int]$entry.dc + '}'
+    }
+    $json = '{"values":[' + ($parts -join ',') + '],"power":[' + ($power -join ',') + ']}'
     Write-Utf8 $pendingPath $json
     $quoted = '"' + $restoreScript.Replace('"', '') + '"'
     $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File $quoted"
@@ -78,13 +108,22 @@ function Remember-Dword([string]$hive, [string]$subkey, [string]$name) {
         }
     }
     $present = $false
-    $data = 0
+    $kind = 'DWord'
+    $data = '0'
     $key = Open-Hive $hive $subkey $false
     if ($null -ne $key) {
         foreach ($existing in @($key.GetValueNames())) {
             if ($existing -eq $name) {
                 $present = $true
-                $data = [int]$key.GetValue($name)
+                $kind = $key.GetValueKind($name).ToString()
+                $raw = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if ($kind -eq 'Binary') {
+                    $data = [Convert]::ToBase64String([byte[]]$raw)
+                } elseif ($kind -eq 'MultiString') {
+                    $data = ([string[]]$raw) -join "`n"
+                } else {
+                    $data = [string]$raw
+                }
             }
         }
         $key.Close()
@@ -94,6 +133,7 @@ function Remember-Dword([string]$hive, [string]$subkey, [string]$name) {
         subkey = $subkey
         name = $name
         present = $present
+        kind = $kind
         data = $data
     })
     Save-Pending
@@ -107,43 +147,163 @@ function Set-SuiteDword([string]$hive, [string]$subkey, [string]$name, [int]$val
     return $read
 }
 
-function Restore-Suite {
-    if ($script:Restored) {
+function Test-SuiteElevated {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Convert-RegistryData([string]$kind, [string]$data) {
+    switch ($kind) {
+        'DWord' { return [int]$data }
+        'QWord' { return [int64]$data }
+        'Binary' {
+            if ([string]::IsNullOrEmpty($data)) { return [byte[]]@() }
+            return [Convert]::FromBase64String($data)
+        }
+        'MultiString' {
+            if ([string]::IsNullOrEmpty($data)) { return [string[]]@() }
+            return [string[]]$data.Split("`n")
+        }
+        default { return $data }
+    }
+}
+
+function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc) {
+    $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
+    $acText = Read-Native { powercfg /SETACVALUEINDEX SCHEME_CURRENT $sub $setting $ac }
+    if ($LASTEXITCODE -ne 0) { return "powercfg AC $setting failed: $acText" }
+    $dcText = Read-Native { powercfg /SETDCVALUEINDEX SCHEME_CURRENT $sub $setting $dc }
+    if ($LASTEXITCODE -ne 0) { return "powercfg DC $setting failed: $dcText" }
+    $active = Read-Native { powercfg /SETACTIVE SCHEME_CURRENT }
+    if ($LASTEXITCODE -ne 0) { return "powercfg SETACTIVE failed: $active" }
+    return ''
+}
+
+function Read-PowerIndex([string]$setting) {
+    $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
+    $text = Read-Native { powercfg /q SCHEME_CURRENT $sub $setting }
+    $ac = [regex]::Match($text, 'Current AC Power Setting Index:\s+0x([0-9A-Fa-f]+)')
+    $dc = [regex]::Match($text, 'Current DC Power Setting Index:\s+0x([0-9A-Fa-f]+)')
+    if (-not $ac.Success -or -not $dc.Success) { return $null }
+    return [pscustomobject]@{
+        setting = $setting
+        ac = [Convert]::ToInt32($ac.Groups[1].Value, 16)
+        dc = [Convert]::ToInt32($dc.Groups[1].Value, 16)
+    }
+}
+
+function Apply-DoNothing([string]$setting) {
+    $current = Read-PowerIndex $setting
+    if ($null -eq $current) { return 'powercfg /q did not return the current index' }
+    $script:Power.Add($current)
+    Save-Pending
+    return Set-PowerIndex $setting 0 0
+}
+
+function Ensure-DoNothing([string]$setting) {
+    $current = Read-PowerIndex $setting
+    if ($null -eq $current) { return 'powercfg /q did not return the current index' }
+    $known = $false
+    foreach ($entry in @($script:Power)) {
+        if ([string]$entry.setting -eq $setting) { $known = $true }
+    }
+    if ($current.ac -eq 0 -and $current.dc -eq 0) {
+        if (-not $known) {
+            $script:Power.Add($current)
+            Save-Pending
+        }
+        return ''
+    }
+    if ($known) { return Set-PowerIndex $setting 0 0 }
+    return Apply-DoNothing $setting
+}
+
+function Complete-Interrupted {
+    if (-not $script:Interrupted) { return }
+    if ($null -eq $plan) {
+        $have = $false
+        foreach ($got in $results) {
+            if ($got.id -eq 'parser-self-test') { $have = $true }
+        }
+        if (-not $have) { Add-Result 'parser-self-test' 'skip' 'interrupted' @{} }
         return
     }
-    $script:Restored = $true
-    if ($null -ne $native) {
-        try {
-            if ($script:Armed -and -not $script:SawLock) {
-                $native::LockNow()
-            }
-        } catch {
+    foreach ($row in @($plan.rows)) {
+        if ($row.id -eq 'restore') { continue }
+        if ($row.action -eq 'record' -or $row.action -eq 'skip') { continue }
+        $have = $false
+        foreach ($got in $results) {
+            if ($got.id -eq $row.id) { $have = $true }
         }
-        try { $native::ReleaseAll() } catch { }
+        if (-not $have) { Add-Result $row.id 'skip' 'interrupted' @{} }
     }
-    foreach ($entry in $script:Changes) {
-        try {
-            $key = Open-Hive $entry.hive $entry.subkey $true
-            if ($null -eq $key) { continue }
-            if ($entry.present) {
-                $key.SetValue([string]$entry.name, [int]$entry.data, [Microsoft.Win32.RegistryValueKind]::DWord)
-            } else {
-                $key.DeleteValue([string]$entry.name, $false)
-            }
-            $key.Close()
-        } catch {
+}
+
+function Write-FallbackReport([string]$outDir, [bool]$restored) {
+    New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+    $pass = 0
+    $fail = 0
+    $skip = 0
+    $tests = @()
+    foreach ($row in $results) {
+        if ($row.status -eq 'pass') { $pass++ }
+        elseif ($row.status -eq 'fail') { $fail++ }
+        else { $skip++ }
+        $reason = 'null'
+        if ($row.status -eq 'skip') { $reason = '"' + (Escape-JsonString ([string]$row.reason)) + '"' }
+        $detail = ''
+        if ($row.status -ne 'skip') { $detail = Escape-JsonString ([string]$row.reason) }
+        $tests += '{"id":"' + $row.id + '","name":"' + $row.id + '","status":"' + $row.status + '","skip_reason":' + $reason + ',"physical":false,"needs_admin":false,"duration_ms":0,"detail":"' + $detail + '","measurements":{}}'
+    }
+    if ($tests.Count -eq 0) {
+        $skip = 1
+        $tests += '{"id":"parser-self-test","name":"Parser self-test","status":"skip","skip_reason":"interrupted","physical":false,"needs_admin":false,"duration_ms":0,"detail":"interrupted","measurements":{}}'
+    }
+    $state = if ($script:LeftLocked) { 'os-locked' } else { 'never-unlocked' }
+    $locked = if ($script:LeftLocked) { 'true' } else { 'false' }
+    $interrupted = if ($script:Interrupted) { 'true' } else { 'false' }
+    $restoredBit = if ($restored) { 'true' } else { 'false' }
+    $mode = if ($ci) { 'ci' } else { 'school' }
+    $startedUtc = $started.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
+    $finishedUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
+    $json = '{"schema":"softlock-hardware-suite/1","suite":"windows","started_utc":"' + $startedUtc + '","finished_utc":"' + $finishedUtc + '","duration_ms":' + (Elapsed-Ms) + ',"mode":"' + $mode + '","config":{},"tests":[' + ($tests -join ',') + '],"summary":{"pass":' + $pass + ',"fail":' + $fail + ',"skip":' + $skip + '},"fail_closed":' + $locked + ',"serial_collected":false,"restored":' + $restoredBit + ',"interrupted":' + $interrupted + ',"state":"' + $state + '"}'
+    Write-Utf8 (Join-Path $outDir 'result.json') $json
+    $text = "Windows hardware suite  schema=softlock-hardware-suite/1  suite=windows`npass=$pass fail=$fail skip=$skip duration=$(([int]((Elapsed-Ms) / 1000)))s state=$state serial-collected=false restored=$restoredBit interrupted=$interrupted`n"
+    if ($script:HklmCommand) {
+        $text += "`nHKLM was not restored. From an elevated prompt run: $($script:HklmCommand)`n"
+    }
+    Write-Utf8 (Join-Path $outDir 'result.txt') $text
+    Write-Host $text
+}
+
+function Write-SuiteReport([bool]$restored) {
+    if ($script:ReportWritten) { return }
+    $script:ReportWritten = $true
+    $stamp = $started.ToString('yyyyMMdd-HHmmss')
+    $outDir = Join-Path $root "suite-output\$stamp"
+    $canReport = $exe -and $facts -and (Test-Path -LiteralPath $exe)
+    if (-not $canReport) {
+        Write-FallbackReport $outDir $restored
+        if ($script:Interrupted) { $script:ExitCode = 130 } else { $script:ExitCode = 1 }
+        return
+    }
+    $bundlePath = Join-Path $env:TEMP ("softlock-hw-bundle-{0}.json" -f $PID)
+    $lockedBit = if ($script:LeftLocked) { 'true' } else { 'false' }
+    $interruptedBit = if ($script:Interrupted) { 'true' } else { 'false' }
+    $restoredBit = if ($restored) { 'true' } else { 'false' }
+    $startedUtc = $started.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
+    $finishedUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
+    $bundle = '{"facts":' + $facts + ',"elapsed_ms":' + (Elapsed-Ms) + ',"rows":' + (ConvertTo-ResultJson) + ',"started_utc":"' + $startedUtc + '","finished_utc":"' + $finishedUtc + '","interrupted":' + $interruptedBit + ',"restored":' + $restoredBit + ',"locked":' + $lockedBit + ',"fail_closed":' + $lockedBit + ',"hklm_command":"' + (Escape-JsonString $script:HklmCommand) + '"}'
+    Write-Utf8 $bundlePath $bundle
+    New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+    & $exe report --bundle $bundlePath --out-dir $outDir
+    $script:ExitCode = $LASTEXITCODE
+    if ($script:HklmCommand) { Write-Host "HKLM was not restored. From an elevated prompt run: $($script:HklmCommand)" }
+    foreach ($path in @($factsPath, $planPath, $bundlePath)) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
         }
-    }
-    if (Test-Path -LiteralPath $pendingPath) {
-        Remove-Item -LiteralPath $pendingPath -Force -ErrorAction SilentlyContinue
-    }
-    try {
-        $runOnce = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\RunOnce', $true)
-        if ($null -ne $runOnce) {
-            $runOnce.DeleteValue('softlock-hwsuite', $false)
-            $runOnce.Close()
-        }
-    } catch {
     }
 }
 
@@ -202,19 +362,24 @@ function Read-Answer([string]$prompt, [int]$seconds) {
     return $kind
 }
 
-function Power-Since([int64]$afterRecord) {
+function Power-Since($afterRecord) {
+    if ($null -eq $afterRecord) {
+        return [pscustomobject]@{ known = $false; sleep = 0; press = 0 }
+    }
     $sleep = 0
-    $wake = 0
+    $press = 0
     try {
         $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power' } -MaxEvents 40 -ErrorAction Stop)
         foreach ($event in $events) {
-            if ([int64]$event.RecordId -le $afterRecord) { continue }
-            if ($event.Id -eq 42) { $sleep++ }
-            if ($event.Id -eq 107 -or $event.Id -eq 507) { $wake++ }
+            if ([int64]$event.RecordId -le [int64]$afterRecord) { continue }
+            if ($event.Id -eq 41 -or $event.Id -eq 42 -or $event.Id -eq 109 -or $event.Id -eq 506) { $sleep++ }
+            $message = [string]$event.Message
+            if ($message -match 'power button') { $press++ }
         }
     } catch {
+        return [pscustomobject]@{ known = $false; sleep = 0; press = 0 }
     }
-    return [pscustomobject]@{ sleep = $sleep; wake = $wake }
+    return [pscustomobject]@{ known = $true; sleep = $sleep; press = $press }
 }
 
 function Latest-PowerRecord {
@@ -222,7 +387,7 @@ function Latest-PowerRecord {
         $event = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power' } -MaxEvents 1 -ErrorAction Stop
         return [int64]$event.RecordId
     } catch {
-        return [int64]0
+        return $null
     }
 }
 
@@ -261,30 +426,97 @@ function Probe-Error($probe) {
     return ''
 }
 
-function Enable-Inhibit {
-    $native::SetInhibit($true)
-    return $native::KeepAwakeJson() | ConvertFrom-Json
-}
-
-function Disable-Inhibit {
-    try { $native::SetInhibit($false) } catch { }
-    try { $native::ReleaseKeepAwake() } catch { }
-}
-
 function Restore-Changes {
-    foreach ($entry in $script:Changes) {
+    $errors = New-Object System.Collections.Generic.List[string]
+    $elevated = Test-SuiteElevated
+    $remaining = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @($script:Changes)) {
+        if ($entry.hive -eq 'HKLM' -and -not $elevated) {
+            $remaining.Add($entry)
+            continue
+        }
         try {
             $key = Open-Hive $entry.hive $entry.subkey $true
-            if ($null -eq $key) { continue }
+            if ($null -eq $key) { throw "cannot open $($entry.hive)\$($entry.subkey)" }
             if ($entry.present) {
-                $key.SetValue([string]$entry.name, [int]$entry.data, [Microsoft.Win32.RegistryValueKind]::DWord)
+                $kindName = 'DWord'
+                if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { $kindName = [string]$entry.kind }
+                $kind = [Microsoft.Win32.RegistryValueKind]$kindName
+                $value = Convert-RegistryData $kindName ([string]$entry.data)
+                $key.SetValue([string]$entry.name, $value, $kind)
             } else {
                 $key.DeleteValue([string]$entry.name, $false)
             }
             $key.Close()
         } catch {
+            $remaining.Add($entry)
+            $errors.Add("$($entry.hive)\$($entry.subkey) $($entry.name): $($_.Exception.Message)")
         }
     }
+    $powerLeft = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @($script:Power)) {
+        try {
+            $err = Set-PowerIndex $entry.setting ([int]$entry.ac) ([int]$entry.dc)
+            if ($err) {
+                $powerLeft.Add($entry)
+                $errors.Add($err)
+            }
+        } catch {
+            $powerLeft.Add($entry)
+            $errors.Add("power $($entry.setting): $($_.Exception.Message)")
+        }
+    }
+    $script:Changes = $remaining
+    $script:Power = $powerLeft
+    if ($remaining.Count -gt 0 -or $powerLeft.Count -gt 0) {
+        Save-Pending
+    }
+    $hklmLeft = $false
+    foreach ($entry in $remaining) {
+        if ($entry.hive -eq 'HKLM') { $hklmLeft = $true }
+    }
+    if ($hklmLeft -and -not $elevated) {
+        $script:HklmCommand = "powershell -ExecutionPolicy Bypass -File `"$restoreScript`""
+        $errors.Add("HKLM was not restored. From an elevated prompt run: $($script:HklmCommand)")
+    }
+    return @($errors)
+}
+
+function Restore-Suite {
+    if ($script:Restored) { return @($script:RestoreErrors) }
+    $script:Restored = $true
+    $errors = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $native) {
+        try { $native::ReleaseAll() } catch { $errors.Add("release: $($_.Exception.Message)") }
+    }
+    foreach ($item in @(Restore-Changes)) {
+        if ($item) { $errors.Add([string]$item) }
+    }
+    if ($script:Changes.Count -eq 0 -and $script:Power.Count -eq 0) {
+        if (Test-Path -LiteralPath $pendingPath) {
+            Remove-Item -LiteralPath $pendingPath -Force -ErrorAction SilentlyContinue
+        }
+        try {
+            $runOnce = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\RunOnce', $true)
+            if ($null -ne $runOnce) {
+                $runOnce.DeleteValue('softlock-hwsuite', $false)
+                $runOnce.Close()
+            }
+        } catch {
+            $errors.Add("RunOnce: $($_.Exception.Message)")
+        }
+    }
+    $script:RestoreErrors = @($errors)
+    return @($errors)
+}
+
+function Invoke-FailClosedLock {
+    if ($script:LockFired) { return }
+    if ($null -eq $native) { throw 'fail-closed lock has no listener' }
+    $native::LockNow()
+    $script:LockFired = $true
+    $script:SawLock = $true
+    $script:LeftLocked = $true
 }
 
 function Add-Result([string]$id, [string]$status, [string]$reason, $measurements) {
@@ -295,6 +527,7 @@ function Add-Result([string]$id, [string]$status, [string]$reason, $measurements
         reason = $reason
         measurements = $measurements
     })
+    if ($status -eq 'fail') { $script:Failed = $true }
 }
 
 function ConvertTo-ResultJson {
@@ -374,17 +607,21 @@ try {
         '}'
     Write-Utf8 $factsPath $facts
 
-    & cargo test --locked --release -p softlock-win-hwsuite -- --test-threads=8
+    $manifest = 'tests\hardware\windows\harness\Cargo.toml'
+    & cargo test --locked --release --manifest-path $manifest -- --test-threads=8
+    if ($script:Interrupted) { throw 'interrupted' }
     if ($LASTEXITCODE -ne 0) {
         Add-Result 'parser-self-test' 'fail' 'cargo test failed' @{}
     } else {
         Add-Result 'parser-self-test' 'pass' '' @{}
     }
-    & cargo build --locked --release -p softlock-win-hwsuite
+    & cargo build --locked --release --manifest-path $manifest
+    if ($script:Interrupted) { throw 'interrupted' }
     if ($LASTEXITCODE -ne 0) { throw 'build failed' }
-    $exe = Join-Path $root 'target\release\softlock-win-hwsuite.exe'
+    $exe = Join-Path $root 'tests\hardware\windows\harness\target\release\softlock-win-hwsuite.exe'
     $planPath = Join-Path $env:TEMP ("softlock-hw-plan-{0}.json" -f $PID)
     & $exe plan --facts $factsPath | Out-File -FilePath $planPath -Encoding utf8
+    if ($script:Interrupted) { throw 'interrupted' }
     if ($LASTEXITCODE -ne 0) { throw 'plan failed' }
     $planRaw = [System.IO.File]::ReadAllText($planPath).TrimStart([char]0xFEFF)
     $plan = $planRaw | ConvertFrom-Json
@@ -399,7 +636,11 @@ try {
 
     foreach ($row in @($plan.rows)) {
         if ($row.action -eq 'skip' -or $row.action -eq 'record') { continue }
-        if ($row.id -eq 'parser-self-test') { continue }
+        if ($row.id -eq 'parser-self-test' -or $row.id -eq 'restore') { continue }
+        if ($script:LockFired -and $row.action -eq 'prompt') {
+            Add-Result $row.id 'skip' 'stopped after fail-closed lock' @{}
+            continue
+        }
         if ((Elapsed-Ms) -gt ($budgetMs - 5000)) {
             Add-Result $row.id 'skip' 'budget' @{}
             continue
@@ -434,8 +675,12 @@ try {
                     $sub = 'Software\Microsoft\Windows\CurrentVersion\PushNotifications'
                     Remember-Dword 'HKCU' $sub 'ToastEnabled'
                     $read = Set-SuiteDword 'HKCU' $sub 'ToastEnabled' 0
-                    Restore-Changes
-                    Add-Result $row.id $(if ($read -eq 0) { 'pass' } else { 'fail' }) '' @{ value = $read }
+                    $restoredNow = @(Restore-Changes)
+                    if ($restoredNow.Count -gt 0) {
+                        Add-Result $row.id 'fail' ($restoredNow -join '; ') @{ value = $read; stderr = ($restoredNow -join '; ') }
+                    } else {
+                        Add-Result $row.id $(if ($read -eq 0) { 'pass' } else { 'fail' }) '' @{ value = $read }
+                    }
                 }
             }
             'input-hook-injected' {
@@ -461,8 +706,8 @@ try {
                 Remove-Item -LiteralPath $requestFile -Force -ErrorAction SilentlyContinue
                 $apiOk = [bool]$probe.system
                 $seenOk = [bool]$seen.system
-                $ok = $apiOk -and ($seenOk -or $ci)
                 $reason = ''
+                $status = 'pass'
                 $extra = @{
                     api_system = $apiOk
                     api_display = [bool]$probe.display
@@ -470,14 +715,24 @@ try {
                     display = [bool]$seen.display
                     system_error = [int]$probe.system_error
                 }
-                if (-not $ok) {
-                    $snippet = ($requests -replace '\s+', ' ').Trim()
-                    if ($snippet.Length -gt 160) { $snippet = $snippet.Substring(0, 160) }
-                    $reason = "win32=$($probe.system_error) api=$apiOk powercfg=$seenOk $(Probe-Error $probe) $snippet"
-                    $extra.stderr = ((Probe-Error $probe) + ' ' + $snippet).Trim()
-                    Write-Host "keep-awake refused: $reason"
+                if (-not $seenOk) {
+                    if ($ci -and $apiOk) {
+                        $status = 'skip'
+                        $reason = 'ci'
+                    } else {
+                        $status = 'fail'
+                        $snippet = ($requests -replace '\s+', ' ').Trim()
+                        if ($snippet.Length -gt 160) { $snippet = $snippet.Substring(0, 160) }
+                        $reason = "win32=$($probe.system_error) api=$apiOk powercfg=$seenOk $(Probe-Error $probe) $snippet"
+                        $extra.stderr = ((Probe-Error $probe) + ' ' + $snippet).Trim()
+                        Write-Host "keep-awake refused: $reason"
+                    }
+                } elseif (-not $apiOk) {
+                    $status = 'fail'
+                    $reason = "win32=$($probe.system_error) $(Probe-Error $probe)"
+                    $extra.stderr = Probe-Error $probe
                 }
-                Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) $reason $extra
+                Add-Result $row.id $status $reason $extra
             }
             'cad-hkcu-readback' {
                 $pairs = @(
@@ -492,8 +747,12 @@ try {
                     Remember-Dword 'HKCU' $pair.sub $pair.name
                     if ((Set-SuiteDword 'HKCU' $pair.sub $pair.name 1) -ne 1) { $ok = $false }
                 }
-                Restore-Changes
-                Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{ values = 5 }
+                $restoredNow = @(Restore-Changes)
+                if ($restoredNow.Count -gt 0) {
+                    Add-Result $row.id 'fail' ($restoredNow -join '; ') @{ values = 5; stderr = ($restoredNow -join '; ') }
+                } else {
+                    Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{ values = 5 }
+                }
             }
             'cad-hklm-readback' {
                 if ($row.action -eq 'skip') { continue }
@@ -501,8 +760,12 @@ try {
                     $sub = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'
                     Remember-Dword 'HKLM' $sub 'HideFastUserSwitching'
                     $read = Set-SuiteDword 'HKLM' $sub 'HideFastUserSwitching' 1
-                    Restore-Changes
-                    Add-Result $row.id $(if ($read -eq 1) { 'pass' } else { 'fail' }) '' @{ value = $read }
+                    $restoredNow = @(Restore-Changes)
+                    if ($restoredNow.Count -gt 0) {
+                        Add-Result $row.id 'fail' ($restoredNow -join '; ') @{ value = $read; stderr = ($restoredNow -join '; ') }
+                    } else {
+                        Add-Result $row.id $(if ($read -eq 1) { 'pass' } else { 'fail' }) '' @{ value = $read }
+                    }
                 } catch {
                     Add-Result $row.id 'fail' 'HKLM write was refused' @{ stderr = $_.Exception.Message }
                 }
@@ -514,10 +777,15 @@ try {
                 Remember-Dword 'HKCU' $sub 'DisableLockWorkstation'
                 Set-SuiteDword 'HKCU' $sub 'DisableLockWorkstation' 1 | Out-Null
                 $probe = $native::MeasureLockJson() | ConvertFrom-Json
-                Restore-Changes
-                if ($probe.locked -or -not $probe.api) {
-                    $script:SawLock = [bool]$probe.locked
+                $restoredNow = @(Restore-Changes)
+                if ($probe.locked) {
+                    $script:LockFired = $true
+                    $script:SawLock = $true
                     $script:LeftLocked = $true
+                }
+                if ($restoredNow.Count -gt 0) {
+                    Add-Result $row.id 'fail' ($restoredNow -join '; ') @{ stderr = ($restoredNow -join '; ') }
+                } elseif ($probe.locked -or -not $probe.api) {
                     Add-Result $row.id 'fail' 'the session was not held unlocked' @{
                         elapsed_ms = [int]$probe.elapsed_ms
                         stderr = Probe-Error $probe
@@ -563,22 +831,20 @@ try {
             }
             'lid-cycle' {
                 if ($row.action -eq 'skip') { continue }
-                $held = Enable-Inhibit
-                if (-not $held.api) {
-                    Disable-Inhibit
-                    Add-Result $row.id 'fail' 'inhibit failed' @{ stderr = Probe-Error $held }
+                $held = Ensure-DoNothing '5ca83367-6e45-459f-a27b-476b1d01c936'
+                if ($held) {
+                    Add-Result $row.id 'fail' 'power button policy was not changed' @{ stderr = $held }
                 } else {
                     $before = $native::SnapshotJson() | ConvertFrom-Json
                     $record = Latest-PowerRecord
                     $answer = Read-Answer @($row.prompts)[0] 25
                     $after = $native::SnapshotJson() | ConvertFrom-Json
                     $power = Power-Since $record
-                    Disable-Inhibit
-                    $slept = ($power.sleep -gt 0) -or ($after.suspend -gt $before.suspend)
                     $moved = ($after.lid_close -gt $before.lid_close) -and ($after.lid_open -gt $before.lid_open)
+                    $transition = ($after.suspend -gt $before.suspend) -or ($power.known -and $power.sleep -gt 0)
                     if ($script:Interrupted) {
-                    } elseif ($slept) {
-                        Add-Result $row.id 'fail' 'sleep was not held off' @{ slept = $true }
+                    } elseif ($transition) {
+                        Add-Result $row.id 'fail' 'power transition started' @{ slept = $true }
                     } elseif ($answer -eq 'budget') {
                         Add-Result $row.id 'skip' 'budget' @{}
                     } elseif ($answer -eq 'operator') {
@@ -594,22 +860,20 @@ try {
             }
             'power-key' {
                 if ($row.action -eq 'skip') { continue }
-                $held = Enable-Inhibit
-                if (-not $held.api) {
-                    Disable-Inhibit
-                    Add-Result $row.id 'fail' 'inhibit failed' @{ stderr = Probe-Error $held }
+                $held = Ensure-DoNothing '7648efa3-dd9c-4e3e-b566-50f929386280'
+                if ($held) {
+                    Add-Result $row.id 'fail' 'power button policy was not changed' @{ stderr = $held }
                 } else {
                     $before = $native::SnapshotJson() | ConvertFrom-Json
                     $record = Latest-PowerRecord
                     $answer = Read-Answer @($row.prompts)[0] 25
                     $after = $native::SnapshotJson() | ConvertFrom-Json
                     $power = Power-Since $record
-                    Disable-Inhibit
-                    $slept = ($power.sleep -gt 0) -or ($after.suspend -gt $before.suspend)
-                    $tapped = ($after.query_suspend -gt $before.query_suspend)
+                    $transition = ($after.suspend -gt $before.suspend) -or ($power.known -and $power.sleep -gt 0)
+                    $tapped = $power.known -and ($power.press -gt 0)
                     if ($script:Interrupted) {
-                    } elseif ($slept) {
-                        Add-Result $row.id 'fail' 'sleep was not held off' @{ slept = $true }
+                    } elseif ($transition) {
+                        Add-Result $row.id 'fail' 'power transition started' @{ slept = $true }
                     } elseif ($answer -eq 'budget') {
                         Add-Result $row.id 'skip' 'budget' @{}
                     } elseif ($answer -eq 'operator') {
@@ -636,7 +900,10 @@ try {
                 } else {
                     $script:Armed = $true
                     $probe = $native::MeasureLockJson() | ConvertFrom-Json
-                    if ($probe.locked) { $script:SawLock = $true }
+                    if ($probe.locked) {
+                        $script:LockFired = $true
+                        $script:SawLock = $true
+                    }
                     $unlocked = $false
                     if ($probe.locked) {
                         $unlocked = $native::WaitForUnlock(40000)
@@ -644,9 +911,11 @@ try {
                     $ok = $probe.api -and $probe.locked -and $unlocked -and ($probe.elapsed_ms -lt 1000)
                     if ($ok) {
                         $script:Armed = $false
+                        $script:LockFired = $false
+                        $script:LeftLocked = $false
                         Add-Result $row.id 'pass' '' @{ locked = $true; elapsed_ms = [int]$probe.elapsed_ms }
                     } else {
-                        $script:LeftLocked = $true
+                        if ($probe.locked) { $script:LeftLocked = $true }
                         Add-Result $row.id 'fail' 'not detected' @{
                             locked = [bool]$probe.locked
                             elapsed_ms = [int]$probe.elapsed_ms
@@ -663,36 +932,36 @@ try {
                 if ($null -ne $_.Exception) { $message = $_.Exception.Message }
                 Add-Result $row.id 'fail' 'setting failed' @{ stderr = $message }
             }
-            if ($row.blocks_input) { $script:LeftLocked = $true }
         }
         if ($script:Interrupted) { break }
     }
-
-    if ($script:Interrupted) {
-        foreach ($row in @($plan.rows)) {
-            if ($row.action -eq 'record' -or $row.action -eq 'skip') { continue }
-            $have = $false
-            foreach ($got in $results) {
-                if ($got.id -eq $row.id) { $have = $true }
-            }
-            if (-not $have) { Add-Result $row.id 'skip' 'interrupted' @{} }
+} catch {
+    if (-not $script:Interrupted -and $_.Exception) {
+        $script:SuiteError = $_.Exception.Message
+        $script:Failed = $true
+    }
+} finally {
+    if ($script:Interrupted -and $null -eq $plan -and $exe -and $factsPath -and (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $factsPath)) {
+        $recovered = & $exe plan --facts $factsPath
+        if ($LASTEXITCODE -eq 0 -and $recovered) {
+            $plan = $recovered | ConvertFrom-Json
         }
     }
-
-    $bundlePath = Join-Path $env:TEMP ("softlock-hw-bundle-{0}.json" -f $PID)
-    $stamp = $started.ToString('yyyyMMdd-HHmmss')
-    $outDir = Join-Path $root "suite-output\$stamp"
-    $lockedBit = if ($script:LeftLocked) { 'true' } else { 'false' }
-    $interruptedBit = if ($script:Interrupted) { 'true' } else { 'false' }
-    $startedUtc = $started.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
-    $finishedUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
-    $bundle = '{"facts":' + $facts + ',"elapsed_ms":' + (Elapsed-Ms) + ',"rows":' + (ConvertTo-ResultJson) + ',"started_utc":"' + $startedUtc + '","finished_utc":"' + $finishedUtc + '","interrupted":' + $interruptedBit + ',"restored":true,"locked":' + $lockedBit + '}'
-    Write-Utf8 $bundlePath $bundle
-    & $exe report --bundle $bundlePath --out-dir $outDir
-    $code = $LASTEXITCODE
-    if ($script:Interrupted) { $code = 130 }
-    Remove-Item -LiteralPath $factsPath, $planPath, $bundlePath -Force -ErrorAction SilentlyContinue
-    exit $code
-} finally {
-    Restore-Suite
+    Complete-Interrupted
+    $restoreErrors = @(Restore-Suite)
+    if ($script:SuiteError) { $restoreErrors += $script:SuiteError }
+    $needLock = ($script:Failed -or $restoreErrors.Count -gt 0) -and -not $script:LockFired
+    if ($needLock) {
+        try { Invoke-FailClosedLock } catch { $script:LockError = $_.Exception.Message }
+    }
+    if ($script:LockError) { $restoreErrors += "fail-closed lock: $($script:LockError)" }
+    $restored = ($restoreErrors.Count -eq 0)
+    if ($restoreErrors.Count -gt 0) {
+        Add-Result 'restore' 'fail' ($restoreErrors -join '; ') @{ stderr = ($restoreErrors -join '; ') }
+    } else {
+        Add-Result 'restore' 'pass' '' @{}
+    }
+    Write-SuiteReport $restored
+    if ($script:Interrupted) { exit 130 }
+    exit $script:ExitCode
 }

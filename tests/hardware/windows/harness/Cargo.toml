@@ -1,11 +1,11 @@
 [package]
 name = "softlock-win-hwsuite"
-description = "Plan, redaction, and report for the Windows hardware suite. No device identifiers."
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-publish.workspace = true
-rust-version.workspace = true
+description = "Plan, redaction, and report for the Windows hardware suite. Not a product crate."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+rust-version = "1.100.0"
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

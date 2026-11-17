@@ -9,10 +9,9 @@ pub const BUDGET_MS: u64 = 300_000;
 pub const PROMPT_PLUG: &str = "Plug in a monitor, then press Enter. Type skip to skip.";
 pub const PROMPT_UNPLUG: &str = "Unplug that monitor, then press Enter. Type skip to skip.";
 pub const PROMPT_REPLUG: &str = "Plug that monitor back in, then press Enter. Type skip to skip.";
-pub const PROMPT_LID: &str =
-    "Close the lid, then open it. Sleep stays off. Then press Enter. Type skip to skip.";
+pub const PROMPT_LID: &str = "Close the lid, then open it. The lid action is Do nothing. Then press Enter. Type skip to skip.";
 pub const PROMPT_POWER: &str =
-    "Tap the power button once. Sleep stays off. Then press Enter. Type skip to skip.";
+    "Press the power button once. Its action is Do nothing. Then press Enter. Type skip to skip.";
 pub const PROMPT_LOCK: &str =
     "Press Enter to lock Windows, then sign in with PIN or password. Type skip to skip.";
 
@@ -72,14 +71,15 @@ pub fn plan(machine: &Machine, flags: &Flags) -> Vec<Planned> {
         lid(machine, flags),
         power_key(machine, flags),
         session_lock(machine, flags),
-        record("ci-probes-stayed-off"),
+        run("restore"),
     ]
 }
 
+fn on_runner(flags: &Flags) -> bool {
+    flags.ci && flags.github_actions
+}
+
 pub fn plan_value(facts: &Value, flags: &Flags) -> Result<(Machine, Vec<Planned>), String> {
-    if service_launch_allowed(flags.ci, flags.github_actions) {
-        return Err("this suite does not install a SYSTEM service".into());
-    }
     let machine = decode_facts(facts)?;
     let rows = plan(&machine, flags);
     debug_assert!(
@@ -160,7 +160,7 @@ fn display_enum(machine: &Machine) -> Planned {
 }
 
 fn hklm(id: &'static str, flags: &Flags) -> Planned {
-    if !flags.admin && !flags.ci {
+    if !flags.admin && !on_runner(flags) {
         return skip(id, "needs-admin", "needs --admin", false, true);
     }
     if !flags.elevated {
@@ -170,7 +170,7 @@ fn hklm(id: &'static str, flags: &Flags) -> Planned {
 }
 
 fn fail_closed(flags: &Flags) -> Planned {
-    if flags.ci {
+    if on_runner(flags) {
         return skip("fail-closed-blocked", "ci", "not run in --ci", false, true);
     }
     if !flags.admin {
@@ -209,7 +209,7 @@ fn physical(
     machine: &Machine,
     prompts: Vec<&'static str>,
 ) -> Planned {
-    if flags.ci {
+    if on_runner(flags) {
         return skip(id, "ci", "physical step", true, false);
     }
     if machine.session == SessionKind::Remote {
@@ -238,7 +238,7 @@ fn hotplug(machine: &Machine, flags: &Flags) -> Planned {
 }
 
 fn lid(machine: &Machine, flags: &Flags) -> Planned {
-    if flags.ci {
+    if on_runner(flags) {
         return skip("lid-cycle", "ci", "physical step", true, false);
     }
     if machine.session == SessionKind::Remote {
@@ -251,7 +251,7 @@ fn lid(machine: &Machine, flags: &Flags) -> Planned {
 }
 
 fn power_key(machine: &Machine, flags: &Flags) -> Planned {
-    if flags.ci {
+    if on_runner(flags) {
         return skip("power-key", "ci", "physical step", true, false);
     }
     if machine.session == SessionKind::Remote {
@@ -274,13 +274,6 @@ fn power_key(machine: &Machine, flags: &Flags) -> Planned {
 
 fn session_lock(machine: &Machine, flags: &Flags) -> Planned {
     physical("session-lock", flags, machine, vec![PROMPT_LOCK])
-}
-
-pub fn service_launch_allowed(ci: bool, github_actions: bool) -> bool {
-    // The suite never installs RunnerDesktopProbe or InputHookProbe.
-    // Those binaries stay in their own workflows, and only on a GitHub runner.
-    let _ = (ci, github_actions);
-    false
 }
 
 #[cfg(test)]
@@ -338,8 +331,21 @@ mod tests {
         assert_eq!(row(&rows, "lid-cycle").action, Action::Prompt);
         assert_eq!(row(&rows, "session-lock").prompts, vec![PROMPT_LOCK]);
         assert!(rows.iter().all(|row| !is_service_probe(row.id)));
-        assert!(!service_launch_allowed(false, false));
-        assert!(!service_launch_allowed(true, true));
+    }
+
+    #[test]
+    fn ci_outside_github_actions_does_not_change_the_plan() {
+        let local = Flags {
+            ci: true,
+            admin: false,
+            elevated: true,
+            github_actions: false,
+        };
+        let rows = plan(&machine(), &local);
+        assert_eq!(row(&rows, "cad-hklm-readback").action, Action::Skip);
+        assert_eq!(row(&rows, "cad-hklm-readback").reason, "needs-admin");
+        assert_eq!(row(&rows, "display-hotplug").action, Action::Prompt);
+        assert_eq!(row(&rows, "fail-closed-blocked").reason, "needs-admin");
     }
 
     #[test]

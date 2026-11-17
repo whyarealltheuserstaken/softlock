@@ -12,7 +12,6 @@ members = [
     "crates/softlock-app/src-tauri",
     # Proof only. Not linked from any product crate and not installed.
     "spikes/overlay",
-    "tests/hardware/windows/harness",
 ]
 exclude = [
     "spikes/desktop-proof",
@@ -22,6 +21,7 @@ exclude = [
     "spikes/macos-lock-kit",
     "tests/hardware/macos",
     "tests/hardware/linux",
+    "tests/hardware/windows/harness",
 ]
 
 [workspace.package]

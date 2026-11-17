@@ -8,7 +8,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::SUITE_NAME;
-use crate::failclosed::finish_state;
 use crate::machine::Machine;
 use crate::plan::{Action, Flags, Planned, plan};
 use crate::redact::redact;
@@ -45,6 +44,8 @@ pub struct Outcome {
     pub interrupted: bool,
     pub restored: bool,
     pub locked: bool,
+    pub fail_closed: bool,
+    pub hklm_command: String,
 }
 
 impl Default for Outcome {
@@ -55,6 +56,8 @@ impl Default for Outcome {
             interrupted: false,
             restored: true,
             locked: false,
+            fail_closed: false,
+            hklm_command: String::new(),
         }
     }
 }
@@ -317,9 +320,6 @@ fn recorded(item: &Planned, machine: &Machine) -> Row {
             measurements.insert("ac".to_string(), json!(machine.ac));
             ("pass", String::new())
         }
-    } else if item.id == "ci-probes-stayed-off" {
-        measurements.insert("launched".to_string(), json!(false));
-        ("pass", "service not installed".to_string())
     } else {
         ("fail", "unknown recorded row".to_string())
     };
@@ -360,7 +360,7 @@ fn row_name(id: &str) -> String {
         "lid-cycle" => "Lid switch",
         "power-key" => "Power button",
         "session-lock" => "Session lock",
-        "ci-probes-stayed-off" => "CI service probes stay off",
+        "restore" => "Restore settings",
         _ => id,
     }
     .to_string()
@@ -387,8 +387,11 @@ fn redact_value(value: &Value) -> Value {
 
 impl Report {
     pub fn state(&self) -> &'static str {
-        let failed = self.summary_fail > 0 || self.outcome.interrupted;
-        finish_state(self.outcome.locked, failed || self.outcome.locked)
+        if self.outcome.locked {
+            "os-locked"
+        } else {
+            "never-unlocked"
+        }
     }
 
     pub fn to_json(&self) -> Value {
@@ -406,7 +409,7 @@ impl Report {
                 "fail": self.summary_fail,
                 "skip": self.summary_skip,
             },
-            "fail_closed": true,
+            "fail_closed": self.outcome.fail_closed,
             "serial_collected": false,
             "restored": self.outcome.restored,
             "interrupted": self.outcome.interrupted,
@@ -455,6 +458,13 @@ impl Report {
                 row.id,
                 row.status,
                 truncate(&detail, 60)
+            ));
+        }
+        if !self.outcome.hklm_command.is_empty() {
+            lines.push(String::new());
+            lines.push(format!(
+                "HKLM was not restored. From an elevated prompt run: {}",
+                self.outcome.hklm_command
             ));
         }
         lines.push(String::new());
@@ -532,6 +542,8 @@ mod tests {
             interrupted: false,
             restored: true,
             locked: false,
+            fail_closed: false,
+            hklm_command: String::new(),
         }
     }
 
@@ -570,14 +582,11 @@ mod tests {
             .unwrap();
         assert_eq!(hotplug.status, "skip");
         assert_eq!(hotplug.skip_reason.as_deref(), Some("ci"));
-        assert_eq!(
+        assert!(
             report
                 .rows
                 .iter()
-                .find(|row| row.id == "ci-probes-stayed-off")
-                .unwrap()
-                .status,
-            "pass"
+                .all(|row| row.id != "ci-probes-stayed-off")
         );
     }
 
@@ -634,6 +643,10 @@ mod tests {
         let (machine, flags) = sample();
         let mut outcome = outcome();
         outcome.locked = true;
+        outcome.fail_closed = false;
+        let locked = render(&machine, &flags, 1_000, &[], &outcome);
+        assert_eq!(locked.state(), "os-locked");
+        outcome.fail_closed = true;
         let report = render(&machine, &flags, 1_000, &[], &outcome);
         assert_eq!(report.state(), "os-locked");
         assert_eq!(report.to_json()["fail_closed"], true);

@@ -3248,14 +3248,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "softlock-win-hwsuite"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "softlock-windows"
 version = "0.1.0"
 
