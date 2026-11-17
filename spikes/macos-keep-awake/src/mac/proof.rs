@@ -871,7 +871,7 @@ fn watch_after_prompt(timeout: Duration, kind: LidKind, since: &str) -> Choice {
         if !raw.is_empty() {
             log_ok = true;
         }
-        let pmset = classify_pmset_since(&raw, &since);
+        let pmset = classify_pmset_since(&raw, since);
         if let Some(event) = detected_sleep(
             ffi::PowerWatch::system_slept(),
             ffi::PowerWatch::display_slept(),
