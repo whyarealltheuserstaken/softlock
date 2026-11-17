@@ -69,6 +69,10 @@ static DEAD_PID: AtomicU32 = AtomicU32::new(0);
 /// The dead PID was passed to `trust_new_process` after the handle was dropped.
 #[cfg(feature = "simulated-physical")]
 static REOPENED_DEAD_PID: AtomicBool = AtomicBool::new(false);
+/// The reuse fixture already wrote a specific failure. Later polls must not
+/// replace it with the pending line.
+#[cfg(feature = "simulated-physical")]
+static REUSE_FIXED: AtomicBool = AtomicBool::new(false);
 /// Why the last armed-event check failed. 1 open, 2 dacl, 3 signal.
 #[cfg(feature = "simulated-physical")]
 static EVENT_FAIL: AtomicU8 = AtomicU8::new(0);
@@ -311,14 +315,25 @@ fn replacement_host_armed_inner() -> bool {
         if dead_pid(pid) {
             return consider_impostor();
         }
+        remember_exited_hold();
         drop_held();
         if trust_new_process(pid, nonce, true).is_ok() {
             return true;
         }
     } else {
+        remember_exited_hold();
         drop_held();
     }
     consider_impostor()
+}
+
+/// A held process that has exited is dead even when the slot cannot be read.
+fn remember_exited_hold() {
+    let pid = HELD_PID.load(Ordering::Acquire);
+    let process = load_handle(&HELD_PROCESS);
+    if pid != 0 && process.is_some_and(|handle| !process_still_active(handle)) {
+        DEAD_PID.store(pid, Ordering::Release);
+    }
 }
 
 fn dead_pid(pid: u32) -> bool {
@@ -349,6 +364,7 @@ fn create_armed_mapping() -> Option<HANDLE> {
         bInheritHandle: false.into(),
     };
     let name = armed_host_name();
+    unsafe { SetLastError(WIN32_ERROR(0)) };
     let mapping = unsafe {
         CreateFileMappingW(
             INVALID_HANDLE_VALUE,
@@ -702,10 +718,11 @@ fn prepare_reuse_fixture() {
         return;
     }
     let Some(nonce) = published_nonce() else {
+        note_reuse_blocked("reason=setup:nonce");
         return;
     };
     let Some((process, pid)) = spawn_suspended_image(&current_image()) else {
-        note_reuse_file("reason=setup");
+        note_reuse_blocked("reason=setup:spawn");
         return;
     };
     if let Err(reject) = trust_new_process(pid, nonce, false) {
@@ -715,13 +732,13 @@ fn prepare_reuse_fixture() {
             ArmReject::Event => event_witness(),
             ArmReject::Inactive => "reason=inactive".to_string(),
         };
-        note_reuse_file(&reason);
+        note_reuse_blocked(&reason);
         terminate_handle(process);
         return;
     }
     let mapping = ARMED_MAPPING.load(Ordering::Acquire);
     if mapping.is_null() || !write_armed_slot(HANDLE(mapping), pid, nonce) {
-        note_reuse_file("reason=setup");
+        note_reuse_blocked("reason=setup:slot");
         terminate_handle(process);
         drop_held();
         return;
@@ -735,11 +752,19 @@ fn note_reuse_witness() {
         return;
     }
     if DEAD_PID.load(Ordering::Acquire) == 0 {
+        if REUSE_FIXED.load(Ordering::Acquire) {
+            return;
+        }
         let sddl = LAST_SDDL
             .lock()
             .map(|text| text.clone())
             .unwrap_or_default();
-        note_reuse_file(&format!("reason=reuse-pending:{sddl}"));
+        note_reuse_file(&format!(
+            "reason=reuse-pending:nonce={} held={} fail={} sddl={sddl}",
+            PUBLISHED_NONCE.load(Ordering::Acquire),
+            HELD_PID.load(Ordering::Acquire),
+            EVENT_FAIL.load(Ordering::Acquire),
+        ));
         return;
     }
     let dropped = HELD_PROCESS.load(Ordering::Acquire) == 0;
@@ -749,6 +774,12 @@ fn note_reuse_witness() {
         u8::from(dropped),
         u8::from(reopened)
     ));
+}
+
+#[cfg(feature = "simulated-physical")]
+fn note_reuse_blocked(text: &str) {
+    REUSE_FIXED.store(true, Ordering::Release);
+    note_reuse_file(text);
 }
 
 #[cfg(feature = "simulated-physical")]
