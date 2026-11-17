@@ -518,11 +518,11 @@ impl Armed {
         if self.finished {
             return;
         }
-        if !signals::tripped() {
-            if let Some(fd) = signals::take_fd() {
-                let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-                let _ = writeln!(file, "{COMPLETE_LINE}");
-            }
+        if !signals::tripped()
+            && let Some(fd) = signals::take_fd()
+        {
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let _ = writeln!(file, "{COMPLETE_LINE}");
         }
         let _ = self.child.wait();
         self.finished = true;
