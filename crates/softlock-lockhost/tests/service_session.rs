@@ -713,7 +713,7 @@ fn standard_user_cannot_plant_the_secret_store() {
     );
     fs::write(&done, b"done").expect("done");
     for child in &children {
-        let _ = wait_process(child.process, Duration::from_secs(20));
+        wait_process(child.process, Duration::from_secs(20));
     }
     remove_service(&name);
     let reports: Vec<String> = modes
@@ -1004,7 +1004,9 @@ struct StandardAccount {
 impl StandardAccount {
     fn create() -> Self {
         let name = format!("slp{}", std::process::id());
-        let password = format!("Aa1!slp{}Qk", std::process::id());
+        // The account name must not appear in the password. The runner
+        // rejects that as a complexity failure.
+        let password = format!("Aa1!QkzzMm9{}", std::process::id() % 97);
         let _ = Command::new("net.exe")
             .args(["user", &name, "/delete"])
             .output();

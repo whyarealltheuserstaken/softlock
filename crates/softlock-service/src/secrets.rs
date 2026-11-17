@@ -441,8 +441,7 @@ fn write_all_handle(handle: windows::Win32::Foundation::HANDLE, bytes: &[u8]) ->
     while offset < bytes.len() {
         let mut wrote = 0u32;
         unsafe {
-            WriteFile(handle, Some(&bytes[offset..]), Some(&mut wrote), None)
-                .map_err(|error| io::Error::from_raw_os_error(error.code().0))?;
+            WriteFile(handle, Some(&bytes[offset..]), Some(&mut wrote), None).map_err(os_error)?;
         }
         if wrote == 0 {
             return Err(io::Error::other("short write"));
@@ -450,7 +449,7 @@ fn write_all_handle(handle: windows::Win32::Foundation::HANDLE, bytes: &[u8]) ->
         offset += wrote as usize;
     }
     unsafe {
-        FlushFileBuffers(handle).map_err(|error| io::Error::from_raw_os_error(error.code().0))?;
+        FlushFileBuffers(handle).map_err(os_error)?;
     }
     Ok(())
 }
@@ -488,7 +487,7 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
             PCWSTR(dest.as_ptr()),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
-        .map_err(|error| io::Error::from_raw_os_error(error.code().0))?;
+        .map_err(os_error)?;
     }
     let _ = fs::remove_file(from);
     Ok(())
@@ -529,7 +528,7 @@ fn create_directory_with(path: &Path, sddl: Option<&str>) -> io::Result<()> {
     if let Some(descriptor) = descriptor.as_ref() {
         free_descriptor(descriptor);
     }
-    created.map_err(|error| io::Error::from_raw_os_error(error.code().0))
+    created.map_err(os_error)
 }
 
 #[cfg(all(windows, feature = "simulated-physical"))]
@@ -557,7 +556,7 @@ fn create_file_new_user(path: &Path) -> io::Result<windows::Win32::Foundation::H
             io::ErrorKind::AlreadyExists,
             "pin temp file exists",
         )),
-        Err(error) => Err(io::Error::from_raw_os_error(error.code().0)),
+        Err(error) => Err(os_error(error)),
     }
 }
 
@@ -582,6 +581,20 @@ fn not_found(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || matches!(error.raw_os_error(), Some(2) | Some(3))
 }
 
+/// `windows::core::Error::code` is an HRESULT. `ERROR_FILE_NOT_FOUND` arrives
+/// as `0x80070002`, which `from_raw_os_error` does not treat as not-found,
+/// so a missing directory was never created.
+#[cfg(windows)]
+fn os_error(error: windows::core::Error) -> io::Error {
+    let code = error.code().0 as u32;
+    let win32 = if code & 0xFFFF_0000 == 0x8007_0000 {
+        (code & 0xFFFF) as i32
+    } else {
+        error.code().0
+    };
+    io::Error::from_raw_os_error(win32)
+}
+
 #[cfg(windows)]
 fn security_descriptor() -> io::Result<windows::Win32::Security::PSECURITY_DESCRIPTOR> {
     security_descriptor_from(SYSTEM_SECURITY_SDDL)
@@ -603,7 +616,7 @@ fn security_descriptor_from(
             &mut descriptor,
             None,
         )
-        .map_err(|error| io::Error::from_raw_os_error(error.code().0))?;
+        .map_err(os_error)?;
     }
     Ok(descriptor)
 }
@@ -683,11 +696,11 @@ fn enable_privilege_scoped(name: windows::core::PCWSTR) -> io::Result<PrivilegeG
             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
             &mut token,
         )
-        .map_err(|error| io::Error::from_raw_os_error(error.code().0))?;
+        .map_err(os_error)?;
         let mut luid = windows::Win32::Foundation::LUID::default();
         if let Err(error) = LookupPrivilegeValueW(windows::core::PCWSTR::null(), name, &mut luid) {
             let _ = windows::Win32::Foundation::CloseHandle(token);
-            return Err(io::Error::from_raw_os_error(error.code().0));
+            return Err(os_error(error));
         }
         let privileges = TOKEN_PRIVILEGES {
             PrivilegeCount: 1,
@@ -709,7 +722,7 @@ fn enable_privilege_scoped(name: windows::core::PCWSTR) -> io::Result<PrivilegeG
         let last = GetLastError();
         if let Err(error) = adjusted {
             let _ = windows::Win32::Foundation::CloseHandle(token);
-            return Err(io::Error::from_raw_os_error(error.code().0));
+            return Err(os_error(error));
         }
         if last == ERROR_NOT_ALL_ASSIGNED {
             let _ = windows::Win32::Foundation::CloseHandle(token);
@@ -743,7 +756,7 @@ fn handle_is_reparse(handle: windows::Win32::Foundation::HANDLE) -> io::Result<b
             &mut info as *mut FILE_ATTRIBUTE_TAG_INFO as *mut core::ffi::c_void,
             std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
         )
-        .map_err(|error| io::Error::from_raw_os_error(error.code().0))?;
+        .map_err(os_error)?;
     }
     Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0)
 }
@@ -762,7 +775,7 @@ fn handle_is_directory(handle: windows::Win32::Foundation::HANDLE) -> io::Result
             &mut info as *mut FILE_ATTRIBUTE_TAG_INFO as *mut core::ffi::c_void,
             std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
         )
-        .map_err(|error| io::Error::from_raw_os_error(error.code().0))?;
+        .map_err(os_error)?;
     }
     Ok(info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0)
 }
@@ -823,7 +836,7 @@ fn open_reparse(
             flags,
             None,
         )
-        .map_err(|error| io::Error::from_raw_os_error(error.code().0))
+        .map_err(os_error)
     }
 }
 
@@ -868,7 +881,7 @@ fn apply_security_on_handle(handle: windows::Win32::Foundation::HANDLE) -> io::R
         )
     };
     free_descriptor(&descriptor);
-    applied.map_err(|error| io::Error::from_raw_os_error(error.code().0))
+    applied.map_err(os_error)
 }
 
 #[cfg(windows)]
@@ -990,7 +1003,7 @@ fn system_sid() -> io::Result<Vec<u8>> {
             Some(PSID(sid_buf.as_mut_ptr().cast())),
             &mut len,
         )
-        .map_err(|error| io::Error::from_raw_os_error(error.code().0))?;
+        .map_err(os_error)?;
     }
     Ok(sid_buf)
 }
