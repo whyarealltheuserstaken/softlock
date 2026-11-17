@@ -60,3 +60,6 @@ name = "macos_lock_kit"
 
 [[test]]
 name = "universal_ci"
+
+[[test]]
+name = "macos_x86_slice"

@@ -8,6 +8,7 @@ mod launchctl;
 mod plist;
 mod png;
 mod report;
+mod smoke;
 mod text;
 mod version;
 

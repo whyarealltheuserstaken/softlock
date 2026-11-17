@@ -114,7 +114,7 @@ The daemon is root and has no graphic session, so it did not create a window. A 
 - **m04** stays for this one 1024x768 display only as a positive capture. All four paths showed non-black pixels and the marker colour. Capture exclusion was not tested. A second monitor is not present.
 - **m07** moves entirely to Henry's Intel Mac. The runner has no lid, no App Nap from a closed lid, and no real idle the way a laptop does.
 - **m08** keeps its chooser rows on the existing verify job. Those rows are a pure function and do not lock. The sheet (lock timing, the screensaver, FileVault, and the password after the screensaver) is Henry's Mac. This spike did not lock the runner.
-- **m11** stays on Henry's Intel Mac. This run is arm64. A Rosetta run is not the x86_64 slice test.
+- **m11** runs on GitHub `macos-15-intel` and `macos-26-intel` (still listed on the hosted-runners page on 16 November 2026), downloading the fat binaries m01 uploaded. This m02 run is arm64. A Rosetta run on this runner is not the x86_64 slice test. CI is the primary m11 evidence. His Intel Mac stays as an optional kit.
 - **m15** can keep load/unload and the socket protocol on the runner. The daemon has no graphic session, so launchd has to start the agent at login for a window. The proof process's window became key and received the posted key. The LaunchAgent's window was key and did not receive it (`CGPreflightPostEventAccess=false`), so a posted key reaching the product agent's window stays on Henry's Mac, along with installing the product agent and locking from a second process.
 
 ## Henry's Intel Mac
@@ -127,6 +127,6 @@ On that Mac:
 - A posted key reaching a LaunchAgent window. The runner's proof process became key and received keyCode 0. The LaunchAgent window was key and still did not receive it, because `CGPreflightPostEventAccess` was false in that process.
 - m07: lid, power assertions, and real idle.
 - m08: the lock sheet, the screensaver, and FileVault.
-- m11: the x86_64 slice.
+- m11: optional `--smoke` of the same fat probe on this machine.
 - m15: a product LaunchAgent in the Aqua session, and locking from a second process.
 - m04: capture exclusion, which this runner did not test, and a second display if one is attached. The runner only showed the positive capture on 1024x768.

@@ -26,7 +26,7 @@ A ticket whose tests are CI and whose checklist line is his Mac is labeled with 
 | [m08](m08-fail-closed-intel.md) | Kit: the two D5 lock paths, the fallback test, and FileVault status | m02 for the sheet; the CI rows wait on nothing | Henry's Intel Mac, and CI for the chooser |
 | [m09](m09-password-sheet-intel.md) | Kit: `LAContext` password sheet above the overlay | m05 | Henry's Intel Mac |
 | [m10](m10-tcc-prompts-intel.md) | Kit: Accessibility and Input Monitoring, no MDM | m05 | Henry's Intel Mac |
-| [m11](m11-x86-slice-intel.md) | Run the x86_64 slice natively | m01, m02 | Henry's Intel Mac |
+| [m11](m11-x86-slice-intel.md) | Run the x86_64 slice natively | m01, m02 | CI on GitHub Intel, and Henry's Intel Mac (optional kit) |
 | [m12](m12-touch-id.md) | Kit: Touch ID | m09 | Henry's Intel Mac |
 | [m14](m14-lock-host.md) | Lock Host: block physical input, pass posted input, dev PIN | m01, m03, m04, m05, m06, m10, m11 | CI only and Henry's Intel Mac |
 | [m15](m15-service.md) | Service: LaunchDaemon, LaunchAgent, socket, Broker nonce | m14, m02 | CI only and Henry's Intel Mac |

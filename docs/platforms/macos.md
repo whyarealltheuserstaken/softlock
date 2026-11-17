@@ -188,7 +188,7 @@ The socket is the named-pipe analogue. Same length-prefixed JSON, same verbs, st
 
 **Verified.** The Tauri 2 CLI documents `--target universal-apple-darwin` as the universal macOS target, and says both `aarch64-apple-darwin` and `x86_64-apple-darwin` must be installed. The page is the [Tauri CLI reference](https://v2.tauri.app/reference/cli/). Tauri's own note, from the CLI maintainer on the docs issue, is that this target is built on a Mac.
 
-**Verified, read 16 November 2026.** GitHub's [hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) list `macos-latest` as arm64 (Apple silicon, M1), in the same row as `macos-15` and `macos-26`. The runner-images README and the 1 October 2026 changelog disagree about whether `macos-latest` is still macOS 15 or has moved to macOS 26. Ticket m02 prints `sw_vers` and does not assume which. The same GitHub page lists Intel labels `macos-15-intel` and `macos-26-intel`. This plan does not use them. Henry's D1 puts the Intel slice on his Mac and the arm64 slice on `macos-latest`. The lead accepted D4, which is the choice not to add the Intel labels.
+**Verified, read 16 November 2026.** GitHub's [hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) list `macos-latest` as arm64 (Apple silicon, M1), in the same row as `macos-15` and `macos-26`. The runner-images README and the 1 October 2026 changelog disagree about whether `macos-latest` is still macOS 15 or has moved to macOS 26. Ticket m02 prints `sw_vers` and does not assume which. The same GitHub page lists Intel labels `macos-15-intel` and `macos-26-intel`. D4 keeps those labels off the m01 build job. On 16 November 2026 they were still listed, so m11's native job downloads the m01 fat binaries there instead of a Rosetta `uname` on `macos-latest`. CI is the primary m11 evidence. The lead kept Henry's Intel Mac as an optional kit on that ticket. GitHub said on 19 September 2025 ([runner-images #13045](https://github.com/actions/runner-images/issues/13045), [changelog](https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/)) that `macos-15-intel` lasts until August 2027 as the last x86_64 image. No end date is published for `macos-26-intel`.
 
 **Spike m01.** On `macos-latest`:
 
@@ -199,7 +199,7 @@ The socket is the named-pipe analogue. Same length-prefixed JSON, same verbs, st
 - `lipo -thin` each slice into its own directory, and the existing release-binary test scans each directory
 - `npm run tauri build -- --target universal-apple-darwin`, then the same `lipo` checks on the executable inside the app bundle
 
-The arm64 slice is executed on that runner. The x86_64 slice is executed on Henry's Intel Mac (m11), not under Rosetta.
+The arm64 slice is executed on that runner. The x86_64 slice is executed on GitHub Intel in m11 (primary), with Henry's Intel Mac as an optional kit, not under Rosetta.
 
 ## 8. Seams and the release-binary scan
 
