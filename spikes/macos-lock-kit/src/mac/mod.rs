@@ -19,7 +19,9 @@ use crate::args::{Args, ExercisePath, Mode};
 use crate::commands::{engine_path_allowed, observation_argv_allowed, read_only_argv_allowed};
 use crate::helper::{HELPER_ENV, HelperAction, helper_should_lock};
 use crate::kit_gate::{KitInvocation, KitPermission, may_lock, permit};
-use crate::lock_attempt::{Attempt, CallWait, LockSeen, SignalEnd, judge, signal_end};
+use crate::lock_attempt::{
+    Attempt, CallWait, InterruptPlan, LockSeen, SignalEnd, interrupt_plan, judge, signal_end,
+};
 use crate::redact::sanitize;
 use crate::report::{
     ExerciseRecord, Facts, KitReport, MISSING_SYMBOL_CI_TEST, build_report, render,
@@ -168,7 +170,9 @@ fn stop_for_signal(
 ) -> i32 {
     let helper_end = wait_helper_end(dir, armed, HELPER_WAIT);
     record.helper_end = helper_end.clone().unwrap_or_else(|| "unread".to_string());
-    match signal_end(record.state == "os-locked", helper_end.as_deref()) {
+    let already_locked =
+        interrupt_plan(record.state == "os-locked") == InterruptPlan::ExitWithoutUnlock;
+    match signal_end(already_locked, helper_end.as_deref()) {
         SignalEnd::AlreadyLocked => {
             push_detail(record, "a signal arrived; the session was already locked");
         }
