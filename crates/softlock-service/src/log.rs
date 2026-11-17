@@ -135,9 +135,9 @@ pub struct FileLog {
 
 impl FileLog {
     pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
-        // The parent is created by `secure_service_directory` before this
-        // call. `create_dir_all` here would inherit ProgramData's DACL and
-        // let Users plant files in the service directory.
+        // The parent is the LocalSystem profile directory, verified before
+        // this call. This function does not create that directory and does
+        // not delete a file that fails the check.
         #[cfg(windows)]
         let data_dir = crate::service_data_directory();
         #[cfg(windows)]

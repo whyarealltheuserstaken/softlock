@@ -15,8 +15,7 @@ use softlock_core::pipe_name;
 use softlock_lockhost::{RunNonce, set_run_nonce};
 use softlock_seam3::{Probe, send_virtual_key};
 use softlock_service::{
-    SYSTEM_ONLY_SDDL, dacl_sddl, is_reparse_point, pin_directory, service_data_directory,
-    user_read_denied,
+    SYSTEM_ONLY_SDDL, dacl_sddl, is_reparse_point, service_data_directory, user_read_denied,
 };
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
@@ -609,9 +608,8 @@ fn local_system_pin_file_is_rewritten_and_unreadable() {
     let _guard = gate();
     let service = service_exe();
     let (name, display) = service_names(&service);
-    let dir = pin_directory();
-    let _ = fs::create_dir_all(&dir);
-    let _ = fs::write(dir.join("pin.phc"), b"planted-by-user");
+    let dir = service_data_directory();
+    reclaim_data_dir(&dir);
     let probe = std::env::temp_dir().join(format!("svc-pin-{}.txt", std::process::id()));
     let body = install_service(
         &service,
@@ -622,6 +620,10 @@ fn local_system_pin_file_is_rewritten_and_unreadable() {
     );
     remove_service(&name);
     assert!(
+        body.contains("pin_loaded=none"),
+        "a hash was loaded before the service wrote one: {body}"
+    );
+    assert!(
         body.contains("pin_reload=ok"),
         "LocalSystem did not save and reload the pin file: {body}"
     );
@@ -631,6 +633,9 @@ fn local_system_pin_file_is_rewritten_and_unreadable() {
         "the interactive user could read {}",
         path.display()
     );
+    assert_eq!(dacl_sddl(&dir).expect("directory dacl"), SYSTEM_ONLY_SDDL);
+    assert_eq!(dacl_sddl(&path).expect("pin dacl"), SYSTEM_ONLY_SDDL);
+    reclaim_data_dir(&dir);
 }
 
 #[test]
@@ -668,24 +673,34 @@ fn several_pipe_instances_accept_at_once() {
 }
 
 #[test]
-fn planted_directory_junction_and_temp_file_are_not_adopted() {
+fn standard_user_cannot_plant_the_secret_store() {
+    if let Ok(mode) = std::env::var("SOFTLOCK_PLANT_CHILD") {
+        plant_child(&mode);
+        return;
+    }
     let _guard = gate();
+    let _account = StandardAccount::create();
     let dir = service_data_directory();
-    let service = service_exe();
-    let (name, display) = service_names(&service);
+    reclaim_data_dir(&dir);
     let bait = std::env::temp_dir().join(format!("svc-bait-{}", std::process::id()));
     let _ = fs::remove_dir_all(&bait);
     fs::create_dir_all(&bait).expect("bait");
     fs::write(bait.join("marker.txt"), b"bait-marker").expect("marker");
     fs::write(bait.join("pin.phc"), b"bait-hash").expect("bait pin");
-    fs::write(bait.join("pin.tmp"), b"bait-temp").expect("bait temp");
-
-    reclaim_data_dir(&dir);
-    as_standard_user(|| create_junction(&dir, &bait).expect("junction"));
-    assert!(
-        is_reparse_point(&dir).expect("reparse query"),
-        "the plant is not a junction"
-    );
+    fs::write(bait.join("outside.txt"), b"outside").expect("outside");
+    let public = PathBuf::from(r"C:\Users\Public");
+    let done = public.join(format!("sl-plant-done-{}.txt", std::process::id()));
+    let _ = fs::remove_file(&done);
+    let modes = ["hold-file", "junction", "replant", "hold-dir"];
+    let mut children = Vec::new();
+    for mode in modes {
+        let report = public.join(format!("sl-plant-{mode}-{}.txt", std::process::id()));
+        let _ = fs::remove_file(&report);
+        children.push(spawn_standard_user(&mode, &dir, &bait, &report, &done));
+    }
+    thread::sleep(Duration::from_millis(500));
+    let service = service_exe();
+    let (name, display) = service_names(&service);
     let probe = std::env::temp_dir().join(format!("svc-plant-{}.txt", std::process::id()));
     let body = install_service(
         &service,
@@ -694,88 +709,83 @@ fn planted_directory_junction_and_temp_file_are_not_adopted() {
         &probe,
         &["SOFTLOCK_PIN_SELFTEST=1".to_string()],
     );
+    fs::write(&done, b"done").expect("done");
+    for child in &children {
+        let _ = wait_process(child.process, Duration::from_secs(20));
+    }
     remove_service(&name);
+    let reports: Vec<String> = modes
+        .iter()
+        .map(|mode| {
+            fs::read_to_string(public.join(format!("sl-plant-{mode}-{}.txt", std::process::id())))
+                .unwrap_or_else(|error| format!("missing report: {error}"))
+        })
+        .collect();
+    for (mode, report) in modes.iter().zip(reports.iter()) {
+        assert!(
+            report.contains("il=8192"),
+            "{mode} did not run at medium integrity: {report}"
+        );
+        assert!(
+            report.contains("result=denied"),
+            "{mode} planted the secret store: {report}"
+        );
+    }
+    assert!(
+        body.contains("pin_loaded=none"),
+        "a planted hash was loaded: {body}"
+    );
     assert!(
         body.contains("pin_reload=ok"),
-        "pin selftest failed after the junction: {body}"
+        "the service did not create its own store: {body}"
+    );
+    assert_eq!(
+        fs::read(bait.join("marker.txt")).expect("marker"),
+        b"bait-marker"
     );
     assert_eq!(
         fs::read(bait.join("pin.phc")).expect("bait pin"),
         b"bait-hash"
     );
     assert_eq!(
-        fs::read(bait.join("pin.tmp")).expect("bait temp"),
-        b"bait-temp"
-    );
-    assert_eq!(
-        fs::read(bait.join("marker.txt")).expect("marker"),
-        b"bait-marker"
+        fs::read(bait.join("outside.txt")).expect("outside"),
+        b"outside"
     );
     assert!(
         !bait.join("service.log").exists(),
-        "the service wrote the log through the junction"
+        "the service wrote the log outside its directory"
     );
     assert!(
-        !is_reparse_point(&dir).unwrap_or(true),
-        "the service directory is still a junction"
-    );
-    assert_eq!(
-        dacl_sddl(&dir).expect("directory dacl"),
-        SYSTEM_ONLY_SDDL,
-        "directory dacl"
-    );
-    assert!(
-        user_read_denied(&dir.join("pin.phc")),
-        "the hash written after the junction was readable"
-    );
-    assert_eq!(
-        dacl_sddl(&dir.join("pin.phc")).expect("pin dacl"),
-        SYSTEM_ONLY_SDDL
-    );
-
-    reclaim_data_dir(&dir);
-    as_standard_user(|| {
-        fs::create_dir_all(&dir).expect("user directory");
-        fs::write(dir.join("pin.phc"), b"planted-by-user").expect("planted pin");
-        fs::write(dir.join("pin.tmp"), b"planted-temp").expect("planted temp");
-        fs::write(dir.join("pin.0.tmp"), b"planted-predictable").expect("predictable temp");
-    });
-    let probe = std::env::temp_dir().join(format!("svc-plant2-{}.txt", std::process::id()));
-    let body = install_service(
-        &service,
-        &name,
-        &display,
-        &probe,
-        &["SOFTLOCK_PIN_SELFTEST=1".to_string()],
-    );
-    remove_service(&name);
-    assert!(
-        body.contains("pin_reload=ok"),
-        "pin selftest failed after the planted directory: {body}"
-    );
-    assert!(
-        !is_reparse_point(&dir).unwrap_or(true),
-        "the recreated directory is a reparse point"
+        is_reparse_point(&dir).ok() != Some(true),
+        "the service directory is a junction"
     );
     assert_eq!(dacl_sddl(&dir).expect("directory dacl"), SYSTEM_ONLY_SDDL);
-    assert!(
-        user_read_denied(&dir.join("pin.phc")),
-        "the hash is readable"
-    );
+    let pin = dir.join("pin.phc");
+    assert!(user_read_denied(&pin), "the hash is readable");
+    assert_eq!(dacl_sddl(&pin).expect("pin dacl"), SYSTEM_ONLY_SDDL);
+    let bytes = read_with_backup(&pin).expect("read hash as backup");
     assert_eq!(
-        dacl_sddl(&dir.join("pin.phc")).expect("pin dacl"),
-        SYSTEM_ONLY_SDDL
+        bytes,
+        b"phc-round-2",
+        "planted bytes were stored: {}",
+        String::from_utf8_lossy(&bytes)
     );
-    for planted in ["pin.tmp", "pin.0.tmp"] {
-        match fs::read(dir.join(planted)) {
-            Ok(bytes) => panic!(
-                "planted {planted} was adopted: {}",
-                String::from_utf8_lossy(&bytes)
-            ),
-            Err(error) => assert!(
-                error.raw_os_error() == Some(5) || error.kind() == std::io::ErrorKind::NotFound,
-                "planted {planted} failed with {error}"
-            ),
+    assert!(
+        !bytes
+            .windows(b"planted".len())
+            .any(|window| window == b"planted"),
+        "planted hash bytes were stored"
+    );
+    drop(children);
+    let _ = fs::remove_file(&done);
+    reclaim_data_dir(&dir);
+}
+
+impl Drop for PlantChild {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::System::Threading::TerminateProcess(self.process, 1);
+            let _ = windows::Win32::Foundation::CloseHandle(self.process);
         }
     }
 }
@@ -984,55 +994,404 @@ fn reclaim_data_dir(dir: &Path) {
     );
 }
 
-/// Drop Administrators to deny-only and turn privileges off, then run `plant`
-/// on this thread. Child processes are not used, so the impersonation applies.
-fn as_standard_user(plant: impl FnOnce()) {
+struct StandardAccount {
+    name: String,
+}
+
+impl StandardAccount {
+    fn create() -> Self {
+        let name = format!("slp{}", std::process::id());
+        let password = format!("Aa1!slp{}Qk", std::process::id());
+        let _ = Command::new("net.exe")
+            .args(["user", &name, "/delete"])
+            .output();
+        let added = Command::new("net.exe")
+            .args(["user", &name, &password, "/add"])
+            .output()
+            .expect("net user");
+        assert!(
+            added.status.success(),
+            "net user /add failed: {} {}",
+            String::from_utf8_lossy(&added.stdout),
+            String::from_utf8_lossy(&added.stderr)
+        );
+        std::env::set_var("SOFTLOCK_PLANT_USER", &name);
+        std::env::set_var("SOFTLOCK_PLANT_PASSWORD", &password);
+        Self { name }
+    }
+}
+
+impl Drop for StandardAccount {
+    fn drop(&mut self) {
+        let _ = Command::new("net.exe")
+            .args(["user", &self.name, "/delete"])
+            .output();
+        std::env::remove_var("SOFTLOCK_PLANT_USER");
+        std::env::remove_var("SOFTLOCK_PLANT_PASSWORD");
+    }
+}
+
+struct PlantChild {
+    process: HANDLE,
+}
+
+fn spawn_standard_user(
+    mode: &str,
+    dir: &Path,
+    bait: &Path,
+    report: &Path,
+    done: &Path,
+) -> PlantChild {
     use windows::Win32::Security::{
-        CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE, ImpersonateLoggedOnUser,
-        PSID, RevertToSelf, SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, WinBuiltinAdministratorsSid,
+        CreateWellKnownSid, DuplicateTokenEx, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT,
+        LogonUserW, PSID, SE_ASSIGNPRIMARYTOKEN_NAME, SE_INCREASE_QUOTA_NAME,
+        SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL, TokenIntegrityLevel,
+        TokenPrimary, WinMediumLabelSid,
     };
-    use windows::Win32::System::SystemServices::SE_GROUP_USE_FOR_DENY_ONLY;
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    struct Revert;
-    impl Drop for Revert {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = RevertToSelf();
-            }
+    use windows::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+    enable_privilege(SE_ASSIGNPRIMARYTOKEN_NAME);
+    enable_privilege(SE_INCREASE_QUOTA_NAME);
+    let user = std::env::var("SOFTLOCK_PLANT_USER").expect("user");
+    let password = std::env::var("SOFTLOCK_PLANT_PASSWORD").expect("password");
+    let user_w = wide_chars(&user);
+    let password_w = wide_chars(&password);
+    let domain = wide_chars(".");
+    let mut token = HANDLE::default();
+    unsafe {
+        LogonUserW(
+            PCWSTR(user_w.as_ptr()),
+            PCWSTR(domain.as_ptr()),
+            PCWSTR(password_w.as_ptr()),
+            LOGON32_LOGON_INTERACTIVE,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut token,
+        )
+        .expect("LogonUserW");
+    }
+    let mut primary = HANDLE::default();
+    unsafe {
+        DuplicateTokenEx(
+            token,
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary,
+        )
+        .expect("DuplicateTokenEx");
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+    }
+    let mut sid = vec![0u8; 68];
+    let mut sid_len = sid.len() as u32;
+    unsafe {
+        CreateWellKnownSid(
+            WinMediumLabelSid,
+            None,
+            Some(PSID(sid.as_mut_ptr().cast())),
+            &mut sid_len,
+        )
+        .expect("medium sid");
+        let label = TOKEN_MANDATORY_LABEL {
+            Label: windows::Win32::Security::SID_AND_ATTRIBUTES {
+                Sid: PSID(sid.as_mut_ptr().cast()),
+                Attributes: (windows::Win32::System::SystemServices::SE_GROUP_INTEGRITY
+                    | windows::Win32::System::SystemServices::SE_GROUP_INTEGRITY_ENABLED)
+                    as u32,
+            },
+        };
+        let _ = windows::Win32::Security::SetTokenInformation(
+            primary,
+            TokenIntegrityLevel,
+            (&label as *const TOKEN_MANDATORY_LABEL).cast(),
+            std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + sid_len,
+        );
+    }
+    let exe = std::env::current_exe().expect("test exe");
+    let command = format!(
+        "\"{}\" --exact standard_user_cannot_plant_the_secret_store --test-threads=1 --nocapture",
+        exe.display()
+    );
+    let mut command_w = wide_chars(&command);
+    let mut env = plant_environment(mode, dir, bait, report, done);
+    let mut desktop = wide_chars(r"winsta0\default");
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        lpDesktop: PWSTR(desktop.as_mut_ptr()),
+        ..STARTUPINFOW::default()
+    };
+    let mut info = PROCESS_INFORMATION::default();
+    let directory = wide_chars(r"C:\Users\Public");
+    unsafe {
+        CreateProcessAsUserW(
+            Some(primary),
+            PCWSTR::null(),
+            Some(PWSTR(command_w.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            Some(env.as_mut_ptr().cast()),
+            PCWSTR(directory.as_ptr()),
+            &startup,
+            &mut info,
+        )
+        .unwrap_or_else(|error| panic!("CreateProcessAsUserW {mode}: {error}"));
+        let _ = windows::Win32::Foundation::CloseHandle(info.hThread);
+        let _ = windows::Win32::Foundation::CloseHandle(primary);
+    }
+    PlantChild {
+        process: info.hProcess,
+    }
+}
+
+fn plant_environment(mode: &str, dir: &Path, bait: &Path, report: &Path, done: &Path) -> Vec<u16> {
+    let mut block = String::new();
+    for (key, value) in std::env::vars() {
+        if key.starts_with("SOFTLOCK_PLANT_") {
+            continue;
+        }
+        block.push_str(&key);
+        block.push('=');
+        block.push_str(&value);
+        block.push('\0');
+    }
+    for (key, value) in [
+        ("SOFTLOCK_PLANT_CHILD", mode),
+        ("SOFTLOCK_PLANT_DIR", &dir.display().to_string()),
+        ("SOFTLOCK_PLANT_BAIT", &bait.display().to_string()),
+        ("SOFTLOCK_PLANT_REPORT", &report.display().to_string()),
+        ("SOFTLOCK_PLANT_DONE", &done.display().to_string()),
+    ] {
+        block.push_str(key);
+        block.push('=');
+        block.push_str(value);
+        block.push('\0');
+    }
+    block.push('\0');
+    block.encode_utf16().collect()
+}
+
+fn plant_child(mode: &str) {
+    let dir = PathBuf::from(std::env::var("SOFTLOCK_PLANT_DIR").unwrap_or_default());
+    let bait = PathBuf::from(std::env::var("SOFTLOCK_PLANT_BAIT").unwrap_or_default());
+    let report = PathBuf::from(std::env::var("SOFTLOCK_PLANT_REPORT").unwrap_or_default());
+    let done = PathBuf::from(std::env::var("SOFTLOCK_PLANT_DONE").unwrap_or_default());
+    let il = integrity_rid();
+    let mut opened = false;
+    let mut code = 0i32;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let held = loop {
+        if done.exists() || Instant::now() > deadline {
+            break None;
+        }
+        match mode {
+            "hold-file" => match create_held_file(&dir.join("pin.phc")) {
+                Ok(handle) => {
+                    opened = true;
+                    break Some(handle);
+                }
+                Err(error) => code = error.raw_os_error().unwrap_or(code),
+            },
+            "junction" => match create_junction(&dir, &bait) {
+                Ok(()) => {
+                    opened = true;
+                    break None;
+                }
+                Err(error) => code = error.raw_os_error().unwrap_or(code),
+            },
+            "replant" => match plant_pin(&dir) {
+                Ok(()) => {
+                    opened = true;
+                    break None;
+                }
+                Err(error) => code = error.raw_os_error().unwrap_or(code),
+            },
+            "hold-dir" => match open_dir_for_write(&dir) {
+                Ok(handle) => {
+                    opened = true;
+                    break Some(handle);
+                }
+                Err(error) => code = error.raw_os_error().unwrap_or(code),
+            },
+            _ => break None,
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    while !done.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let result = if opened { "opened" } else { "denied" };
+    let _ = fs::write(
+        &report,
+        format!("il={il}\nresult={result}\ncode={code}\nmode={mode}\n"),
+    );
+    if let Some(handle) = held {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
         }
     }
+}
+
+fn integrity_rid() -> u32 {
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, TokenIntegrityLevel,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     unsafe {
         let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut token).expect("token");
-        let mut sid_buf = vec![0u8; 64];
-        let mut len = sid_buf.len() as u32;
-        CreateWellKnownSid(
-            WinBuiltinAdministratorsSid,
-            None,
-            Some(PSID(sid_buf.as_mut_ptr().cast())),
-            &mut len,
-        )
-        .expect("administrators sid");
-        let deny = [SID_AND_ATTRIBUTES {
-            Sid: PSID(sid_buf.as_mut_ptr().cast()),
-            Attributes: SE_GROUP_USE_FOR_DENY_ONLY as u32,
-        }];
-        let mut restricted = HANDLE::default();
-        CreateRestrictedToken(
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return 0;
+        }
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut needed);
+        let mut buffer = vec![0u8; needed as usize];
+        if GetTokenInformation(
             token,
-            DISABLE_MAX_PRIVILEGE,
-            Some(&deny),
-            None,
-            None,
-            &mut restricted,
+            TokenIntegrityLevel,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
         )
-        .expect("restricted token");
+        .is_err()
+        {
+            let _ = windows::Win32::Foundation::CloseHandle(token);
+            return 0;
+        }
+        let label = &*(buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>());
+        let count = *GetSidSubAuthorityCount(label.Label.Sid);
+        let rid = *GetSidSubAuthority(label.Label.Sid, u32::from(count.saturating_sub(1)));
         let _ = windows::Win32::Foundation::CloseHandle(token);
-        ImpersonateLoggedOnUser(restricted).expect("impersonate");
-        let _revert = Revert;
-        plant();
-        let _ = windows::Win32::Foundation::CloseHandle(restricted);
+        rid
     }
+}
+
+fn create_held_file(path: &Path) -> std::io::Result<HANDLE> {
+    use windows::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_MODE,
+    };
+    use windows::core::PCWSTR;
+    let wide_path = wide_chars(&path.display().to_string());
+    unsafe {
+        CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+            FILE_SHARE_MODE(0),
+            None,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        .map_err(|error| std::io::Error::from_raw_os_error(error.code().0))
+    }
+}
+
+fn plant_pin(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    fs::write(dir.join("pin.phc"), b"planted-by-user")?;
+    Ok(())
+}
+
+fn open_dir_for_write(path: &Path) -> std::io::Result<HANDLE> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_MODE, OPEN_EXISTING,
+        WRITE_DAC,
+    };
+    use windows::core::PCWSTR;
+    let wide_path = wide_chars(&path.display().to_string());
+    unsafe {
+        CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            FILE_ADD_FILE.0 | WRITE_DAC.0,
+            FILE_SHARE_MODE(0),
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        .map_err(|error| std::io::Error::from_raw_os_error(error.code().0))
+    }
+}
+
+fn enable_privilege(name: windows::core::PCWSTR) {
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let mut luid = windows::Win32::Foundation::LUID::default();
+        if LookupPrivilegeValueW(windows::core::PCWSTR::null(), name, &mut luid).is_err() {
+            let _ = windows::Win32::Foundation::CloseHandle(token);
+            return;
+        }
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let _ = AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None);
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+    }
+}
+
+fn wait_process(process: HANDLE, timeout: Duration) {
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    unsafe {
+        let _ = WaitForSingleObject(process, timeout.as_millis() as u32);
+    }
+}
+
+fn read_with_backup(path: &Path) -> std::io::Result<Vec<u8>> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+        ReadFile,
+    };
+    use windows::core::PCWSTR;
+    enable_privilege(windows::Win32::Security::SE_BACKUP_NAME);
+    let wide_path = wide_chars(&path.display().to_string());
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        .map_err(|error| std::io::Error::from_raw_os_error(error.code().0))?
+    };
+    let mut buffer = vec![0u8; 64];
+    let mut read = 0u32;
+    unsafe {
+        ReadFile(handle, Some(&mut buffer), Some(&mut read), None)
+            .map_err(|error| std::io::Error::from_raw_os_error(error.code().0))?;
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+    }
+    buffer.truncate(read as usize);
+    Ok(buffer)
+}
+
+fn wide_chars(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn create_junction(link: &Path, target: &Path) -> std::io::Result<()> {

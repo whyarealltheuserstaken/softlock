@@ -410,8 +410,12 @@ impl Authority {
         match hash_softlock_pin(pin) {
             Ok(hash) => {
                 if let Err(error) = crate::secrets::PinStore::in_dir(&pin_directory()).save(&hash) {
-                    let code = error.raw_os_error().unwrap_or(0).to_string();
-                    audit("pin-set", &[("result", "rejected"), ("os", &code)]);
+                    let reason = if error.to_string().contains("LocalSystem") {
+                        "localsystem"
+                    } else {
+                        "io"
+                    };
+                    audit("pin-set", &[("result", "rejected"), ("reason", reason)]);
                     return ResponseKind::Unsupported;
                 }
                 self.pin_hash = Some(hash);
@@ -496,16 +500,35 @@ pub fn pin_directory() -> PathBuf {
     service_data_directory()
 }
 
-/// `C:\ProgramData\<service name>` on Windows. Ignores the test override so
-/// service start can secure this directory before any log write.
+/// The LocalSystem profile directory. A standard user cannot create it.
+/// Ignores the test override so service start verifies this directory before
+/// any log write.
 pub fn service_data_directory() -> PathBuf {
     default_pin_directory()
 }
 
 #[cfg(windows)]
 fn default_pin_directory() -> PathBuf {
-    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
-    PathBuf::from(base).join(softlock_core::SERVICE_NAME)
+    system_directory()
+        .join("config")
+        .join("systemprofile")
+        .join("AppData")
+        .join("Local")
+        .join(softlock_core::SERVICE_NAME)
+}
+
+#[cfg(windows)]
+fn system_directory() -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buffer = [0u16; 260];
+    let length = unsafe { GetSystemDirectoryW(Some(&mut buffer[..])) } as usize;
+    if length == 0 || length >= buffer.len() {
+        PathBuf::from(r"C:\Windows\System32")
+    } else {
+        PathBuf::from(OsString::from_wide(&buffer[..length]))
+    }
 }
 
 #[cfg(not(windows))]

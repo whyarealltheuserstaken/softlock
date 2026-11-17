@@ -178,17 +178,32 @@ fn correct_pin_consumes_the_service_nonce() {
                 pin: Secret::new(PIN),
             },
         );
-        if stored != ResponseKind::Ok {
+        #[cfg(windows)]
+        {
             // A process that is not LocalSystem must not write the hash.
             // The nonce check below uses the hash in memory.
             assert_eq!(
                 stored,
                 ResponseKind::Unsupported,
-                "pin was not stored: {}",
+                "pin was not refused: {}",
+                capture.text()
+            );
+            assert!(
+                capture.text().contains("reason=localsystem"),
+                "not the LocalSystem refusal: {}",
                 capture.text()
             );
             let hash = softlock_core::hash_softlock_pin(&Secret::new(PIN)).expect("hash");
             authority.install_pin_hash(hash);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                stored,
+                ResponseKind::Ok,
+                "pin was not stored: {}",
+                capture.text()
+            );
         }
         let hash = authority.pin_hash().expect("hash").to_string();
         assert!(hash.starts_with("$argon2id$"));

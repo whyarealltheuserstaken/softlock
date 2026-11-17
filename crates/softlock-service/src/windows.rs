@@ -69,6 +69,7 @@ static STATUS: AtomicIsize = AtomicIsize::new(0);
 static HOST_USER: Mutex<String> = Mutex::new(String::new());
 static HOST_SESSION: AtomicU64 = AtomicU64::new(u64::MAX);
 static PIN_STATUS: Mutex<String> = Mutex::new(String::new());
+static PIN_LOADED: Mutex<String> = Mutex::new(String::new());
 static SESSION_TX: Mutex<Option<Sender<SessionEvent>>> = Mutex::new(None);
 
 const ACCEPT_CONTROLS: u32 = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SESSIONCHANGE;
@@ -193,26 +194,50 @@ fn session_event(
 }
 
 fn serve(probe: Option<PathBuf>) -> i32 {
-    // Secure ProgramData before the log exists. FileLog must not create that
-    // directory itself: create_dir_all would inherit a DACL that lets Users
-    // plant files there.
-    let _ = crate::secrets::secure_service_directory(&crate::service_data_directory());
+    let data_dir = crate::service_data_directory();
+    let store = crate::secrets::verify_service_directory(&data_dir);
     let log = log_path();
-    if let Some(parent) = log.parent()
-        && parent != crate::service_data_directory()
-    {
-        let _ = std::fs::create_dir_all(parent);
+    let mut logged = false;
+    if store.is_ok() && log.parent() == Some(data_dir.as_path()) {
+        if let Ok(file_log) = FileLog::create(&log) {
+            logged = tracing::subscriber::set_global_default(file_log).is_ok();
+        }
+    } else if log.parent() != Some(data_dir.as_path()) {
+        if let Some(parent) = log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(file_log) = FileLog::create(&log) {
+            logged = tracing::subscriber::set_global_default(file_log).is_ok();
+        }
     }
-    let _ = FileLog::create(&log).map(tracing::subscriber::set_global_default);
+    if !logged {
+        crate::secrets::report_event(
+            "SoftLock could not open a verified service log; PIN unlock stays unavailable when the store does not verify",
+        );
+    }
     let mode = if stub_os_lock() {
         OsLock::Fails
     } else {
         OsLock::System
     };
     let mut authority = Authority::new(ServicePlatform::new(mode), dev_pin_allowed());
-    if let Ok(Some(hash)) = PinStore::in_dir(&pin_directory()).load() {
-        authority.install_pin_hash(hash);
-    }
+    // A directory that fails verification is fatal for the PIN store. Locking
+    // still runs. No hash is installed, so a planted pin.phc cannot unlock.
+    let loaded = if store.is_err() && pin_directory() == data_dir {
+        "refused".to_string()
+    } else {
+        match PinStore::in_dir(&pin_directory()).load() {
+            Ok(Some(hash)) => {
+                authority.install_pin_hash(hash);
+                "verified".to_string()
+            }
+            Ok(None) => "none".to_string(),
+            Err(_) => "refused".to_string(),
+        }
+    };
+    *PIN_LOADED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = loaded;
     remember_pin_status();
     let arm = ArmWait::new();
     authority.platform_mut().set_arm_wait(arm.clone());
@@ -1103,10 +1128,14 @@ fn write_self_probe(pipe_name: &str, path: &Path) -> std::io::Result<()> {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .clone();
+    let loaded = PIN_LOADED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
     write_probe(
         path,
         &format!(
-            "session={}\nsystem={system}\nkind={kind}\nhost_user={host_user}\nhost_session={host_session}\nconsole={}\npin_reload={pin}\n",
+            "session={}\nsystem={system}\nkind={kind}\nhost_user={host_user}\nhost_session={host_session}\nconsole={}\npin_loaded={loaded}\npin_reload={pin}\n",
             current_session(),
             console_session()
         ),

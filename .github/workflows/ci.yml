@@ -261,7 +261,7 @@ jobs:
           grep -F "lock_host_token_is_system_in_the_console_session ... ok" target/seam3-service.txt
           grep -F "service_stop_while_locked_keeps_input_blocked ... ok" target/seam3-service.txt
           grep -F "local_system_pin_file_is_rewritten_and_unreadable ... ok" target/seam3-service.txt
-          grep -F "planted_directory_junction_and_temp_file_are_not_adopted ... ok" target/seam3-service.txt
+          grep -F "standard_user_cannot_plant_the_secret_store ... ok" target/seam3-service.txt
           grep -F "several_pipe_instances_accept_at_once ... ok" target/seam3-service.txt
       - name: Service race loops
         shell: bash
