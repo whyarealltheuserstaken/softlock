@@ -12,7 +12,7 @@ No contributor agreement is required while the maintainer is the only author. A 
 
 ## Continuous integration
 
-Pull requests run platform jobs only when shared crates, `Cargo.lock`, platform-specific trees, or workflow files change; pushes to `main` run the full matrix. Required checks aggregate into `ci ok` and `universal ok`, which pass when every needed job succeeded or was skipped.
+Pull requests classify changed files with `.github/ci-path-outputs.sh` (fail closed): only listed macOS, Windows, Linux, and `*.md` paths can skip other platforms; anything else (including new crates, scripts, or unlisted spikes) runs the full matrix. Pushes to `main` always run everything. Required checks aggregate into `ci ok` and `universal ok`, which pass when every needed job succeeded or was skipped.
 
 ## Tests
 

@@ -21,52 +21,20 @@ jobs:
       linux: ${{ steps.paths.outputs.linux }}
       windows: ${{ steps.paths.outputs.windows }}
       macos: ${{ steps.paths.outputs.macos }}
-      app: ${{ steps.paths.outputs.app }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
-        id: filter
-        if: github.ref != 'refs/heads/main'
-        with:
-          filters: |
-            shared:
-              - Cargo.toml
-              - Cargo.lock
-              - deny.toml
-              - crates/softlock-core/**
-              - crates/softlock-service/**
-              - crates/softlock-lockhost/**
-              - crates/softlock-broker/**
-              - crates/softlock-app/**
-              - spikes/overlay/**
-              - .github/**
-            linux:
-              - crates/softlock-linux/**
-            windows:
-              - crates/softlock-windows/**
-              - crates/softlock-seam3/**
-            macos:
-              - crates/softlock-macos/**
-              - tests/hardware/macos/**
-            app:
-              - crates/softlock-app/**
-      - id: paths
+      - name: Path filter self-check
+        run: bash .github/ci-path-outputs.sh --self-check
+      - name: Classify changed paths (fail closed)
+        id: paths
         shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            for key in shared linux windows macos app; do
-              echo "${key}=true" >> "$GITHUB_OUTPUT"
-            done
-          else
-            echo "shared=${{ steps.filter.outputs.shared }}" >> "$GITHUB_OUTPUT"
-            echo "linux=${{ steps.filter.outputs.linux }}" >> "$GITHUB_OUTPUT"
-            echo "windows=${{ steps.filter.outputs.windows }}" >> "$GITHUB_OUTPUT"
-            echo "macos=${{ steps.filter.outputs.macos }}" >> "$GITHUB_OUTPUT"
-            echo "app=${{ steps.filter.outputs.app }}" >> "$GITHUB_OUTPUT"
-          fi
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_EVENT_PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash .github/ci-path-outputs.sh
 
   verify-linux:
     name: fmt, clippy, seam 1 (ubuntu-latest)
@@ -352,9 +320,7 @@ jobs:
     if: |
       always() &&
       needs.changes.result == 'success' &&
-      (github.ref == 'refs/heads/main' ||
-       needs.changes.outputs.shared == 'true' ||
-       needs.changes.outputs.app == 'true')
+      (github.ref == 'refs/heads/main' || needs.changes.outputs.shared == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

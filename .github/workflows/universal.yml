@@ -31,34 +31,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
-        id: filter
-        if: github.ref != 'refs/heads/main'
-        with:
-          filters: |
-            shared:
-              - Cargo.toml
-              - Cargo.lock
-              - crates/softlock-core/**
-              - crates/softlock-service/**
-              - crates/softlock-lockhost/**
-              - crates/softlock-broker/**
-              - crates/softlock-app/**
-              - spikes/macos-desktop-proof/**
-              - .github/**
-            macos:
-              - crates/softlock-macos/**
-      - id: paths
+      - name: Path filter self-check
+        run: bash .github/ci-path-outputs.sh --self-check
+      - name: Classify changed paths (fail closed)
+        id: paths
         shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            echo "shared=true" >> "$GITHUB_OUTPUT"
-            echo "macos=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "shared=${{ steps.filter.outputs.shared }}" >> "$GITHUB_OUTPUT"
-            echo "macos=${{ steps.filter.outputs.macos }}" >> "$GITHUB_OUTPUT"
-          fi
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_EVENT_PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash .github/ci-path-outputs.sh
 
   universal:
     name: universal 2
