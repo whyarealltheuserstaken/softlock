@@ -1,6 +1,6 @@
 name: macOS keep-awake kit
 
-# Runner slice only: assertions, pmset reason, caffeinate control, short timer.
+# Runner slice: assertions, pmset reason, caffeinate control, short timer.
 # No lid, no power key, no launchd.
 on:
   workflow_dispatch:
@@ -20,9 +20,13 @@ concurrency:
 
 jobs:
   kit:
-    name: macos keep-awake runner
-    runs-on: macos-latest
+    name: macos keep-awake runner (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [macos-latest, macos-15-intel, macos-26-intel]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
@@ -44,4 +48,14 @@ jobs:
       - name: Unit tests
         run: cargo test --locked --manifest-path spikes/macos-keep-awake/Cargo.toml
       - name: Runner slice
-        run: cargo run --locked --release --manifest-path spikes/macos-keep-awake/Cargo.toml -- --runner --output-dir proof-output
+        run: |
+          set -euo pipefail
+          cargo run --locked --release --manifest-path spikes/macos-keep-awake/Cargo.toml -- --runner --output-dir keep-awake-output
+          test -f keep-awake-output/result.json
+          test -f keep-awake-output/result.txt
+          grep -F "result=pass" keep-awake-output/result.txt
+          grep -F "interrupted=false" keep-awake-output/result.txt
+          grep -F "no-input=false" keep-awake-output/result.txt
+          grep -F "serial-collected=false" keep-awake-output/result.txt
+          echo "----- result.txt -----"
+          cat keep-awake-output/result.txt

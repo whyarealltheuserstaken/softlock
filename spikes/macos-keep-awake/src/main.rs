@@ -3,8 +3,10 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 mod args;
+mod drift;
 mod report;
 mod scrub;
+mod sleep_detect;
 mod text;
 mod version;
 

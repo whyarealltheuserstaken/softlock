@@ -4,9 +4,6 @@ use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub const APP_NAP_READY_PROMPT: &str =
-    "Press Return when Activity Monitor shows the App Nap column";
-
 /// `println!` panics on EPIPE after Terminal closes. This does not.
 pub fn write_line(mut out: impl Write, line: &str) {
     let _ = writeln!(out, "{line}");
@@ -19,6 +16,8 @@ pub fn write_stdout(line: &str) {
 
 #[cfg(test)]
 use crate::args::{APP_NAP_SAMPLE_MS, DEFAULT_INTERVAL_MS, REASON_PREFIX, RUNNER_SAMPLE_MS};
+#[cfg(test)]
+use crate::drift::{APP_NAP_GAP_THRESHOLD_MS, APP_NAP_THRESHOLD_WHY};
 use crate::scrub::{contains_serial, filter_pmset, scrub};
 use crate::text::one_line;
 
@@ -84,6 +83,13 @@ pub struct TimerReport {
     pub app_nap_count: Option<u64>,
     pub app_nap_occlusion_visible: Option<bool>,
     pub app_nap_ran: bool,
+    pub max_gap_ms: Option<u64>,
+    pub p95_gap_ms: Option<u64>,
+    pub mean_gap_ms: Option<u64>,
+    pub max_wake_late_ms: Option<u64>,
+    pub app_nap_threshold_ms: u64,
+    pub app_nap_verdict: String,
+    pub app_nap_reason: String,
     /// `None` means slowing is not claimed (baseline below expected, or counts missing).
     pub slowed: Option<bool>,
     pub sentence: String,
@@ -97,6 +103,7 @@ pub struct HardwareRow {
     pub heartbeat_gap_ms: Option<u64>,
     pub assertion_held: bool,
     pub note: String,
+    pub detection_method: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +124,7 @@ pub struct KitReport {
     pub locked_session: bool,
     pub reversible: bool,
     pub interrupted: bool,
+    pub no_input: bool,
     pub probe_crash: Option<String>,
 }
 
@@ -165,6 +173,7 @@ pub fn runner_hardware_row(subject: &str, assertion_held: bool) -> HardwareRow {
         note: format!(
             "{subject} needs Henry's Intel Mac. The GitHub runner has no lid and no power key."
         ),
+        detection_method: "not-run-on-runner".to_string(),
     }
 }
 
@@ -174,6 +183,7 @@ pub fn hardware_row(
     gap: Option<u64>,
     assertion_held: bool,
     note: &str,
+    detection_method: &str,
 ) -> HardwareRow {
     HardwareRow {
         status,
@@ -181,6 +191,7 @@ pub fn hardware_row(
         heartbeat_gap_ms: gap,
         assertion_held,
         note: note.to_string(),
+        detection_method: detection_method.to_string(),
     }
 }
 
@@ -262,27 +273,19 @@ pub fn hardware_only_list() -> Vec<String> {
         "lid-closed-on-power".to_string(),
         "lid-closed-with-external-display".to_string(),
         "power-key".to_string(),
-        "App Nap of a covered process on a real idle Intel Mac".to_string(),
+        "App Nap of a covered process on a real idle Intel Mac (timer-tick drift)".to_string(),
     ]
 }
 
 pub fn instructions(kit: bool) -> &'static str {
     if kit {
-        "step=1 Stay at the Mac. This kit does not lock it and does not swallow the keyboard. Control-C ends it any time; Terminal still has keyboard focus behind the black screen.\n\
-         step=2 It holds both IOPMAssertionCreateWithName idle-system and idle-display assertions through the lid and power-key steps (QA1340). They are released afterwards.\n\
-         step=3 A timer process ticks for 60 s with the overlay down, then 60 s covering that window. The overlay is fully opaque, ignores the mouse, and does not become key. Escape ends it early only if Terminal has Accessibility permission; otherwise it closes by itself after about 60 s. Control-C ends it any time; Terminal still has keyboard focus behind the black screen.\n\
-         step=4 Press Return when Activity Monitor shows the App Nap column. The 300 s sample starts only after that, covering only the timer window. All three processes are named macos-keep-awake; find the timer by the printed timer-pid=. Then keep your hands off. Control-C ends it any time.\n\
-         step=5 Lid closed on power, no external display if you can unplug it. Stay next to the machine. After about 20 seconds, open the lid. Type slept, awake, or skip. \"no lid\" is not a row on this laptop. Both assertions stay held.\n\
-         step=6 If you use an external display, plug it in, wait until it shows the desktop, close the lid, wait, open the lid. Type slept, awake, no-external-display, or skip. Both assertions stay held.\n\
-         step=7 On this 2020 MacBook Pro the power key is the Touch ID button. A tap may sleep the display or lock the screen: unlock with Touch ID or your password, then answer. Type slept, restart-panel, nothing, or skip. Both assertions are still held for this row (assertion-held=true). They are released after this step. Nothing is left armed. Paste the filtered JSON onto the sheet."
+        "This run holds idle-sleep assertions, measures a covered timer (the screen goes black for about 60s), then asks for lid and Touch ID only.\n\
+         App Nap and throttling are scored from timer-tick drift in that sample. Enter skips any physical step.\n\
+         Control-C ends it; the session is not locked and settings are not changed. Send result.json and result.txt from the output folder."
     } else {
-        "step=1 Runner proof only. No lid, no power key, no real idle App Nap.\n\
-         step=2 Create idle-system and idle-display assertions with IOPMAssertionCreateWithName and keep them held.\n\
-         step=3 Confirm the probe reason in a filtered pmset excerpt (summary counts plus this pid/reason only).\n\
-         step=4 If caffeinate exists, run it as caffeinate -i -t 5 -w <kit pid>.\n\
-         step=5 Timer counts with the overlay down and covering that window, same duration. Overlay is fully opaque. Record timer occlusion.\n\
-         step=6 Hardware rows stay not-run-on-runner while both assertions are still held (assertion-held=true).\n\
-         step=7 Release both assertions after those rows."
+        "Runner slice: create idle assertions, filtered pmset, optional caffeinate, short overlay-down and overlay-up timers.\n\
+         App Nap, lid, and power-key rows stay not-run-on-runner. Drift is recorded but not claimed as App Nap.\n\
+         Assertions are released before exit."
     }
 }
 
@@ -297,9 +300,12 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
     if report.interrupted {
         reasons.push("the kit was interrupted".to_string());
     }
-    if report.mode == "runner" && report.version.uname_m != "arm64" {
+    if report.mode == "runner"
+        && report.version.uname_m != "arm64"
+        && report.version.uname_m != "x86_64"
+    {
         reasons.push(format!(
-            "runner uname -m is {}, expected arm64",
+            "runner uname -m is {}, expected arm64 or x86_64",
             report.version.uname_m
         ));
     }
@@ -350,6 +356,14 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
     {
         reasons.push("app-nap occlusion is not false".to_string());
     }
+    if report.mode == "kit"
+        && report.timer.app_nap_ran
+        && report.timer.app_nap_verdict != "napped"
+        && report.timer.app_nap_verdict != "not-napped"
+        && report.timer.app_nap_verdict != "not-claimed"
+    {
+        reasons.push("app-nap verdict is missing".to_string());
+    }
     if !report.timer.overlay_ordered_front {
         reasons.push("overlay did not order front over the timer window".to_string());
     }
@@ -392,6 +406,9 @@ pub fn incomplete_reasons(report: &KitReport) -> Vec<String> {
     }
     if report.timer.app_nap_count.is_none() {
         reasons.push("App Nap count is missing".to_string());
+    }
+    if report.timer.app_nap_verdict.is_empty() {
+        reasons.push("App Nap verdict is missing".to_string());
     }
     if !hardware_row_filled(&report.lid_on_power) {
         reasons.push("lid-on-power row was skipped".to_string());
@@ -563,16 +580,56 @@ pub fn render(report: &KitReport) -> String {
             "app-nap-occlusion-visible={}\n",
             fmt_flag(report.timer.app_nap_occlusion_visible)
         ));
+        out.push_str(&format!(
+            "app-nap-max-gap-ms={}\n",
+            fmt_count(report.timer.max_gap_ms)
+        ));
+        out.push_str(&format!(
+            "app-nap-p95-gap-ms={}\n",
+            fmt_count(report.timer.p95_gap_ms)
+        ));
+        out.push_str(&format!(
+            "app-nap-mean-gap-ms={}\n",
+            fmt_count(report.timer.mean_gap_ms)
+        ));
+        out.push_str(&format!(
+            "app-nap-max-wake-late-ms={}\n",
+            fmt_count(report.timer.max_wake_late_ms)
+        ));
+        out.push_str(&format!(
+            "app-nap-threshold-ms={}\n",
+            report.timer.app_nap_threshold_ms
+        ));
+        out.push_str(&format!(
+            "app-nap-verdict={}\n",
+            one_line(&report.timer.app_nap_verdict)
+        ));
+        out.push_str(&format!(
+            "app-nap-reason={}\n",
+            one_line(&report.timer.app_nap_reason)
+        ));
     }
     out.push_str(&format!(
         "lid-on-power={}\n",
         row_token(&report.lid_on_power)
     ));
     out.push_str(&format!(
+        "lid-on-power-detection={}\n",
+        one_line(&report.lid_on_power.detection_method)
+    ));
+    out.push_str(&format!(
         "lid-external={}\n",
         row_token(&report.lid_external)
     ));
+    out.push_str(&format!(
+        "lid-external-detection={}\n",
+        one_line(&report.lid_external.detection_method)
+    ));
     out.push_str(&format!("power-key={}\n", row_token(&report.power_key)));
+    out.push_str(&format!(
+        "power-key-detection={}\n",
+        one_line(&report.power_key.detection_method)
+    ));
     out.push_str(&format!(
         "keep-awake-claim={}\n",
         one_line(&report.keep_awake_claim)
@@ -585,6 +642,7 @@ pub fn render(report: &KitReport) -> String {
     out.push_str(&format!("locked-session={}\n", report.locked_session));
     out.push_str(&format!("reversible={}\n", report.reversible));
     out.push_str(&format!("interrupted={}\n", report.interrupted));
+    out.push_str(&format!("no-input={}\n", report.no_input));
     if let Some(crash) = &report.probe_crash {
         out.push_str(&format!("probe-crash={}\n", one_line(crash)));
     }
@@ -713,6 +771,16 @@ fn passing_runner_fixture() -> KitReport {
             app_nap_count: None,
             app_nap_occlusion_visible: None,
             app_nap_ran: false,
+            max_gap_ms: Some(60),
+            p95_gap_ms: Some(55),
+            mean_gap_ms: Some(52),
+            max_wake_late_ms: Some(4),
+            app_nap_threshold_ms: APP_NAP_GAP_THRESHOLD_MS,
+            app_nap_verdict: "not-run-on-runner".to_string(),
+            app_nap_reason: format!(
+                "sample {} ms is shorter than 50000 ms, so App Nap is not claimed",
+                RUNNER_SAMPLE_MS
+            ),
             slowed,
             sentence,
             error: None,
@@ -725,6 +793,7 @@ fn passing_runner_fixture() -> KitReport {
         locked_session: false,
         reversible: true,
         interrupted: false,
+        no_input: false,
         probe_crash: None,
     }
 }
@@ -758,6 +827,7 @@ mod tests {
             None,
             true,
             "operator",
+            "iokit-power-notification",
         )
     }
 
@@ -768,6 +838,15 @@ mod tests {
         report.timer.app_nap_count = Some(400);
         report.timer.app_nap_occlusion_visible = Some(false);
         report.timer.app_nap_ms = APP_NAP_SAMPLE_MS;
+        report.timer.max_gap_ms = Some(1_400);
+        report.timer.p95_gap_ms = Some(80);
+        report.timer.mean_gap_ms = Some(70);
+        report.timer.max_wake_late_ms = Some(1_200);
+        report.timer.app_nap_threshold_ms = APP_NAP_GAP_THRESHOLD_MS;
+        report.timer.app_nap_verdict = "napped".to_string();
+        report.timer.app_nap_reason = format!(
+            "napped: max-gap=1400ms threshold={APP_NAP_GAP_THRESHOLD_MS}ms because {APP_NAP_THRESHOLD_WHY}"
+        );
         report.lid_on_power = recorded("slept");
         report.lid_external = recorded("no-external-display");
         report.power_key = recorded("nothing");
@@ -803,6 +882,7 @@ mod tests {
             Some(8000),
             true,
             "lid",
+            "pmset-log",
         );
         let claim = keep_awake_claim(true, &slept);
         assert!(claim.contains("must not claim agents kept running with the lid shut"));
@@ -821,9 +901,9 @@ mod tests {
         assert!(text.contains("lid-on-power=not-run-on-runner"));
         assert!(!text.contains("no lid"));
         assert!(!contains_serial(&text));
-        assert!(text.contains("step=1"));
-        assert!(text.contains("step=7"));
-        assert!(text.contains("IOPMAssertionCreateWithName"));
+        assert!(text.contains("Runner slice:"));
+        assert!(text.contains("not-run-on-runner"));
+        assert!(text.contains("IOPMAssertionCreateWithName") || text.contains("idle assertions"));
         assert!(text.contains("overlay-opaque=true"));
         assert!(text.contains("timer-occlusion-visible-down=true"));
         assert!(text.contains("timer-occlusion-visible-up=false"));
@@ -867,14 +947,17 @@ mod tests {
     }
 
     #[test]
-    fn intel_uname_is_allowed_on_the_kit_not_the_runner() {
+    fn intel_uname_is_allowed_on_the_runner() {
         let mut report = passing_runner_fixture();
         report.version.uname_m = "x86_64".to_string();
+        assert!(failure_reasons(&report).is_empty());
+        report.version.uname_m = "ppc".to_string();
         assert!(
             failure_reasons(&report)
                 .iter()
-                .any(|reason| reason.contains("arm64"))
+                .any(|reason| reason.contains("arm64 or x86_64"))
         );
+        report.version.uname_m = "x86_64".to_string();
         report.mode = "kit".to_string();
         assert!(failure_reasons(&report).is_empty());
         assert!(!incomplete_reasons(&report).is_empty());
@@ -934,7 +1017,11 @@ mod tests {
         assert!(render(&ok).contains("result=pass"));
         assert!(render(&ok).contains("app-nap-count=400"));
         assert!(render(&ok).contains("app-nap-occlusion-visible=false"));
-        assert!(instructions(true).contains(APP_NAP_READY_PROMPT));
+        assert!(render(&ok).contains("app-nap-verdict=napped"));
+        assert!(render(&ok).contains("app-nap-threshold-ms=1000"));
+        assert!(render(&ok).contains("lid-on-power-detection=iokit-power-notification"));
+        assert!(instructions(true).contains("Enter skips"));
+        assert!(!instructions(true).contains("Return when"));
         assert!(!render(&ok).contains("app-nap=not-run-on-runner"));
 
         let mut no_nap = passing_kit_fixture();
@@ -974,11 +1061,12 @@ mod tests {
 
         let mut power = passing_kit_fixture();
         power.power_key = hardware_row(
-            "needs-terminal".to_string(),
-            Some("needs-terminal".to_string()),
+            "no-input".to_string(),
+            Some("no-input".to_string()),
             None,
             true,
-            "stdin",
+            "stdin closed",
+            "no-input",
         );
         assert!(
             incomplete_reasons(&power)
@@ -1041,6 +1129,30 @@ mod tests {
         assert!(text.contains("timer-slowed=not-claimed"));
         assert!(text.contains("timer-sentence=not claimed: baseline below expected"));
         assert!(!text.contains("timer-slowed=false"));
+    }
+
+    #[test]
+    fn closed_stdin_is_no_input_not_interrupted() {
+        let mut report = passing_kit_fixture();
+        report.no_input = true;
+        report.interrupted = false;
+        report.lid_on_power = hardware_row(
+            "no-input".to_string(),
+            Some("no-input".to_string()),
+            None,
+            true,
+            "stdin closed",
+            "no-input",
+        );
+        assert!(
+            !failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("interrupted"))
+        );
+        let text = render(&report);
+        assert!(text.contains("no-input=true"));
+        assert!(text.contains("interrupted=false"));
+        assert!(text.contains("result=incomplete"));
     }
 
     #[test]

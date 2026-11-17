@@ -6,7 +6,8 @@ pub const REASON_PREFIX: &str = "m07-keep-awake-probe";
 pub const DEFAULT_INTERVAL_MS: u64 = 50;
 pub const RUNNER_SAMPLE_MS: u64 = 8_000;
 pub const KIT_SAMPLE_MS: u64 = 60_000;
-pub const APP_NAP_SAMPLE_MS: u64 = 300_000;
+pub const APP_NAP_SAMPLE_MS: u64 = 60_000;
+pub const DEFAULT_OUTPUT_DIR: &str = "keep-awake-output";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -47,7 +48,7 @@ where
     let mut runner = false;
     let mut kit = false;
     let mut role = None;
-    let mut output_dir = PathBuf::from("proof-output");
+    let mut output_dir = PathBuf::from(DEFAULT_OUTPUT_DIR);
     let mut sample_ms = None;
     let mut interval_ms = DEFAULT_INTERVAL_MS;
     let mut lid_on_power = None;
@@ -205,6 +206,7 @@ mod tests {
         assert!(args.mode.holds_assertions());
         assert_eq!(args.sample_ms, RUNNER_SAMPLE_MS);
         assert_eq!(args.interval_ms, DEFAULT_INTERVAL_MS);
+        assert!(args.output_dir.ends_with(DEFAULT_OUTPUT_DIR));
     }
 
     #[test]
@@ -213,7 +215,7 @@ mod tests {
         assert_eq!(kit.mode, Mode::Kit);
         assert!(kit.mode.holds_assertions());
         assert_eq!(kit.sample_ms, KIT_SAMPLE_MS);
-        assert_eq!(APP_NAP_SAMPLE_MS, 300_000);
+        assert_eq!(APP_NAP_SAMPLE_MS, 60_000);
 
         let timer = parse(tokens(&["--role", "timer"])).unwrap();
         assert_eq!(timer.mode, Mode::Timer);

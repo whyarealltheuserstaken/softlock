@@ -26,7 +26,7 @@ Do not paste a hardware serial number. Do not paste a full `pmset -g assertions`
 | Timer count, overlay up (same duration) | |
 | Timer occlusion visible down / up | |
 | Covered process slowed? | |
-| Hands-off App Nap (300 s, overlay covers only the timer window) | |
+| App Nap (60 s overlay-up drift, automatic) | |
 | Lid closed on power (`assertion-held`) | slept / awake (not "no lid") |
 | Lid closed with an external display (`assertion-held`) | slept / awake / no-external-display |
 | Power key tap (`assertion-held`; Touch ID button, unlock first if it locks) | slept / restart-panel / nothing |

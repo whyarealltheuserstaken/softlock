@@ -95,6 +95,8 @@ fn macos_keep_awake_workflow_runs_the_runner_slice_and_pins_actions() {
     let root = common::repo_root();
     let text = fs::read_to_string(root.join(KIT_WORKFLOW)).expect("kit workflow");
     assert!(text.contains("macos-latest"));
+    assert!(text.contains("macos-15-intel"));
+    assert!(text.contains("macos-26-intel"));
     assert!(text.contains("sw_vers"));
     assert!(text.contains("uname -m"));
     assert!(text.contains("spikes/macos-keep-awake"));
@@ -104,6 +106,9 @@ fn macos_keep_awake_workflow_runs_the_runner_slice_and_pins_actions() {
     assert!(text.contains("contents: read"));
     assert!(text.contains("--runner"));
     assert!(text.contains("--locked"));
+    assert!(text.contains("keep-awake-output"));
+    assert!(text.contains("result.json"));
+    assert!(text.contains("result.txt"));
     assert!(text.contains("IOPMAssertionCreateWithName") || text.contains("keep-awake"));
     assert!(!text.contains("sudo"));
     assert!(!text.contains("launchctl"));
@@ -179,11 +184,19 @@ fn stop_handler_covers_hangup_and_the_overlay_follows_its_parent() {
     assert!(proof.contains("SIGHUP"));
     assert!(proof.contains("parent_alive(parent)"));
     assert!(proof.contains("timer-pid="));
-    assert!(proof.contains("wait_for_app_nap_ready"));
-    assert!(proof.contains("APP_NAP_READY_PROMPT"));
+    assert!(proof.contains("no-input"));
+    assert!(proof.contains("result.json"));
+    assert!(proof.contains("result.txt"));
+    assert!(!proof.contains("wait_for_app_nap_ready"));
+    let activity = format!("{} {}", "Activity", "Monitor");
+    assert!(!proof.contains(&activity));
     let report =
         fs::read_to_string(root.join("spikes/macos-keep-awake/src/report.rs")).expect("report");
-    assert!(report.contains("Press Return when Activity Monitor shows the App Nap column"));
+    assert!(!report.contains(&activity));
+    assert!(report.contains("no_input"));
+    let probe = fs::read_to_string(root.join("spikes/macos-keep-awake/src/mac/probe.m")).expect("m");
+    assert!(probe.contains("IORegisterForSystemPower"));
+    assert!(probe.contains("IOAllowPowerChange"));
     let timer = proof
         .split("fn run_timer")
         .nth(1)

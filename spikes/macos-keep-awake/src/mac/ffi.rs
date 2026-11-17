@@ -55,6 +55,14 @@ unsafe extern "C" {
     fn m07_timer_close() -> i32;
     fn m07_timer_tick(out: *mut TimerOut) -> i32;
     fn m07_hw_model(dest: *mut c_char, cap: usize) -> i32;
+    fn m07_power_watch_start() -> i32;
+    fn m07_power_watch_stop() -> i32;
+    fn m07_power_reset();
+    fn m07_power_system_slept() -> i32;
+    fn m07_power_system_woke() -> i32;
+    fn m07_power_display_slept() -> i32;
+    fn m07_power_display_woke() -> i32;
+    fn m07_power_pump(millis: u32);
 }
 
 pub fn assertion_names() -> AssertionNames {
@@ -248,6 +256,45 @@ impl Drop for TimerWindow {
 
 pub fn display_count() -> i32 {
     unsafe { m07_display_count() }
+}
+
+pub struct PowerWatch;
+
+impl PowerWatch {
+    pub fn start() -> Self {
+        unsafe {
+            m07_power_watch_start();
+        }
+        PowerWatch
+    }
+
+    pub fn reset() {
+        unsafe {
+            m07_power_reset();
+        }
+    }
+
+    pub fn system_slept() -> bool {
+        unsafe { m07_power_system_slept() != 0 }
+    }
+
+    pub fn display_slept() -> bool {
+        unsafe { m07_power_display_slept() != 0 }
+    }
+
+    pub fn pump(millis: u32) {
+        unsafe {
+            m07_power_pump(millis);
+        }
+    }
+}
+
+impl Drop for PowerWatch {
+    fn drop(&mut self) {
+        unsafe {
+            m07_power_watch_stop();
+        }
+    }
 }
 
 pub fn hw_model() -> String {
