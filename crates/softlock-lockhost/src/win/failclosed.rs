@@ -72,6 +72,9 @@ static REOPENED_DEAD_PID: AtomicBool = AtomicBool::new(false);
 /// Why the last armed-event check failed. 1 open, 2 dacl, 3 signal.
 #[cfg(feature = "simulated-physical")]
 static EVENT_FAIL: AtomicU8 = AtomicU8::new(0);
+/// SDDL of the object that last failed the SYSTEM-only check.
+#[cfg(feature = "simulated-physical")]
+static LAST_SDDL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 const ARMED_SLOT_BYTES: usize = 16;
 
 use super::session::Shared;
@@ -543,6 +546,11 @@ fn trust_new_process(pid: u32, nonce: u64, require_same_slot: bool) -> Result<()
         close_handle(process);
         return Err(ArmReject::Inactive);
     }
+    if !process_token_is_system(process) {
+        close_handle(event);
+        close_handle(process);
+        return Err(ArmReject::Token);
+    }
     if !image_path_is_current_exe(process) {
         close_handle(event);
         close_handle(process);
@@ -601,7 +609,8 @@ fn impostor_case() -> ImpostorCase {
 #[cfg(feature = "simulated-physical")]
 fn judge_impostor_pid(spawn_other_path: bool) -> bool {
     let Some(nonce) = published_nonce() else {
-        note_impostor(event_witness());
+        let reason = event_witness();
+        note_impostor(&reason);
         return false;
     };
     let mut creator: Option<HANDLE> = None;
@@ -630,13 +639,13 @@ fn judge_impostor_pid(spawn_other_path: bool) -> bool {
         terminate_handle(process);
     }
     let reason = match decision {
-        Ok(()) => "released",
-        Err(ArmReject::Token) => "reason=token",
-        Err(ArmReject::Path) => "reason=path",
+        Ok(()) => "released".to_string(),
+        Err(ArmReject::Token) => "reason=token".to_string(),
+        Err(ArmReject::Path) => "reason=path".to_string(),
         Err(ArmReject::Event) => event_witness(),
-        Err(ArmReject::Inactive) => "reason=inactive",
+        Err(ArmReject::Inactive) => "reason=inactive".to_string(),
     };
-    note_impostor(reason);
+    note_impostor(&reason);
     false
 }
 
@@ -661,12 +670,18 @@ fn note_impostor(text: &str) {
 }
 
 #[cfg(feature = "simulated-physical")]
-fn event_witness() -> &'static str {
+fn event_witness() -> String {
     match EVENT_FAIL.load(Ordering::Acquire) {
-        1 => "reason=event-open",
-        2 => "reason=event-dacl",
-        3 => "reason=event-signal",
-        _ => "reason=event",
+        1 => "reason=event-open".to_string(),
+        2 => {
+            let sddl = LAST_SDDL
+                .lock()
+                .map(|text| text.clone())
+                .unwrap_or_default();
+            format!("reason=event-dacl:{sddl}")
+        }
+        3 => "reason=event-signal".to_string(),
+        _ => "reason=event".to_string(),
     }
 }
 
@@ -694,12 +709,13 @@ fn prepare_reuse_fixture() {
         return;
     };
     if let Err(reject) = trust_new_process(pid, nonce, false) {
-        note_reuse_file(match reject {
-            ArmReject::Token => "reason=token",
-            ArmReject::Path => "reason=path",
+        let reason = match reject {
+            ArmReject::Token => "reason=token".to_string(),
+            ArmReject::Path => "reason=path".to_string(),
             ArmReject::Event => event_witness(),
-            ArmReject::Inactive => "reason=inactive",
-        });
+            ArmReject::Inactive => "reason=inactive".to_string(),
+        };
+        note_reuse_file(&reason);
         terminate_handle(process);
         return;
     }
@@ -982,6 +998,12 @@ fn armed_event_name(nonce: u64) -> Vec<u16> {
 }
 
 fn mapping_is_system_only(mapping: HANDLE) -> bool {
+    let text = security_sddl(mapping);
+    remember_sddl(&text);
+    sddl_is_system_only(&text)
+}
+
+fn security_sddl(mapping: HANDLE) -> String {
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     let status = unsafe {
         GetSecurityInfo(
@@ -996,7 +1018,7 @@ fn mapping_is_system_only(mapping: HANDLE) -> bool {
         )
     };
     if status.0 != 0 || descriptor.0.is_null() {
-        return false;
+        return String::new();
     }
     let mut wide = PWSTR::null();
     let converted = unsafe {
@@ -1019,7 +1041,68 @@ fn mapping_is_system_only(mapping: HANDLE) -> bool {
         }
     }
     free_security(&descriptor);
-    text.contains("O:SY") && text.contains("D:P(A;;FA;;;SY)")
+    text
+}
+
+/// Owner is SYSTEM and the DACL is one protected allow ACE for SYSTEM.
+/// `CreateEvent` rewrites `FA` to the event's own access mask, so the string
+/// that comes back is not the literal `D:P(A;;FA;;;SY)`.
+fn sddl_is_system_only(text: &str) -> bool {
+    if !text.contains("O:SY") {
+        return false;
+    }
+    let Some(dacl) = text.split("D:").nth(1) else {
+        return false;
+    };
+    let Some(open) = dacl.find('(') else {
+        return false;
+    };
+    if &dacl[..open] != "P" {
+        return false;
+    }
+    let Some(close) = dacl[open + 1..].find(')') else {
+        return false;
+    };
+    let ace = &dacl[open + 1..open + 1 + close];
+    if dacl[open + 1 + close + 1..].contains('(') {
+        return false;
+    }
+    let mut parts = ace.split(';');
+    let kind = parts.next();
+    let flags = parts.next();
+    let rights = parts.next();
+    let _object = parts.next();
+    let _inherit = parts.next();
+    let sid = parts.next();
+    kind == Some("A")
+        && flags == Some("")
+        && sid == Some("SY")
+        && parts.next().is_none()
+        && rights.is_some_and(system_control_rights)
+}
+
+fn system_control_rights(mask: &str) -> bool {
+    if matches!(mask, "FA" | "GA" | "KA") {
+        return true;
+    }
+    let Some(hex) = mask.strip_prefix("0x").or_else(|| mask.strip_prefix("0X")) else {
+        return false;
+    };
+    let Ok(value) = u32::from_str_radix(hex, 16) else {
+        return false;
+    };
+    // Event ALL_ACCESS is 0x1F0003. Section and file-map masks keep the
+    // standard rights and the object-specific bits. A mask that cannot
+    // read, write, or wait is not the object this host published.
+    value & 0x1F0003 == 0x1F0003
+}
+
+fn remember_sddl(text: &str) {
+    #[cfg(feature = "simulated-physical")]
+    if let Ok(mut slot) = LAST_SDDL.lock() {
+        *slot = text.to_string();
+    }
+    let _ = text;
 }
 
 fn armed_descriptor() -> Option<PSECURITY_DESCRIPTOR> {
@@ -1082,5 +1165,26 @@ pub(crate) fn clear_execution_state(shared: &Shared) {
                 windows::Win32::System::Power::ES_CONTINUOUS,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sddl_tests {
+    use super::sddl_is_system_only;
+
+    #[test]
+    fn literal_and_rewritten_masks_are_system_only() {
+        assert!(sddl_is_system_only("O:SYD:P(A;;FA;;;SY)"));
+        assert!(sddl_is_system_only("O:SYD:P(A;;0x1F0003;;;SY)"));
+        assert!(sddl_is_system_only("O:SYD:P(A;;0x1f0003;;;SY)"));
+        assert!(sddl_is_system_only("O:SYG:SYD:P(A;;0x1F01FF;;;SY)"));
+    }
+
+    #[test]
+    fn a_second_ace_or_another_owner_is_rejected() {
+        assert!(!sddl_is_system_only("O:BAD:P(A;;FA;;;SY)"));
+        assert!(!sddl_is_system_only("O:SYD:P(A;;FA;;;SY)(A;;FA;;;WD)"));
+        assert!(!sddl_is_system_only("O:SYD:(A;;FA;;;SY)"));
+        assert!(!sddl_is_system_only("O:SYD:P(A;;0x1;;;SY)"));
     }
 }
