@@ -1206,7 +1206,7 @@ pub fn server_image_is_agent(pipe: HANDLE) -> bool {
 /// The pipe server is LocalSystem and its image is the service executable.
 pub fn server_is_system_agent(pipe: HANDLE) -> bool {
     match server_pid(pipe) {
-        Some(pid) => image_is_service(pid) && pid_is_system(pid),
+        Some(pid) => image_is_service(pid) && (pid_is_system(pid) || scm_pid_is_local_system(pid)),
         None => false,
     }
 }
@@ -1288,6 +1288,84 @@ fn pid_is_system(pid: u32) -> bool {
         let _ = CloseHandle(token);
         equal
     }
+}
+
+/// A client may not be allowed to open the service process token. The
+/// Service Control Manager still reports the process id and the account.
+fn scm_pid_is_local_system(pid: u32) -> bool {
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceConfigW,
+        QueryServiceStatusEx, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_CONFIG,
+        SERVICE_QUERY_STATUS, SERVICE_STATUS_PROCESS,
+    };
+    unsafe {
+        let Ok(manager) = OpenSCManagerW(None, None, SC_MANAGER_CONNECT) else {
+            return false;
+        };
+        let name = wide(softlock_core::SERVICE_NAME);
+        let Ok(service) = OpenServiceW(
+            manager,
+            PCWSTR(name.as_ptr()),
+            SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG,
+        ) else {
+            let _ = CloseServiceHandle(manager);
+            return false;
+        };
+        let mut status_buf = vec![0u8; std::mem::size_of::<SERVICE_STATUS_PROCESS>()];
+        let mut needed = 0u32;
+        let status_ok = QueryServiceStatusEx(
+            service,
+            SC_STATUS_PROCESS_INFO,
+            Some(status_buf.as_mut_slice()),
+            &mut needed,
+        );
+        let service_pid = if status_ok.is_ok() {
+            (*status_buf.as_ptr().cast::<SERVICE_STATUS_PROCESS>()).dwProcessId
+        } else {
+            0
+        };
+        let mut needed = 0u32;
+        let _ = QueryServiceConfigW(service, None, 0, &mut needed);
+        let account_is_system = if needed == 0 {
+            false
+        } else {
+            let mut config_buf = vec![0u8; needed as usize];
+            let read = QueryServiceConfigW(
+                service,
+                Some(config_buf.as_mut_ptr().cast()),
+                needed,
+                &mut needed,
+            );
+            if read.is_err() {
+                false
+            } else {
+                let config = &*config_buf
+                    .as_ptr()
+                    .cast::<windows::Win32::System::Services::QUERY_SERVICE_CONFIGW>();
+                account_text(config.lpServiceStartName).eq_ignore_ascii_case("LocalSystem")
+            }
+        };
+        let _ = CloseServiceHandle(service);
+        let _ = CloseServiceHandle(manager);
+        service_pid == pid && pid != 0 && account_is_system
+    }
+}
+
+fn account_text(wide: PWSTR) -> String {
+    if wide.is_null() {
+        return String::new();
+    }
+    let mut units = Vec::new();
+    let mut cursor = wide.0;
+    for _ in 0..256 {
+        let unit = unsafe { cursor.read() };
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+        cursor = unsafe { cursor.add(1) };
+    }
+    String::from_utf16_lossy(&units)
 }
 
 fn is_local_system() -> bool {
