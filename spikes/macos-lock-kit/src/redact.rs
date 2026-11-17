@@ -168,7 +168,7 @@ fn match_email(text: &str, index: usize) -> Option<usize> {
 }
 
 fn match_uuid(text: &str, index: usize) -> Option<usize> {
-    let rest = text[index..].as_bytes();
+    let rest = &text.as_bytes()[index..];
     const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
     let mut cursor = 0;
     for (group, size) in GROUPS.iter().enumerate() {
@@ -239,7 +239,7 @@ fn match_serial_token(text: &str, index: usize) -> Option<usize> {
             return None;
         }
     }
-    let rest = text[index..].as_bytes();
+    let rest = &text.as_bytes()[index..];
     if rest.len() < 10 || rest[0] != b'C' || rest[1] != b'0' {
         return None;
     }
