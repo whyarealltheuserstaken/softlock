@@ -731,7 +731,15 @@ fn prepare_reuse_fixture() {
 
 #[cfg(feature = "simulated-physical")]
 fn note_reuse_witness() {
-    if !matches!(impostor_case(), ImpostorCase::Reuse) || DEAD_PID.load(Ordering::Acquire) == 0 {
+    if !matches!(impostor_case(), ImpostorCase::Reuse) {
+        return;
+    }
+    if DEAD_PID.load(Ordering::Acquire) == 0 {
+        let sddl = LAST_SDDL
+            .lock()
+            .map(|text| text.clone())
+            .unwrap_or_default();
+        note_reuse_file(&format!("reason=reuse-pending:{sddl}"));
         return;
     }
     let dropped = HELD_PROCESS.load(Ordering::Acquire) == 0;
@@ -1091,10 +1099,11 @@ fn system_control_rights(mask: &str) -> bool {
     let Ok(value) = u32::from_str_radix(hex, 16) else {
         return false;
     };
-    // Event ALL_ACCESS is 0x1F0003. Section and file-map masks keep the
-    // standard rights and the object-specific bits. A mask that cannot
-    // read, write, or wait is not the object this host published.
-    value & 0x1F0003 == 0x1F0003
+    // Event ALL_ACCESS is 0x1F0003. A section's FILE_MAP_ALL_ACCESS is
+    // 0x000F001F and does not include SYNCHRONIZE, so either full mask counts.
+    const EVENT_ALL: u32 = 0x1F0003;
+    const FILE_MAP_ALL: u32 = 0x000F001F;
+    (value & EVENT_ALL) == EVENT_ALL || (value & FILE_MAP_ALL) == FILE_MAP_ALL
 }
 
 fn remember_sddl(text: &str) {
@@ -1180,7 +1189,7 @@ mod sddl_tests {
         assert!(sddl_is_system_only("O:SYD:P(A;;0x1F0003;;;SY)"));
         assert!(sddl_is_system_only("O:SYD:P(A;;0x1f0003;;;SY)"));
         assert!(sddl_is_system_only("O:SYG:SYD:P(A;;0x1F01FF;;;SY)"));
-        assert!(sddl_is_system_only("O:SYD:P(A;;0x1f0003;;;SY)"));
+        assert!(sddl_is_system_only("O:SYD:P(A;;0x000f001f;;;SY)"));
     }
 
     #[test]
