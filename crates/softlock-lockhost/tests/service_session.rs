@@ -688,13 +688,16 @@ fn standard_user_cannot_plant_the_secret_store() {
     fs::write(bait.join("marker.txt"), b"bait-marker").expect("marker");
     fs::write(bait.join("pin.phc"), b"bait-hash").expect("bait pin");
     fs::write(bait.join("outside.txt"), b"outside").expect("outside");
-    let public = PathBuf::from(r"C:\Users\Public");
-    let done = public.join(format!("sl-plant-done-{}.txt", std::process::id()));
+    let public = std::env::temp_dir().join(format!("sl-plant-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&public);
+    fs::create_dir_all(&public).expect("report dir");
+    grant_users_modify(&public);
+    let done = public.join("done.txt");
     let _ = fs::remove_file(&done);
     let modes = ["hold-file", "junction", "replant", "hold-dir"];
     let mut children = Vec::new();
     for mode in modes {
-        let report = public.join(format!("sl-plant-{mode}-{}.txt", std::process::id()));
+        let report = public.join(format!("{mode}.txt"));
         let _ = fs::remove_file(&report);
         children.push(spawn_standard_user(
             &account, mode, &dir, &bait, &report, &done,
@@ -721,7 +724,7 @@ fn standard_user_cannot_plant_the_secret_store() {
     let reports: Vec<String> = modes
         .iter()
         .map(|mode| {
-            fs::read_to_string(public.join(format!("sl-plant-{mode}-{}.txt", std::process::id())))
+            fs::read_to_string(public.join(format!("{mode}.txt")))
                 .unwrap_or_else(|error| format!("missing report: {error}"))
         })
         .collect();
@@ -1135,11 +1138,16 @@ struct PlantJob {
     done: PathBuf,
 }
 
+fn grant_users_modify(path: &Path) {
+    let text = path.display().to_string();
+    let _ = Command::new("icacls.exe")
+        .args([&text, "/grant", "*S-1-1-0:(OI)(CI)M"])
+        .output();
+}
+
 fn plant_job_from_args() -> Option<PlantJob> {
     let mut args = std::env::args().skip_while(|arg| arg != "--");
-    if args.next().is_none() {
-        return None;
-    }
+    args.next()?;
     Some(PlantJob {
         mode: args.next()?,
         dir: PathBuf::from(args.next()?),
@@ -1214,7 +1222,7 @@ fn plant_child(job: &PlantJob) {
     }
     let result = if opened { "opened" } else { "denied" };
     let _ = fs::write(
-        &report,
+        report,
         format!("il={il}\nresult={result}\ncode={code}\nmode={mode}\n"),
     );
     if let Some(handle) = held {
