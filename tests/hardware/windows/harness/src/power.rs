@@ -215,17 +215,9 @@ hardware suite
 AWAYMODE:
 None.
 ";
-        assert!(!section_contains(
-            text,
-            "DISPLAY",
-            "hardware suite"
-        ));
+        assert!(!section_contains(text, "DISPLAY", "hardware suite"));
         assert!(section_contains(text, "SYSTEM", "hardware suite"));
-        assert!(!section_contains(
-            text,
-            "AWAYMODE",
-            "hardware suite"
-        ));
+        assert!(!section_contains(text, "AWAYMODE", "hardware suite"));
         assert!(!section_contains(text, "SYSTEM", ""));
     }
 }

@@ -226,6 +226,17 @@ function Latest-PowerRecord {
     }
 }
 
+function Read-Native([scriptblock]$command) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = @(& $command 2>&1 | ForEach-Object { "$_" })
+        return ($lines -join "`n")
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 function Probe-Error($probe) {
     if ($null -eq $probe) { return '' }
     if ($probe.PSObject.Properties.Name -contains 'error') { return [string]$probe.error }
@@ -298,7 +309,7 @@ try {
     $detect = $native::DetectJson() | ConvertFrom-Json
 
     $version = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-    $powerText = & powercfg.exe /a 2>&1 | Out-String
+    $powerText = Read-Native { powercfg.exe /a }
     $laptop = $null
     try {
         $chassis = @(Get-CimInstance -ClassName Win32_SystemEnclosure -ErrorAction Stop | Select-Object -ExpandProperty ChassisTypes)
@@ -354,6 +365,8 @@ try {
     } else {
         Add-Result 'parser-self-test' 'pass' '' @{}
     }
+    & cargo build --locked --release -p softlock-win-hwsuite
+    if ($LASTEXITCODE -ne 0) { throw 'build failed' }
     $exe = Join-Path $root 'target\release\softlock-win-hwsuite.exe'
     $planPath = Join-Path $env:TEMP ("softlock-hw-plan-{0}.json" -f $PID)
     & $exe plan --facts $factsPath | Out-File -FilePath $planPath -Encoding utf8
@@ -424,9 +437,8 @@ try {
             'keep-awake-request' {
                 $probe = $native::KeepAwakeJson() | ConvertFrom-Json
                 Start-Sleep -Milliseconds 400
-                $merged = @( & powercfg.exe /requests 2>&1 )
-                $stderr = (@($merged | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) | ForEach-Object { "$_" }) -join ' '
-                $requests = ($merged | ForEach-Object { "$_" }) -join "`n"
+                $requests = Read-Native { powercfg.exe /requests }
+                $stderr = ''
                 $requestFile = Join-Path $env:TEMP ("softlock-hw-requests-{0}.txt" -f $PID)
                 Write-Utf8 $requestFile $requests
                 $seenRaw = & $exe requests --text $requestFile --needle 'hardware suite'
