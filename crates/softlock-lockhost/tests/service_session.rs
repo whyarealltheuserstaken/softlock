@@ -50,6 +50,9 @@ impl Session {
 
     fn launch(panic: Option<&str>, dev_app: bool, stub: &str, mark: Option<&Path>) -> Self {
         let _ = gate;
+        // A host whose OS lock failed stays guarded after its service dies.
+        // Kill any survivor before the next service starts.
+        stop_lock_hosts();
         let root = std::env::temp_dir().join(format!("svc-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("temp");
@@ -159,7 +162,18 @@ impl Drop for Session {
         let _ = Command::new("taskkill")
             .args(["/F", "/T", "/PID", &self.child.id().to_string()])
             .output();
+        // Quit while the OS lock is unavailable does not exit the host. The
+        // test process must not leave it holding the runner's stdout pipe.
+        stop_lock_hosts();
     }
+}
+
+fn stop_lock_hosts() {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "softlock-lockhost.exe"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
 }
 
 fn service_exe() -> PathBuf {

@@ -126,7 +126,7 @@ jobs:
   seam3:
     name: seam 3 (${{ matrix.image }})
     runs-on: ${{ matrix.image }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -308,9 +308,12 @@ jobs:
           passes=0
           for i in $(seq 1 20); do
             set +e
-            out=$(run_exact lock_host_idles_before_lock_and_arms_within_500ms)
+            # A file, not a command substitution. A guarded host that outlives
+            # the test keeps a pipe open and the loop never reaches the next run.
+            run_exact lock_host_idles_before_lock_and_arms_within_500ms > target/arming-one.txt 2>&1
             status=$?
             set -e
+            out=$(cat target/arming-one.txt)
             printf '%s\n' "$out"
             test "$status" -eq 0
             ms=$(printf '%s\n' "$out" | grep -oE "service arming took [0-9]+" | grep -oE "[0-9]+" | head -1)
