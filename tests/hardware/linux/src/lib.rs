@@ -8,6 +8,7 @@ compile_error!("linux-hardware-suite builds only on Linux");
 pub mod args;
 pub mod detect;
 pub mod display;
+pub mod exec;
 pub mod fail_closed;
 pub mod input;
 pub mod overlay;

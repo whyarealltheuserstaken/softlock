@@ -1,5 +1,7 @@
 name: Linux hardware suite
 
+# Result schema: docs/hardware-suite-schema.md
+
 on:
   push:
     branches: [main]
@@ -42,6 +44,7 @@ jobs:
           grep -F '"serial_collected": false' /tmp/linux-hw-out/result.json
           grep -F 'never-unlocked' /tmp/linux-hw-out/result.json
           grep -F 'serial-collected=false' /tmp/linux-hw-out/result.txt
+          python3 tests/hardware/check-schema.py /tmp/linux-hw-out/result.json
           python3 - <<'PY'
           import json
           from pathlib import Path

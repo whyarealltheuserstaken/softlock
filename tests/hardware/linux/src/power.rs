@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::detect::DetectedConfig;
-use crate::report::TestRow;
+use crate::report::{TestRow, empty_measurements};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemSleep {
@@ -47,14 +47,44 @@ pub fn parse_inhibit_list(text: &str, who: &str) -> bool {
 }
 
 pub fn parse_lid_closed_property(text: &str) -> Option<bool> {
-    let t = text.trim();
-    if t.contains("true") || t.ends_with("yes") || t == "b true" {
-        return Some(true);
+    match text.trim() {
+        "b true" | "true" => Some(true),
+        "b false" | "false" => Some(false),
+        _ => None,
     }
-    if t.contains("false") || t.ends_with("no") || t == "b false" {
-        return Some(false);
+}
+
+pub fn parse_locked_hint(text: &str) -> Option<bool> {
+    for line in text.lines() {
+        if let Some(value) = line.trim().strip_prefix("LockedHint=") {
+            return match value.trim() {
+                "yes" => Some(true),
+                "no" => Some(false),
+                _ => None,
+            };
+        }
     }
     None
+}
+
+pub fn environment_refusal(stderr: &str) -> bool {
+    let text = stderr.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "no medium",
+        "failed to connect to bus",
+        "not supported",
+        "access denied",
+        "permission denied",
+        "no session",
+        "cannot inhibit",
+        "interactive authentication",
+        "not been booted with systemd",
+        "connection refused",
+        "host is down",
+        "operation not permitted",
+        "no such file",
+    ];
+    NEEDLES.iter().any(|needle| text.contains(needle))
 }
 
 pub fn parse_prepare_for_sleep(line: &str) -> Option<bool> {
@@ -75,21 +105,25 @@ pub fn parse_prepare_for_sleep(line: &str) -> Option<bool> {
 }
 
 pub fn suspend_modes_row(config: &DetectedConfig) -> TestRow {
-    let mut measurements = map();
+    let mut measurements = empty_measurements();
     measurements.insert("states".into(), json!(config.suspend_states));
     measurements.insert("mem_sleep".into(), json!(config.mem_sleep));
     if config.suspend_states.is_empty() {
-        return skip(
+        return TestRow::skip(
             "power.suspend.modes",
             "Read suspend states (never issue them)",
+            "not-applicable",
+            false,
+            false,
             "no /sys/power/state",
             measurements,
         );
     }
-    row(
+    TestRow::pass(
         "power.suspend.modes",
         "Read suspend states (never issue them)",
-        "pass",
+        false,
+        false,
         format!(
             "states={} mem_sleep={}",
             config.suspend_states.join(","),
@@ -99,43 +133,65 @@ pub fn suspend_modes_row(config: &DetectedConfig) -> TestRow {
     )
 }
 
-pub fn inhibit_row(config: &DetectedConfig) -> TestRow {
-    let mut measurements = map();
+pub fn inhibit_row(config: &DetectedConfig, ci: bool) -> TestRow {
+    let mut measurements = empty_measurements();
     if !config.logind && which("systemd-inhibit").is_none() {
-        return skip(
+        return TestRow::skip(
             "power.inhibit.logind",
             "Take and release a logind idle inhibit",
+            "not-applicable",
+            false,
+            false,
             "no logind / systemd-inhibit",
             measurements,
         );
     }
     match take_and_release_inhibit() {
-        Ok(shown) => {
-            measurements.insert("listed_while_held".into(), json!(shown));
-            if shown {
-                row(
+        Ok(true) => {
+            measurements.insert("listed_while_held".into(), json!(true));
+            TestRow::pass(
+                "power.inhibit.logind",
+                "Take and release a logind idle inhibit",
+                false,
+                false,
+                "inhibit listed then released",
+                measurements,
+            )
+        }
+        Ok(false) => {
+            measurements.insert("listed_while_held".into(), json!(false));
+            TestRow::fail(
+                "power.inhibit.logind",
+                "Take and release a logind idle inhibit",
+                false,
+                false,
+                "list did not name us",
+                measurements,
+            )
+        }
+        Err(err) => {
+            measurements.insert("stderr".into(), json!(err));
+            if ci && environment_refusal(&err) {
+                TestRow::skip(
                     "power.inhibit.logind",
                     "Take and release a logind idle inhibit",
-                    "pass",
-                    "inhibit listed then released".into(),
+                    "ci",
+                    false,
+                    false,
+                    err,
                     measurements,
                 )
             } else {
-                row(
+                TestRow::fail(
                     "power.inhibit.logind",
                     "Take and release a logind idle inhibit",
-                    "pass",
-                    "inhibit held and released; list did not name us".into(),
+                    false,
+                    false,
+                    err,
                     measurements,
                 )
             }
         }
-        Err(e) => skip(
-            "power.inhibit.logind",
-            "Take and release a logind idle inhibit",
-            &e,
-            measurements,
-        ),
     }
 }
 
@@ -151,17 +207,23 @@ fn take_and_release_inhibit() -> Result<bool, String> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("systemd-inhibit: {e}"))?;
+        .map_err(|err| format!("systemd-inhibit: {err}"))?;
     thread::sleep(Duration::from_millis(200));
     if let Ok(Some(status)) = child.try_wait() {
-        return Err(format!("systemd-inhibit exited {status}"));
+        let err = read_stderr(&mut child);
+        return Err(format!("systemd-inhibit exited {status}: {err}"));
     }
     let list = Command::new("systemd-inhibit").arg("--list").output().ok();
     let shown = list
         .as_ref()
-        .map(|o| parse_inhibit_list(&String::from_utf8_lossy(&o.stdout), "linux-hardware-suite"))
+        .map(|out| {
+            parse_inhibit_list(
+                &String::from_utf8_lossy(&out.stdout),
+                "linux-hardware-suite",
+            )
+        })
         .unwrap_or(false);
     let _ = child.kill();
     let _ = child.wait();
@@ -169,7 +231,12 @@ fn take_and_release_inhibit() -> Result<bool, String> {
     let after = Command::new("systemd-inhibit").arg("--list").output().ok();
     let still = after
         .as_ref()
-        .map(|o| parse_inhibit_list(&String::from_utf8_lossy(&o.stdout), "linux-hardware-suite"))
+        .map(|out| {
+            parse_inhibit_list(
+                &String::from_utf8_lossy(&out.stdout),
+                "linux-hardware-suite",
+            )
+        })
         .unwrap_or(false);
     if still {
         return Err("inhibit still listed after release".into());
@@ -177,14 +244,23 @@ fn take_and_release_inhibit() -> Result<bool, String> {
     Ok(shown)
 }
 
+fn read_stderr(child: &mut std::process::Child) -> String {
+    let mut text = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut pipe, &mut text);
+    }
+    text
+}
+
 pub fn refuse_suspend_row() -> TestRow {
-    let mut measurements = map();
+    let mut measurements = empty_measurements();
     measurements.insert("issued_suspend".into(), json!(false));
-    row(
+    TestRow::pass(
         "power.suspend.not-issued",
         "Automated run never writes /sys/power/state",
-        "pass",
-        "no suspend issued".into(),
+        false,
+        false,
+        "no suspend issued",
         measurements,
     )
 }
@@ -198,52 +274,11 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
     })
 }
 
-fn map() -> std::collections::BTreeMap<String, serde_json::Value> {
-    std::collections::BTreeMap::new()
-}
-
-fn row(
-    id: &str,
-    name: &str,
-    status: &str,
-    detail: String,
-    measurements: std::collections::BTreeMap<String, serde_json::Value>,
-) -> TestRow {
-    TestRow {
-        id: id.into(),
-        name: name.into(),
-        status: status.into(),
-        skip_reason: if status == "skip" {
-            Some(detail.clone())
-        } else {
-            None
-        },
-        physical: false,
-        needs_admin: false,
-        duration_ms: 0,
-        detail: if status == "skip" {
-            String::new()
-        } else {
-            detail
-        },
-        measurements,
-    }
-}
-
-fn skip(
-    id: &str,
-    name: &str,
-    reason: &str,
-    measurements: std::collections::BTreeMap<String, serde_json::Value>,
-) -> TestRow {
-    row(id, name, "skip", reason.to_string(), measurements)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_inhibit_list, parse_lid_closed_property, parse_mem_sleep, parse_power_state,
-        parse_prepare_for_sleep,
+        environment_refusal, parse_inhibit_list, parse_lid_closed_property, parse_locked_hint,
+        parse_mem_sleep, parse_power_state, parse_prepare_for_sleep,
     };
 
     #[test]
@@ -272,10 +307,20 @@ mod tests {
     fn lid_and_sleep_lines() {
         assert_eq!(parse_lid_closed_property("b false"), Some(false));
         assert_eq!(parse_lid_closed_property("b true"), Some(true));
+        assert_eq!(parse_locked_hint("LockedHint=yes\n"), Some(true));
+        assert_eq!(parse_locked_hint("LockedHint=no\n"), Some(false));
+        assert_eq!(parse_locked_hint("BlockInhibited=yes\n"), None);
         assert_eq!(
             parse_prepare_for_sleep("PrepareForSleep boolean true"),
             Some(true)
         );
         assert_eq!(parse_prepare_for_sleep("System resumed."), Some(false));
+    }
+
+    #[test]
+    fn inhibit_refusal_fails_outside_ci() {
+        let stderr = "Failed to connect to bus: No medium found";
+        assert!(environment_refusal(stderr));
+        assert!(!environment_refusal("list did not name us"));
     }
 }

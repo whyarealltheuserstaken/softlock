@@ -31,6 +31,103 @@ pub struct TestRow {
     pub measurements: BTreeMap<String, Value>,
 }
 
+impl TestRow {
+    pub fn pass(
+        id: &str,
+        name: &str,
+        physical: bool,
+        needs_admin: bool,
+        detail: impl Into<String>,
+        measurements: BTreeMap<String, Value>,
+    ) -> Self {
+        Self::make(
+            id,
+            name,
+            "pass",
+            None,
+            physical,
+            needs_admin,
+            detail,
+            measurements,
+        )
+    }
+
+    pub fn fail(
+        id: &str,
+        name: &str,
+        physical: bool,
+        needs_admin: bool,
+        detail: impl Into<String>,
+        measurements: BTreeMap<String, Value>,
+    ) -> Self {
+        Self::make(
+            id,
+            name,
+            "fail",
+            None,
+            physical,
+            needs_admin,
+            detail,
+            measurements,
+        )
+    }
+
+    pub fn skip(
+        id: &str,
+        name: &str,
+        reason: &str,
+        physical: bool,
+        needs_admin: bool,
+        detail: impl Into<String>,
+        measurements: BTreeMap<String, Value>,
+    ) -> Self {
+        let detail = detail.into();
+        let detail = if detail.is_empty() {
+            reason.to_string()
+        } else {
+            detail
+        };
+        Self::make(
+            id,
+            name,
+            "skip",
+            Some(reason),
+            physical,
+            needs_admin,
+            detail,
+            measurements,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make(
+        id: &str,
+        name: &str,
+        status: &str,
+        skip_reason: Option<&str>,
+        physical: bool,
+        needs_admin: bool,
+        detail: impl Into<String>,
+        measurements: BTreeMap<String, Value>,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            status: status.to_string(),
+            skip_reason: skip_reason.map(str::to_string),
+            physical,
+            needs_admin,
+            duration_ms: 0,
+            detail: detail.into(),
+            measurements,
+        }
+    }
+}
+
+pub fn empty_measurements() -> BTreeMap<String, Value> {
+    BTreeMap::new()
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct SuiteResult {
     pub schema: String,
@@ -128,10 +225,11 @@ impl SuiteResult {
         for row in &self.tests {
             let admin = if row.needs_admin { "yes" } else { "no " };
             let phys = if row.physical { "yes" } else { "no " };
-            let note = row
-                .skip_reason
-                .clone()
-                .unwrap_or_else(|| row.detail.clone());
+            let note = if row.detail.is_empty() {
+                row.skip_reason.clone().unwrap_or_default()
+            } else {
+                row.detail.clone()
+            };
             let note = truncate(&note, 48);
             lines.push(format!(
                 "{:<28} {:<6}  {}   {}   {note}",

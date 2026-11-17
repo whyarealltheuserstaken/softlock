@@ -5,15 +5,18 @@ use std::process::Command;
 use serde_json::json;
 
 use crate::detect::DetectedConfig;
-use crate::report::TestRow;
+use crate::report::{TestRow, empty_measurements};
 
 pub fn wayland_layer_shell(config: &DetectedConfig) -> TestRow {
-    let mut measurements = map();
+    let mut measurements = empty_measurements();
     measurements.insert("session".into(), json!(config.session_type));
     if config.session_type != "wayland" {
-        return skip(
+        return TestRow::skip(
             "overlay.wayland.layer-shell",
             "Wayland wlr-layer-shell / lock surface",
+            "not-applicable",
+            false,
+            false,
             "not a Wayland session",
             measurements,
         );
@@ -24,10 +27,11 @@ pub fn wayland_layer_shell(config: &DetectedConfig) -> TestRow {
         .is_some_and(|t| t.contains("zwlr_layer_shell") || t.contains("ext_session_lock"));
     measurements.insert("layer_shell".into(), json!(layer));
     measurements.insert("wayland_info".into(), json!(info.is_some()));
-    row(
+    TestRow::pass(
         "overlay.wayland.layer-shell",
         "Wayland wlr-layer-shell / lock surface",
-        "pass",
+        false,
+        false,
         format!(
             "compositor={} layer_shell_or_session_lock={layer}",
             config.compositor
@@ -37,12 +41,15 @@ pub fn wayland_layer_shell(config: &DetectedConfig) -> TestRow {
 }
 
 pub fn x11_override_redirect(config: &DetectedConfig) -> TestRow {
-    let mut measurements = map();
+    let mut measurements = empty_measurements();
     measurements.insert("session".into(), json!(config.session_type));
     if config.session_type != "x11" {
-        return skip(
+        return TestRow::skip(
             "overlay.x11.redirect",
             "X11 override-redirect overlay path",
+            "not-applicable",
+            false,
+            false,
             "not an X11 session",
             measurements,
         );
@@ -52,38 +59,46 @@ pub fn x11_override_redirect(config: &DetectedConfig) -> TestRow {
     measurements.insert("xwininfo".into(), json!(xwin.is_some()));
     measurements.insert("xrandr".into(), json!(xrandr.is_some()));
     if xwin.is_none() && xrandr.is_none() {
-        return skip(
+        return TestRow::skip(
             "overlay.x11.redirect",
             "X11 override-redirect overlay path",
+            "not-applicable",
+            false,
+            false,
             "DISPLAY set but xwininfo/xrandr missing",
             measurements,
         );
     }
-    row(
+    TestRow::pass(
         "overlay.x11.redirect",
         "X11 override-redirect overlay path",
-        "pass",
-        "X11 session reachable without creating a lock window".into(),
+        false,
+        false,
+        "X11 session reachable without creating a lock window",
         measurements,
     )
 }
 
 pub fn coverage(config: &DetectedConfig) -> TestRow {
-    let mut measurements = map();
+    let mut measurements = empty_measurements();
     measurements.insert("display_count".into(), json!(config.display_count));
     measurements.insert("outputs".into(), json!(config.displays.len()));
     if config.display_count == 0 && config.session_type == "none" {
-        return skip(
+        return TestRow::skip(
             "overlay.coverage",
             "One overlay surface per connected output",
+            "not-applicable",
+            false,
+            false,
             "no connected display",
             measurements,
         );
     }
-    row(
+    TestRow::pass(
         "overlay.coverage",
         "One overlay surface per connected output",
-        "pass",
+        false,
+        false,
         format!(
             "connected={} listed={}",
             config.display_count,
@@ -99,45 +114,4 @@ fn stdout(bin: &str, args: &[&str]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn map() -> std::collections::BTreeMap<String, serde_json::Value> {
-    std::collections::BTreeMap::new()
-}
-
-fn row(
-    id: &str,
-    name: &str,
-    status: &str,
-    detail: String,
-    measurements: std::collections::BTreeMap<String, serde_json::Value>,
-) -> TestRow {
-    TestRow {
-        id: id.into(),
-        name: name.into(),
-        status: status.into(),
-        skip_reason: if status == "skip" {
-            Some(detail.clone())
-        } else {
-            None
-        },
-        physical: false,
-        needs_admin: false,
-        duration_ms: 0,
-        detail: if status == "skip" {
-            String::new()
-        } else {
-            detail
-        },
-        measurements,
-    }
-}
-
-fn skip(
-    id: &str,
-    name: &str,
-    reason: &str,
-    measurements: std::collections::BTreeMap<String, serde_json::Value>,
-) -> TestRow {
-    row(id, name, "skip", reason.to_string(), measurements)
 }

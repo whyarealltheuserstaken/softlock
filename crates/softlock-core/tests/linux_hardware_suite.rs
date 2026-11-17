@@ -88,6 +88,8 @@ fn the_ci_workflow_runs_ci_mode_on_ubuntu_and_pins_actions() {
     assert!(text.contains("softlock-hardware-suite/1"));
     assert!(text.contains("never-unlocked"));
     assert!(text.contains("serial-collected"));
+    assert!(text.contains("tests/hardware/check-schema.py"));
+    assert!(text.contains("docs/hardware-suite-schema.md"));
     assert!(text.contains("contents: read"));
     let mut uses = 0;
     for line in text.lines() {

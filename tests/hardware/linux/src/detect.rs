@@ -170,7 +170,7 @@ pub fn parse_compositor(
 
 pub fn parse_sudo_status(code: Option<i32>, ran: bool) -> String {
     if !ran {
-        return "none".to_string();
+        return "not-probed".to_string();
     }
     match code {
         Some(0) => "passwordless".to_string(),
@@ -180,7 +180,7 @@ pub fn parse_sudo_status(code: Option<i32>, ran: bool) -> String {
     }
 }
 
-pub fn probe_system() -> DetectedConfig {
+pub fn probe_system(probe_sudo: bool) -> DetectedConfig {
     let os_release = fs::read_to_string("/etc/os-release").unwrap_or_default();
     let (distro_id, distro_version) = parse_os_release(&os_release);
     let kernel = uname_field("-r");
@@ -206,7 +206,11 @@ pub fn probe_system() -> DetectedConfig {
         .ok()
         .map(|t| parse_mem_sleep(&t))
         .map(|m: MemSleep| m.current);
-    let sudo = parse_sudo_status(sudo_n_code(), true);
+    let sudo = if probe_sudo {
+        parse_sudo_status(sudo_n_code(), true)
+    } else {
+        parse_sudo_status(None, false)
+    };
     let uid_is_root = unsafe { libc::geteuid() == 0 };
     let logind = command_ok("busctl", &["status", "org.freedesktop.login1"]);
     let dbus_system = Path::new("/run/dbus/system_bus_socket").exists()
@@ -401,6 +405,6 @@ mod tests {
             parse_sudo_status(Some(1), true),
             "needs-password-or-missing"
         );
-        assert_eq!(parse_sudo_status(None, false), "none");
+        assert_eq!(parse_sudo_status(None, false), "not-probed");
     }
 }

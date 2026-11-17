@@ -89,19 +89,27 @@ fn long_hex_id(text: &str) -> bool {
 }
 
 fn redact_mac(line: &str) -> String {
-    let bytes = line.as_bytes();
+    let chars: Vec<char> = line.chars().collect();
     let mut out = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 17 <= bytes.len() && is_mac(&bytes[i..i + 17]) {
+    let mut index = 0;
+    while index < chars.len() {
+        if mac_at(&chars[index..]) {
             out.push_str("[mac]");
-            i += 17;
+            index += 17;
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            out.push(chars[index]);
+            index += 1;
         }
     }
     out
+}
+
+fn mac_at(chars: &[char]) -> bool {
+    if chars.len() < 17 {
+        return false;
+    }
+    let text: String = chars.iter().take(17).collect();
+    is_mac(text.as_bytes())
 }
 
 fn redact_hex_ids(line: &str) -> String {
@@ -141,6 +149,14 @@ mod tests {
         assert!(cleaned.contains("[mac]"));
         assert!(cleaned.contains("[id]"));
         assert!(!contains_serial(&cleaned));
+    }
+
+    #[test]
+    fn mac_redact_keeps_non_ascii() {
+        let cleaned = redact("é 00:11:22:33:44:55");
+        assert!(cleaned.starts_with('é'));
+        assert!(cleaned.contains("[mac]"));
+        assert!(!cleaned.contains("00:11"));
     }
 
     #[test]

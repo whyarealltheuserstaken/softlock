@@ -11,6 +11,7 @@ pub struct DisplayInfo {
     pub connected: bool,
     pub kind: String,
     pub current_mode: Option<String>,
+    pub current_rate: Option<String>,
 }
 
 pub fn parse_xrandr(text: &str) -> Vec<DisplayInfo> {
@@ -21,9 +22,19 @@ pub fn parse_xrandr(text: &str) -> Vec<DisplayInfo> {
             if let Some(idx) = current
                 && line.contains('*')
             {
-                let mode = line.split_whitespace().next().unwrap_or("");
-                if !mode.is_empty() {
+                if let Some(mode) = line.split_whitespace().next()
+                    && !mode.is_empty()
+                    && out[idx].current_mode.is_none()
+                {
                     out[idx].current_mode = Some(mode.to_string());
+                }
+                for token in line.split_whitespace().skip(1) {
+                    if token.contains('*') {
+                        let rate = token.trim_end_matches(['*', '+']);
+                        if !rate.is_empty() {
+                            out[idx].current_rate = Some(rate.to_string());
+                        }
+                    }
                 }
             }
             continue;
@@ -42,6 +53,7 @@ pub fn parse_xrandr(text: &str) -> Vec<DisplayInfo> {
             connected: state == "connected",
             kind: "xrandr".to_string(),
             current_mode: None,
+            current_rate: None,
         });
         current = Some(out.len() - 1);
     }
@@ -62,6 +74,7 @@ pub fn parse_wlr_randr(text: &str) -> Vec<DisplayInfo> {
                 connected: true,
                 kind: "wlr-randr".to_string(),
                 current_mode: None,
+                current_rate: None,
             });
             current = Some(out.len() - 1);
             continue;
@@ -93,6 +106,7 @@ pub fn parse_drm_status_map(pairs: &[(String, String)]) -> Vec<DisplayInfo> {
             connected,
             kind: "drm".to_string(),
             current_mode: None,
+            current_rate: None,
         });
     }
     out
@@ -150,6 +164,7 @@ HDMI-1 disconnected (normal left inverted right x axis y axis)
         assert!(rows[0].connected);
         assert_eq!(rows[0].name, "eDP-1");
         assert_eq!(rows[0].current_mode.as_deref(), Some("1920x1080"));
+        assert_eq!(rows[0].current_rate.as_deref(), Some("60.00"));
         assert!(!rows[1].connected);
     }
 
