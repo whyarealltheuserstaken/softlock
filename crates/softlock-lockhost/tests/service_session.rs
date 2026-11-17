@@ -679,7 +679,7 @@ fn standard_user_cannot_plant_the_secret_store() {
         return;
     }
     let _guard = gate();
-    let _account = StandardAccount::create();
+    let account = StandardAccount::create();
     let dir = service_data_directory();
     reclaim_data_dir(&dir);
     let bait = std::env::temp_dir().join(format!("svc-bait-{}", std::process::id()));
@@ -696,7 +696,9 @@ fn standard_user_cannot_plant_the_secret_store() {
     for mode in modes {
         let report = public.join(format!("sl-plant-{mode}-{}.txt", std::process::id()));
         let _ = fs::remove_file(&report);
-        children.push(spawn_standard_user(&mode, &dir, &bait, &report, &done));
+        children.push(spawn_standard_user(
+            &account, mode, &dir, &bait, &report, &done,
+        ));
     }
     thread::sleep(Duration::from_millis(500));
     let service = service_exe();
@@ -996,6 +998,7 @@ fn reclaim_data_dir(dir: &Path) {
 
 struct StandardAccount {
     name: String,
+    password: String,
 }
 
 impl StandardAccount {
@@ -1015,9 +1018,7 @@ impl StandardAccount {
             String::from_utf8_lossy(&added.stdout),
             String::from_utf8_lossy(&added.stderr)
         );
-        std::env::set_var("SOFTLOCK_PLANT_USER", &name);
-        std::env::set_var("SOFTLOCK_PLANT_PASSWORD", &password);
-        Self { name }
+        Self { name, password }
     }
 }
 
@@ -1026,8 +1027,6 @@ impl Drop for StandardAccount {
         let _ = Command::new("net.exe")
             .args(["user", &self.name, "/delete"])
             .output();
-        std::env::remove_var("SOFTLOCK_PLANT_USER");
-        std::env::remove_var("SOFTLOCK_PLANT_PASSWORD");
     }
 }
 
@@ -1036,6 +1035,7 @@ struct PlantChild {
 }
 
 fn spawn_standard_user(
+    account: &StandardAccount,
     mode: &str,
     dir: &Path,
     bait: &Path,
@@ -1055,8 +1055,8 @@ fn spawn_standard_user(
     use windows::core::{PCWSTR, PWSTR};
     enable_privilege(SE_ASSIGNPRIMARYTOKEN_NAME);
     enable_privilege(SE_INCREASE_QUOTA_NAME);
-    let user = std::env::var("SOFTLOCK_PLANT_USER").expect("user");
-    let password = std::env::var("SOFTLOCK_PLANT_PASSWORD").expect("password");
+    let user = account.name.clone();
+    let password = account.password.clone();
     let user_w = wide_chars(&user);
     let password_w = wide_chars(&password);
     let domain = wide_chars(".");
