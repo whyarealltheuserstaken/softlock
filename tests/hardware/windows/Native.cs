@@ -55,6 +55,8 @@ namespace SoftLock.Hardware
         static IntPtr powerRequest = IntPtr.Zero;
         static IntPtr reasonText = IntPtr.Zero;
         static bool dpiReady;
+        static ConsoleCtrlHandler ctrlHandler;
+        static int interrupted;
 
         public static string DetectJson()
         {
@@ -335,6 +337,57 @@ namespace SoftLock.Hardware
             LockWorkStation();
         }
 
+        public static void InstallCtrlHandler()
+        {
+            ctrlHandler = OnCtrl;
+            SetConsoleCtrlHandler(ctrlHandler, true);
+        }
+
+        public static bool WasInterrupted()
+        {
+            return System.Threading.Interlocked.CompareExchange(ref interrupted, 0, 0) != 0;
+        }
+
+        // WTSINFOEXW.Level is a DWORD, then padding to the 8-byte union.
+        // WTSINFOEX_LEVEL1_W.SessionFlags is the third DWORD of that union (offset 16).
+        // https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/ns-wtsapi32-wtsinfoex_level1_w
+        // WTS_SESSIONSTATE_LOCK is 0 and WTS_SESSIONSTATE_UNLOCK is 1 since Windows 7.
+        public static string SessionStateJson()
+        {
+            IntPtr buffer;
+            int bytes;
+            if (!WTSQuerySessionInformationW(IntPtr.Zero, -1, 25, out buffer, out bytes) || buffer == IntPtr.Zero)
+            {
+                return "{\"ok\":false,\"locked\":false,\"flags\":-1}";
+            }
+            try
+            {
+                if (bytes < 20)
+                {
+                    return "{\"ok\":false,\"locked\":false,\"flags\":-1}";
+                }
+                int level = Marshal.ReadInt32(buffer);
+                int flags = Marshal.ReadInt32(buffer, 16);
+                bool known = level == 1 && (flags == 0 || flags == 1);
+                bool locked = known && flags == 0;
+                return "{\"ok\":" + Bool(known) + ",\"locked\":" + Bool(locked) + ",\"flags\":" + flags + "}";
+            }
+            finally
+            {
+                WTSFreeMemory(buffer);
+            }
+        }
+
+        static bool OnCtrl(int ctrlType)
+        {
+            if (ctrlType == 0 || ctrlType == 1)
+            {
+                System.Threading.Interlocked.Exchange(ref interrupted, 1);
+                return true;
+            }
+            return false;
+        }
+
         public static bool WaitForUnlock(int milliseconds)
         {
             StartListener();
@@ -573,6 +626,7 @@ namespace SoftLock.Hardware
             return text.Replace("\\", " ").Replace("\"", "'").Replace("\r", " ").Replace("\n", " ");
         }
 
+        delegate bool ConsoleCtrlHandler(int ctrlType);
         delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
         delegate IntPtr WndProc(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
         delegate bool MonitorEnum(IntPtr monitor, IntPtr hdc, ref Rect rect, IntPtr data);
@@ -664,6 +718,7 @@ namespace SoftLock.Hardware
         [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref Msg msg);
         [DllImport("user32.dll")] static extern bool PostThreadMessage(uint thread, uint msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] static extern IntPtr RegisterPowerSettingNotification(IntPtr hwnd, ref Guid setting, uint flags);
+        [DllImport("kernel32.dll")] static extern bool SetConsoleCtrlHandler(ConsoleCtrlHandler handler, bool add);
         [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
         [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);

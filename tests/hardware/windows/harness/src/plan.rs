@@ -10,8 +10,6 @@ pub const PROMPT_PLUG: &str = "Plug in a monitor, then press Enter. Type skip to
 pub const PROMPT_UNPLUG: &str = "Unplug that monitor, then press Enter. Type skip to skip.";
 pub const PROMPT_REPLUG: &str = "Plug that monitor back in, then press Enter. Type skip to skip.";
 pub const PROMPT_LID: &str = "Close the lid, then open it. The lid action is Do nothing. Then press Enter. Type skip to skip.";
-pub const PROMPT_POWER: &str =
-    "Press the power button once. Its action is Do nothing. Then press Enter. Type skip to skip.";
 pub const PROMPT_LOCK: &str =
     "Press Enter to lock Windows, then sign in with PIN or password. Type skip to skip.";
 
@@ -250,26 +248,17 @@ fn lid(machine: &Machine, flags: &Flags) -> Planned {
     physical("lid-cycle", flags, machine, vec![PROMPT_LID])
 }
 
-fn power_key(machine: &Machine, flags: &Flags) -> Planned {
-    if on_runner(flags) {
-        return skip("power-key", "ci", "physical step", true, false);
-    }
-    if machine.session == SessionKind::Remote {
-        return skip("power-key", "not-applicable", "remote session", true, false);
-    }
-    if !machine.power.known {
-        return skip(
-            "power-key",
-            "not-applicable",
-            "could not read powercfg /a",
-            true,
-            false,
-        );
-    }
-    if !machine.power.any_sleep() {
-        return skip("power-key", "not-applicable", "no sleep state", true, false);
-    }
-    physical("power-key", flags, machine, vec![PROMPT_POWER])
+fn power_key(_machine: &Machine, _flags: &Flags) -> Planned {
+    // The chassis button is an ACPI control, not a HID key, and RegisterPowerSettingNotification
+    // has no press GUID for it. With the action set to Do nothing, Windows writes no
+    // language-independent event. https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerpowersettingnotification
+    skip(
+        "power-key",
+        "not-applicable",
+        "no language-independent power-button signal while the action is Do nothing",
+        true,
+        false,
+    )
 }
 
 fn session_lock(machine: &Machine, flags: &Flags) -> Planned {
@@ -330,6 +319,8 @@ mod tests {
         );
         assert_eq!(row(&rows, "lid-cycle").action, Action::Prompt);
         assert_eq!(row(&rows, "session-lock").prompts, vec![PROMPT_LOCK]);
+        assert_eq!(row(&rows, "power-key").action, Action::Skip);
+        assert_eq!(row(&rows, "power-key").reason, "not-applicable");
         assert!(rows.iter().all(|row| !is_service_probe(row.id)));
     }
 
@@ -353,7 +344,11 @@ mod tests {
         let skipped = plan(&machine(), &flags(true, false, false));
         assert_eq!(row(&skipped, "display-hotplug").reason, "ci");
         assert_eq!(row(&skipped, "lid-cycle").reason, "ci");
-        assert_eq!(row(&skipped, "power-key").reason, "ci");
+        assert_eq!(row(&skipped, "power-key").reason, "not-applicable");
+        assert_eq!(
+            row(&skipped, "power-key").detail,
+            "no language-independent power-button signal while the action is Do nothing"
+        );
         assert_eq!(row(&skipped, "session-lock").reason, "ci");
         assert_eq!(row(&skipped, "fail-closed-blocked").reason, "ci");
         assert_eq!(row(&skipped, "cad-hklm-readback").reason, "needs-admin");
@@ -392,7 +387,10 @@ mod tests {
         assert_eq!(row(&rows, "lid-cycle").reason, "not-applicable");
         assert_eq!(row(&rows, "lid-cycle").detail, "no lid");
         assert_eq!(row(&rows, "power-key").reason, "not-applicable");
-        assert_eq!(row(&rows, "power-key").detail, "no sleep state");
+        assert_eq!(
+            row(&rows, "power-key").detail,
+            "no language-independent power-button signal while the action is Do nothing"
+        );
         assert_eq!(
             row(&rows, "display-hotplug").prompts,
             vec![PROMPT_UNPLUG, PROMPT_REPLUG]
