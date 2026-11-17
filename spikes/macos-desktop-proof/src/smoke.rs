@@ -1,5 +1,10 @@
-//! Native x86_64 smoke. Refuses a Rosetta `uname`.
+//! Native x86_64 smoke. Refuses a Rosetta `uname`. Calls public CoreGraphics
+//! in-process. Resolves the D5 lock symbol with dlopen/dlsym and never calls it.
 
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
+#[cfg(target_os = "macos")]
+use std::os::raw::c_void;
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
@@ -11,6 +16,16 @@ pub struct HostFacts {
     pub uname_m: String,
     pub proc_translated: Option<String>,
     pub hw_optional_arm64: Option<String>,
+    pub hw_cputype: Option<String>,
+    pub cpu_brand: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameworkReport {
+    pub display_id: String,
+    pub bounds: String,
+    pub session_dictionary: String,
+    pub sac_lock_symbol: String,
 }
 
 pub fn native_intel(facts: &HostFacts) -> Result<(), String> {
@@ -27,6 +42,19 @@ pub fn native_intel(facts: &HostFacts) -> Result<(), String> {
         return Err(
             "hw.optional.arm64 is 1; this host is Apple silicon, not native Intel".to_string(),
         );
+    }
+    if facts.hw_cputype.as_deref() != Some("7") {
+        return Err(format!(
+            "hw.cputype is {}, expected 7",
+            display(facts.hw_cputype.as_deref().unwrap_or(""))
+        ));
+    }
+    let brand = facts.cpu_brand.as_deref().unwrap_or("");
+    if !brand.contains("Intel") {
+        return Err(format!(
+            "machdep.cpu.brand_string is {}, expected Intel",
+            display(brand)
+        ));
     }
     Ok(())
 }
@@ -49,6 +77,7 @@ pub fn render(
     archs: &str,
     native: Result<(), String>,
     fat: Result<(), String>,
+    framework: &FrameworkReport,
 ) -> (String, bool) {
     let mut lines = vec![
         "uname -m".to_string(),
@@ -61,8 +90,21 @@ pub fn render(
             "hw.optional.arm64={}",
             facts.hw_optional_arm64.as_deref().unwrap_or("absent")
         ),
+        format!(
+            "hw.cputype={}",
+            facts.hw_cputype.as_deref().unwrap_or("absent")
+        ),
+        format!(
+            "machdep.cpu.brand_string={}",
+            facts.cpu_brand.as_deref().unwrap_or("absent")
+        ),
         format!("lipo -info {info}"),
         format!("lipo -archs {archs}"),
+        format!("cg-main-display-id={}", framework.display_id),
+        format!("cg-main-display-bounds={}", framework.bounds),
+        format!("cg-session-dictionary={}", framework.session_dictionary),
+        format!("sac-lock-symbol={}", framework.sac_lock_symbol),
+        "sac-lock-called=false".to_string(),
     ];
     let mut ok = true;
     match &native {
@@ -94,11 +136,12 @@ pub fn render(
 
 #[cfg(target_os = "macos")]
 pub fn run(args: &Args) -> i32 {
-    let _ = args;
     let facts = HostFacts {
         uname_m: command_stdout(&["uname", "-m"]),
         proc_translated: optional_sysctl("sysctl.proc_translated"),
         hw_optional_arm64: optional_sysctl("hw.optional.arm64"),
+        hw_cputype: optional_sysctl("hw.cputype"),
+        cpu_brand: optional_sysctl("machdep.cpu.brand_string"),
     };
     let exe = match std::env::current_exe() {
         Ok(path) => path,
@@ -109,12 +152,14 @@ pub fn run(args: &Args) -> i32 {
     };
     let info = command_stdout(&["lipo", "-info", &exe.to_string_lossy()]);
     let archs = command_stdout(&["lipo", "-archs", &exe.to_string_lossy()]);
+    let framework = measure_frameworks();
     let (text, ok) = render(
         &facts,
         &info,
         &archs,
         native_intel(&facts),
         fat_universal(&info, &archs),
+        &framework,
     );
     println!("{text}");
     println!("runner-image={}", args.runner_image);
@@ -150,6 +195,70 @@ fn optional_sysctl(name: &str) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct CGRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayBounds(id: u32) -> CGRect;
+    fn CGSessionCopyCurrentDictionary() -> *mut c_void;
+    fn CFRelease(cf: *const c_void);
+}
+
+/// Open the private login image and look up the D5 symbol. The pointer is
+/// discarded. This function must not call the symbol.
+#[cfg(target_os = "macos")]
+fn sac_lock_symbol_resolved() -> bool {
+    let path = CString::new("/System/Library/PrivateFrameworks/login.framework/login")
+        .expect("login path");
+    let name = CString::new("SACLockScreenImmediate").expect("symbol name");
+    unsafe {
+        let handle = libc::dlopen(path.as_ptr(), libc::RTLD_LAZY);
+        if handle.is_null() {
+            return false;
+        }
+        let symbol = libc::dlsym(handle, name.as_ptr());
+        !symbol.is_null()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn measure_frameworks() -> FrameworkReport {
+    unsafe {
+        let id = CGMainDisplayID();
+        let bounds = CGDisplayBounds(id);
+        let session = CGSessionCopyCurrentDictionary();
+        let session_dictionary = if session.is_null() {
+            "null".to_string()
+        } else {
+            CFRelease(session);
+            "non-null".to_string()
+        };
+        FrameworkReport {
+            display_id: id.to_string(),
+            bounds: format!(
+                "{},{},{},{}",
+                bounds.x, bounds.y, bounds.width, bounds.height
+            ),
+            session_dictionary,
+            sac_lock_symbol: if sac_lock_symbol_resolved() {
+                "resolved".to_string()
+            } else {
+                "missing".to_string()
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,18 +268,43 @@ mod tests {
             uname_m: "x86_64".to_string(),
             proc_translated: Some("0".to_string()),
             hw_optional_arm64: Some("0".to_string()),
+            hw_cputype: Some("7".to_string()),
+            cpu_brand: Some("Intel(R) Core(TM) i5".to_string()),
+        }
+    }
+
+    fn framework() -> FrameworkReport {
+        FrameworkReport {
+            display_id: "1".to_string(),
+            bounds: "0,0,1024,768".to_string(),
+            session_dictionary: "non-null".to_string(),
+            sac_lock_symbol: "resolved".to_string(),
         }
     }
 
     #[test]
-    fn native_intel_accepts_x86_64_without_translation() {
+    fn native_intel_accepts_x86_64_intel_cputype() {
         native_intel(&intel()).expect("native");
-        let missing_keys = HostFacts {
-            uname_m: "x86_64".to_string(),
-            proc_translated: None,
-            hw_optional_arm64: None,
-        };
-        native_intel(&missing_keys).expect("Intel hosts may omit the Rosetta keys");
+    }
+
+    #[test]
+    fn native_intel_requires_cputype_7_and_an_intel_brand() {
+        let mut wrong_type = intel();
+        wrong_type.hw_cputype = Some("16777228".to_string());
+        assert!(
+            native_intel(&wrong_type)
+                .unwrap_err()
+                .contains("hw.cputype")
+        );
+
+        let mut apple = intel();
+        apple.cpu_brand = Some("Apple M1".to_string());
+        assert!(native_intel(&apple).unwrap_err().contains("Intel"));
+
+        let mut missing = intel();
+        missing.hw_cputype = None;
+        missing.cpu_brand = None;
+        assert!(native_intel(&missing).is_err());
     }
 
     #[test]
@@ -179,6 +313,8 @@ mod tests {
             uname_m: "x86_64".to_string(),
             proc_translated: Some("1".to_string()),
             hw_optional_arm64: Some("1".to_string()),
+            hw_cputype: Some("7".to_string()),
+            cpu_brand: Some("Intel".to_string()),
         };
         let error = native_intel(&rosetta).expect_err("Rosetta");
         assert!(error.contains("Rosetta"));
@@ -187,6 +323,8 @@ mod tests {
             uname_m: "arm64".to_string(),
             proc_translated: Some("0".to_string()),
             hw_optional_arm64: Some("1".to_string()),
+            hw_cputype: Some("16777228".to_string()),
+            cpu_brand: Some("Apple M1".to_string()),
         };
         let error = native_intel(&arm).expect_err("arm64");
         assert!(error.contains("arm64"));
@@ -221,13 +359,38 @@ mod tests {
             archs,
             native_intel(&intel()),
             fat_universal(info, archs),
+            &framework(),
         );
         assert!(ok);
         assert!(text.contains("uname -m\nx86_64"));
+        assert!(text.contains("hw.cputype=7"));
+        assert!(text.contains("Intel"));
         assert!(text.contains("native-intel=true"));
         assert!(text.contains("rosetta=false"));
+        assert!(text.contains("cg-main-display-id=1"));
+        assert!(text.contains("cg-session-dictionary=non-null"));
+        assert!(text.contains("sac-lock-symbol=resolved"));
+        assert!(text.contains("sac-lock-called=false"));
         assert!(text.contains("smoke=pass"));
-        assert!(text.contains("x86_64"));
-        assert!(text.contains("arm64"));
+    }
+
+    #[test]
+    fn smoke_source_never_calls_the_private_lock_symbol() {
+        let src = include_str!("smoke.rs");
+        let production = src.split("#[cfg(test)]").next().expect("production");
+        assert!(production.contains("dlopen"));
+        assert!(production.contains("dlsym"));
+        assert!(production.contains("SACLockScreenImmediate"));
+        assert!(production.contains("login.framework"));
+        assert!(
+            !production.contains("transmute"),
+            "resolving the symbol must not transmute it into a callable"
+        );
+        assert!(
+            !production.contains("SACLockScreenImmediate("),
+            "the private lock function must not be called"
+        );
+        assert!(production.contains("The pointer is"));
+        assert!(production.contains("discarded"));
     }
 }

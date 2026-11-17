@@ -47,7 +47,9 @@ GitHub lists `macos-15-intel` and `macos-26-intel` as well as the arm64 `macos-l
 
 **Accepted by the lead, 16 November 2026,** as written.
 
-On 16 November 2026 the hosted-runners page still listed `macos-15-intel` and `macos-26-intel`. Ticket m11 uses those labels for the native x86_64 smoke. m01 still does not.
+On 16 November 2026 the hosted-runners page still listed `macos-15-intel` and `macos-26-intel`. Ticket m11's native job uses those labels to download and run the fat binaries the m01 build job uploaded. The m01 *build* job stays on `macos-latest` and still does not run on Intel.
+
+**Lead, 16 November 2026:** m11's primary evidence is that GitHub Intel CI. Do not remove Henry's Intel Mac from m11. Keep an optional kit checkbox to run the same `--smoke` on his Intel MacBook Pro. Do not write that his Mac is not required.
 
 ## D5. Private API for the real lock
 

@@ -1,5 +1,13 @@
 name: Universal
 
+# m01 builds both slices on macos-latest (arm64). m11 downloads those fat
+# binaries onto GitHub Intel. GitHub said on 19 September 2025 (runner-images
+# #13045 and the changelog) that macos-15-intel lasts until August 2027 as the
+# last x86_64 image. No end date is published for macos-26-intel. When those
+# labels go, the m11 CI evidence disappears.
+# https://github.com/actions/runner-images/issues/13045
+# https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/
+# The native Intel job does not run on push to main.
 on:
   push:
     branches: [main]
@@ -25,6 +33,10 @@ jobs:
         with:
           toolchain: 1.100.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            spikes/macos-desktop-proof -> spikes/macos-desktop-proof/target
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
@@ -281,3 +293,209 @@ jobs:
             exit 1
           fi
           echo "x86_64 slice is not executed"
+
+      - name: Build and lipo the m02 probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path spikes/macos-desktop-proof/Cargo.toml \
+            --target x86_64-apple-darwin
+          cargo build --release --locked --manifest-path spikes/macos-desktop-proof/Cargo.toml \
+            --target aarch64-apple-darwin
+          mkdir -p target/universal/probe
+          x86="spikes/macos-desktop-proof/target/x86_64-apple-darwin/release/macos-desktop-proof"
+          arm="spikes/macos-desktop-proof/target/aarch64-apple-darwin/release/macos-desktop-proof"
+          fat="target/universal/probe/macos-desktop-proof"
+          lipo -create "${x86}" "${arm}" -output "${fat}"
+          chmod +x "${fat}"
+          # Ad-hoc signature. Decision D2.
+          codesign --force --sign - "${fat}"
+          echo "=== lipo -info ${fat} ==="
+          lipo -info "${fat}"
+          echo "=== lipo -archs ${fat} ==="
+          lipo -archs "${fat}"
+
+      - name: Upload fat product binaries and the fat probe
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: universal-fat
+          path: |
+            target/universal/fat
+            target/universal/tauri
+            target/universal/probe
+          if-no-files-found: error
+
+  native_x86:
+    name: native x86_64 (${{ matrix.image }})
+    needs: universal
+    if: github.event_name != 'push'
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [macos-15-intel, macos-26-intel]
+    steps:
+      - name: Record the Intel runner
+        run: |
+          set -euo pipefail
+          sw_vers
+          machine="$(uname -m)"
+          echo "uname -m is ${machine}"
+          if [ "${machine}" != "x86_64" ]; then
+            echo "native x86_64 requires an Intel runner, not Rosetta"
+            exit 1
+          fi
+          if translated="$(sysctl -n sysctl.proc_translated 2>/dev/null)"; then
+            echo "sysctl.proc_translated=${translated}"
+            if [ "${translated}" != "0" ]; then
+              echo "sysctl.proc_translated is not 0; this is Rosetta"
+              exit 1
+            fi
+          else
+            echo "sysctl.proc_translated absent"
+          fi
+          if arm="$(sysctl -n hw.optional.arm64 2>/dev/null)"; then
+            echo "hw.optional.arm64=${arm}"
+            if [ "${arm}" != "0" ]; then
+              echo "hw.optional.arm64 is not 0; this host is Apple silicon"
+              exit 1
+            fi
+          else
+            echo "hw.optional.arm64 absent"
+          fi
+          cputype="$(sysctl -n hw.cputype)"
+          echo "hw.cputype=${cputype}"
+          if [ "${cputype}" != "7" ]; then
+            echo "hw.cputype is not 7; this host is not Intel"
+            exit 1
+          fi
+          brand="$(sysctl -n machdep.cpu.brand_string)"
+          echo "machdep.cpu.brand_string=${brand}"
+          case "${brand}" in
+            *Intel*) ;;
+            *)
+              echo "machdep.cpu.brand_string does not contain Intel"
+              exit 1
+              ;;
+          esac
+
+      - name: Download the m01 fat binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: universal-fat
+          path: m01-fat
+
+      - name: Lipo-check and smoke-launch each fat x86_64 slice
+        run: |
+          set -euo pipefail
+
+          require_fat() {
+            path="$1"
+            echo "=== lipo -info ${path} ==="
+            info="$(lipo -info "${path}")"
+            echo "${info}"
+            echo "=== lipo -archs ${path} ==="
+            archs="$(lipo -archs "${path}")"
+            echo "${archs}"
+            case "${info}" in
+              *x86_64*) ;;
+              *) echo "lipo -info missing x86_64: ${info}"; exit 1 ;;
+            esac
+            case "${info}" in
+              *arm64*) ;;
+              *) echo "lipo -info missing arm64: ${info}"; exit 1 ;;
+            esac
+            case "${archs}" in
+              *x86_64*) ;;
+              *) echo "lipo -archs missing x86_64: ${archs}"; exit 1 ;;
+            esac
+            case "${archs}" in
+              *arm64*) ;;
+              *) echo "lipo -archs missing arm64: ${archs}"; exit 1 ;;
+            esac
+          }
+
+          kill_tree() {
+            parent="$1"
+            children="$(pgrep -P "${parent}" 2>/dev/null || true)"
+            if [ -n "${children}" ]; then
+              for child in ${children}; do
+                kill_tree "${child}"
+              done
+            fi
+            kill "${parent}" 2>/dev/null || true
+          }
+
+          smoke_launch() {
+            path="$1"
+            chmod +x "${path}"
+            # Ad-hoc signature. Decision D2.
+            codesign --force --sign - "${path}"
+            log="m01-fat/smoke-$(basename "${path}").log"
+            "${path}" >"${log}" 2>&1 &
+            pid=$!
+            sleep 5
+            if kill -0 "${pid}" 2>/dev/null; then
+              echo "x86_64 slice smoke launch is running: ${path}"
+              kill_tree "${pid}"
+              sleep 1
+              kill -9 "${pid}" 2>/dev/null || true
+              wait "${pid}" 2>/dev/null || true
+            else
+              set +e
+              wait "${pid}"
+              status=$?
+              set -e
+              echo "x86_64 slice exited ${status}: ${path}"
+              cat "${log}"
+              if [ "${status}" -ne 0 ]; then
+                exit "${status}"
+              fi
+            fi
+          }
+
+          launched=0
+          probe_smoked=0
+          shopt -s nullglob
+          for path in m01-fat/fat/* m01-fat/tauri/* m01-fat/probe/*; do
+            if [ ! -f "${path}" ]; then
+              continue
+            fi
+            if ! lipo -info "${path}" >/dev/null 2>&1; then
+              continue
+            fi
+            require_fat "${path}"
+            name="$(basename "${path}")"
+            if [ "${name}" = "macos-desktop-proof" ]; then
+              chmod +x "${path}"
+              codesign --force --sign - "${path}"
+              "${path}" --smoke --runner-image "${{ matrix.image }}" --output-dir proof-output \
+                | tee m01-fat/probe-smoke.txt
+              grep -F "uname -m" m01-fat/probe-smoke.txt
+              grep -Fx "x86_64" m01-fat/probe-smoke.txt
+              grep -F "hw.cputype=7" m01-fat/probe-smoke.txt
+              grep -F "Intel" m01-fat/probe-smoke.txt
+              grep -F "native-intel=true" m01-fat/probe-smoke.txt
+              grep -F "rosetta=false" m01-fat/probe-smoke.txt
+              grep -F "cg-main-display-id=" m01-fat/probe-smoke.txt
+              grep -F "cg-main-display-bounds=" m01-fat/probe-smoke.txt
+              grep -F "cg-session-dictionary=" m01-fat/probe-smoke.txt
+              grep -F "sac-lock-symbol=" m01-fat/probe-smoke.txt
+              grep -F "sac-lock-called=false" m01-fat/probe-smoke.txt
+              grep -F "smoke=pass" m01-fat/probe-smoke.txt
+              probe_smoked=$((probe_smoked + 1))
+            else
+              smoke_launch "${path}"
+            fi
+            launched=$((launched + 1))
+          done
+          if [ "${launched}" -lt 1 ]; then
+            echo "no fat binary to launch"
+            exit 1
+          fi
+          if [ "${probe_smoked}" -lt 1 ]; then
+            echo "m01 artifact is missing the fat probe"
+            exit 1
+          fi
+          echo "smoked ${launched} fat binaries on native x86_64"

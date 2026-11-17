@@ -30,9 +30,10 @@ fn universal_job_builds_both_slices_on_macos_latest() {
         text.contains("runs-on: macos-latest"),
         "the arm64 slice is built on macos-latest"
     );
+    let build = universal_build_job(&text);
     assert!(
-        !text.contains("macos-15-intel") && !text.contains("macos-26-intel"),
-        "Intel runner labels stay off this job"
+        !build.contains("macos-15-intel") && !build.contains("macos-26-intel"),
+        "Intel runner labels stay off the m01 build job"
     );
     assert!(text.contains("sw_vers"), "the job prints sw_vers");
     assert!(text.contains("MACOSX_DEPLOYMENT_TARGET"));
@@ -150,6 +151,14 @@ fn step(text: &str, name: &str) -> String {
         .unwrap_or_else(|| panic!("missing step {name}"));
     let rest = &text[start + marker.len()..];
     let end = rest.find("\n      - name:").unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+fn universal_build_job(text: &str) -> String {
+    let marker = "  universal:\n";
+    let start = text.find(marker).expect("universal job");
+    let rest = &text[start + marker.len()..];
+    let end = rest.find("\n  native_x86:").expect("native_x86 job");
     rest[..end].to_string()
 }
 
