@@ -40,7 +40,6 @@ jobs:
         shell: powershell
         continue-on-error: true
         run: |
-          . "${{ github.workspace }}/.github/ps-strict.ps1"
           cmd /c "query user"
           cmd /c "query session"
           Write-Output "ImageOS=$env:ImageOS"

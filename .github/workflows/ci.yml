@@ -96,7 +96,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          . "${{ github.workspace }}/.github/ps-strict.ps1"
           $output = cargo run -p softlock-spike-overlay -- tour --only Fullscreen --no-prompt --pause-secs 2 --timeout-secs 30 --allow-admin 2>&1 | Out-String
           Write-Host $output
           if ($LASTEXITCODE -ne 0) { Write-Error $output; exit $LASTEXITCODE }
