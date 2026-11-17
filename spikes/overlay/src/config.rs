@@ -327,7 +327,12 @@ mod tests {
 
     #[test]
     fn an_elevated_session_needs_allow_admin() {
-        for command in [Command::Run, Command::Tour, Command::Smoke, Command::RestoreToasts] {
+        for command in [
+            Command::Run,
+            Command::Tour,
+            Command::Smoke,
+            Command::RestoreToasts,
+        ] {
             assert!(elevated_command_allowed(command, false, false).is_ok());
             assert!(elevated_command_allowed(command, true, true).is_ok());
             let error = elevated_command_allowed(command, true, false).unwrap_err();

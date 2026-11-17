@@ -89,7 +89,10 @@ mod tests {
     fn identical_rectangles_cover_one_window_and_a_new_screen_is_kept() {
         let same = rect(0, 0, 1920, 1080);
         let extra = rect(1920, 0, 1280, 720);
-        assert_eq!(windows_for(&[same, same, extra]).unwrap(), vec![same, extra]);
+        assert_eq!(
+            windows_for(&[same, same, extra]).unwrap(),
+            vec![same, extra]
+        );
     }
 
     #[test]

@@ -37,15 +37,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GW_HWNDFIRST, GW_HWNDNEXT,
     GWL_EXSTYLE, GetForegroundWindow, GetMessageW, GetWindow, GetWindowDisplayAffinity,
-    GetWindowLongPtrW, GetWindowRect, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW,
-    IsWindow, LWA_ALPHA, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage,
-    PostThreadMessageW, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowDisplayAffinity,
-    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WINDOWPOS,
-    WM_DESTROY, HWND_MESSAGE, KillTimer,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_NCHITTEST, WM_PAINT,
-    WM_QUIT, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    GetWindowLongPtrW, GetWindowRect, HTTRANSPARENT, HWND_MESSAGE, HWND_NOTOPMOST, HWND_TOPMOST,
+    IDC_ARROW, IsWindow, KillTimer, LWA_ALPHA, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
+    PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetTimer, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
+    TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WINDOWPOS, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_TIMER,
+    WM_WINDOWPOSCHANGED, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
