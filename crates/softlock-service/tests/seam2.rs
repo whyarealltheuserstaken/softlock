@@ -71,10 +71,6 @@ fn private_message_on_the_public_pipe_is_rejected() {
 fn forged_host_ready_does_not_arm_the_host() {
     let mut authority = authority();
     let nonce = lock(&mut authority, LockSource::App);
-    assert!(
-        !authority.host_ready(),
-        "the host was ready before HostReady"
-    );
     let mut bytes = *nonce.as_bytes();
     bytes[0] ^= 0xff;
     let forged = LaunchNonce::from_bytes(bytes);
@@ -85,12 +81,10 @@ fn forged_host_ready_does_not_arm_the_host() {
         })
         .expect_err("forged HostReady was accepted");
     assert_eq!(error, HostFault::ForgedNonce);
-    assert!(!authority.host_ready(), "a forged HostReady armed the host");
     assert!(matches!(authority.state(), LockState::Locked { .. }));
     authority
         .accept_host(HostToService::HostReady { monitors: 2, nonce })
         .expect("the real HostReady still arms");
-    assert!(authority.host_ready());
 }
 
 #[test]

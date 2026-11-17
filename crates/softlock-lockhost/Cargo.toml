@@ -10,13 +10,13 @@ rust-version.workspace = true
 [features]
 # Test-only. Release builds do not enable this. Injected events whose
 # extra-info matches the per-run nonce are classified as simulated-physical.
-simulated-physical = ["dep:getrandom"]
+simulated-physical = []
 # Dev-only marker. Release builds do not enable this. The lock host no longer
 # hashes a PIN or draws its own nonce.
 dev-launch = []
 
 [dependencies]
-getrandom = { version = "0.2.16", optional = true }
+getrandom = "0.2.16"
 
 [dev-dependencies]
 softlock-seam3 = { path = "../softlock-seam3" }

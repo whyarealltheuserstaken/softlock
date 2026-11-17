@@ -42,9 +42,10 @@ use windows::Win32::System::RemoteDesktop::{
 };
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::System::Threading::{
-    CreateEventW, EVENT_ALL_ACCESS, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
-    GetExitCodeProcess, OpenEventW, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, SetEvent, WaitForSingleObject,
+    CreateEventW, EVENT_ALL_ACCESS, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess,
+    OpenEventW, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResetEvent, SetEvent,
+    WaitForSingleObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
@@ -58,11 +59,16 @@ static HELD_PROCESS: AtomicIsize = AtomicIsize::new(0);
 static HELD_EVENT: AtomicIsize = AtomicIsize::new(0);
 static HELD_PID: AtomicU32 = AtomicU32::new(0);
 static HELD_NONCE: AtomicU64 = AtomicU64::new(0);
-const ARMED_SLOT_BYTES: usize = 16;
-/// Nonce used only by the simulated-physical impostor seam. It never matches a
-/// published arm event, so the seam cannot satisfy the armed-event check.
+/// Nonce this process published. The impostor seam uses it so the armed event
+/// exists and is signaled; token and path are what can still reject.
+static PUBLISHED_NONCE: AtomicU64 = AtomicU64::new(0);
+/// PID of a replacement this host already held and then saw exit. That number
+/// is never trusted again: the operating system can reuse it.
+static DEAD_PID: AtomicU32 = AtomicU32::new(0);
+/// The dead PID was passed to `trust_new_process` after the handle was dropped.
 #[cfg(feature = "simulated-physical")]
-const IMPOSTOR_NONCE: u64 = 0x51F7_10C5_A11E_0002;
+static REOPENED_DEAD_PID: AtomicBool = AtomicBool::new(false);
+const ARMED_SLOT_BYTES: usize = 16;
 
 use super::session::Shared;
 use crate::real_lock::{RealLock, decide};
@@ -233,7 +239,9 @@ pub(crate) fn publish_armed_host() {
     if !ARMED_MAPPING.load(Ordering::Acquire).is_null() {
         return;
     }
-    let nonce = fresh_nonce();
+    let Some(nonce) = fresh_nonce() else {
+        return;
+    };
     let Some(event) = create_armed_event(nonce) else {
         return;
     };
@@ -258,6 +266,7 @@ pub(crate) fn publish_armed_host() {
     }
     ARMED_EVENT.store(event.0, Ordering::Release);
     ARMED_MAPPING.store(mapping.0, Ordering::Release);
+    PUBLISHED_NONCE.store(nonce, Ordering::Release);
 }
 
 /// Another live lock host has armed. PID and image name are not enough: the
@@ -266,18 +275,37 @@ pub(crate) fn publish_armed_host() {
 /// token is SYSTEM, the full image path is this executable, and the per-run
 /// SYSTEM-only event is signaled. Any doubt keeps the hooks.
 pub(crate) fn replacement_host_armed() -> bool {
+    #[cfg(feature = "simulated-physical")]
+    prepare_reuse_fixture();
+    let armed = replacement_host_armed_inner();
+    #[cfg(feature = "simulated-physical")]
+    note_reuse_witness();
+    armed
+}
+
+fn replacement_host_armed_inner() -> bool {
     if let Some((pid, nonce)) = read_trusted_slot() {
         if held_matches(pid, nonce) {
             if held_still_armed() {
                 return true;
             }
-            // The process behind the held handle is gone. Do not open the
-            // same PID again in this call: it may already belong to someone else.
+            let process = load_handle(&HELD_PROCESS);
+            let exited = process.is_none_or(|handle| !process_still_active(handle));
+            if exited {
+                // The handle is the identity. Drop it and never open this PID
+                // again, including on a later poll after the number is reused.
+                DEAD_PID.store(pid, Ordering::Release);
+            }
             drop_held();
+            if exited {
+                return consider_impostor();
+            }
+        }
+        if dead_pid(pid) {
             return consider_impostor();
         }
         drop_held();
-        if trust_new_process(pid, nonce, true) {
+        if trust_new_process(pid, nonce, true).is_ok() {
             return true;
         }
     } else {
@@ -286,10 +314,24 @@ pub(crate) fn replacement_host_armed() -> bool {
     consider_impostor()
 }
 
+fn dead_pid(pid: u32) -> bool {
+    let dead = DEAD_PID.load(Ordering::Acquire);
+    dead != 0 && pid == dead
+}
+
 pub(crate) fn clear_armed_host() {
     drop_held();
-    close_stored(&ARMED_EVENT);
+    let raw = ARMED_EVENT.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    if !raw.is_null() {
+        let event = HANDLE(raw);
+        // Manual-reset. Reset before the last close so signaled means armed.
+        unsafe {
+            let _ = ResetEvent(event);
+        }
+        close_handle(event);
+    }
     close_stored(&ARMED_MAPPING);
+    PUBLISHED_NONCE.store(0, Ordering::Release);
 }
 
 fn create_armed_mapping() -> Option<HANDLE> {
@@ -381,8 +423,15 @@ fn create_armed_event(nonce: u64) -> Option<HANDLE> {
     };
     let name = armed_event_name(nonce);
     let event = unsafe { CreateEventW(Some(&sa), true, false, PCWSTR(name.as_ptr())) };
+    // Captured before any other call. An existing object may be a squatter.
+    let already = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     free_security(&descriptor);
-    event.ok()
+    let event = event.ok()?;
+    if already {
+        close_handle(event);
+        return None;
+    }
+    Some(event)
 }
 
 fn confirmed_event(nonce: u64) -> Option<HANDLE> {
@@ -403,33 +452,61 @@ fn event_is_signaled(event: HANDLE) -> bool {
     waited == WAIT_OBJECT_0
 }
 
-fn trust_new_process(pid: u32, nonce: u64, require_same_slot: bool) -> bool {
+enum ArmReject {
+    Event,
+    Token,
+    Path,
+    Inactive,
+}
+
+fn trust_new_process(pid: u32, nonce: u64, require_same_slot: bool) -> Result<(), ArmReject> {
     if pid == 0 || nonce == 0 || pid == current_pid() {
-        return false;
+        return Err(ArmReject::Inactive);
+    }
+    if dead_pid(pid) {
+        #[cfg(feature = "simulated-physical")]
+        REOPENED_DEAD_PID.store(true, Ordering::Release);
+        return Err(ArmReject::Inactive);
     }
     let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
     else {
-        return false;
+        return Err(ArmReject::Inactive);
     };
     if require_same_slot && read_trusted_slot() != Some((pid, nonce)) {
         close_handle(process);
-        return false;
+        return Err(ArmReject::Inactive);
     }
     let Some(event) = confirmed_event(nonce) else {
         close_handle(process);
-        return false;
+        return Err(ArmReject::Event);
     };
-    let trusted = process_still_active(process)
-        && process_token_is_system(process)
-        && image_path_is_current_exe(process)
-        && process_still_active(process);
-    if !trusted {
+    if !process_still_active(process) {
         close_handle(event);
         close_handle(process);
-        return false;
+        return Err(ArmReject::Inactive);
+    }
+    if !process_token_is_system(process) {
+        close_handle(event);
+        close_handle(process);
+        return Err(ArmReject::Token);
+    }
+    if !image_path_is_current_exe(process) {
+        close_handle(event);
+        close_handle(process);
+        return Err(ArmReject::Path);
+    }
+    if !process_still_active(process) {
+        close_handle(event);
+        close_handle(process);
+        return Err(ArmReject::Inactive);
     }
     store_held(process, event, pid, nonce);
-    held_still_armed()
+    if held_still_armed() {
+        Ok(())
+    } else {
+        drop_held();
+        Err(ArmReject::Inactive)
+    }
 }
 
 fn consider_impostor() -> bool {
@@ -439,6 +516,50 @@ fn consider_impostor() -> bool {
     }
     #[cfg(feature = "simulated-physical")]
     {
+        match impostor_case() {
+            ImpostorCase::None | ImpostorCase::Reuse => false,
+            ImpostorCase::Token => judge_impostor_pid(false),
+            ImpostorCase::Path => judge_impostor_pid(true),
+        }
+    }
+}
+
+#[cfg(feature = "simulated-physical")]
+enum ImpostorCase {
+    None,
+    Token,
+    Path,
+    Reuse,
+}
+
+#[cfg(feature = "simulated-physical")]
+fn impostor_case() -> ImpostorCase {
+    match std::env::var("SOFTLOCK_IMPOSTOR_CASE").ok().as_deref() {
+        Some("path") => ImpostorCase::Path,
+        Some("reuse") => ImpostorCase::Reuse,
+        Some("token") => ImpostorCase::Token,
+        _ => ImpostorCase::None,
+    }
+}
+
+/// The published nonce's event is ours: it exists, is SYSTEM-only, and is
+/// signaled. A standard-user copy fails the token check. A SYSTEM process
+/// started from another path fails the path check.
+#[cfg(feature = "simulated-physical")]
+fn judge_impostor_pid(spawn_other_path: bool) -> bool {
+    let Some(nonce) = published_nonce() else {
+        note_impostor("reason=event");
+        return false;
+    };
+    let mut creator: Option<HANDLE> = None;
+    let pid = if spawn_other_path {
+        let Some((process, pid)) = other_path_process() else {
+            note_impostor("reason=event");
+            return false;
+        };
+        creator = Some(process);
+        pid
+    } else {
         let Some(pid) = impostor_pid() else {
             return false;
         };
@@ -449,10 +570,21 @@ fn consider_impostor() -> bool {
             return false;
         };
         close_handle(probe);
-        let trusted = trust_new_process(pid, IMPOSTOR_NONCE, false);
-        note_impostor(trusted);
-        trusted
+        pid
+    };
+    let decision = trust_new_process(pid, nonce, false);
+    if let Some(process) = creator {
+        terminate_handle(process);
     }
+    let reason = match decision {
+        Ok(()) => "released",
+        Err(ArmReject::Token) => "reason=token",
+        Err(ArmReject::Path) => "reason=path",
+        Err(ArmReject::Event) => "reason=event",
+        Err(ArmReject::Inactive) => "reason=event",
+    };
+    note_impostor(reason);
+    false
 }
 
 #[cfg(feature = "simulated-physical")]
@@ -464,7 +596,7 @@ fn impostor_pid() -> Option<u32> {
 }
 
 #[cfg(feature = "simulated-physical")]
-fn note_impostor(trusted: bool) {
+fn note_impostor(text: &str) {
     static NOTED: AtomicBool = AtomicBool::new(false);
     if NOTED.swap(true, Ordering::AcqRel) {
         return;
@@ -472,8 +604,142 @@ fn note_impostor(trusted: bool) {
     let Ok(path) = std::env::var("SOFTLOCK_IMPOSTOR_WITNESS") else {
         return;
     };
-    let text = if trusted { "released" } else { "rejected" };
     let _ = std::fs::write(path, text);
+}
+
+#[cfg(feature = "simulated-physical")]
+fn published_nonce() -> Option<u64> {
+    let nonce = PUBLISHED_NONCE.load(Ordering::Acquire);
+    if nonce == 0 { None } else { Some(nonce) }
+}
+
+/// Hold a second SYSTEM process at this exact image, then kill it, so the
+/// next check sees a dead held PID. Windows will not recycle that number
+/// during the test; the proof is that the handle is dropped and the PID is
+/// not opened again.
+#[cfg(feature = "simulated-physical")]
+fn prepare_reuse_fixture() {
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if !matches!(impostor_case(), ImpostorCase::Reuse) || ONCE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(nonce) = published_nonce() else {
+        return;
+    };
+    let Some((process, pid)) = spawn_suspended_image(&current_image()) else {
+        note_reuse_file("reason=setup");
+        return;
+    };
+    if let Err(reject) = trust_new_process(pid, nonce, false) {
+        note_reuse_file(match reject {
+            ArmReject::Token => "reason=token",
+            ArmReject::Path => "reason=path",
+            ArmReject::Event => "reason=event",
+            ArmReject::Inactive => "reason=inactive",
+        });
+        terminate_handle(process);
+        return;
+    }
+    let mapping = ARMED_MAPPING.load(Ordering::Acquire);
+    if mapping.is_null() || !write_armed_slot(HANDLE(mapping), pid, nonce) {
+        note_reuse_file("reason=setup");
+        terminate_handle(process);
+        drop_held();
+        return;
+    }
+    terminate_handle(process);
+}
+
+#[cfg(feature = "simulated-physical")]
+fn note_reuse_witness() {
+    if !matches!(impostor_case(), ImpostorCase::Reuse) || DEAD_PID.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let dropped = HELD_PROCESS.load(Ordering::Acquire) == 0;
+    let reopened = REOPENED_DEAD_PID.load(Ordering::Acquire);
+    note_reuse_file(&format!(
+        "dropped={} reopened={} rejected=1",
+        u8::from(dropped),
+        u8::from(reopened)
+    ));
+}
+
+#[cfg(feature = "simulated-physical")]
+fn note_reuse_file(text: &str) {
+    let Ok(path) = std::env::var("SOFTLOCK_IMPOSTOR_WITNESS") else {
+        return;
+    };
+    let _ = std::fs::write(path, text);
+}
+
+#[cfg(feature = "simulated-physical")]
+fn other_path_process() -> Option<(HANDLE, u32)> {
+    static PID: AtomicU32 = AtomicU32::new(0);
+    let existing = PID.load(Ordering::Acquire);
+    if existing != 0 {
+        return None;
+    }
+    let source = current_image();
+    if source.as_os_str().is_empty() {
+        return None;
+    }
+    let dir = std::env::temp_dir().join(format!("softlock-path-{}", current_pid()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let dest = dir.join("other-lockhost.exe");
+    std::fs::copy(&source, &dest).ok()?;
+    let spawned = spawn_suspended_image(&dest)?;
+    PID.store(spawned.1, Ordering::Release);
+    Some(spawned)
+}
+
+#[cfg(feature = "simulated-physical")]
+fn current_image() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_default()
+}
+
+#[cfg(feature = "simulated-physical")]
+fn spawn_suspended_image(image: &std::path::Path) -> Option<(HANDLE, u32)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Threading::{
+        CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    let wide: Vec<u16> = image
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..STARTUPINFOW::default()
+    };
+    let mut info = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            PCWSTR(wide.as_ptr()),
+            None,
+            None,
+            None,
+            false,
+            CREATE_SUSPENDED,
+            None,
+            PCWSTR::null(),
+            &startup,
+            &mut info,
+        )
+        .ok()?;
+        let _ = CloseHandle(info.hThread);
+    }
+    Some((info.hProcess, info.dwProcessId))
+}
+
+#[cfg(feature = "simulated-physical")]
+fn terminate_handle(process: HANDLE) {
+    use windows::Win32::System::Threading::TerminateProcess;
+    unsafe {
+        let _ = TerminateProcess(process, 1);
+        let _ = WaitForSingleObject(process, 2000);
+    }
+    close_handle(process);
 }
 
 fn held_matches(pid: u32, nonce: u64) -> bool {
@@ -600,15 +866,11 @@ fn current_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
 }
 
-fn fresh_nonce() -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(1);
-    let mixed = nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (u64::from(unsafe { GetCurrentProcessId() }) << 32)
-        ^ u64::from(unsafe { GetCurrentThreadId() });
-    if mixed == 0 { 1 } else { mixed }
+fn fresh_nonce() -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes).ok()?;
+    // Zero is not a nonce. Forcing the low bit keeps the value non-zero.
+    Some(u64::from_le_bytes(bytes) | 1)
 }
 
 fn load_handle(slot: &AtomicIsize) -> Option<HANDLE> {

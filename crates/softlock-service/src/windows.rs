@@ -864,6 +864,7 @@ fn host_env_allowed(key: &str, allow_panic: bool) -> bool {
     #[cfg(feature = "simulated-physical")]
     if key.eq_ignore_ascii_case("SOFTLOCK_IMPOSTOR_PID")
         || key.eq_ignore_ascii_case("SOFTLOCK_IMPOSTOR_WITNESS")
+        || key.eq_ignore_ascii_case("SOFTLOCK_IMPOSTOR_CASE")
     {
         return true;
     }

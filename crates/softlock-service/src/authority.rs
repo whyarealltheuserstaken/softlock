@@ -120,6 +120,8 @@ impl Authority {
         self.note_len
     }
 
+    /// Test observation. Production code reads the field directly.
+    #[cfg(any(test, feature = "simulated-physical"))]
     pub fn host_ready(&self) -> bool {
         self.host_ready
     }
@@ -579,5 +581,49 @@ pub fn stub_os_lock() -> bool {
     #[cfg(not(feature = "simulated-physical"))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod host_ready_tests {
+    use softlock_core::{
+        HostToService, LaunchNonce, LockSource, LockState, RequestKind, ResponseKind, Role,
+    };
+
+    use super::Authority;
+    use crate::platform::{OsLock, ServicePlatform};
+
+    #[test]
+    fn forged_host_ready_leaves_the_host_not_ready() {
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), true);
+        let nonce = authority.issue_launch_nonce().expect("nonce");
+        let response = authority.handle_public(
+            Role::App,
+            RequestKind::Lock {
+                source: LockSource::App,
+                note: None,
+            },
+        );
+        assert_eq!(response, ResponseKind::Accepted);
+        assert!(
+            !authority.host_ready(),
+            "the host was ready before HostReady"
+        );
+        let mut bytes = *nonce.as_bytes();
+        bytes[0] ^= 0xff;
+        let forged = LaunchNonce::from_bytes(bytes);
+        let error = authority
+            .accept_host(HostToService::HostReady {
+                monitors: 2,
+                nonce: forged,
+            })
+            .expect_err("forged HostReady was accepted");
+        assert_eq!(error, super::HostFault::ForgedNonce);
+        assert!(!authority.host_ready(), "a forged HostReady armed the host");
+        assert!(matches!(authority.state(), LockState::Locked { .. }));
+        authority
+            .accept_host(HostToService::HostReady { monitors: 2, nonce })
+            .expect("the real HostReady still arms");
+        assert!(authority.host_ready());
     }
 }

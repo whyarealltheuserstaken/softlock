@@ -246,6 +246,7 @@ jobs:
           grep -F "private_message_on_the_public_pipe_is_rejected ... ok" target/seam2-service.txt
           grep -F "forged_launch_nonce_is_rejected ... ok" target/seam2-service.txt
           grep -F "forged_host_ready_does_not_arm_the_host ... ok" target/seam2-service.txt
+          grep -F "forged_host_ready_leaves_the_host_not_ready ... ok" target/seam2-service.txt
           grep -F "verified_nonce_is_single_use ... ok" target/seam2-service.txt
           grep -F "non_console_client_is_rejected ... ok" target/seam2-service.txt
           grep -F "get_status_snapshots_source_and_health ... ok" target/seam2-service.txt
@@ -286,6 +287,8 @@ jobs:
           grep -F "service_kill_while_locked_stays_guarded_when_os_lock_fails ... ok" target/seam3-service.txt
           grep -F "service_kill_while_locked_releases_only_after_os_lock ... ok" target/seam3-service.txt
           grep -F "impostor_pid_does_not_release_the_guard ... ok" target/seam3-service.txt
+          grep -F "impostor_path_does_not_release_the_guard ... ok" target/seam3-service.txt
+          grep -F "reused_pid_is_not_trusted_again ... ok" target/seam3-service.txt
           grep -F "several_pipe_instances_accept_at_once ... ok" target/seam3-service.txt
       - name: Service race loops
         shell: bash
@@ -363,6 +366,20 @@ jobs:
             passes=$((passes + 1))
           done
           echo "impostor loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact impostor_path_does_not_release_the_guard
+            passes=$((passes + 1))
+          done
+          echo "impostor-path loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact reused_pid_is_not_trusted_again
+            passes=$((passes + 1))
+          done
+          echo "reuse loop: ${passes} passed"
           test "$passes" -eq 20
       - name: Release build of the Windows target omits the test feature
         shell: bash
