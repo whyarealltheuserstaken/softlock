@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: callback-panic-repro-${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -28,6 +28,8 @@ jobs:
         with:
           toolchain: 1.100.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: callback-panic-${{ matrix.image }}
       - name: Windows target
         run: rustup target add x86_64-pc-windows-msvc
       - name: Loop the callback panic test

@@ -17,12 +17,58 @@ permissions:
   contents: read
 
 concurrency:
-  group: universal-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  changes:
+    name: path changes
+    runs-on: ubuntu-latest
+    outputs:
+      shared: ${{ steps.paths.outputs.shared }}
+      macos: ${{ steps.paths.outputs.macos }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        if: github.ref != 'refs/heads/main'
+        with:
+          filters: |
+            shared:
+              - Cargo.toml
+              - Cargo.lock
+              - crates/softlock-core/**
+              - crates/softlock-service/**
+              - crates/softlock-lockhost/**
+              - crates/softlock-broker/**
+              - crates/softlock-app/**
+              - spikes/macos-desktop-proof/**
+              - .github/**
+            macos:
+              - crates/softlock-macos/**
+      - id: paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "shared=true" >> "$GITHUB_OUTPUT"
+            echo "macos=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "shared=${{ steps.filter.outputs.shared }}" >> "$GITHUB_OUTPUT"
+            echo "macos=${{ steps.filter.outputs.macos }}" >> "$GITHUB_OUTPUT"
+          fi
+
   universal:
     name: universal 2
+    needs: changes
+    if: |
+      always() &&
+      needs.changes.result == 'success' &&
+      (github.ref == 'refs/heads/main' ||
+       needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs.macos == 'true')
     runs-on: macos-latest
     timeout-minutes: 90
     env:
@@ -34,6 +80,7 @@ jobs:
           toolchain: 1.100.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          shared-key: universal-universal2
           workspaces: |
             . -> target
             spikes/macos-desktop-proof -> spikes/macos-desktop-proof/target
@@ -346,8 +393,14 @@ jobs:
 
   native_x86:
     name: native x86_64 (${{ matrix.image }})
-    needs: universal
-    if: github.event_name != 'push'
+    needs:
+      - changes
+      - universal
+    if: |
+      always() &&
+      needs.changes.result == 'success' &&
+      needs.universal.result == 'success' &&
+      github.event_name == 'pull_request'
     runs-on: ${{ matrix.image }}
     timeout-minutes: 30
     strategy:
@@ -527,3 +580,31 @@ jobs:
             launched=$((launched + 1))
           done
           echo "smoked ${launched} fat binaries on native x86_64"
+
+  universal-ok:
+    name: universal ok
+    runs-on: ubuntu-latest
+    needs:
+      - changes
+      - universal
+      - native_x86
+    if: always()
+    steps:
+      - name: Required checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          check() {
+            local name="$1"
+            local result="$2"
+            case "${result}" in
+              success | skipped) ;;
+              *)
+                echo "${name}: ${result}"
+                exit 1
+                ;;
+            esac
+          }
+          check changes "${{ needs.changes.result }}"
+          check universal "${{ needs.universal.result }}"
+          check native_x86 "${{ needs.native_x86.result }}"
