@@ -4,7 +4,7 @@ CI is the primary evidence. Henry's Intel Mac stays on the ticket as an optional
 
 The m01 `universal 2` job on `macos-latest` uploads the fat product binaries and the fat m02 probe. The `native x86_64` job downloads that artifact onto GitHub Intel. It does not rebuild. The native Intel job does not run on push to main; only the arm64 universal build does.
 
-Measured on 16 November 2026 UTC. Head SHA and the Intel job log lines land here after the first green run of that `needs:` job.
+Measured on 16 November 2026 UTC from [run 43980483196](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43980483196) on `d9983cda1b05dbe49555ab0ef8ee20eec0391954`.
 
 ## Runner labels
 
@@ -20,18 +20,76 @@ Apple's universal-binary page says an Intel Mac executes the `x86_64` slice and 
 
 The probe `--smoke` path calls `CGMainDisplayID` / `CGDisplayBounds` and `CGSessionCopyCurrentDictionary` in-process. It `dlopen`s the private login image and `dlsym`s the D5 lock symbol. It does not call that symbol, lock the session, or load a LaunchAgent.
 
-## Job (filled after the first green `needs:` run)
+## Job
 
-Expected host lines:
+Both Intel jobs downloaded artifact `universal-fat` from the `universal 2` job. Each smoked three fat Mach-O files: `m01-fat/fat/softlock-app`, `m01-fat/tauri/softlock-app`, and `m01-fat/probe/macos-desktop-proof`. `lipo -info` and `lipo -archs` on each named `x86_64` and `arm64`.
+
+### macos-15-intel
+
+[Job 133701793116](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43980483196/job/133701793116)
 
 ```
+ProductName:		macOS
+ProductVersion:		15.7.9
 uname -m is x86_64
 hw.cputype=7
-machdep.cpu.brand_string=...Intel...
+machdep.cpu.brand_string=Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz
+Architectures in the fat file: m01-fat/fat/softlock-app are: x86_64 arm64
+x86_64 arm64
+x86_64 slice smoke launch is running: m01-fat/fat/softlock-app
+Architectures in the fat file: m01-fat/tauri/softlock-app are: x86_64 arm64
+x86_64 arm64
+x86_64 slice smoke launch is running: m01-fat/tauri/softlock-app
+Architectures in the fat file: m01-fat/probe/macos-desktop-proof are: x86_64 arm64
+x86_64 arm64
+sysctl.proc_translated=absent
+hw.optional.arm64=absent
+hw.cputype=7
+machdep.cpu.brand_string=Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz
+lipo -info Architectures in the fat file: /Users/runner/work/softlock/softlock/m01-fat/probe/macos-desktop-proof are: x86_64 arm64
+lipo -archs x86_64 arm64
+cg-main-display-id=25165824
+cg-main-display-bounds=0,0,1920,1080
+cg-session-dictionary=non-null
+sac-lock-symbol=resolved
+sac-lock-called=false
 native-intel=true
 rosetta=false
 smoke=pass
-sac-lock-called=false
+smoked 3 fat binaries on native x86_64
 ```
 
-`lipo -info` and `lipo -archs` on each fat binary that ran both contain `x86_64` and `arm64`.
+### macos-26-intel
+
+[Job 133701793073](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43980483196/job/133701793073)
+
+```
+ProductName:		macOS
+ProductVersion:		26.6.1
+uname -m is x86_64
+hw.cputype=7
+machdep.cpu.brand_string=Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz
+Architectures in the fat file: m01-fat/fat/softlock-app are: x86_64 arm64
+x86_64 arm64
+x86_64 slice smoke launch is running: m01-fat/fat/softlock-app
+Architectures in the fat file: m01-fat/tauri/softlock-app are: x86_64 arm64
+x86_64 arm64
+x86_64 slice smoke launch is running: m01-fat/tauri/softlock-app
+Architectures in the fat file: m01-fat/probe/macos-desktop-proof are: x86_64 arm64
+x86_64 arm64
+sysctl.proc_translated=absent
+hw.optional.arm64=absent
+hw.cputype=7
+machdep.cpu.brand_string=Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz
+lipo -info Architectures in the fat file: /Users/runner/work/softlock/softlock/m01-fat/probe/macos-desktop-proof are: x86_64 arm64
+lipo -archs x86_64 arm64
+cg-main-display-id=25165824
+cg-main-display-bounds=0,0,1920,1080
+cg-session-dictionary=non-null
+sac-lock-symbol=resolved
+sac-lock-called=false
+native-intel=true
+rosetta=false
+smoke=pass
+smoked 3 fat binaries on native x86_64
+```

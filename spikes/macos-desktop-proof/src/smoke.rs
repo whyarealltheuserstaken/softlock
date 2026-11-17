@@ -206,11 +206,15 @@ struct CGRect {
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
-#[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(id: u32) -> CGRect;
     fn CGSessionCopyCurrentDictionary() -> *mut c_void;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
     fn CFRelease(cf: *const c_void);
 }
 
