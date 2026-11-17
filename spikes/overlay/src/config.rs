@@ -251,7 +251,7 @@ Flags:
   --suppress-toasts    turn the user toast setting off, and restore it on exit
   --only Surface       tour one surface
   --no-prompt          do not wait for Enter
-  --allow-admin        run the tour even when this window is already admin
+  --allow-admin        allow run, tour, smoke, and restore-toasts when this window is already admin
   --alpha N            1 to 255, default {DEFAULT_ALPHA}
 "
     )
