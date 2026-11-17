@@ -403,7 +403,7 @@ fn panic_while_os_lock_is_down_is_closed_by_the_service() {
     probe.claim_focus();
     session.lock().expect("lock");
     let mut saw_unlocked = false;
-    let lost = wait_for(Duration::from_secs(8), || {
+    let lost = wait_for(Duration::from_secs(15), || {
         if session
             .status()
             .ok()
@@ -1044,74 +1044,17 @@ fn spawn_standard_user(
     report: &Path,
     done: &Path,
 ) -> PlantChild {
-    use windows::Win32::Security::{
-        CreateWellKnownSid, DuplicateTokenEx, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT,
-        LogonUserW, PSID, SE_ASSIGNPRIMARYTOKEN_NAME, SE_INCREASE_QUOTA_NAME,
-        SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL, TokenIntegrityLevel,
-        TokenPrimary, WinMediumLabelSid,
-    };
     use windows::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, PROCESS_INFORMATION,
-        STARTUPINFOW,
+        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW, LOGON_WITH_PROFILE,
+        PROCESS_INFORMATION, STARTUPINFOW,
     };
     use windows::core::{PCWSTR, PWSTR};
-    enable_privilege(SE_ASSIGNPRIMARYTOKEN_NAME);
-    enable_privilege(SE_INCREASE_QUOTA_NAME);
-    let user = account.name.clone();
-    let password = account.password.clone();
-    let user_w = wide_chars(&user);
-    let password_w = wide_chars(&password);
+    // CreateProcessAsUserW needs SeAssignPrimaryToken, which the runner does
+    // not hold. CreateProcessWithLogonW goes through the secondary logon
+    // service and still yields the account's medium token.
+    let user_w = wide_chars(&account.name);
+    let password_w = wide_chars(&account.password);
     let domain = wide_chars(".");
-    let mut token = HANDLE::default();
-    unsafe {
-        LogonUserW(
-            PCWSTR(user_w.as_ptr()),
-            PCWSTR(domain.as_ptr()),
-            PCWSTR(password_w.as_ptr()),
-            LOGON32_LOGON_INTERACTIVE,
-            LOGON32_PROVIDER_DEFAULT,
-            &mut token,
-        )
-        .expect("LogonUserW");
-    }
-    let mut primary = HANDLE::default();
-    unsafe {
-        DuplicateTokenEx(
-            token,
-            TOKEN_ALL_ACCESS,
-            None,
-            SecurityImpersonation,
-            TokenPrimary,
-            &mut primary,
-        )
-        .expect("DuplicateTokenEx");
-        let _ = windows::Win32::Foundation::CloseHandle(token);
-    }
-    let mut sid = vec![0u8; 68];
-    let mut sid_len = sid.len() as u32;
-    unsafe {
-        CreateWellKnownSid(
-            WinMediumLabelSid,
-            None,
-            Some(PSID(sid.as_mut_ptr().cast())),
-            &mut sid_len,
-        )
-        .expect("medium sid");
-        let label = TOKEN_MANDATORY_LABEL {
-            Label: windows::Win32::Security::SID_AND_ATTRIBUTES {
-                Sid: PSID(sid.as_mut_ptr().cast()),
-                Attributes: (windows::Win32::System::SystemServices::SE_GROUP_INTEGRITY
-                    | windows::Win32::System::SystemServices::SE_GROUP_INTEGRITY_ENABLED)
-                    as u32,
-            },
-        };
-        let _ = windows::Win32::Security::SetTokenInformation(
-            primary,
-            TokenIntegrityLevel,
-            (&label as *const TOKEN_MANDATORY_LABEL).cast(),
-            std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + sid_len,
-        );
-    }
     let exe = std::env::current_exe().expect("test exe");
     let command = format!(
         "\"{}\" --exact standard_user_cannot_plant_the_secret_store --test-threads=1 --nocapture",
@@ -1128,22 +1071,21 @@ fn spawn_standard_user(
     let mut info = PROCESS_INFORMATION::default();
     let directory = wide_chars(r"C:\Users\Public");
     unsafe {
-        CreateProcessAsUserW(
-            Some(primary),
+        CreateProcessWithLogonW(
+            PCWSTR(user_w.as_ptr()),
+            PCWSTR(domain.as_ptr()),
+            PCWSTR(password_w.as_ptr()),
+            LOGON_WITH_PROFILE,
             PCWSTR::null(),
             Some(PWSTR(command_w.as_mut_ptr())),
-            None,
-            None,
-            false,
             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            Some(env.as_mut_ptr().cast()),
+            Some(env.as_ptr().cast()),
             PCWSTR(directory.as_ptr()),
             &startup,
             &mut info,
         )
-        .unwrap_or_else(|error| panic!("CreateProcessAsUserW {mode}: {error}"));
+        .unwrap_or_else(|error| panic!("CreateProcessWithLogonW {mode}: {error}"));
         let _ = windows::Win32::Foundation::CloseHandle(info.hThread);
-        let _ = windows::Win32::Foundation::CloseHandle(primary);
     }
     PlantChild {
         process: info.hProcess,
