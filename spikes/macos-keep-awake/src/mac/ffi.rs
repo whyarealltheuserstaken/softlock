@@ -49,7 +49,6 @@ unsafe extern "C" {
     fn m07_display_count() -> i32;
     fn m07_overlay_open(out: *mut WindowOut, x: f64, y: f64, w: f64, h: f64, use_rect: i32) -> i32;
     fn m07_overlay_close() -> i32;
-    fn m07_overlay_escape_seen() -> i32;
     fn m07_overlay_pump(millis: u32);
     fn m07_timer_open(out: *mut WindowOut) -> i32;
     fn m07_timer_close() -> i32;
@@ -59,9 +58,7 @@ unsafe extern "C" {
     fn m07_power_watch_stop() -> i32;
     fn m07_power_reset();
     fn m07_power_system_slept() -> i32;
-    fn m07_power_system_woke() -> i32;
     fn m07_power_display_slept() -> i32;
-    fn m07_power_display_woke() -> i32;
     fn m07_power_pump(millis: u32);
 }
 
@@ -179,10 +176,6 @@ impl Overlay {
         unsafe {
             m07_overlay_pump(millis);
         }
-    }
-
-    pub fn escape_seen() -> bool {
-        unsafe { m07_overlay_escape_seen() != 0 }
     }
 
     pub fn close() {

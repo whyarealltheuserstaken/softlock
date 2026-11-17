@@ -1090,9 +1090,6 @@ fn note_observations(record: &mut ExerciseRecord, auto_observe: bool) -> bool {
     } else {
         watched.external_display_covered.to_string()
     };
-    if record.external_display_covered == "unanswered" && !stdin_open {
-        record.external_display_covered = "no-input".to_string();
-    }
     watched.leave_locked
 }
 

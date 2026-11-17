@@ -787,9 +787,7 @@ fn start_heartbeat(args: &Args, stamp: &str) -> Option<HeartbeatChild> {
 }
 
 fn stop_heartbeat(beat: Option<HeartbeatChild>) -> Option<u64> {
-    let Some(mut beat) = beat else {
-        return None;
-    };
+    let mut beat = beat?;
     if let Some(mut child) = beat.child.take() {
         let _ = child.kill();
         let _ = child.wait();
@@ -918,8 +916,6 @@ fn fallback_prompt(allowed: &[&str]) -> Choice {
         LineRead::Line(line) => {
             let value = if allowed.contains(&line.as_str()) {
                 line
-            } else if line.is_empty() {
-                "skip".to_string()
             } else {
                 "skip".to_string()
             };

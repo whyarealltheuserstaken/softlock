@@ -194,7 +194,8 @@ fn stop_handler_covers_hangup_and_the_overlay_follows_its_parent() {
         fs::read_to_string(root.join("spikes/macos-keep-awake/src/report.rs")).expect("report");
     assert!(!report.contains(&activity));
     assert!(report.contains("no_input"));
-    let probe = fs::read_to_string(root.join("spikes/macos-keep-awake/src/mac/probe.m")).expect("m");
+    let probe =
+        fs::read_to_string(root.join("spikes/macos-keep-awake/src/mac/probe.m")).expect("m");
     assert!(probe.contains("IORegisterForSystemPower"));
     assert!(probe.contains("IOAllowPowerChange"));
     let timer = proof
