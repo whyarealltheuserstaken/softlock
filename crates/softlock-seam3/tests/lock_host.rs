@@ -819,9 +819,10 @@ fn a_liveness_thread_panic_tries_the_os_lock_without_trapping_input() {
 #[test]
 fn a_callback_panic_tries_the_os_lock_then_drops_the_hooks() {
     let _guard = gate();
-    // Silences the caught callback panic. When SOFTLOCK_PANIC_LOG is set,
-    // the same hook still writes every panic's location and thread.
-    let _hook = filter_lock_host_hook_panics();
+    // The service hook runs on the hook thread and must return. Joining that
+    // thread from inside the hook would stall this wait.
+    let previous = std::panic::take_hook();
+    let _restore = RestoreHook(Some(previous));
     panic_note("test-start");
     let probe = Probe::open().expect("probe");
     probe.claim_focus();
@@ -831,6 +832,7 @@ fn a_callback_panic_tries_the_os_lock_then_drops_the_hooks() {
     let lock = arm("unused", None);
     panic_note("armed");
     lock.stub_os_lock_unavailable();
+    lock.install_service_panic_hook();
     lock.panic_in_callback();
     panic_note("flag-set");
     send_virtual_key(VK_F13, extra).expect("callback panic");
@@ -840,6 +842,10 @@ fn a_callback_panic_tries_the_os_lock_then_drops_the_hooks() {
         "a callback panic did not try the OS lock"
     );
     panic_note("os-lock-seen");
+    assert!(
+        lock.panic_hook_ran_on_hook_thread(),
+        "the panic hook did not run on the hook thread"
+    );
     assert!(
         wait_for(Duration::from_secs(3), || lock.hooks_removed()),
         "the poisoned hooks were still installed when the next key was sent"

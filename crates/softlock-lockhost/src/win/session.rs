@@ -257,6 +257,31 @@ impl DevLock {
         self.shared.panic_in_callback.store(true, Ordering::Release);
     }
 
+    /// Installs the service panic hook. A panic on the hook thread tries the
+    /// OS lock and then releases the guard without joining that thread.
+    /// Panics on any other thread are forwarded to the hook that was current.
+    #[cfg(feature = "simulated-physical")]
+    pub fn install_service_panic_hook(&self) {
+        let previous = std::panic::take_hook();
+        let shared = Arc::clone(&self.shared);
+        std::panic::set_hook(Box::new(move |info| {
+            if guard::current_thread_is_hook(&shared) {
+                host_panic_hook(&shared, info);
+            } else {
+                previous(info);
+            }
+        }));
+    }
+
+    /// The service panic hook ran on the hook thread. The callback-panic test
+    /// uses this to prove the self-join path returned.
+    #[cfg(feature = "simulated-physical")]
+    pub fn panic_hook_ran_on_hook_thread(&self) -> bool {
+        self.shared
+            .panic_hook_on_hook_thread
+            .load(Ordering::Acquire)
+    }
+
     /// The hook thread has been joined. Its id is 0 only after `remove`.
     /// Tests wait for this before sending a key that must reach the probe.
     /// The product path tries the OS lock first and drops the hooks only
@@ -332,6 +357,8 @@ pub(crate) struct Shared {
     /// quiet, so a service test can fire `emergency()` after the host is ready.
     #[cfg(feature = "simulated-physical")]
     pub panic_callback_on_f13: AtomicBool,
+    #[cfg(feature = "simulated-physical")]
+    pub panic_hook_on_hook_thread: AtomicBool,
     pub failing_closed: AtomicBool,
     pub heartbeat_missed: AtomicBool,
     pub emergency_ran: AtomicBool,
@@ -390,6 +417,8 @@ impl Shared {
             panic_in_callback: AtomicBool::new(false),
             #[cfg(feature = "simulated-physical")]
             panic_callback_on_f13: AtomicBool::new(false),
+            #[cfg(feature = "simulated-physical")]
+            panic_hook_on_hook_thread: AtomicBool::new(false),
             failing_closed: AtomicBool::new(false),
             heartbeat_missed: AtomicBool::new(false),
             emergency_ran: AtomicBool::new(false),
@@ -655,6 +684,23 @@ fn retry_os_lock(
             shared.os_lock_error.store(false, Ordering::Release);
             controller.handle(Event::OsLockConfirmed);
         }
+    }
+}
+
+/// OS lock, then hooks. The hook thread must not join itself; `remove` skips
+/// that join. The OS lock attempt stays first.
+fn host_panic_hook(shared: &Shared, info: &std::panic::PanicHookInfo) {
+    eprintln!("lock host panic: {info}");
+    #[cfg(feature = "simulated-physical")]
+    if guard::current_thread_is_hook(shared) {
+        shared
+            .panic_hook_on_hook_thread
+            .store(true, Ordering::Release);
+    }
+    emergency(shared);
+    if shared.pipe_mode.load(Ordering::Acquire) {
+        publish(shared, PipeReport::GuardDown);
+        std::process::exit(1);
     }
 }
 
@@ -1146,10 +1192,7 @@ pub fn run_service_host() -> i32 {
     // guard down and exit before that unwind, so the service sees host-lost.
     let hook_shared = Arc::clone(&shared);
     std::panic::set_hook(Box::new(move |info| {
-        eprintln!("lock host panic: {info}");
-        emergency(&hook_shared);
-        publish(&hook_shared, PipeReport::GuardDown);
-        std::process::exit(1);
+        host_panic_hook(&hook_shared, info);
     }));
     ui_main(Arc::clone(&shared), ready_tx);
     drop(ready_rx);

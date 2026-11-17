@@ -86,13 +86,17 @@ pub(crate) fn remove(shared: &Shared) {
     shared
         .stop
         .store(true, std::sync::atomic::Ordering::Release);
+    // A panic hook running on this thread must not join it. Joining the
+    // liveness thread from here can also stall: that thread's SendInput waits
+    // for this hook to return.
+    let on_hook_thread = current_thread_is_hook(shared);
     if let Some(liveness) = shared
         .liveness
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .take()
     {
-        let _ = liveness.join();
+        join_or_detach(liveness, on_hook_thread);
     }
     let thread_id = shared
         .hook_thread_id
@@ -108,12 +112,31 @@ pub(crate) fn remove(shared: &Shared) {
         .unwrap_or_else(|poison| poison.into_inner())
         .take()
     {
-        let _ = hook.join();
+        join_or_detach(hook, on_hook_thread);
     }
-    shared
-        .hook_thread_id
-        .store(0, std::sync::atomic::Ordering::Release);
+    if !on_hook_thread {
+        shared
+            .hook_thread_id
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
     SESSION.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn current_thread_is_hook(shared: &Shared) -> bool {
+    let thread_id = shared
+        .hook_thread_id
+        .load(std::sync::atomic::Ordering::Acquire);
+    thread_id != 0 && thread_id == unsafe { GetCurrentThreadId() }
+}
+
+/// `detach` is set when the caller is the hook thread. Dropping the handle
+/// detaches instead of waiting. Joining the current thread would wait forever.
+fn join_or_detach(handle: thread::JoinHandle<()>, detach: bool) {
+    if detach || handle.thread().id() == thread::current().id() {
+        drop(handle);
+        return;
+    }
+    let _ = handle.join();
 }
 
 pub(crate) fn liveness(shared: Arc<Shared>) {
@@ -272,6 +295,10 @@ fn hook_thread(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<u32, (
         let _ = UnhookWindowsHookEx(keyboard);
         let _ = UnhookWindowsHookEx(mouse);
     }
+    // `remove` skips this store when it is already running on this thread.
+    // The id stays set until the hooks are actually gone.
+    keep.hook_thread_id
+        .store(0, std::sync::atomic::Ordering::Release);
 }
 
 /// A panic inside either callback is caught here. Unwinding out of

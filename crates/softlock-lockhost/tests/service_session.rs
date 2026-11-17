@@ -49,6 +49,16 @@ impl Session {
     }
 
     fn launch(panic: Option<&str>, dev_app: bool, stub: &str, mark: Option<&Path>) -> Self {
+        Self::launch_extra(panic, dev_app, stub, mark, &[])
+    }
+
+    fn launch_extra(
+        panic: Option<&str>,
+        dev_app: bool,
+        stub: &str,
+        mark: Option<&Path>,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         let _ = gate;
         // A host whose OS lock failed stays guarded after its service dies.
         // Kill any survivor before the next service starts.
@@ -91,6 +101,9 @@ impl Session {
         }
         if let Some(mark) = mark {
             command.env("SOFTLOCK_OS_LOCK_MARK", mark);
+        }
+        for (key, value) in extra_env {
+            command.env(key, value);
         }
         let child = command.spawn().expect("service process");
         let session = Self {
@@ -165,6 +178,17 @@ impl Drop for Session {
         // Quit while the OS lock is unavailable does not exit the host. The
         // test process must not leave it holding the runner's stdout pipe.
         stop_lock_hosts();
+    }
+}
+
+struct KillChild(Option<std::process::Child>);
+
+impl Drop for KillChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -502,15 +526,41 @@ fn kill_while_locked(stub: &str, stay_blocked: bool) {
     );
     session.child.kill().expect("kill service");
     let _ = session.child.wait();
+    let mut passed_before_mark = false;
+    let marked = wait_for(Duration::from_secs(8), || {
+        if !mark.is_file() {
+            let passed = physical_reached(&probe, session.extra);
+            if passed && !mark.is_file() {
+                passed_before_mark = true;
+            }
+        }
+        mark.is_file()
+    });
     assert!(
-        wait_for(Duration::from_secs(8), || mark.is_file()),
-        "Quit did not call the OS lock"
+        !passed_before_mark,
+        "physical input passed before the OS lock mark existed"
     );
-    thread::sleep(Duration::from_secs(1));
+    assert!(marked, "Quit did not call the OS lock");
     if stay_blocked {
+        thread::sleep(Duration::from_secs(1));
         assert!(
             physical_is_blocked(&probe, session.extra),
             "hooks dropped after the service died without an OS lock"
+        );
+        assert!(
+            lock_host_running(),
+            "the lock host exited without a confirmed OS lock"
+        );
+    } else {
+        assert!(
+            wait_for(Duration::from_secs(8), || {
+                physical_reached(&probe, session.extra)
+            }),
+            "physical input stayed blocked after the OS lock mark"
+        );
+        assert!(
+            wait_for(Duration::from_secs(8), || !lock_host_running()),
+            "hooks stayed installed after the OS lock"
         );
     }
     if let Ok(status) = session.status() {
@@ -523,6 +573,109 @@ fn kill_while_locked(stub: &str, stay_blocked: bool) {
         .args(["/IM", "softlock-lockhost.exe", "/F"])
         .output();
     let _ = fs::remove_file(&mark);
+}
+
+#[test]
+fn impostor_process_holds() {
+    let Ok(done) = std::env::var("SOFTLOCK_IMPOSTOR_HOLD") else {
+        return;
+    };
+    let done = PathBuf::from(done);
+    if let Some(parent) = done.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(done.with_extension("ready"), b"up").expect("ready");
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(60) && !done.exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn impostor_pid_does_not_release_the_guard() {
+    let _guard = gate();
+    let root = std::env::temp_dir().join(format!("impostor-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("impostor dir");
+    let image = root.join("softlock-lockhost.exe");
+    fs::copy(std::env::current_exe().expect("test exe"), &image).expect("copy impostor");
+    assert!(
+        image
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("softlock-lockhost.exe")),
+        "the impostor image name is the one the old check trusted"
+    );
+    let done = root.join("done");
+    let ready = done.with_extension("ready");
+    let pid_file = root.join("pid");
+    let witness = root.join("witness");
+    let _ = fs::remove_file(&ready);
+    let _ = fs::remove_file(&done);
+    let mark = root.join("os-lock.txt");
+    let pid_text = pid_file.display().to_string();
+    let witness_text = witness.display().to_string();
+    // Launch first. It kills every softlock-lockhost.exe, including a copy.
+    let mut session = Session::launch_extra(
+        None,
+        false,
+        "fail",
+        Some(&mark),
+        &[
+            ("SOFTLOCK_IMPOSTOR_PID", pid_text.as_str()),
+            ("SOFTLOCK_IMPOSTOR_WITNESS", witness_text.as_str()),
+        ],
+    );
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    session.lock().expect("lock");
+    let impostor = Command::new(&image)
+        .args([
+            "--exact",
+            "impostor_process_holds",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("SOFTLOCK_IMPOSTOR_HOLD", &done)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("impostor process");
+    let impostor_pid = impostor.id();
+    let _keep = KillChild(Some(impostor));
+    assert!(
+        wait_for(Duration::from_secs(8), || ready.is_file()),
+        "impostor did not stay running"
+    );
+    assert!(
+        physical_is_blocked(&probe, session.extra),
+        "lock did not block physical input"
+    );
+    session.child.kill().expect("kill service");
+    let _ = session.child.wait();
+    assert!(
+        wait_for(Duration::from_secs(8), || mark.is_file()),
+        "Quit did not call the OS lock"
+    );
+    fs::write(&pid_file, impostor_pid.to_string()).expect("pid file");
+    let noted = wait_for(Duration::from_secs(8), || witness.is_file());
+    let decision = fs::read_to_string(&witness).unwrap_or_default();
+    assert!(noted, "the host never judged the impostor pid");
+    assert_eq!(decision, "rejected", "the impostor released the guard");
+    thread::sleep(Duration::from_secs(1));
+    assert!(
+        physical_is_blocked(&probe, session.extra),
+        "hooks dropped for a reused pid"
+    );
+    if let Ok(status) = session.status() {
+        assert!(
+            !status.contains("Unlocked"),
+            "state reached Unlocked for an impostor: {status}"
+        );
+    }
+    fs::write(&done, b"done").expect("release impostor");
+    stop_lock_hosts();
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1118,6 +1271,41 @@ fn sc_image(path: &Path) -> String {
     } else {
         text
     }
+}
+
+fn lock_host_running() -> bool {
+    let output = Command::new("tasklist")
+        .args([
+            "/FI",
+            "IMAGENAME eq softlock-lockhost.exe",
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .output();
+    output.is_ok_and(|output| {
+        String::from_utf8_lossy(&output.stdout)
+            .to_ascii_lowercase()
+            .contains("softlock-lockhost.exe")
+    })
+}
+
+fn physical_reached(probe: &Probe, extra: u64) -> bool {
+    let before = probe
+        .inputs()
+        .iter()
+        .filter(|input| input.virtual_key == VK_F14)
+        .count();
+    if send_virtual_key(VK_F14, extra).is_err() {
+        return false;
+    }
+    thread::sleep(Duration::from_millis(40));
+    probe
+        .inputs()
+        .iter()
+        .filter(|input| input.virtual_key == VK_F14)
+        .count()
+        > before
 }
 
 fn physical_is_blocked(probe: &Probe, extra: u64) -> bool {
