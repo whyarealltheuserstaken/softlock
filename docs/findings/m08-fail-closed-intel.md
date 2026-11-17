@@ -25,10 +25,53 @@ The job is the `macOS lock kit` workflow. It prints `mode=read-only`, `private-c
 
 That FileVault reading is the runner's disk, as the console user. It is not Henry's Mac. The job does not reboot, so a FileVault pre-boot screen was not observed. `uname -m` has to be `arm64`. A missing symbol on that OS is recorded and is not a crash. Forcing the symbol to be missing is not part of the job. The first chooser row is the proof of that branch.
 
-The lines from the job on this pull request are filled in after the run. Until that section is replaced, the runner numbers below are not a measurement.
+The lines below are the read-only job on `ba6fbab` ([run 43981784644](https://github.com/whyarealltheuserstaken/softlock/actions/runs/43981784644)). The symbol was present, so the missing-symbol row is the CI test, not this runner. FileVault on this disk is off. `fdesetup isactive` printed `false` and exited 1; that exit is not itself a successful Off reading. `fdesetup status` exited 0 with `FileVault is Off.`, and the combined label is `filevault=off`. The screen-saver delay key was missing, so the chooser refuses to arm. The Actions log masked two lines whose keys contain `password=`. The delay line and the refuse rows are the measurement of that setting. No pre-boot screen was observed. The result has no account name, home directory, serial, or other device.
 
 ```text
-runner-log=pending
+ProductName:		macOS
+ProductVersion:		26.7.2
+BuildVersion:		25G332
+arm64
+uid=501
+mode=read-only
+result=pass
+state=never-unlocked
+private-symbol=present
+private-symbol-detail=resolved
+private-call=not-called
+documented-path=not-started
+documented-engine=/System/Library/CoreServices/ScreenSaverEngine.app/Contents/MacOS/ScreenSaverEngine
+screen-saver-engine-present=true
+immediate-password=(Actions masked this line)
+ask-for-password=(Actions masked this line)
+ask-for-password-delay=missing
+arm=not-applied
+chooser-if-symbol-missing=refuse
+chooser-if-call-failed=refuse
+chooser-if-call-succeeded=private
+fdesetup-status=FileVault is Off.
+fdesetup-status-exit=0
+fdesetup-isactive=false
+fdesetup-isactive-exit=1
+filevault=off
+filevault-pre-boot-observed=false
+settings-changed=false
+filevault-changed=false
+serial-collected=false
+linked-login-framework=false
+otool-checked=true
+uid=501
+uid-is-root=false
+runner-lock-allowed=false
+product-name=macOS
+product-version=26.7.2
+build-version=25G332
+uname-m=arm64
+hw-model=VirtualMac2,1
+lock-screen-appeared=not-asked
+input-reached-desktop-without-password=not-asked
+fail-closed=not-needed
+missing-symbol-ci-test=symbol_missing_requests_the_documented_path
 ```
 
 ## What only hardware proves
