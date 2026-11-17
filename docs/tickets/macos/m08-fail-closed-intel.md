@@ -23,16 +23,16 @@ This kit does not install the product service. It measures the two paths D5 alre
 
 **Type:** Hardware kit, plus the chooser test. Deliverable is the sheet under `docs/findings/`, and a green verify job.
 
-**Status:** waiting for Henry to run the sheet. The machine is recorded. The number of external displays is still open. Not ready-for-agent. Not a GitHub issue.
+**Status:** chooser rows and the read-only kit are in the tree. The sheet's hardware rows are still Henry's. The finding is `docs/findings/m08-fail-closed-intel.md`. The machine is recorded. The number of external displays is still open.
 
 - [ ] Private-call row: reached the real lock and the time, or the error, including a missing symbol when his OS can show one (sheet)
 - [ ] Documented-path row: reached the lock screen and the time, and whether a click or a key reached the desktop without the account password (sheet)
 - [ ] The sheet records the password-after-screensaver setting and the delay (sheet)
 - [ ] If a missing symbol cannot be forced on his Mac, the sheet says so and points at the CI row that covers it
-- [ ] CI: symbol missing requests the documented path, and does not crash
-- [ ] CI: a failed call requests the documented path
-- [ ] CI: a successful private call does not request the documented path
-- [ ] CI: documented path unavailable or password not required → never Unlocked; refuse to arm
+- [x] CI: symbol missing requests the documented path, and does not crash
+- [x] CI: a failed call requests the documented path
+- [x] CI: a successful private call does not request the documented path
+- [x] CI: documented path unavailable or password not required → never Unlocked; refuse to arm
 - [ ] `fdesetup status` and `fdesetup isactive` output as the console user, or the permission error (sheet)
 - [ ] Written finding records both paths and says FileVault pre-boot was or was not observed. This Mac has the T2 chip, so a FileVault-on pre-boot screen is the Secure Enclave path. If FileVault is off, that screen stays unproven
 

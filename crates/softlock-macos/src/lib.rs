@@ -2,7 +2,31 @@
 //!
 //! Phase 2 is not implemented. Every capability reports Unsupported.
 //! The decisions and open risks are in `docs/platforms/macos.md`.
+//!
+//! The lock-path chooser, the FileVault text parser, and the screen-saver
+//! password check are pure. They do not call `SACLockScreenImmediate`, start
+//! the screen saver, or change FileVault.
 
+mod filevault;
+mod kit_gate;
+mod lock_choice;
+mod screensaver;
+
+pub use filevault::{
+    CommandText, FileVaultRead, console_filevault, disk_label, interpret_isactive, interpret_status,
+};
+pub use kit_gate::{
+    ACK_REFUSAL, HELPER_REFUSAL, KitInvocation, KitPermission, ROOT_REFUSAL, RUNNER_LOCK_REFUSAL,
+    may_lock, permit,
+};
+pub use lock_choice::{
+    FailClosedEnd, LOGIN_FRAMEWORK_IMAGE, LockArm, PRIVATE_LOCK_SYMBOL,
+    SCREEN_SAVER_ENGINE_CANDIDATES, choose, fail_closed_after_error, refuse_to_arm_message,
+};
+pub use screensaver::{
+    PasswordAfterScreensaver, parse_defaults_value, password_after_screensaver, preference_label,
+    resolve_preference,
+};
 pub use softlock_core::CapabilityReport;
 pub use softlock_core::UnsupportedPlatform as MacosBackend;
 
@@ -90,5 +114,35 @@ mod tests {
         assert_eq!(report.power, Support::Unsupported);
         assert_eq!(report.credentials, Support::Unsupported);
         assert_eq!(report.encryption_status, Support::Unsupported);
+    }
+
+    #[test]
+    fn the_backend_does_not_call_the_live_lock_or_filevault() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let entries = std::fs::read_dir(&root).expect("macos src");
+        let mut files = 0;
+        for entry in entries {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            files += 1;
+            let text = std::fs::read_to_string(&path).expect("read");
+            let dlopen_call = ["dlo", "pen("].concat();
+            let dlsym_call = ["dls", "ym("].concat();
+            assert!(
+                !text.contains(&dlopen_call) && !text.contains(&dlsym_call),
+                "{} calls the live symbol",
+                path.display()
+            );
+            let command_new = ["Command", "::new"].concat();
+            let link_attr = ["#[", "link"].concat();
+            assert!(
+                !text.contains(&command_new) && !text.contains(&link_attr),
+                "{} links or spawns a command",
+                path.display()
+            );
+        }
+        assert!(files >= 4);
     }
 }
