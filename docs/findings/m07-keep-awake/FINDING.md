@@ -8,13 +8,39 @@ The kit never prints or stores the full `pmset -g assertions` dump. stdout, `m07
 
 m02 (`docs/findings/m02-macos-runner-desktop.md`) already showed that `macos-latest` can host a window. This kit reuses that shape for a fully opaque covering overlay and records the timer window's occlusion state. The 60 s overlay-up sample can cover the display; the 300 s App Nap sample covers **only the timer window**, so Activity Monitor stays visible. m02 also said m07 moves entirely to Henry's Intel Mac for lid, real idle, and App Nap. The GitHub job here is the slice that can still run on the runner: create the idle assertions, print the names that compile, grep a **filtered** `pmset` excerpt for the reason string, optionally run `caffeinate` as a control, take two equal-length timer counts with the overlay down and covering the timer window, skip the 300 s hands-off App Nap step, leave hardware rows `not-run-on-runner` while the assertions are still held, then release them.
 
-Each timer tick pumps the run loop for at most 10 ms (`untilDate` capped at `min(remaining, 0.01)`), then sleeps `interval-ms` (50). `timer-expected-ticks` is `sample_ms / (interval_ms + 10)`: **133** in an 8 s runner sample. If the uncovered count is below ~80% of that, `timer-sentence` is `not claimed: baseline below expected`. Earlier jobs that printed ~50 ticks were waiting 50 ms inside `pump(0.01)` because `nextEventMatchingMask` used a 0.05 s `untilDate`; that was the kit, not runner throttling.
+Each timer tick pumps the run loop for at most 10 ms (`untilDate` capped at `min(remaining, 0.01)`), then sleeps `interval-ms` (50). `timer-expected-ticks` is `sample_ms / (interval_ms + 10)`: **133** in an 8 s runner sample. If the uncovered count is below ~80% of that, `timer-sentence` is `not claimed: baseline below expected`. Jobs before the pump cap printed ~50 ticks because `nextEventMatchingMask` used a 0.05 s `untilDate` inside `pump(0.01)`; that was the kit.
 
 ## What the runner can prove
 
-Filled from the macOS keep-awake workflow on this PR after the pump cap. Quote the job log exactly. `uname -m` must be `arm64`. The runner has no lid and no power key.
+Filled from GitHub Actions run [44008672549](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44008672549/job/133790098867) (`macos keep-awake runner` on this PR after the pump cap, head `c205326`). The job prints `sw_vers` and `uname -m`. `uname -m` must be `arm64`. The runner has no lid and no power key.
 
-Log lines from the latest green `--runner` job on this PR will be pasted here after CI (see the PR and the `macos keep-awake runner` job). Until that paste, do not claim "did not slow" and do not claim the runner was throttled.
+Quoted from that job log:
+
+```
+sw_vers-product=macOS
+sw_vers-version=26.7.2
+sw_vers-build=25G332
+uname-m=arm64
+assertion-reason=m07-keep-awake-probe-2163
+assertion-created=true
+assertion-released=true
+pmset-shows-reason=true
+timer-overlay-down=73
+timer-overlay-up=75
+timer-slowed=false
+timer-sentence=not claimed: baseline below expected (73 uncovered ticks, expected 133)
+timer-expected-ticks=133
+overlay-opaque=true
+timer-occlusion-visible-down=true
+timer-occlusion-visible-up=false
+app-nap-ran=false
+lid-on-power-assertion-held=true
+power-key-assertion-held=true
+interrupted=false
+result=pass
+```
+
+73 uncovered ticks is below 80% of 133, so slowing is not claimed. That is not evidence the runner was throttled, and it does not prove "did not slow".
 
 | Claim | Runner |
 |---|---|
@@ -24,7 +50,7 @@ Log lines from the latest green `--runner` job on this PR will be pasted here af
 | Assertions release, and filtered `pmset` no longer shows the reason | `assertion-released=true`, `pmset-after-shows-reason=false` |
 | `caffeinate -i -t 5 -w <pid>` present or absent, used only as a control | `caffeinate-*` |
 | Timer counts overlay-down and overlay-up, same duration, opaque overlay, occlusion recorded | `timer-overlay-*`, `overlay-opaque`, `timer-occlusion-visible-*`, `timer-expected-ticks` |
-| Short sample is not App Nap | `--runner` is 8 s; `--kit` is 60 s then 300 s over the timer window only |
+| Short sample is not App Nap | `--runner` is 8 s; log `timer-sentence=not claimed: baseline below expected (73 uncovered ticks, expected 133)`; `--kit` is 60 s then 300 s over the timer window only |
 | Lid closed on power | `not-run-on-runner` |
 | Lid closed with an external display | `not-run-on-runner` |
 | Power key tap | `not-run-on-runner` |
