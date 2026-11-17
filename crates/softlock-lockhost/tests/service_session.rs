@@ -1061,7 +1061,7 @@ fn spawn_standard_user(
         exe.display()
     );
     let mut command_w = wide_chars(&command);
-    let mut env = plant_environment(mode, dir, bait, report, done);
+    let env = plant_environment(mode, dir, bait, report, done);
     let mut desktop = wide_chars(r"winsta0\default");
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
