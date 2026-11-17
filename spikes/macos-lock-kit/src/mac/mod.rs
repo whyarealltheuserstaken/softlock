@@ -421,7 +421,7 @@ struct SessionApi {
     release: unsafe extern "C" fn(*const std::ffi::c_void),
     type_id: unsafe extern "C" fn(*const std::ffi::c_void) -> libc::c_ulong,
     bool_type: unsafe extern "C" fn() -> libc::c_ulong,
-    key: *const std::ffi::c_void,
+    key: usize,
 }
 
 fn session_is_locked() -> bool {
@@ -433,7 +433,7 @@ fn session_is_locked() -> bool {
         if dict.is_null() {
             return false;
         }
-        let value = (api.get)(dict, api.key);
+        let value = (api.get)(dict, api.key as *const std::ffi::c_void);
         let locked = !value.is_null()
             && (api.type_id)(value) == (api.bool_type)()
             && (api.bool_value)(value) != 0;
@@ -491,7 +491,7 @@ fn load_session_api() -> Option<SessionApi> {
             release,
             type_id,
             bool_type,
-            key,
+            key: key as usize,
         })
     }
 }
