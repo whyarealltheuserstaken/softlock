@@ -1253,41 +1253,48 @@ static void one_post(const char *exe, const char *dir, const char *source, int s
     if (out->post_count >= 6) {
         return;
     }
-    atomic_store(&g_tap_saw, 0);
-    int before = 0;
-    int ignored = 0;
-    int64_t last0 = 0;
-    int64_t last1 = 0;
-    read_target_state(dir, &before, &ignored, &last0, &last1);
-    char last[1024];
-    join_path(last, sizeof last, dir, "last-post.txt");
-    unlink(last);
-    char error[256];
-    error[0] = 0;
-    if (same_process) {
-        post_named(source, dir, (CGKeyCode)kProbeKey, error, sizeof error);
-    } else {
-        char *argv[] = {(char *)exe, "--classify-post", (char *)source, "--output-dir", (char *)dir, NULL};
-        pid_t pid = 0;
-        if (spawn_child(exe, argv, &pid) != 0) {
-            snprintf(error, sizeof error, "posix_spawn of CGEventPost failed");
+    /* A single second-process post is sometimes missed by the tap. Repeat it, and keep the attempt the tap saw. */
+    int attempts = same_process ? 1 : 5;
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        atomic_store(&g_tap_saw, 0);
+        int before = 0;
+        int ignored = 0;
+        int64_t last0 = 0;
+        int64_t last1 = 0;
+        read_target_state(dir, &before, &ignored, &last0, &last1);
+        char last[1024];
+        join_path(last, sizeof last, dir, "last-post.txt");
+        unlink(last);
+        char error[256];
+        error[0] = 0;
+        if (same_process) {
+            post_named(source, dir, (CGKeyCode)kProbeKey, error, sizeof error);
         } else {
-            int status = 0;
-            waitpid(pid, &status, 0);
+            char *argv[] = {(char *)exe, "--classify-post", (char *)source, "--output-dir", (char *)dir, NULL};
+            pid_t pid = 0;
+            if (spawn_child(exe, argv, &pid) != 0) {
+                snprintf(error, sizeof error, "posix_spawn of CGEventPost failed");
+            } else {
+                int status = 0;
+                waitpid(pid, &status, 0);
+            }
         }
-    }
-    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:0.6];
-    while (atomic_load(&g_tap_saw) == 0 && [until timeIntervalSinceNow] > 0) {
-        run_loop(0.05);
-    }
-    run_loop(0.15);
-    int after = before;
-    read_target_state(dir, &after, &ignored, &last0, &last1);
-    PostRow *row = &out->posts[out->post_count];
-    fill_post(row, source, same_process, atomic_load(&g_tap_saw), atomic_load(&g_tap_state), atomic_load(&g_tap_pid),
-              before, after, dir);
-    if (row->error[0] == 0 && error[0] != 0) {
-        snprintf(row->error, sizeof row->error, "%s", error);
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:0.6];
+        while (atomic_load(&g_tap_saw) == 0 && [until timeIntervalSinceNow] > 0) {
+            run_loop(0.05);
+        }
+        run_loop(0.15);
+        int after = before;
+        read_target_state(dir, &after, &ignored, &last0, &last1);
+        PostRow *row = &out->posts[out->post_count];
+        fill_post(row, source, same_process, atomic_load(&g_tap_saw), atomic_load(&g_tap_state), atomic_load(&g_tap_pid),
+                  before, after, dir);
+        if (row->error[0] == 0 && error[0] != 0) {
+            snprintf(row->error, sizeof row->error, "%s", error);
+        }
+        if (same_process || row->tap_saw) {
+            break;
+        }
     }
     out->post_count += 1;
 }

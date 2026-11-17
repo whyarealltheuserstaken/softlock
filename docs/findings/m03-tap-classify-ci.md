@@ -19,7 +19,7 @@ post source=kCGEventSourceStateHIDSystemState poster=second-process poster-pid=5
 post source=kCGEventSourceStateHIDSystemState poster=same-process poster-pid=5765 state-id=1 state-name=kCGEventSourceStateHIDSystemState state-matches=true source-pid=5765 tap-saw=true window-received=true draft=software error=none
 ```
 
-The header value of `kCGEventSourceStatePrivate` is -1. This log did not read -1. The private posts came back as `1102520059` and `2044897763` on every passing run. Combined session was 0 and HID system was 1, which matches the header. Every source pid was the posting process, never 0. The tap saw every post in this log. The target window received all six.
+The header value of `kCGEventSourceStatePrivate` is -1. This log did not read -1. The private posts came back as `1102520059` and `2044897763` on every passing run. Combined session was 0 and HID system was 1, which matches the header. Every source pid was the posting process, never 0. The tap saw every post in this log. A later run of the single-post probe missed the combined-session post from the second process (`tap-saw=false` on [run 44013354296](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44013354296) and [run 44013940136](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44013940136)). The probe now repeats a second-process post up to five times and records the attempt the tap saw. A row that is still `tap-saw=false` fails the run. The target window received all six.
 
 The draft rule stands for these posts. All six are software. HID state did not mean physical. The rule is not replaced. It is also not proved for a finger on a key, because this runner never sent one.
 
