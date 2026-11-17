@@ -25,7 +25,7 @@ The job is the `macOS lock kit` workflow. It prints `mode=read-only`, `private-c
 
 That FileVault reading is the runner's disk, as the console user. It is not Henry's Mac. The job does not reboot, so a FileVault pre-boot screen was not observed. `uname -m` has to be `arm64`. A missing symbol on that OS is recorded and is not a crash. Forcing the symbol to be missing is not part of the job. The first chooser row is the proof of that branch.
 
-The read-only job on `7e91923bf240c93f7ca8bda5be464fc664d29015` is [run 44017059503](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44017059503), job `macos lock kit read-only`. `sw_vers` printed ProductVersion 26.7.2 and BuildVersion 25G332, and `id -u` printed `uid=501`. The kit printed:
+The read-only job on `8924571e2c0d8315a8a4f08c4915d97b2239d60e` is that commit's own job, [run 44020650978](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44020650978), job `macos lock kit read-only`. This commit changes only the finding, so the kit code here is identical to that parent and the measurement below is the parent's own run. `sw_vers` printed ProductVersion 26.7.2 and BuildVersion 25G332, and `id -u` printed `uid=501`. The kit printed:
 
 ```
 mode=read-only
@@ -41,7 +41,7 @@ immediate-lock-required=false
 ask-for-lock=missing
 ask-for-lock-delay=missing
 screen-lock-status=delayed
-screen-lock-detail=2026-11-17 04:26:28.166 sysadminctl[2466:12595] screenLock delay is 300 seconds
+screen-lock-detail=2026-11-17 04:57:46.889 sysadminctl[6764:25144] screenLock delay is 300 seconds
 screen-lock-disagreement=false
 arm=not-applied
 chooser-if-symbol-missing=refuse
@@ -79,7 +79,7 @@ fail-closed=not-needed
 
 There is no `ms-until-locked` line. The read-only run does not start a lock, so that field stays empty. The result keys that used to contain the word password are now `immediate-lock-required`, `ask-for-lock`, and `ask-for-lock-delay`, so the log shows `immediate-lock-required=false` with `ask-for-lock=missing` and `ask-for-lock-delay=missing`. The two chooser rows that are not a successful call both printed `refuse`, and `screen-lock-status=delayed` with `screen-lock-disagreement=false`. `session-lock-check=available` means `CGSessionCopyCurrentDictionary` returned a dictionary. On this unlocked runner the `CGSSessionScreenIsLocked` key was absent, so `session-lock-key-present=false` and `session-lock-key-false=false`. `fdesetup isactive` printed `false` and exited 1, so that exit is not itself a successful Off. `fdesetup status` exited 0 with `FileVault is Off.`, and the combined reading is `filevault=off`. This is the runner's disk, not Henry's Mac. A missing symbol was not forced.
 
-This commit changes only the finding.
+This commit changes only the finding. The kit code is identical to parent `8924571e2c0d8315a8a4f08c4915d97b2239d60e`, and the log above is that parent's own run.
 
 ## What only hardware proves
 
