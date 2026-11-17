@@ -562,6 +562,11 @@ fn trust_new_process(pid: u32, nonce: u64, require_same_slot: bool) -> Result<()
         close_handle(process);
         return Err(ArmReject::Inactive);
     }
+    if !process_token_is_system(process) {
+        close_handle(event);
+        close_handle(process);
+        return Err(ArmReject::Token);
+    }
     if !image_path_is_current_exe(process) {
         close_handle(event);
         close_handle(process);
