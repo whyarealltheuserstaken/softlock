@@ -13,6 +13,53 @@ use crate::text::one_line;
 pub const MISSING_SYMBOL_CI_TEST: &str = "symbol_missing_requests_the_documented_path";
 pub const HARDWARE_ONLY: &str = "only hardware proves that a path showed a lock screen, how long that took to appear, whether a click or a key reached the desktop without the account password, and whether a FileVault pre-boot screen appeared";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionWatch {
+    pub saw_locked: bool,
+    pub saw_unlock: bool,
+    pub displays: i32,
+    pub stdin_open: bool,
+}
+
+pub struct WatchedLock {
+    pub lock_screen_appeared: &'static str,
+    pub input_reached_desktop_without_login: &'static str,
+    pub external_display_covered: &'static str,
+    pub leave_locked: bool,
+    pub needs_display_prompt: bool,
+}
+
+pub fn watch_lock(watch: SessionWatch) -> WatchedLock {
+    if !watch.stdin_open {
+        return WatchedLock {
+            lock_screen_appeared: "no-input",
+            input_reached_desktop_without_login: "no-input",
+            external_display_covered: "no-input",
+            leave_locked: watch.saw_locked && !watch.saw_unlock,
+            needs_display_prompt: false,
+        };
+    }
+    let appeared = if watch.saw_locked { "yes" } else { "no" };
+    let input = if watch.saw_locked {
+        "no"
+    } else {
+        "not-observed"
+    };
+    let needs_display_prompt = watch.displays >= 2;
+    let external = if needs_display_prompt {
+        "not-asked"
+    } else {
+        "none"
+    };
+    WatchedLock {
+        lock_screen_appeared: appeared,
+        input_reached_desktop_without_login: input,
+        external_display_covered: external,
+        leave_locked: watch.saw_locked && !watch.saw_unlock,
+        needs_display_prompt,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Facts {
     pub sw_vers: String,
@@ -744,5 +791,38 @@ mod tests {
         let spawn = include_str!("signals.rs");
         assert!(spawn.contains("pre_exec"));
         assert!(spawn.contains("setsid"));
+    }
+
+    #[test]
+    fn session_watch_fills_lock_rows_without_three_questions() {
+        let unlocked = watch_lock(SessionWatch {
+            saw_locked: true,
+            saw_unlock: true,
+            displays: 1,
+            stdin_open: true,
+        });
+        assert_eq!(unlocked.lock_screen_appeared, "yes");
+        assert_eq!(unlocked.input_reached_desktop_without_login, "no");
+        assert_eq!(unlocked.external_display_covered, "none");
+        assert!(!unlocked.leave_locked);
+        assert!(!unlocked.needs_display_prompt);
+
+        let still = watch_lock(SessionWatch {
+            saw_locked: true,
+            saw_unlock: false,
+            displays: 2,
+            stdin_open: true,
+        });
+        assert!(still.leave_locked);
+        assert!(still.needs_display_prompt);
+
+        let closed = watch_lock(SessionWatch {
+            saw_locked: true,
+            saw_unlock: false,
+            displays: 1,
+            stdin_open: false,
+        });
+        assert_eq!(closed.lock_screen_appeared, "no-input");
+        assert!(closed.leave_locked);
     }
 }

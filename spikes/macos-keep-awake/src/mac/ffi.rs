@@ -49,12 +49,17 @@ unsafe extern "C" {
     fn m07_display_count() -> i32;
     fn m07_overlay_open(out: *mut WindowOut, x: f64, y: f64, w: f64, h: f64, use_rect: i32) -> i32;
     fn m07_overlay_close() -> i32;
-    fn m07_overlay_escape_seen() -> i32;
     fn m07_overlay_pump(millis: u32);
     fn m07_timer_open(out: *mut WindowOut) -> i32;
     fn m07_timer_close() -> i32;
     fn m07_timer_tick(out: *mut TimerOut) -> i32;
     fn m07_hw_model(dest: *mut c_char, cap: usize) -> i32;
+    fn m07_power_watch_start() -> i32;
+    fn m07_power_watch_stop() -> i32;
+    fn m07_power_reset();
+    fn m07_power_system_slept() -> i32;
+    fn m07_power_display_slept() -> i32;
+    fn m07_power_pump(millis: u32);
 }
 
 pub fn assertion_names() -> AssertionNames {
@@ -173,10 +178,6 @@ impl Overlay {
         }
     }
 
-    pub fn escape_seen() -> bool {
-        unsafe { m07_overlay_escape_seen() != 0 }
-    }
-
     pub fn close() {
         unsafe {
             m07_overlay_close();
@@ -248,6 +249,44 @@ impl Drop for TimerWindow {
 
 pub fn display_count() -> i32 {
     unsafe { m07_display_count() }
+}
+
+pub struct PowerWatch;
+
+impl PowerWatch {
+    /// Returns the watch and whether IOKit registration succeeded.
+    pub fn start() -> (Self, bool) {
+        let ok = unsafe { m07_power_watch_start() == 0 };
+        (PowerWatch, ok)
+    }
+
+    pub fn reset() {
+        unsafe {
+            m07_power_reset();
+        }
+    }
+
+    pub fn system_slept() -> bool {
+        unsafe { m07_power_system_slept() != 0 }
+    }
+
+    pub fn display_slept() -> bool {
+        unsafe { m07_power_display_slept() != 0 }
+    }
+
+    pub fn pump(millis: u32) {
+        unsafe {
+            m07_power_pump(millis);
+        }
+    }
+}
+
+impl Drop for PowerWatch {
+    fn drop(&mut self) {
+        unsafe {
+            m07_power_watch_stop();
+        }
+    }
 }
 
 pub fn hw_model() -> String {

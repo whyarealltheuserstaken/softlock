@@ -3,6 +3,7 @@
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
+#import <IOKit/IOMessage.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
 
 #include <stdatomic.h>
@@ -341,6 +342,149 @@ int m07_timer_close(void) {
     }
     return 0;
 }
+
+static IONotificationPortRef g_power_notify = NULL;
+static io_connect_t g_power_root = 0;
+static io_object_t g_power_object = 0;
+static id g_ws_will_sleep = nil;
+static id g_ws_did_wake = nil;
+static id g_ws_screens_sleep = nil;
+static id g_ws_screens_wake = nil;
+static atomic_int g_sys_sleep = 0;
+static atomic_int g_sys_wake = 0;
+static atomic_int g_disp_sleep = 0;
+static atomic_int g_disp_wake = 0;
+
+static void power_interest(void *refcon, io_service_t service, uint32_t messageType,
+                           void *messageArgument) {
+    (void)refcon;
+    (void)service;
+    switch (messageType) {
+    case kIOMessageCanSystemSleep:
+        if (g_power_root != 0) {
+            IOAllowPowerChange(g_power_root, (long)messageArgument);
+        }
+        break;
+    case kIOMessageSystemWillSleep:
+        atomic_store(&g_sys_sleep, 1);
+        if (g_power_root != 0) {
+            IOAllowPowerChange(g_power_root, (long)messageArgument);
+        }
+        break;
+    case kIOMessageSystemHasPoweredOn:
+        atomic_store(&g_sys_wake, 1);
+        break;
+    default:
+        break;
+    }
+}
+
+void m07_power_reset(void) {
+    atomic_store(&g_sys_sleep, 0);
+    atomic_store(&g_sys_wake, 0);
+    atomic_store(&g_disp_sleep, 0);
+    atomic_store(&g_disp_wake, 0);
+}
+
+int m07_power_watch_start(void) {
+    @autoreleasepool {
+        ensure_app();
+        m07_power_reset();
+        if (g_power_root == 0) {
+            g_power_root =
+                IORegisterForSystemPower(NULL, &g_power_notify, power_interest, &g_power_object);
+            if (g_power_root != 0 && g_power_notify != NULL) {
+                CFRunLoopAddSource(CFRunLoopGetCurrent(),
+                                   IONotificationPortGetRunLoopSource(g_power_notify),
+                                   kCFRunLoopDefaultMode);
+            }
+        }
+        NSNotificationCenter *center = [NSWorkspace sharedWorkspace].notificationCenter;
+        if (g_ws_will_sleep == nil) {
+            g_ws_will_sleep = [center addObserverForName:NSWorkspaceWillSleepNotification
+                                                  object:nil
+                                                   queue:nil
+                                              usingBlock:^(NSNotification *note) {
+                                                (void)note;
+                                                atomic_store(&g_sys_sleep, 1);
+                                              }];
+        }
+        if (g_ws_did_wake == nil) {
+            g_ws_did_wake = [center addObserverForName:NSWorkspaceDidWakeNotification
+                                                object:nil
+                                                 queue:nil
+                                            usingBlock:^(NSNotification *note) {
+                                              (void)note;
+                                              atomic_store(&g_sys_wake, 1);
+                                            }];
+        }
+        if (g_ws_screens_sleep == nil) {
+            g_ws_screens_sleep =
+                [center addObserverForName:NSWorkspaceScreensDidSleepNotification
+                                    object:nil
+                                     queue:nil
+                                usingBlock:^(NSNotification *note) {
+                                  (void)note;
+                                  atomic_store(&g_disp_sleep, 1);
+                                }];
+        }
+        if (g_ws_screens_wake == nil) {
+            g_ws_screens_wake =
+                [center addObserverForName:NSWorkspaceScreensDidWakeNotification
+                                    object:nil
+                                     queue:nil
+                                usingBlock:^(NSNotification *note) {
+                                  (void)note;
+                                  atomic_store(&g_disp_wake, 1);
+                                }];
+        }
+    }
+    return (g_power_root != 0) ? 0 : 1;
+}
+
+int m07_power_watch_stop(void) {
+    @autoreleasepool {
+        NSNotificationCenter *center = [NSWorkspace sharedWorkspace].notificationCenter;
+        if (g_ws_will_sleep != nil) {
+            [center removeObserver:g_ws_will_sleep];
+            g_ws_will_sleep = nil;
+        }
+        if (g_ws_did_wake != nil) {
+            [center removeObserver:g_ws_did_wake];
+            g_ws_did_wake = nil;
+        }
+        if (g_ws_screens_sleep != nil) {
+            [center removeObserver:g_ws_screens_sleep];
+            g_ws_screens_sleep = nil;
+        }
+        if (g_ws_screens_wake != nil) {
+            [center removeObserver:g_ws_screens_wake];
+            g_ws_screens_wake = nil;
+        }
+        if (g_power_notify != NULL) {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(),
+                                  IONotificationPortGetRunLoopSource(g_power_notify),
+                                  kCFRunLoopDefaultMode);
+        }
+        if (g_power_root != 0 && g_power_object != 0) {
+            IODeregisterForSystemPower(&g_power_object);
+        }
+        if (g_power_notify != NULL) {
+            IONotificationPortDestroy(g_power_notify);
+            g_power_notify = NULL;
+        }
+        g_power_root = 0;
+        g_power_object = 0;
+    }
+    return 0;
+}
+
+int m07_power_system_slept(void) { return atomic_load(&g_sys_sleep); }
+int m07_power_system_woke(void) { return atomic_load(&g_sys_wake); }
+int m07_power_display_slept(void) { return atomic_load(&g_disp_sleep); }
+int m07_power_display_woke(void) { return atomic_load(&g_disp_wake); }
+
+void m07_power_pump(uint32_t millis) { m07_overlay_pump(millis); }
 
 int m07_timer_tick(TimerOut *out) {
     if (out == NULL) {

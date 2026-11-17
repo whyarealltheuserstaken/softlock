@@ -2,7 +2,8 @@
 
 use std::fs;
 use std::io::{self, BufRead, ErrorKind, Write};
-use std::path::Path;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::args::{APP_NAP_SAMPLE_MS, Args, Mode};
+use crate::drift::{APP_NAP_GAP_THRESHOLD_MS, DriftStats, nap_verdict, stats_from_gaps};
 use crate::mac::ffi::{self, HeldAssertions};
 use crate::report::{
     AssertionReport, CaffeinateReport, DISPLAY_ASSERTION, HardwareRow, KIT_ID, KitReport,
@@ -19,6 +21,7 @@ use crate::report::{
     runner_hardware_row, slowed_sentence,
 };
 use crate::scrub::{contains_serial, filter_pmset};
+use crate::sleep_detect::{classify_pmset_since, detected_sleep, detection_method, outcome_token};
 use crate::version::parse_sw_vers;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -32,13 +35,24 @@ fn stop_requested() -> bool {
 }
 
 pub fn dispatch(args: Args) -> i32 {
+    let output_dir = args.output_dir.clone();
+    match catch_unwind(AssertUnwindSafe(|| dispatch_inner(&args))) {
+        Ok(code) => code,
+        Err(_) => {
+            let _ = write_crash_report(&output_dir, "probe panicked");
+            1
+        }
+    }
+}
+
+fn dispatch_inner(args: &Args) -> i32 {
     if args.mode.holds_assertions() {
-        run_orchestrator(&args)
+        run_orchestrator(args)
     } else {
         match args.mode {
-            Mode::Timer => run_timer(&args),
-            Mode::Overlay => run_overlay(&args),
-            Mode::Heartbeat => run_heartbeat(&args),
+            Mode::Timer => run_timer(args),
+            Mode::Overlay => run_overlay(args),
+            Mode::Heartbeat => run_heartbeat(args),
             Mode::Runner | Mode::Kit => unreachable!("orchestrator already ran"),
         }
     }
@@ -51,6 +65,7 @@ fn run_orchestrator(args: &Args) -> i32 {
         return 1;
     }
     let kit = args.mode == Mode::Kit;
+    crate::report::write_stdout(crate::report::instructions(kit));
     for name in [
         "timer-down.json",
         "timer-up.json",
@@ -62,7 +77,6 @@ fn run_orchestrator(args: &Args) -> i32 {
     ] {
         let _ = fs::remove_file(args.output_dir.join(name));
     }
-    crate::report::write_stdout(crate::report::instructions(kit));
 
     let version = read_version();
     let display_count = ffi::display_count();
@@ -73,23 +87,46 @@ fn run_orchestrator(args: &Args) -> i32 {
     let shows_reason = pmset_shows(&pmset_held, &held.reason);
     let shows_system = pmset_shows(&pmset_held, SYSTEM_ASSERTION);
     let shows_display = pmset_shows(&pmset_held, DISPLAY_ASSERTION);
-    let caffeinate = caffeinate_control(pid);
     let mut interrupted = stop_requested();
+    let mut no_input = false;
+    let exe = current_exe().ok();
+    let down_ms = args.down_ms.unwrap_or(args.sample_ms);
+    let down_child = if interrupted {
+        None
+    } else {
+        exe.as_ref()
+            .and_then(|exe| start_child_timer(exe, args, "timer-down.json", down_ms).ok())
+    };
+    let caffeinate = caffeinate_control(pid);
+    interrupted = interrupted || stop_requested();
     let timer = if interrupted {
+        if let Some(mut child) = down_child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         empty_timer(args, "interrupted before the timer sample")
     } else {
-        match sample_timers(args) {
+        match sample_timers(args, down_child) {
             Ok(timer) => timer,
             Err(error) => empty_timer(args, &error),
         }
     };
     interrupted = interrupted || stop_requested();
     let (lid_on_power, lid_external, power_key) = if interrupted {
-        skipped_hardware("interrupted", measure_held(pid, &held.reason))
+        skipped_hardware(
+            "interrupted",
+            measure_held(pid, &held.reason),
+            "interrupted",
+        )
     } else {
-        hardware_rows(args, pid, &held.reason)
+        let rows = hardware_rows(args, pid, &held.reason);
+        no_input = row_no_input(&rows.0) || row_no_input(&rows.1) || row_no_input(&rows.2);
+        rows
     };
     interrupted = interrupted || stop_requested();
+    if interrupted {
+        no_input = false;
+    }
     held.release();
     let pmset_after = filtered_pmset(pid, &held.reason);
     let after_shows = pmset_shows(&pmset_after, &held.reason);
@@ -130,19 +167,28 @@ fn run_orchestrator(args: &Args) -> i32 {
         locked_session: false,
         reversible,
         interrupted,
+        no_input,
         probe_crash: None,
     };
     let text = render(&report);
     crate::report::write_stdout(&text);
-    let path = args.output_dir.join("m07.json");
-    if let Err(error) = write_json(&path, &report) {
+    if let Err(error) = write_outputs(&args.output_dir, &report, &text) {
         eprintln!("{error}");
         return 1;
     }
+    crate::report::write_stdout(&format!("Wrote {}", args.output_dir.display()));
+    crate::report::write_stdout("Send result.json and result.txt from that folder.");
     if exit_nonzero(&report) { 1 } else { 0 }
 }
 
+fn row_no_input(row: &HardwareRow) -> bool {
+    row.status == "no-input" || row.detection_method == "no-input"
+}
+
 fn empty_timer(args: &Args, error: &str) -> TimerReport {
+    let expected = expected_ticks(args.sample_ms, args.interval_ms);
+    let stats = stats_from_gaps(0, expected, &[], &[]);
+    let verdict = nap_verdict(&stats, args.sample_ms);
     TimerReport {
         interval_ms: args.interval_ms,
         duration_ms: args.sample_ms,
@@ -153,7 +199,7 @@ fn empty_timer(args: &Args, error: &str) -> TimerReport {
         overlay_display_count: 0,
         occlusion_visible_down: None,
         occlusion_visible_up: None,
-        expected_ticks: expected_ticks(args.sample_ms, args.interval_ms),
+        expected_ticks: expected,
         app_nap_ms: if args.mode == Mode::Kit {
             APP_NAP_SAMPLE_MS
         } else {
@@ -162,44 +208,51 @@ fn empty_timer(args: &Args, error: &str) -> TimerReport {
         app_nap_count: None,
         app_nap_occlusion_visible: None,
         app_nap_ran: false,
+        max_gap_ms: None,
+        p95_gap_ms: None,
+        mean_gap_ms: None,
+        max_wake_late_ms: None,
+        app_nap_threshold_ms: APP_NAP_GAP_THRESHOLD_MS,
+        app_nap_verdict: verdict.token.to_string(),
+        app_nap_reason: verdict.reason,
         slowed: None,
         sentence: error.to_string(),
         error: Some(error.to_string()),
     }
 }
 
-fn skipped_hardware(status: &str, held: bool) -> (HardwareRow, HardwareRow, HardwareRow) {
+fn skipped_hardware(
+    status: &str,
+    held: bool,
+    method: &str,
+) -> (HardwareRow, HardwareRow, HardwareRow) {
+    let note = if status == "no-input" {
+        "stdin closed; results still written"
+    } else {
+        "skipped because the kit was interrupted"
+    };
     (
-        hardware_row(
-            status.to_string(),
-            None,
-            None,
-            held,
-            "skipped because the kit was interrupted",
-        ),
-        hardware_row(
-            status.to_string(),
-            None,
-            None,
-            held,
-            "skipped because the kit was interrupted",
-        ),
-        hardware_row(
-            status.to_string(),
-            None,
-            None,
-            held,
-            "skipped because the kit was interrupted",
-        ),
+        hardware_row(status.to_string(), None, None, held, note, method),
+        hardware_row(status.to_string(), None, None, held, note, method),
+        hardware_row(status.to_string(), None, None, held, note, method),
     )
 }
 
-fn sample_timers(args: &Args) -> Result<TimerReport, String> {
+fn sample_timers(args: &Args, down_child: Option<Child>) -> Result<TimerReport, String> {
     let exe = current_exe()?;
-    let down = run_child_timer(&exe, args, "timer-down.json")?;
+    let down_ms = args.down_ms.unwrap_or(args.sample_ms);
+    let down = if let Some(child) = down_child {
+        finish_child_timer(child, args, "timer-down.json", down_ms)?
+    } else {
+        run_child_timer(&exe, args, "timer-down.json", down_ms)?
+    };
     if stop_requested() {
         return Err("interrupted".to_string());
     }
+    let overlay_secs = (args.sample_ms / 1000).max(1);
+    crate::report::write_stdout(&format!(
+        "The screen will go black for {overlay_secs} seconds. That is expected."
+    ));
     let (up, overlay) = run_child_timer_with_overlay(&exe, args, "timer-up.json", args.sample_ms)?;
     if stop_requested() {
         return Err("interrupted".to_string());
@@ -212,19 +265,13 @@ fn sample_timers(args: &Args) -> Result<TimerReport, String> {
             "Timer counts are incomplete, so slowing is not claimed.".to_string(),
         ),
     };
-    let mut app_nap_count = None;
-    let mut app_nap_occlusion = None;
-    let mut app_nap_ran = false;
-    if args.mode == Mode::Kit && !stop_requested() {
-        crate::report::write_stdout(
-            "STEP hands-off App Nap: the 300 s sample covers only the timer window (the overlay-down/up pair is 60 s each). All three processes are named macos-keep-awake; find the timer by the printed timer-pid=. Keep your hands off after you press Return. Control-C ends it any time.",
-        );
-        wait_for_app_nap_ready()?;
-        let nap = run_app_nap_timer(&exe, args, "timer-app-nap.json", APP_NAP_SAMPLE_MS)?;
-        app_nap_count = nap.0.ticks;
-        app_nap_occlusion = nap.0.occlusion_visible;
-        app_nap_ran = true;
-    }
+    let stats = up
+        .drift
+        .clone()
+        .unwrap_or_else(|| stats_from_gaps(up.ticks.unwrap_or(0), expected, &[], &[]));
+    let sample_for_nap = args.sample_ms;
+    let verdict = nap_verdict(&stats, sample_for_nap);
+    let app_nap_ran = args.mode == Mode::Kit && !stop_requested();
     Ok(TimerReport {
         interval_ms: args.interval_ms,
         duration_ms: args.sample_ms,
@@ -235,15 +282,30 @@ fn sample_timers(args: &Args) -> Result<TimerReport, String> {
         overlay_display_count: overlay.display_count,
         occlusion_visible_down: down.occlusion_visible,
         occlusion_visible_up: up.occlusion_visible,
-        expected_ticks: expected_ticks(args.sample_ms, args.interval_ms),
+        expected_ticks: expected,
         app_nap_ms: if args.mode == Mode::Kit {
             APP_NAP_SAMPLE_MS
         } else {
             0
         },
-        app_nap_count,
-        app_nap_occlusion_visible: app_nap_occlusion,
+        app_nap_count: if app_nap_ran { up.ticks } else { None },
+        app_nap_occlusion_visible: if app_nap_ran {
+            up.occlusion_visible
+        } else {
+            None
+        },
         app_nap_ran,
+        max_gap_ms: Some(stats.max_gap_ms),
+        p95_gap_ms: Some(stats.p95_gap_ms),
+        mean_gap_ms: Some(stats.mean_gap_ms),
+        max_wake_late_ms: Some(stats.max_wake_late_ms),
+        app_nap_threshold_ms: APP_NAP_GAP_THRESHOLD_MS,
+        app_nap_verdict: if args.mode == Mode::Kit {
+            verdict.token.to_string()
+        } else {
+            "not-run-on-runner".to_string()
+        },
+        app_nap_reason: verdict.reason,
         slowed,
         sentence,
         error: None,
@@ -253,6 +315,7 @@ fn sample_timers(args: &Args) -> Result<TimerReport, String> {
 struct CountFile {
     ticks: Option<u64>,
     occlusion_visible: Option<bool>,
+    drift: Option<DriftStats>,
 }
 
 struct OverlayState {
@@ -261,12 +324,16 @@ struct OverlayState {
     display_count: i32,
 }
 
-fn run_child_timer(exe: &Path, args: &Args, count_file: &str) -> Result<CountFile, String> {
-    let path = args.output_dir.join(count_file);
+fn start_child_timer(
+    exe: &Path,
+    args: &Args,
+    count_file: &str,
+    sample_ms: u64,
+) -> Result<Child, String> {
     let out = args.output_dir.to_str().unwrap_or(".").to_string();
-    let sample = args.sample_ms.to_string();
+    let sample = sample_ms.to_string();
     let interval = args.interval_ms.to_string();
-    let mut child = spawn_role(
+    spawn_role(
         exe,
         &[
             "--role",
@@ -280,12 +347,33 @@ fn run_child_timer(exe: &Path, args: &Args, count_file: &str) -> Result<CountFil
             "--count-file",
             count_file,
         ],
-    )?;
+    )
+}
+
+fn finish_child_timer(
+    mut child: Child,
+    args: &Args,
+    count_file: &str,
+    sample_ms: u64,
+) -> Result<CountFile, String> {
     let status = wait_child(&mut child)?;
     if !status.success() {
         return Err(format!("timer {count_file} exited {status}"));
     }
-    read_count(&path)
+    read_count(
+        &args.output_dir.join(count_file),
+        expected_ticks(sample_ms, args.interval_ms),
+    )
+}
+
+fn run_child_timer(
+    exe: &Path,
+    args: &Args,
+    count_file: &str,
+    sample_ms: u64,
+) -> Result<CountFile, String> {
+    let child = start_child_timer(exe, args, count_file, sample_ms)?;
+    finish_child_timer(child, args, count_file, sample_ms)
 }
 
 struct OverlayChild {
@@ -347,96 +435,15 @@ fn run_child_timer_with_overlay(
             count_file,
         ],
     )?;
+    crate::report::write_stdout(&format!("timer-pid={}", timer.id()));
     let timer_status = wait_child(&mut timer)?;
     if !timer_status.success() {
         return Err(format!(
             "timer {count_file} overlay-up exited {timer_status}"
         ));
     }
-    let count = read_count(&timer_json)?;
+    let count = read_count(&timer_json, expected_ticks(sample_ms, args.interval_ms))?;
     Ok((count, read_overlay(&overlay_json)))
-}
-
-fn run_app_nap_timer(
-    exe: &Path,
-    args: &Args,
-    count_file: &str,
-    sample_ms: u64,
-) -> Result<(CountFile, OverlayState), String> {
-    let overlay_json = args.output_dir.join("overlay.json");
-    let timer_json = args.output_dir.join(count_file);
-    let frame_path = args.output_dir.join("timer-frame.json");
-    let _ = fs::remove_file(&frame_path);
-    let out = args.output_dir.to_str().unwrap_or(".").to_string();
-    let sample = sample_ms.to_string();
-    let interval = args.interval_ms.to_string();
-    let mut timer = spawn_role(
-        exe,
-        &[
-            "--role",
-            "timer",
-            "--output-dir",
-            &out,
-            "--sample-ms",
-            &sample,
-            "--interval-ms",
-            &interval,
-            "--count-file",
-            count_file,
-        ],
-    )?;
-    crate::report::write_stdout(&format!("timer-pid={}", timer.id()));
-    let frame = match wait_for_frame(&frame_path) {
-        Ok(frame) => frame,
-        Err(error) => {
-            let _ = timer.kill();
-            let _ = timer.wait();
-            return Err(error);
-        }
-    };
-    let cover = format!("{},{},{},{}", frame.0, frame.1, frame.2, frame.3);
-    let _overlay = match OverlayChild::spawn(
-        exe,
-        &[
-            "--role",
-            "overlay",
-            "--output-dir",
-            &out,
-            "--sample-ms",
-            &sample,
-            "--cover-frame",
-            &cover,
-        ],
-    ) {
-        Ok(overlay) => overlay,
-        Err(error) => {
-            let _ = timer.kill();
-            let _ = timer.wait();
-            return Err(error);
-        }
-    };
-    let timer_status = wait_child(&mut timer)?;
-    if !timer_status.success() {
-        return Err(format!("timer {count_file} App Nap exited {timer_status}"));
-    }
-    let count = read_count(&timer_json)?;
-    Ok((count, read_overlay(&overlay_json)))
-}
-
-fn wait_for_frame(path: &Path) -> Result<(i32, i32, i32, i32), String> {
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(5) {
-        if stop_requested() {
-            return Err("interrupted".to_string());
-        }
-        if let Ok(text) = fs::read_to_string(path)
-            && let Ok(file) = serde_json::from_str::<FrameFile>(&text)
-        {
-            return Ok((file.x as i32, file.y as i32, file.w as i32, file.h as i32));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Err("timer window frame was not published".to_string())
 }
 
 fn spawn_role(exe: &Path, extra: &[&str]) -> Result<Child, String> {
@@ -490,7 +497,15 @@ fn run_timer(args: &Args) -> i32 {
     let step = Duration::from_millis(args.interval_ms.max(1));
     let mut ticks = 0_u64;
     let mut occlusion_visible = true;
+    let mut gaps = Vec::new();
+    let mut lates = Vec::new();
+    let mut last_tick: Option<Instant> = None;
     while started.elapsed() < limit && !stop_requested() && parent_alive(parent) {
+        let now = Instant::now();
+        if let Some(previous) = last_tick {
+            gaps.push(now.duration_since(previous).as_millis() as u64);
+        }
+        last_tick = Some(now);
         match ffi::TimerWindow::tick() {
             Ok((value, visible)) => {
                 ticks = value;
@@ -501,8 +516,13 @@ fn run_timer(args: &Args) -> i32 {
                 return 1;
             }
         }
+        let sleep_started = Instant::now();
         thread::sleep(step);
+        let slept = sleep_started.elapsed().as_millis() as u64;
+        lates.push(slept.saturating_sub(args.interval_ms));
     }
+    let expected = expected_ticks(args.sample_ms, args.interval_ms);
+    let stats = stats_from_gaps(ticks, expected, &gaps, &lates);
     let name = args.count_file.as_deref().unwrap_or("timer-down.json");
     let path = args.output_dir.join(name);
     if let Err(error) = write_json(
@@ -510,6 +530,10 @@ fn run_timer(args: &Args) -> i32 {
         &TickFile {
             ticks,
             occlusion_visible,
+            max_gap_ms: stats.max_gap_ms,
+            p95_gap_ms: stats.p95_gap_ms,
+            mean_gap_ms: stats.mean_gap_ms,
+            max_wake_late_ms: stats.max_wake_late_ms,
         },
     ) {
         eprintln!("{error}");
@@ -540,9 +564,6 @@ fn run_overlay(args: &Args) -> i32 {
     let limit = Duration::from_millis(args.sample_ms + 500);
     while started.elapsed() < limit && !stop_requested() && parent_alive(parent) {
         ffi::Overlay::pump(50);
-        if ffi::Overlay::escape_seen() {
-            break;
-        }
     }
     if stop_requested() { 1 } else { 0 }
 }
@@ -589,97 +610,195 @@ fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareR
         );
     }
     if stop_requested() {
-        return skipped_hardware("interrupted", measure_held(pid, reason));
+        return skipped_hardware("interrupted", measure_held(pid, reason), "interrupted");
     }
-    let mut lid = record_lid(
+    let mut lid = record_physical(
         args,
-        "lid-on-power",
-        args.lid_on_power.as_deref(),
-        &[
-            "STEP lid-closed-on-power",
-            "Leave the Mac on power. Unplug the external display if one is attached and you can do that safely.",
-            "Stay next to the machine. Close the lid. After about 20 seconds, open it.",
-            "Both idle assertions are still held. This kit does not change the lid-close action and does not lock the session.",
-            "Type slept, awake, or skip. Do not type no-lid.",
-        ],
-        laptop_lid_row,
-        &["slept", "awake", "skip"],
-        held,
+        PhysicalSpec {
+            stamp: "lid-on-power",
+            preset: args.lid_on_power.as_deref(),
+            instruction: "Close the lid on power (unplug any external display). Press Enter when that is done. Type skip to skip.",
+            parse: laptop_lid_row,
+            held,
+            timeout: Duration::from_secs(25),
+            kind: LidKind::OnPower,
+        },
     );
     lid.assertion_held = measure_held(pid, reason);
     if stop_requested() {
-        let rest = skipped_hardware("interrupted", lid.assertion_held);
+        let rest = skipped_hardware("interrupted", lid.assertion_held, "interrupted");
         return (lid, rest.1, rest.2);
     }
-    let mut external = record_lid(
+    if lid.status == "no-input" {
+        let rest = skipped_hardware("no-input", lid.assertion_held, "no-input");
+        return (lid, rest.1, rest.2);
+    }
+    let mut external = record_physical(
         args,
-        "lid-external",
-        args.lid_external.as_deref(),
-        &[
-            "STEP lid-closed-with-external-display",
-            "If you use an external display, plug it in and wait until it shows the desktop.",
-            "Close the lid, wait about 20 seconds, then open it. Clamshell may stay awake; that is the measurement.",
-            "Both idle assertions are still held.",
-            "Type slept, awake, no-external-display, or skip.",
-        ],
-        lid_external_row,
-        &["slept", "awake", "no-external-display", "skip"],
-        lid.assertion_held,
+        PhysicalSpec {
+            stamp: "lid-external",
+            preset: args.lid_external.as_deref(),
+            instruction: "Plug in an external display, then close the lid. Press Enter when that is done. Type skip to skip.",
+            parse: lid_external_row,
+            held: lid.assertion_held,
+            timeout: Duration::from_secs(25),
+            kind: LidKind::External,
+        },
     );
     external.assertion_held = measure_held(pid, reason);
     if stop_requested() {
-        let rest = skipped_hardware("interrupted", external.assertion_held);
+        let rest = skipped_hardware("interrupted", external.assertion_held, "interrupted");
         return (lid, external, rest.2);
     }
-    let mut power = record_choice(
-        args.power_key.as_deref(),
-        &[
-            "STEP power-key",
-            "On this 2020 MacBook Pro the power key is the Touch ID button. A tap may sleep the display or lock the screen: unlock with Touch ID or your password, then answer.",
-            "Tap it once. Do not hold it. Holding it can force a shutdown.",
-            "Both idle assertions are still held. They are released after this row.",
-            "Type slept, restart-panel, nothing, or skip.",
-        ],
-        power_key_row,
-        &["slept", "restart-panel", "nothing", "skip"],
-        "power key tap",
-        external.assertion_held,
+    if external.status == "no-input" {
+        let rest = skipped_hardware("no-input", external.assertion_held, "no-input");
+        return (lid, external, rest.2);
+    }
+    let mut power = record_physical(
+        args,
+        PhysicalSpec {
+            stamp: "power-key",
+            preset: args.power_key.as_deref(),
+            instruction: "Tap the Touch ID (power) key once; do not hold it. Press Enter when that is done. Type skip to skip.",
+            parse: power_key_row,
+            held: external.assertion_held,
+            timeout: Duration::from_secs(12),
+            kind: LidKind::PowerKey,
+        },
     );
     power.assertion_held = measure_held(pid, reason);
     (lid, external, power)
 }
 
-fn record_lid(
-    args: &Args,
-    stamp: &str,
-    preset: Option<&str>,
-    steps: &[&str],
+#[derive(Clone, Copy)]
+enum LidKind {
+    OnPower,
+    External,
+    PowerKey,
+}
+
+struct PhysicalSpec<'a> {
+    stamp: &'a str,
+    preset: Option<&'a str>,
+    instruction: &'a str,
     parse: fn(&str) -> Result<String, String>,
-    allowed: &[&str],
     held: bool,
-) -> HardwareRow {
-    for step in steps {
-        crate::report::write_stdout(step);
+    timeout: Duration,
+    kind: LidKind,
+}
+
+fn record_physical(args: &Args, spec: PhysicalSpec<'_>) -> HardwareRow {
+    let PhysicalSpec {
+        stamp,
+        preset,
+        instruction,
+        parse,
+        held,
+        timeout,
+        kind,
+    } = spec;
+    if preset.is_none() && !stdin_is_terminal() {
+        return hardware_row(
+            "no-input".to_string(),
+            Some("no-input".to_string()),
+            None,
+            held,
+            "stdin closed before the prompt; results still written",
+            "no-input",
+        );
     }
+    if preset.is_none() && matches!(kind, LidKind::External) && ffi::display_count() < 2 {
+        return hardware_row(
+            "recorded".to_string(),
+            Some("no-external-display".to_string()),
+            None,
+            held,
+            "skipped before the prompt: fewer than two displays",
+            "pre-prompt",
+        );
+    }
+    let since = match local_stamp() {
+        Some(stamp) => stamp,
+        None => {
+            return hardware_row(
+                "error".to_string(),
+                Some("not-detected".to_string()),
+                None,
+                held,
+                "no clock stamp before the prompt",
+                "none",
+            );
+        }
+    };
+    crate::report::write_stdout(instruction);
     if stop_requested() {
         return hardware_row(
             "interrupted".to_string(),
             None,
             None,
             held,
-            "interrupted before the lid row",
+            "interrupted before the row",
+            "interrupted",
         );
     }
-    let exe = match current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            return hardware_row("error".to_string(), None, None, held, &error);
-        }
+    let beat = start_heartbeat(args, stamp);
+    let choice = match preset {
+        Some(value) => Choice {
+            outcome: value.to_string(),
+            method: "preset".to_string(),
+        },
+        None => wait_for_sleep_or_skip(timeout, kind, &since),
     };
+    let gap = stop_heartbeat(beat);
+    if choice.outcome == "interrupted" || stop_requested() {
+        return hardware_row(
+            "interrupted".to_string(),
+            None,
+            gap,
+            held,
+            "operator interrupted",
+            "interrupted",
+        );
+    }
+    if choice.outcome == "no-input" {
+        return hardware_row(
+            "no-input".to_string(),
+            Some("no-input".to_string()),
+            gap,
+            held,
+            "stdin closed; results still written",
+            "no-input",
+        );
+    }
+    match parse(&choice.outcome) {
+        Ok(outcome) => hardware_row(
+            "recorded".to_string(),
+            Some(outcome),
+            gap,
+            held,
+            "sleep detection plus heartbeat gap if the process paused",
+            &choice.method,
+        ),
+        Err(error) => hardware_row("error".to_string(), None, gap, held, &error, &choice.method),
+    }
+}
+
+struct Choice {
+    outcome: String,
+    method: String,
+}
+
+struct HeartbeatChild {
+    child: Option<Child>,
+    path: PathBuf,
+}
+
+fn start_heartbeat(args: &Args, stamp: &str) -> Option<HeartbeatChild> {
+    let exe = current_exe().ok()?;
     let beat_name = format!("{stamp}-heartbeat.txt");
-    let beat = args.output_dir.join(&beat_name);
-    let _ = fs::remove_file(&beat);
-    let mut child = Command::new(&exe)
+    let path = args.output_dir.join(&beat_name);
+    let _ = fs::remove_file(&path);
+    let child = Command::new(&exe)
         .arg("--role")
         .arg("heartbeat")
         .arg("--output-dir")
@@ -692,129 +811,151 @@ fn record_lid(
         .stderr(Stdio::null())
         .spawn()
         .ok();
-    let choice = match preset {
-        Some(value) => value.to_string(),
-        None => read_choice(allowed),
-    };
-    if let Some(mut child) = child.take() {
+    Some(HeartbeatChild { child, path })
+}
+
+fn stop_heartbeat(beat: Option<HeartbeatChild>) -> Option<u64> {
+    let mut beat = beat?;
+    if let Some(mut child) = beat.child.take() {
         let _ = child.kill();
         let _ = child.wait();
     }
-    if choice == "interrupted" || stop_requested() {
-        return hardware_row(
-            "interrupted".to_string(),
-            None,
-            heartbeat_gap(&beat),
-            held,
-            "operator interrupted",
-        );
+    heartbeat_gap(&beat.path)
+}
+
+fn wait_for_sleep_or_skip(timeout: Duration, kind: LidKind, since: &str) -> Choice {
+    if stop_requested() {
+        return Choice {
+            outcome: "interrupted".to_string(),
+            method: "interrupted".to_string(),
+        };
     }
-    let gap = heartbeat_gap(&beat);
-    match parse(&choice) {
-        Ok(outcome) => hardware_row(
-            "recorded".to_string(),
-            Some(outcome),
-            gap,
-            held,
-            "operator row plus heartbeat gap if the process paused",
-        ),
-        Err(error) => hardware_row("error".to_string(), None, gap, held, &error),
+    crate::report::write_stdout(">");
+    match read_line_blocking() {
+        LineRead::Eof => Choice {
+            outcome: "no-input".to_string(),
+            method: "no-input".to_string(),
+        },
+        LineRead::Interrupted => Choice {
+            outcome: "interrupted".to_string(),
+            method: "interrupted".to_string(),
+        },
+        LineRead::Line(line) => {
+            let word = line.trim().to_ascii_lowercase();
+            if word.is_empty() || word == "enter" || word == "y" || word == "yes" {
+                watch_after_prompt(timeout, kind, since)
+            } else {
+                Choice {
+                    outcome: "skip".to_string(),
+                    method: "operator-skip".to_string(),
+                }
+            }
+        }
     }
 }
 
-fn record_choice(
-    preset: Option<&str>,
-    steps: &[&str],
-    parse: fn(&str) -> Result<String, String>,
-    allowed: &[&str],
-    note: &str,
-    held: bool,
-) -> HardwareRow {
-    for step in steps {
-        crate::report::write_stdout(step);
+fn watch_after_prompt(timeout: Duration, kind: LidKind, since: &str) -> Choice {
+    let (watch, watch_ok) = ffi::PowerWatch::start();
+    ffi::PowerWatch::reset();
+    let started = Instant::now();
+    let mut log_ok = false;
+    loop {
+        if stop_requested() {
+            drop(watch);
+            return Choice {
+                outcome: "interrupted".to_string(),
+                method: "interrupted".to_string(),
+            };
+        }
+        let raw = pmset_log();
+        if !raw.is_empty() {
+            log_ok = true;
+        }
+        let pmset = classify_pmset_since(&raw, since);
+        if let Some(event) = detected_sleep(
+            ffi::PowerWatch::system_slept(),
+            ffi::PowerWatch::display_slept(),
+            pmset,
+        ) {
+            let method = detection_method(
+                ffi::PowerWatch::system_slept(),
+                ffi::PowerWatch::display_slept(),
+                pmset,
+            );
+            drop(watch);
+            return Choice {
+                outcome: outcome_token(event).to_string(),
+                method: method.to_string(),
+            };
+        }
+        if started.elapsed() >= timeout {
+            break;
+        }
+        ffi::PowerWatch::pump(200);
     }
-    if stop_requested() {
-        return hardware_row(
-            "interrupted".to_string(),
-            None,
-            None,
-            held,
-            "interrupted before the prompt",
-        );
-    }
-    let choice = match preset {
-        Some(value) => value.to_string(),
-        None => read_choice(allowed),
+    drop(watch);
+    let method = if watch_ok {
+        "iokit-power-notification"
+    } else if log_ok {
+        "pmset-log"
+    } else {
+        "none"
     };
-    if choice == "interrupted" || stop_requested() {
-        return hardware_row(
-            "interrupted".to_string(),
-            None,
-            None,
-            held,
-            "operator interrupted",
-        );
+    if method == "none" {
+        return Choice {
+            outcome: "not-detected".to_string(),
+            method: "none".to_string(),
+        };
     }
-    match parse(&choice) {
-        Ok(outcome) => hardware_row("recorded".to_string(), Some(outcome), None, held, note),
-        Err(error) => hardware_row("error".to_string(), None, None, held, &error),
-    }
-}
-
-fn read_choice(allowed: &[&str]) -> String {
-    if stop_requested() {
-        return "interrupted".to_string();
-    }
-    if !stdin_is_terminal() {
-        return "needs-terminal".to_string();
-    }
-    let _ = write!(io::stdout(), "> ");
-    let _ = io::stdout().flush();
-    let mut line = String::new();
-    loop {
-        if stop_requested() {
-            return "interrupted".to_string();
-        }
-        match io::stdin().lock().read_line(&mut line) {
-            Ok(0) => return "skip".to_string(),
-            Ok(_) => {
-                let value = line.trim();
-                if allowed.contains(&value) {
-                    return value.to_string();
-                }
-                return "skip".to_string();
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {
-                if stop_requested() {
-                    return "interrupted".to_string();
-                }
-                line.clear();
-            }
-            Err(_) => return "skip".to_string(),
-        }
+    let outcome = if matches!(kind, LidKind::PowerKey) {
+        "nothing"
+    } else {
+        "awake"
+    };
+    Choice {
+        outcome: outcome.to_string(),
+        method: method.to_string(),
     }
 }
 
-fn wait_for_app_nap_ready() -> Result<(), String> {
-    crate::report::write_stdout(crate::report::APP_NAP_READY_PROMPT);
-    if stop_requested() {
-        return Err("interrupted".to_string());
+fn local_stamp() -> Option<String> {
+    let output = Command::new("date")
+        .arg("+%Y-%m-%d %H:%M:%S")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.len() >= 19 && crate::sleep_detect::line_stamp(&text).is_some() {
+        Some(text)
+    } else {
+        None
+    }
+}
+
+enum LineRead {
+    Line(String),
+    Eof,
+    Interrupted,
+}
+
+fn read_line_blocking() -> LineRead {
     let mut line = String::new();
     loop {
         if stop_requested() {
-            return Err("interrupted".to_string());
+            return LineRead::Interrupted;
         }
         match io::stdin().lock().read_line(&mut line) {
-            Ok(0) => return Err("interrupted".to_string()),
-            Ok(_) => return Ok(()),
+            Ok(0) => return LineRead::Eof,
+            Ok(_) => return LineRead::Line(line.trim().to_string()),
             Err(error) if error.kind() == ErrorKind::Interrupted => {
                 if stop_requested() {
-                    return Err("interrupted".to_string());
+                    return LineRead::Interrupted;
                 }
                 line.clear();
             }
-            Err(_) => return Err("interrupted".to_string()),
+            Err(_) => return LineRead::Eof,
         }
     }
 }
@@ -896,6 +1037,13 @@ fn pmset_raw() -> String {
     }
 }
 
+fn pmset_log() -> String {
+    match Command::new("pmset").args(["-g", "log"]).output() {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
 fn filtered_pmset(pid: u32, reason: &str) -> String {
     filter_pmset(&pmset_raw(), pid, reason)
 }
@@ -919,12 +1067,20 @@ fn current_exe() -> Result<std::path::PathBuf, String> {
     std::env::current_exe().map_err(|error| error.to_string())
 }
 
-fn read_count(path: &Path) -> Result<CountFile, String> {
+fn read_count(path: &Path, expected: u64) -> Result<CountFile, String> {
     let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
     let file: TickFile = serde_json::from_str(&text).map_err(|error| error.to_string())?;
     Ok(CountFile {
         ticks: Some(file.ticks),
         occlusion_visible: Some(file.occlusion_visible),
+        drift: Some(DriftStats {
+            tick_count: file.ticks,
+            expected_ticks: expected,
+            max_gap_ms: file.max_gap_ms,
+            p95_gap_ms: file.p95_gap_ms,
+            mean_gap_ms: file.mean_gap_ms,
+            max_wake_late_ms: file.max_wake_late_ms,
+        }),
     })
 }
 
@@ -956,6 +1112,36 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         return Err("refusing to write a serial number".to_string());
     }
     fs::write(path, text).map_err(|error| error.to_string())
+}
+
+fn write_outputs(dir: &Path, report: &KitReport, text: &str) -> Result<(), String> {
+    write_json(&dir.join("result.json"), report)?;
+    if contains_serial(text) {
+        return Err("refusing to write a serial number".to_string());
+    }
+    fs::write(dir.join("result.txt"), text).map_err(|error| error.to_string())
+}
+
+fn write_crash_report(dir: &Path, message: &str) -> Result<(), String> {
+    let _ = fs::create_dir_all(dir);
+    let payload = serde_json::json!({
+        "kit": KIT_ID,
+        "probe_crash": message,
+        "interrupted": false,
+        "no_input": false,
+        "serial_collected": false,
+        "locked_session": false,
+    });
+    fs::write(
+        dir.join("result.json"),
+        serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    fs::write(
+        dir.join("result.txt"),
+        format!("probe-crash={message}\nresult=fail\n"),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn append_line(path: &Path, line: &str) -> Result<(), String> {
@@ -990,6 +1176,10 @@ fn install_stop_handler() {
 struct TickFile {
     ticks: u64,
     occlusion_visible: bool,
+    max_gap_ms: u64,
+    p95_gap_ms: u64,
+    mean_gap_ms: u64,
+    max_wake_late_ms: u64,
 }
 
 #[derive(Serialize, serde::Deserialize)]

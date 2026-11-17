@@ -28,8 +28,8 @@ use crate::lock_attempt::{
 };
 use crate::redact::sanitize;
 use crate::report::{
-    ExerciseRecord, Facts, KitReport, MISSING_SYMBOL_CI_TEST, build_report, render,
-    safety_violation,
+    ExerciseRecord, Facts, KitReport, MISSING_SYMBOL_CI_TEST, SessionWatch, build_report, render,
+    safety_violation, watch_lock,
 };
 use crate::signals::{self, Armed, detach_helper_session};
 use crate::text::one_line;
@@ -48,6 +48,7 @@ pub fn run(args: Args) -> i32 {
     let invocation = match args.mode {
         Mode::ReadOnly => KitInvocation::ReadOnly,
         Mode::Exercise { acknowledged, .. } => KitInvocation::Exercise { acknowledged },
+        Mode::FailClosed => KitInvocation::Exercise { acknowledged: true },
         Mode::Helper(_) => KitInvocation::Helper { parent_armed },
     };
     let permission = permit(invocation, github, root);
@@ -64,14 +65,23 @@ pub fn run(args: Args) -> i32 {
             }
             publish(&args.output_dir, &build_report(&collect(root), None))
         }
+        Mode::FailClosed => {
+            if !may_lock(permission) {
+                eprintln!("{}", refusal(permission));
+                return 1;
+            }
+            forced_failure(&args.output_dir)
+        }
         Mode::Exercise { which, .. } => {
             if !may_lock(permission) {
                 eprintln!("{}", refusal(permission));
                 return 1;
             }
             match which {
-                ExercisePath::Private => exercise_private(&args.output_dir),
-                ExercisePath::Documented => exercise_documented(&args.output_dir),
+                ExercisePath::Private => exercise_private(&args.output_dir, args.auto_observe),
+                ExercisePath::Documented => {
+                    exercise_documented(&args.output_dir, args.auto_observe)
+                }
             }
         }
     }
@@ -84,7 +94,28 @@ fn refusal(permission: KitPermission) -> &'static str {
     }
 }
 
-fn exercise_private(dir: &Path) -> i32 {
+/// A forced failure arms the helper and returns without `stand_down`.
+/// Drop closes the helper stdin, and the helper locks. It never unlocks.
+fn forced_failure(dir: &Path) -> i32 {
+    let facts = collect(false);
+    let Some(mut armed) = arm_helper(HelperAction::Private, dir) else {
+        return refuse_unarmed(dir, &facts, ExercisePath::Private);
+    };
+    let mut record = ExerciseRecord::blank("fail-closed");
+    record.result = "fail".to_string();
+    record.state = "os-locked".to_string();
+    record.fail_closed = FailClosedEnd::LockPrivate.as_str().to_string();
+    record.detail =
+        "forced failure; the helper is left armed so the session ends locked".to_string();
+    let code = publish(dir, &build_report(&facts, Some(&record)));
+    if crate::lock_attempt::stand_down_on_forced_failure() {
+        stand_down(&mut armed);
+    }
+    drop(armed);
+    if code == 0 { 1 } else { code }
+}
+
+fn exercise_private(dir: &Path, auto_observe: bool) -> i32 {
     let facts = collect(false);
     if !facts.symbol_present {
         let mut record = ExerciseRecord::blank(ExercisePath::Private.label());
@@ -111,16 +142,19 @@ fn exercise_private(dir: &Path) -> i32 {
     if signals::tripped() {
         return stop_for_signal(dir, &facts, &mut record, &mut armed);
     }
-    ask_observations(&mut record);
+    let leave_locked = note_observations(&mut record, auto_observe);
     if signals::tripped() {
         return stop_for_signal(dir, &facts, &mut record, &mut armed);
     }
     let code = publish(dir, &build_report(&facts, Some(&record)));
+    if leave_locked {
+        return exit_code(code, &record);
+    }
     stand_down(&mut armed);
     exit_code(code, &record)
 }
 
-fn exercise_documented(dir: &Path) -> i32 {
+fn exercise_documented(dir: &Path, auto_observe: bool) -> i32 {
     let facts = collect(false);
     if !immediate(&facts) {
         let mut record = ExerciseRecord::blank(ExercisePath::Documented.label());
@@ -148,11 +182,14 @@ fn exercise_documented(dir: &Path) -> i32 {
     if signals::tripped() {
         return stop_for_signal(dir, &facts, &mut record, &mut armed);
     }
-    ask_observations(&mut record);
+    let leave_locked = note_observations(&mut record, auto_observe);
     if signals::tripped() {
         return stop_for_signal(dir, &facts, &mut record, &mut armed);
     }
     let code = publish(dir, &build_report(&facts, Some(&record)));
+    if leave_locked {
+        return exit_code(code, &record);
+    }
     stand_down(&mut armed);
     exit_code(code, &record)
 }
@@ -1032,6 +1069,82 @@ fn immediate(facts: &Facts) -> bool {
     combine_lock_setting(ask, screen).setting == LockSetting::Immediate
 }
 
+fn note_observations(record: &mut ExerciseRecord, auto_observe: bool) -> bool {
+    if !auto_observe {
+        ask_observations(record);
+        return false;
+    }
+    if record.state != "os-locked" {
+        record.lock_screen_appeared = "no".to_string();
+        record.input_reached_desktop_without_login = "not-observed".to_string();
+        record.external_display_covered = if online_display_count() >= 2 {
+            "not-asked".to_string()
+        } else {
+            "none".to_string()
+        };
+        return false;
+    }
+    let _ = writeln!(io::stderr(), "Unlock with your password.");
+    let stdin_open = stdin_is_terminal();
+    let mut saw_locked = true;
+    let mut saw_unlock = false;
+    if stdin_open {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(90) && !signals::tripped() {
+            let view = read_session();
+            if view.locked {
+                saw_locked = true;
+            }
+            if view.available && !view.locked {
+                saw_unlock = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let watched = watch_lock(SessionWatch {
+        saw_locked,
+        saw_unlock,
+        displays: online_display_count(),
+        stdin_open,
+    });
+    record.lock_screen_appeared = watched.lock_screen_appeared.to_string();
+    record.input_reached_desktop_without_login =
+        watched.input_reached_desktop_without_login.to_string();
+    record.external_display_covered = if watched.needs_display_prompt && stdin_open {
+        ask_words(
+            "Did the lock cover every display?",
+            &["yes", "no", "skip", "none"],
+        )
+    } else {
+        watched.external_display_covered.to_string()
+    };
+    watched.leave_locked
+}
+
+fn online_display_count() -> i32 {
+    unsafe {
+        let Some(cg) = dlopen_path(CORE_GRAPHICS) else {
+            return 1;
+        };
+        let Some(symbol) = dlsym_name(cg, "CGGetOnlineDisplayList") else {
+            return 1;
+        };
+        let list: unsafe extern "C" fn(u32, *mut u32, *mut u32) -> i32 =
+            std::mem::transmute(symbol);
+        let mut ids = [0u32; 16];
+        let mut count = 0u32;
+        if list(16, ids.as_mut_ptr(), &mut count) != 0 {
+            return 1;
+        }
+        count as i32
+    }
+}
+
+fn stdin_is_terminal() -> bool {
+    unsafe { libc::isatty(0) == 1 }
+}
+
 fn ask_observations(record: &mut ExerciseRecord) {
     if record.state != "os-locked" {
         return;
@@ -1067,6 +1180,9 @@ fn ask_words(prompt: &str, words: &[&str]) -> String {
         return "unanswered".to_string();
     }
     let trimmed = line.trim();
+    if trimmed.is_empty() && words.contains(&"skip") {
+        return "skip".to_string();
+    }
     if words.contains(&trimmed) {
         trimmed.to_string()
     } else {

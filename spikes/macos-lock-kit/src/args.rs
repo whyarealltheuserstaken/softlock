@@ -26,12 +26,17 @@ pub enum Mode {
         which: ExercisePath,
         acknowledged: bool,
     },
+    /// Arm the private helper and exit without `complete`, so the helper locks.
+    FailClosed,
     Helper(HelperAction),
 }
 
 impl Mode {
     pub const fn may_request_a_lock(self) -> bool {
-        matches!(self, Self::Exercise { .. } | Self::Helper(_))
+        matches!(
+            self,
+            Self::Exercise { .. } | Self::FailClosed | Self::Helper(_)
+        )
     }
 }
 
@@ -39,6 +44,7 @@ impl Mode {
 pub struct Args {
     pub output_dir: PathBuf,
     pub mode: Mode,
+    pub auto_observe: bool,
 }
 
 pub fn parse_env() -> Result<Args, String> {
@@ -54,11 +60,15 @@ where
     let mut exercise = None;
     let mut acknowledged = false;
     let mut helper = None;
+    let mut auto_observe = false;
+    let mut fail_closed = false;
     let mut tokens = tokens.into_iter();
     while let Some(token) = tokens.next() {
         match token.as_str() {
             "--read-only" => read_only = true,
             "--i-will-unlock" => acknowledged = true,
+            "--auto-observe" => auto_observe = true,
+            "--fail-closed" => fail_closed = true,
             "--output-dir" => {
                 output_dir = PathBuf::from(tokens.next().ok_or("--output-dir needs a value")?);
             }
@@ -84,7 +94,7 @@ where
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    let selected = [read_only, exercise.is_some(), helper.is_some()]
+    let selected = [read_only, exercise.is_some(), helper.is_some(), fail_closed]
         .into_iter()
         .filter(|selected| *selected)
         .count();
@@ -94,7 +104,15 @@ where
     if acknowledged && exercise.is_none() {
         return Err("--i-will-unlock is only valid with --exercise".to_string());
     }
-    let mode = if let Some(action) = helper {
+    if auto_observe && exercise.is_none() {
+        return Err("--auto-observe is only valid with --exercise".to_string());
+    }
+    if fail_closed && (acknowledged || auto_observe) {
+        return Err("--fail-closed does not take --i-will-unlock or --auto-observe".to_string());
+    }
+    let mode = if fail_closed {
+        Mode::FailClosed
+    } else if let Some(action) = helper {
         Mode::Helper(action)
     } else if let Some(which) = exercise {
         Mode::Exercise {
@@ -107,6 +125,7 @@ where
     Ok(Args {
         output_dir: absolute_dir(&output_dir),
         mode,
+        auto_observe,
     })
 }
 
@@ -160,8 +179,21 @@ mod tests {
         assert!(parse(tokens(&["--i-will-unlock"])).is_err());
         assert!(parse(tokens(&["--read-only", "--exercise", "private"])).is_err());
         assert!(parse(tokens(&["--exercise", "loginwindow"])).is_err());
+        assert!(parse(tokens(&["--auto-observe"])).is_err());
+        let auto = parse(tokens(&[
+            "--exercise",
+            "private",
+            "--i-will-unlock",
+            "--auto-observe",
+        ]))
+        .unwrap();
+        assert!(auto.auto_observe);
         assert!(parse(tokens(&["--helper"])).is_err());
         let helper = parse(tokens(&["--helper", "none"])).unwrap();
         assert_eq!(helper.mode, Mode::Helper(crate::helper::HelperAction::None));
+        let forced = parse(tokens(&["--fail-closed"])).unwrap();
+        assert_eq!(forced.mode, Mode::FailClosed);
+        assert!(forced.mode.may_request_a_lock());
+        assert!(parse(tokens(&["--fail-closed", "--i-will-unlock"])).is_err());
     }
 }
