@@ -48,6 +48,7 @@ pub fn run(args: Args) -> i32 {
     let invocation = match args.mode {
         Mode::ReadOnly => KitInvocation::ReadOnly,
         Mode::Exercise { acknowledged, .. } => KitInvocation::Exercise { acknowledged },
+        Mode::FailClosed => KitInvocation::Exercise { acknowledged: true },
         Mode::Helper(_) => KitInvocation::Helper { parent_armed },
     };
     let permission = permit(invocation, github, root);
@@ -63,6 +64,13 @@ pub fn run(args: Args) -> i32 {
                 return 1;
             }
             publish(&args.output_dir, &build_report(&collect(root), None))
+        }
+        Mode::FailClosed => {
+            if !may_lock(permission) {
+                eprintln!("{}", refusal(permission));
+                return 1;
+            }
+            forced_failure(&args.output_dir)
         }
         Mode::Exercise { which, .. } => {
             if !may_lock(permission) {
@@ -84,6 +92,24 @@ fn refusal(permission: KitPermission) -> &'static str {
         KitPermission::Refuse(text) => text,
         KitPermission::ReadOnly | KitPermission::MayLock => "the kit refused this run",
     }
+}
+
+/// A forced failure arms the helper and returns without `stand_down`.
+/// Drop closes the helper stdin, and the helper locks. It never unlocks.
+fn forced_failure(dir: &Path) -> i32 {
+    let facts = collect(false);
+    let Some(armed) = arm_helper(HelperAction::Private, dir) else {
+        return refuse_unarmed(dir, &facts, ExercisePath::Private);
+    };
+    let mut record = ExerciseRecord::blank("fail-closed");
+    record.result = "fail".to_string();
+    record.state = "os-locked".to_string();
+    record.fail_closed = FailClosedEnd::LockPrivate.as_str().to_string();
+    record.detail =
+        "forced failure; the helper is left armed so the session ends locked".to_string();
+    let code = publish(dir, &build_report(&facts, Some(&record)));
+    drop(armed);
+    if code == 0 { 1 } else { code }
 }
 
 fn exercise_private(dir: &Path, auto_observe: bool) -> i32 {

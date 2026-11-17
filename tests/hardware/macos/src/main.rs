@@ -3,26 +3,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use macos_hardware_suite::{
-    Row, exit_row, keep_awake_rows, lock_exercise_row, lock_read_only_row, scrub_model, smoke_row,
-    suite_status, summary_table,
+    Config, SCHEMA, SuiteResult, budget_skip, decided_skip, exit_row, fail_closed, keep_awake_rows,
+    lock_exercise_row, lock_read_only_row, over_budget, scrub_model, smoke_row, suite_exit,
+    summary_of,
 };
-use serde::Serialize;
 
-#[derive(Serialize)]
-struct SuiteReport {
-    suite: String,
-    ci: bool,
-    elapsed_ms: u128,
-    model: String,
-    arch: String,
-    os_version: String,
-    serial_collected: bool,
-    result: String,
-    tests: Vec<Row>,
-}
+const BUDGET_MS: u64 = 300_000;
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let code = run();
@@ -30,10 +22,12 @@ fn main() {
 }
 
 fn run() -> i32 {
+    install_interrupt();
     let ci = std::env::args().any(|arg| arg == "--ci");
     let root = std::env::var("SUITE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
+    let started_at = SystemTime::now();
     let started = std::time::Instant::now();
     let stamp = unix_secs().to_string();
     let out = root.join("suite-output").join(&stamp);
@@ -49,7 +43,7 @@ fn run() -> i32 {
         println!("--ci skips lid, Touch ID, and lock exercises.");
     } else {
         println!(
-            "Then: lid on power, external display plus lid, Touch ID tap, unlock with your password. Enter skips."
+            "Then: lid on power, external display plus lid, Touch ID tap, unlock with your password. Enter after each step. Type skip to skip."
         );
     }
 
@@ -90,6 +84,7 @@ fn run() -> i32 {
     );
     rows.push(exit_row(
         "m03-posted-input",
+        "Posted input",
         m03 == 0,
         false,
         &format!("exit {m03}"),
@@ -109,6 +104,7 @@ fn run() -> i32 {
     );
     rows.push(exit_row(
         "m04-sharing",
+        "Sharing probe",
         sharing == 0,
         false,
         &format!("exit {sharing}"),
@@ -128,52 +124,80 @@ fn run() -> i32 {
     );
     rows.push(smoke_row(&read_text(&out.join("m11.log")), arch.trim()));
 
-    let keep = if ci {
-        spawn(
-            &bin(
-                &root,
-                "spikes/macos-keep-awake/target/release/macos-keep-awake",
+    let past_budget = over_budget(started.elapsed().as_millis() as u64, BUDGET_MS);
+    if !ci && past_budget {
+        for (id, name, physical) in [
+            ("m07-assertions", "Idle-sleep assertions", false),
+            ("m07-app-nap", "App Nap sample", false),
+            ("m07-lid-on-power", "Lid close on power", true),
+            (
+                "m07-lid-external",
+                "Lid close with an external display",
+                true,
             ),
-            &[
-                "--runner",
-                "--output-dir",
-                &out.join("m07").to_string_lossy(),
-            ],
-            &out.join("m07.log"),
-            false,
-        )
+            ("m07-power-key", "Touch ID / power key", true),
+        ] {
+            rows.push(budget_skip(id, name, physical));
+        }
     } else {
-        spawn(
-            &bin(
-                &root,
-                "spikes/macos-keep-awake/target/release/macos-keep-awake",
-            ),
-            &[
-                "--kit",
-                "--down-ms",
-                "8000",
-                "--output-dir",
-                &out.join("m07").to_string_lossy(),
-            ],
-            &out.join("m07.log"),
-            true,
-        )
-    };
-    rows.extend(keep_awake_rows(&read_text(
-        &out.join("m07").join("result.txt"),
-    )));
-    if keep != 0 && rows.iter().all(|row| row.status != "fail") {
-        rows.push(exit_row(
-            "m07-process",
-            false,
-            false,
-            &format!("exit {keep}"),
-        ));
+        let keep_dir = out.join("m07").to_string_lossy().to_string();
+        let keep = if ci {
+            spawn(
+                &bin(
+                    &root,
+                    "spikes/macos-keep-awake/target/release/macos-keep-awake",
+                ),
+                &["--runner", "--output-dir", &keep_dir],
+                &out.join("m07.log"),
+                false,
+            )
+        } else {
+            spawn(
+                &bin(
+                    &root,
+                    "spikes/macos-keep-awake/target/release/macos-keep-awake",
+                ),
+                &["--kit", "--down-ms", "8000", "--output-dir", &keep_dir],
+                &out.join("m07.log"),
+                true,
+            )
+        };
+        rows.extend(keep_awake_rows(&read_text(
+            &out.join("m07").join("result.txt"),
+        )));
+        if keep != 0 && rows.iter().all(|row| row.status != "fail") && !interrupted() {
+            rows.push(exit_row(
+                "m07-process",
+                "Keep-awake process",
+                false,
+                false,
+                &format!("exit {keep}"),
+            ));
+        }
     }
 
+    let interrupted_now = interrupted();
     if ci {
         rows.push(lock_exercise_row("m08-private", "", false));
         rows.push(lock_exercise_row("m08-documented", "", false));
+    } else if interrupted_now {
+        rows.push(decided_skip(
+            "m08-private",
+            "Private lock",
+            "not-applicable",
+            "skipped before the prompt because the run was interrupted",
+            true,
+        ));
+        rows.push(decided_skip(
+            "m08-documented",
+            "Documented lock",
+            "not-applicable",
+            "skipped before the prompt because the run was interrupted",
+            true,
+        ));
+    } else if over_budget(started.elapsed().as_millis() as u64, BUDGET_MS) {
+        rows.push(budget_skip("m08-private", "Private lock", true));
+        rows.push(budget_skip("m08-documented", "Documented lock", true));
     } else {
         println!("The Mac will lock. Unlock with your password.");
         let private_code = spawn(
@@ -194,15 +218,17 @@ fn run() -> i32 {
         if private_code != 0 && private_row.status == "pass" {
             private_row.status = "fail".into();
         }
-        let leave = private_row.status == "fail" || private_row.status == "no-input";
+        let leave =
+            private_row.status == "fail" || private_row.skip_reason.as_deref() == Some("no-input");
         rows.push(private_row);
-        if leave {
-            rows.push(Row {
-                id: "m08-documented".into(),
-                status: "skip".into(),
-                physical: true,
-                detail: "skipped so a failed lock stays locked".into(),
-            });
+        if leave || interrupted() {
+            rows.push(decided_skip(
+                "m08-documented",
+                "Documented lock",
+                "not-applicable",
+                "skipped before the prompt so a failed lock stays locked",
+                true,
+            ));
         } else {
             println!("The Mac may lock again. Unlock with your password.");
             let documented_code = spawn(
@@ -227,33 +253,51 @@ fn run() -> i32 {
         }
     }
 
-    let result = suite_status(&rows);
-    let report = SuiteReport {
-        suite: "macos-hardware-v1".into(),
-        ci,
-        elapsed_ms: started.elapsed().as_millis(),
-        model,
-        arch: arch.trim().into(),
-        os_version,
-        serial_collected: false,
-        result: result.into(),
-        tests: rows.clone(),
-    };
-    let json = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
-    let mut text = format!(
-        "suite=macos-hardware-v1\nci={ci}\nmodel={}\narch={}\nos={}\nelapsed-ms={}\nresult={result}\n",
-        report.model, report.arch, report.os_version, report.elapsed_ms
-    );
-    text.push_str(&summary_table(&rows));
-    for row in &rows {
-        text.push_str(&format!("{}={} {}\n", row.id, row.status, row.detail));
+    let interrupted_run = interrupted();
+    let summary = summary_of(&rows);
+    let plan = fail_closed(summary.fail > 0, ci, interrupted_run);
+    if plan.lock {
+        let _ = spawn(
+            &bin(&root, "spikes/macos-lock-kit/target/release/macos-lock-kit"),
+            &[
+                "--fail-closed",
+                "--output-dir",
+                &out.join("fail-closed").to_string_lossy(),
+            ],
+            &out.join("fail-closed.log"),
+            false,
+        );
     }
-    let _ = fs::write(out.join("result.json"), json);
+    let report = SuiteResult {
+        schema: SCHEMA.into(),
+        suite: "macos".into(),
+        started_utc: utc_stamp(started_at),
+        finished_utc: utc_stamp(SystemTime::now()),
+        duration_ms: started.elapsed().as_millis() as u64,
+        mode: if ci { "ci" } else { "hardware" }.into(),
+        config: Config {
+            os: "macOS".into(),
+            os_version,
+            arch: arch.trim().into(),
+            model,
+            ci,
+        },
+        tests: rows,
+        summary,
+        fail_closed: true,
+        serial_collected: false,
+        restored: !plan.lock,
+        interrupted: interrupted_run,
+        state: plan.state.into(),
+    };
+    let json = report.to_json();
+    let text = report.to_txt();
+    let _ = fs::write(out.join("result.json"), &json);
     let _ = fs::write(out.join("result.txt"), &text);
     print!("{text}");
     println!("Wrote {}", out.display());
     println!("Send result.json and result.txt from that folder.");
-    if result == "fail" { 1 } else { 0 }
+    suite_exit(&report.summary, interrupted_run)
 }
 
 fn bin(root: &Path, rel: &str) -> PathBuf {
@@ -317,3 +361,34 @@ fn unix_secs() -> u64 {
         .map(|value| value.as_secs())
         .unwrap_or(0)
 }
+
+fn utc_stamp(now: SystemTime) -> String {
+    let secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    format!("{secs:016}")
+}
+
+fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+#[cfg(target_os = "macos")]
+fn install_interrupt() {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_sigint as *const () as usize;
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        let _ = libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn on_sigint(_: i32) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_interrupt() {}

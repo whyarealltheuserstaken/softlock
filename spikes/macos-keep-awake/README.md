@@ -6,6 +6,6 @@ Run it from the hardware suite:
 ./tests/hardware/macos/run.sh
 ```
 
-The screen goes black for about 60 seconds. App Nap is scored from timer drift. Lid and Touch ID are the only prompts. Enter skips. Results land in `suite-output/<timestamp>/`.
+The screen goes black for about 60 seconds. App Nap is scored from timer drift. Lid and Touch ID are the only prompts. Press Enter after each one, or type skip. Results land in `suite-output/<timestamp>/`.
 
 `--runner` remains the short GitHub slice.

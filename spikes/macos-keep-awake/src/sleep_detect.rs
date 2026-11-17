@@ -17,6 +17,31 @@ impl SleepEvent {
     }
 }
 
+/// Keep `pmset -g log` lines whose local timestamp is at or after `since`
+/// (`YYYY-MM-DD HH:MM:SS`). Older sleep entries must not count.
+pub fn log_since(text: &str, since: &str) -> String {
+    text.lines()
+        .filter(|line| line_stamp(line).is_some_and(|stamp| stamp.as_str() >= since))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn line_stamp(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b' ' {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    Some(trimmed[..19].to_string())
+}
+
+pub fn classify_pmset_since(text: &str, since: &str) -> SleepEvent {
+    classify_pmset_log(&log_since(text, since))
+}
+
 /// Scan `pmset -g log` text captured after a physical step started.
 pub fn classify_pmset_log(text: &str) -> SleepEvent {
     let mut event = SleepEvent::None;
@@ -208,5 +233,23 @@ mod tests {
         );
         assert_eq!(outcome_token(SleepEvent::SystemSleep), "slept");
         assert_eq!(outcome_token(SleepEvent::None), "awake");
+    }
+
+    #[test]
+    fn pmset_lines_before_the_prompt_are_ignored() {
+        let text = "\
+2020-01-01 00:00:01 -0800 Entering Sleep state due to 'Clamshell Sleep'\n\
+2026-11-17 18:00:00 -0800 Assertion status system-wide\n\
+2026-11-17 18:05:01 -0800 Display is turned off\n";
+        assert_eq!(
+            classify_pmset_since(text, "2026-11-17 18:04:00"),
+            SleepEvent::DisplaySleep
+        );
+        assert_eq!(
+            classify_pmset_since(text, "2026-11-17 18:06:00"),
+            SleepEvent::None
+        );
+        assert!(log_since(text, "2026-11-17 18:04:00").contains("Display is turned off"));
+        assert!(!log_since(text, "2026-11-17 18:04:00").contains("2020-01-01"));
     }
 }

@@ -254,11 +254,10 @@ pub fn display_count() -> i32 {
 pub struct PowerWatch;
 
 impl PowerWatch {
-    pub fn start() -> Self {
-        unsafe {
-            m07_power_watch_start();
-        }
-        PowerWatch
+    /// Returns the watch and whether IOKit registration succeeded.
+    pub fn start() -> (Self, bool) {
+        let ok = unsafe { m07_power_watch_start() == 0 };
+        (PowerWatch, ok)
     }
 
     pub fn reset() {

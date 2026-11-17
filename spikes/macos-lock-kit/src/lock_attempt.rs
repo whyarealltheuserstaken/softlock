@@ -104,6 +104,11 @@ pub enum InterruptPlan {
     ExitWithoutUnlock,
 }
 
+/// A forced failure must not send `complete` (that stands the helper down).
+pub fn stand_down_on_forced_failure() -> bool {
+    false
+}
+
 pub fn interrupt_plan(session_locked: bool) -> InterruptPlan {
     if session_locked {
         InterruptPlan::ExitWithoutUnlock
@@ -179,6 +184,12 @@ mod tests {
             helper_locked_again("lock-private"),
             "the helper locked again: lock-private"
         );
+    }
+
+    #[test]
+    fn a_forced_failure_does_not_stand_the_helper_down() {
+        assert!(!stand_down_on_forced_failure());
+        assert_ne!(interrupt_plan(true), InterruptPlan::FallbackThenExit);
     }
 
     #[test]

@@ -53,7 +53,16 @@ jobs:
       - name: Hardware suite unit tests
         run: cargo test --locked --manifest-path tests/hardware/macos/Cargo.toml
       - name: Hardware suite CI
-        run: ./tests/hardware/macos/run.sh --ci
+        run: |
+          set -euo pipefail
+          ./tests/hardware/macos/run.sh --ci
+          result="$(find suite-output -name result.txt | head -n 1)"
+          test -n "$result"
+          grep -F "softlock-hardware-suite/1" "$result"
+          grep -E "pass=[0-9]+ fail=[0-9]+ skip=[0-9]+" "$result"
+          grep -F "serial-collected=false" "$result"
+          echo "----- suite result.txt -----"
+          cat "$result"
       - name: Runner slice
         run: |
           set -euo pipefail

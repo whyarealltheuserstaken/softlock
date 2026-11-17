@@ -130,7 +130,7 @@ pub struct KitReport {
 
 pub fn laptop_lid_row(outcome: &str) -> Result<String, String> {
     match outcome {
-        "slept" | "awake" | "skip" | "not-run-on-runner" | "needs-terminal" => {
+        "slept" | "awake" | "skip" | "not-detected" | "not-run-on-runner" | "needs-terminal" => {
             Ok(outcome.to_string())
         }
         "no-lid" | "no lid" | "nolid" => {
@@ -146,6 +146,7 @@ pub fn lid_external_row(outcome: &str) -> Result<String, String> {
         | "awake"
         | "no-external-display"
         | "skip"
+        | "not-detected"
         | "not-run-on-runner"
         | "needs-terminal" => Ok(outcome.to_string()),
         "no-lid" | "no lid" => {
@@ -157,9 +158,8 @@ pub fn lid_external_row(outcome: &str) -> Result<String, String> {
 
 pub fn power_key_row(outcome: &str) -> Result<String, String> {
     match outcome {
-        "slept" | "restart-panel" | "nothing" | "skip" | "not-run-on-runner" | "needs-terminal" => {
-            Ok(outcome.to_string())
-        }
+        "slept" | "restart-panel" | "nothing" | "skip" | "not-detected" | "not-run-on-runner"
+        | "needs-terminal" => Ok(outcome.to_string()),
         other => Err(format!("unknown power-key outcome {other}")),
     }
 }
@@ -280,8 +280,8 @@ pub fn hardware_only_list() -> Vec<String> {
 pub fn instructions(kit: bool) -> &'static str {
     if kit {
         "This run holds idle-sleep assertions, measures a covered timer (the screen goes black for about 60s), then asks for lid and Touch ID only.\n\
-         App Nap and throttling are scored from timer-tick drift in that sample. Enter skips any physical step.\n\
-         Control-C ends it; the session is not locked and settings are not changed. Send result.json and result.txt from the output folder."
+         App Nap and throttling are scored from timer-tick drift in that sample. Press Enter after a physical step. Type skip to skip it.\n\
+         Control-C ends it and exits non-zero. The session is not locked and settings are not changed. Send result.json and result.txt."
     } else {
         "Runner slice: create idle assertions, filtered pmset, optional caffeinate, short overlay-down and overlay-up timers.\n\
          App Nap, lid, and power-key rows stay not-run-on-runner. Drift is recorded but not claimed as App Nap.\n\
@@ -1020,7 +1020,7 @@ mod tests {
         assert!(render(&ok).contains("app-nap-verdict=napped"));
         assert!(render(&ok).contains("app-nap-threshold-ms=1000"));
         assert!(render(&ok).contains("lid-on-power-detection=iokit-power-notification"));
-        assert!(instructions(true).contains("Enter skips"));
+        assert!(instructions(true).contains("Type skip"));
         assert!(!instructions(true).contains("Return when"));
         assert!(!render(&ok).contains("app-nap=not-run-on-runner"));
 
