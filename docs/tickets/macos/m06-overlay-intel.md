@@ -1,21 +1,21 @@
 # m06: Kit: overlay level, Spaces, full-screen, every display
 
-**What to build:** Henry runs the m04 probe on his Intel Mac, native x86_64. He records the marker counts for the same capture paths on his OS version. He switches Spaces, opens a full-screen app, and looks at every display he has, including one he plugs in while the windows are up if he has a second display. He checks that a click falls through (`ignoresMouseEvents`) and that the previously focused window keeps keyboard focus. He tries Command-Tab, Command-Option-Escape, and the power key, and records whether the presentation options did anything while the probe was not the active app.
+**What to build:** Henry runs the m04 probe on his Intel Mac, native x86_64. He records the marker counts for the same capture paths on his OS version. He switches Spaces, opens a full-screen app, and looks at every display already attached when the probe starts. He checks that a click falls through (`ignoresMouseEvents`) and that the previously focused window keeps keyboard focus. He tries Command-Tab, Command-Option-Escape, and the power key, and records whether the presentation options did anything while the probe was not the active app. A display plugged in during the run, a closed lid with an external display, AirPlay, Sidecar, DisplayLink, and inbound Screen Sharing are m23. This ticket does not repeat those rows.
 
 **Blocked by:** m04.
 
-**Blocks:** m14.
+**Blocks:** m14, m23.
 
-**Where:** Henry's Intel Mac. A one-display Mac does not prove hot-plug. The sheet says how many displays were attached. That count is still unknown.
+**Where:** Henry's Intel Mac. The displays already attached at the start. Hot-plug is m23. The sheet says how many displays were attached at the start. The machine paragraph is D1.
 
-**Test machine:** MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports). 2 GHz quad-core Intel Core i5. Intel Iris Plus Graphics. 16 GB LPDDR4X. macOS Tahoe 26.7.3. Laptop, with Touch ID and the T2 chip. The number of external displays is still unknown. macOS 11 through 15 are untested: this machine is on 26.x, and arm64 CI is `macos-latest`. Full list: D1 and [Henry's sheet](henry-sheet.md).
+**Test machine:** The paragraph in D1 of [`decisions.md`](decisions.md). [Henry's sheet](henry-sheet.md) points at the same paragraph.
 
 **Type:** Hardware kit. Deliverable is the filled sheet and the probe log under `docs/findings/`.
 
 **Status:** waiting for Henry. Not ready-for-agent. Not a GitHub issue.
 
 - [ ] Marker counts on his OS for each capture path, sharing type default and `.none` (sheet)
-- [ ] The overlay is visible on every display that was attached, and a display plugged in during the run is either covered or recorded as a miss (sheet)
+- [ ] The overlay is visible on every display that was already attached when the probe started (sheet). A display plugged in during the run is m23
 - [ ] A Space switch and one full-screen app: the overlay stayed up, or the sheet names which one covered it (sheet)
 - [ ] A click reached the window under the overlay, and keyboard focus did not move (sheet)
 - [ ] Command-Tab, Force Quit, and the power key each have a row: swallowed, presentation option worked, or the desktop was reachable (sheet)

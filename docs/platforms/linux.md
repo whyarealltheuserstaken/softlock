@@ -29,3 +29,9 @@ PAM.
 - An evdev grab has to keep `uinput` devices ungrabbed or agents stop.
 
 No lock behavior belongs in this crate until those risks have a tested answer.
+
+## Connected displays and remote views
+
+Henry's Decision 20 in `docs/SPEC.md` applies here: Windows 11, Windows 10, Linux, and the macOS Universal build. This file is the phase-3 sketch above. It is not a ticketed Linux platform plan. There are no other Linux product tickets.
+
+The display and remote-display tickets are [`docs/tickets/linux/`](../tickets/linux/README.md). They are blocked on a Linux platform plan. They name X11 and Wayland, and the remote paths xrdp, VNC, GNOME Remote Desktop, and RustDesk, because those are the paths the requirement covers. They do not choose a compositor, a capture API, or a lock-surface protocol. Henry closed that behavior in Decision 20. Wayland still has no portable capture exclusion, and this sketch does not add one. v1 frameworks the detection hook, the remote-pass types, and fail-closed. Full remote rows are v1.x or v2. A measurement that cannot separate a remote viewer from local capture is a risk on l02. It does not change the rule.

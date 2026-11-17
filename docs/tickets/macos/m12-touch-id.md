@@ -10,7 +10,7 @@ GitHub arm64 runners have no Touch ID sensor. His Intel Mac has Touch ID and the
 
 **Where:** Henry's Intel Mac. Not CI.
 
-**Test machine:** MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports). 2 GHz quad-core Intel Core i5. Intel Iris Plus Graphics. 16 GB LPDDR4X. macOS Tahoe 26.7.3. Laptop, with Touch ID and the T2 chip. The number of external displays is still unknown. macOS 11 through 15 are untested: this machine is on 26.x, and arm64 CI is `macos-latest`. Full list: D1 and [Henry's sheet](henry-sheet.md).
+**Test machine:** The paragraph in D1 of [`decisions.md`](decisions.md). [Henry's sheet](henry-sheet.md) points at the same paragraph.
 
 **Type:** Hardware kit. It does not block the Intel tracer bullet.
 
