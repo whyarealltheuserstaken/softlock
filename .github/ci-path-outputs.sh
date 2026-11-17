@@ -119,6 +119,7 @@ run_self_check() {
   expect new-crate true false false false false crates/softlock-new/src/lib.rs
   expect macos-spike false false false true false spikes/macos-lock-kit/src/foo.rs
   expect windows-hw false false true false false tests/hardware/windows/run.ps1
+  expect linux-hw false true false false false tests/hardware/linux/run.sh
   expect readme false false false false true README.md
   expect hw-schema true false false false false tests/hardware/check-schema.py
   expect desktop-spike false false true false false spikes/desktop-proof/src/main.rs

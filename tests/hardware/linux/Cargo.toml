@@ -1,0 +1,30 @@
+[package]
+name = "linux-hardware-suite"
+description = "Throwaway Linux hardware suite. Excluded from the product workspace."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+rust-version = "1.100.0"
+
+[lib]
+name = "linux_hardware_suite"
+path = "src/lib.rs"
+
+[[bin]]
+name = "linux-hardware-suite"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+softlock-core = { path = "../../../crates/softlock-core" }
+softlock-linux = { path = "../../../crates/softlock-linux" }
+
+[dev-dependencies]
+libc = "0.2"
+
+[[test]]
+name = "interrupt"
+harness = false

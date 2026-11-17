@@ -622,6 +622,49 @@ jobs:
             2>&1 | tee target/windows-release-scan.txt
           grep -F "scanned release binaries" target/windows-release-scan.txt
 
+  linux-hardware:
+    name: linux hardware suite --ci
+    needs: changes
+    if: |
+      always() &&
+      needs.changes.result == 'success' &&
+      (github.ref == 'refs/heads/main' ||
+       needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs.linux == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: tests/hardware/linux -> tests/hardware/linux/target
+      - name: Format
+        run: cargo fmt --manifest-path tests/hardware/linux/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path tests/hardware/linux/Cargo.toml --all-targets -- -D warnings
+      - name: Suite
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/linux-hw-out
+          ./tests/hardware/linux/run.sh --ci --output-dir /tmp/linux-hw-out
+          test -f /tmp/linux-hw-out/result.json
+          test -f /tmp/linux-hw-out/result.txt
+          python3 tests/hardware/check-schema.py /tmp/linux-hw-out/result.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("/tmp/linux-hw-out/result.json").read_text())
+          assert report["schema"] == "softlock-hardware-suite/1"
+          assert report["suite"] == "linux"
+          assert report["serial_collected"] is False
+          assert report["summary"]["fail"] == 0
+          print("ci suite ok", report["summary"])
+          PY
+
   ci-ok:
     name: ci ok
     runs-on: ubuntu-latest
@@ -633,6 +676,7 @@ jobs:
       - deny
       - seam4
       - seam3
+      - linux-hardware
     if: always()
     steps:
       - name: Required checks
@@ -657,3 +701,4 @@ jobs:
           check deny "${{ needs.deny.result }}"
           check seam4 "${{ needs.seam4.result }}"
           check seam3 "${{ needs.seam3.result }}"
+          check linux-hardware "${{ needs.linux-hardware.result }}"
