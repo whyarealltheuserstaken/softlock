@@ -87,6 +87,7 @@ pub fn fail_closed_end() -> &'static str {
     "Locked"
 }
 
+#[cfg(test)]
 pub fn failure_ends_unlocked(end: &str) -> bool {
     end == "Unlocked"
 }
