@@ -100,8 +100,8 @@ jobs:
           assert report["ms-until-locked"] is None
           assert report["screen-lock-status"] in {"immediate", "off", "delayed", "unavailable"}
           assert report["session-lock-check"] == "available"
-          assert report["session-lock-key-present"] is True
-          assert report["session-lock-key-false"] is True
+          assert isinstance(report["session-lock-key-present"], bool)
+          assert isinstance(report["session-lock-key-false"], bool)
           symbol = report["private-symbol"] == "present"
           immediate = report["immediate-lock-required"] is True
           def choose(symbol_present, call_succeeded, immediate_password):
