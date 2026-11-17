@@ -53,6 +53,8 @@ pub struct ExerciseRecord {
     pub fail_closed: String,
     pub lock_check: String,
     pub helper_end: String,
+    pub session_lock_key_present: Option<bool>,
+    pub session_lock_key_false: Option<bool>,
     pub detail: String,
 }
 
@@ -73,6 +75,8 @@ impl ExerciseRecord {
             fail_closed: "not-needed".to_string(),
             lock_check: "not-checked".to_string(),
             helper_end: "not-armed".to_string(),
+            session_lock_key_present: None,
+            session_lock_key_false: None,
             detail: String::new(),
         }
     }
@@ -264,8 +268,12 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
         external_display_covered: external_display,
         input_reached_desktop_without_login: input,
         session_lock_check: facts.session_lock_check.clone(),
-        session_lock_key_present: facts.session_lock_key_present,
-        session_lock_key_false: facts.session_lock_key_false,
+        session_lock_key_present: exercise
+            .and_then(|record| record.session_lock_key_present)
+            .unwrap_or(facts.session_lock_key_present),
+        session_lock_key_false: exercise
+            .and_then(|record| record.session_lock_key_false)
+            .unwrap_or(facts.session_lock_key_false),
         lock_check,
         helper_end,
         fail_closed,
@@ -693,6 +701,8 @@ mod tests {
             input_reached_desktop_without_login: "not-asked".to_string(),
             lock_check: "not-checked".to_string(),
             helper_end: "not-armed".to_string(),
+            session_lock_key_present: None,
+            session_lock_key_false: None,
             state: "unlocked".to_string(),
             result: "pass".to_string(),
             fail_closed: FailClosedEnd::NeverUnlocked.as_str().to_string(),
@@ -706,6 +716,23 @@ mod tests {
         assert_eq!(miss.mode, "exercise-private");
         assert_eq!(miss.arm, "not-applied");
         assert_eq!(miss.private_call, "not-called");
+    }
+
+    #[test]
+    fn an_exercise_records_the_session_lock_key_it_observed() {
+        let mut facts = sample();
+        facts.session_lock_key_present = false;
+        facts.session_lock_key_false = false;
+        let mut exercise = ExerciseRecord::blank("private");
+        exercise.result = "pass".to_string();
+        exercise.state = "os-locked".to_string();
+        exercise.private_call = "returned".to_string();
+        exercise.session_lock_key_present = Some(true);
+        exercise.session_lock_key_false = Some(false);
+        let report = build_report(&facts, Some(&exercise));
+        assert!(report.session_lock_key_present);
+        assert!(!report.session_lock_key_false);
+        assert!(render(&report).contains("session-lock-key-present=true\n"));
     }
 
     #[test]

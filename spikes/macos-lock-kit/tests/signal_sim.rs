@@ -41,8 +41,10 @@ fn a_group_interrupt_leaves_the_helper_alive_and_locking() {
     assert!(helper.contains("action=none\n"), "{helper}");
 }
 
+// The parent is a session leader with no controlling terminal, so this
+// kill(-sid) is a group signal, not a hangup from a terminal.
 #[test]
-fn a_session_hangup_leaves_the_helper_alive_and_locking() {
+fn a_group_hangup_leaves_the_helper_alive_and_locking() {
     let helper = signal_parent("parent", "session", |parent, ready| {
         let _ = parent;
         let sid: i32 = field(&ready, "sid").parse().expect("sid");

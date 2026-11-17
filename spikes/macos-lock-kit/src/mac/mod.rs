@@ -17,10 +17,14 @@ use softlock_macos::{
 
 use crate::args::{Args, ExercisePath, Mode};
 use crate::commands::{engine_path_allowed, observation_argv_allowed, read_only_argv_allowed};
-use crate::helper::{HELPER_ENV, HelperAction, helper_should_lock};
+use crate::helper::{
+    HELPER_ENV, HELPER_NONCE_ENV, HelperAction, helper_end_for_nonce, helper_should_lock,
+    write_helper_result,
+};
 use crate::kit_gate::{KitInvocation, KitPermission, may_lock, permit};
 use crate::lock_attempt::{
-    Attempt, CallWait, InterruptPlan, LockSeen, SignalEnd, interrupt_plan, judge, signal_end,
+    Attempt, CallWait, InterruptPlan, LockSeen, SignalEnd, helper_locked_again, interrupt_plan,
+    judge, signal_end, signal_state,
 };
 use crate::redact::sanitize;
 use crate::report::{
@@ -96,7 +100,8 @@ fn exercise_private(dir: &Path) -> i32 {
     if signals::tripped() {
         return stop_for_signal(dir, &facts, &mut record, &mut armed);
     }
-    note_private(&mut record, attempt_private());
+    let tried = attempt_private();
+    note_private(&mut record, tried.attempt, tried.keys);
     if signals::tripped() {
         return stop_for_signal(dir, &facts, &mut record, &mut armed);
     }
@@ -132,7 +137,8 @@ fn exercise_documented(dir: &Path) -> i32 {
     if signals::tripped() {
         return stop_for_signal(dir, &facts, &mut record, &mut armed);
     }
-    note_documented(&mut record, attempt_documented(&facts));
+    let tried = attempt_documented(&facts);
+    note_documented(&mut record, tried.attempt, tried.keys);
     if signals::tripped() {
         return stop_for_signal(dir, &facts, &mut record, &mut armed);
     }
@@ -172,9 +178,10 @@ fn stop_for_signal(
     record.helper_end = helper_end.clone().unwrap_or_else(|| "unread".to_string());
     let already_locked =
         interrupt_plan(record.state == "os-locked") == InterruptPlan::ExitWithoutUnlock;
+    record.state = signal_state(already_locked, helper_end.as_deref()).to_string();
     match signal_end(already_locked, helper_end.as_deref()) {
         SignalEnd::AlreadyLocked => {
-            push_detail(record, "a signal arrived; the session was already locked");
+            push_detail(record, &helper_locked_again(&record.helper_end));
         }
         SignalEnd::HelperLocked => {
             record.state = "os-locked".to_string();
@@ -210,7 +217,7 @@ fn wait_helper_end(dir: &Path, armed: &mut Armed, budget: Duration) -> Option<St
     let path = dir.join("helper-result.txt");
     let deadline = Instant::now() + budget;
     loop {
-        if let Some(end) = read_helper_end(&path) {
+        if let Some(end) = read_helper_end(&path, &armed.nonce) {
             armed.finish();
             return Some(end);
         }
@@ -221,21 +228,18 @@ fn wait_helper_end(dir: &Path, armed: &mut Armed, budget: Duration) -> Option<St
             .is_some_and(|status| status.is_some());
         if exited {
             armed.finish();
-            return read_helper_end(&path);
+            return read_helper_end(&path, &armed.nonce);
         }
         if Instant::now() >= deadline {
-            return read_helper_end(&path);
+            return read_helper_end(&path, &armed.nonce);
         }
         thread::sleep(Duration::from_millis(50));
     }
 }
 
-fn read_helper_end(path: &Path) -> Option<String> {
+fn read_helper_end(path: &Path, nonce: &str) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("helper-end="))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    helper_end_for_nonce(&text, nonce)
 }
 
 fn apply_fallback(facts: &Facts, private_failed: bool, record: &mut ExerciseRecord) {
@@ -249,11 +253,13 @@ fn apply_fallback(facts: &Facts, private_failed: bool, record: &mut ExerciseReco
     record.fail_closed = end.as_str().to_string();
     match end {
         FailClosedEnd::LockDocumented => {
-            note_documented(record, attempt_documented(facts));
+            let tried = attempt_documented(facts);
+            note_documented(record, tried.attempt, tried.keys);
             settle_after_fallback(record);
         }
         FailClosedEnd::LockPrivate => {
-            note_private(record, attempt_private());
+            let tried = attempt_private();
+            note_private(record, tried.attempt, tried.keys);
             settle_after_fallback(record);
         }
         FailClosedEnd::NeverUnlocked => never_unlocked(record),
@@ -283,7 +289,8 @@ fn never_unlocked(record: &mut ExerciseRecord) {
     record.fail_closed = FailClosedEnd::NeverUnlocked.as_str().to_string();
 }
 
-fn note_private(record: &mut ExerciseRecord, attempt: Attempt) {
+fn note_private(record: &mut ExerciseRecord, attempt: Attempt, keys: KeyNote) {
+    remember_keys(record, keys);
     match attempt {
         Attempt::Locked {
             returned_ms,
@@ -327,7 +334,8 @@ fn note_private(record: &mut ExerciseRecord, attempt: Attempt) {
     }
 }
 
-fn note_documented(record: &mut ExerciseRecord, attempt: Attempt) {
+fn note_documented(record: &mut ExerciseRecord, attempt: Attempt, keys: KeyNote) {
+    remember_keys(record, keys);
     match attempt {
         Attempt::Locked {
             returned_ms,
@@ -367,6 +375,15 @@ fn note_documented(record: &mut ExerciseRecord, attempt: Attempt) {
     }
 }
 
+fn remember_keys(record: &mut ExerciseRecord, keys: KeyNote) {
+    if let Some(present) = keys.present {
+        record.session_lock_key_present = Some(present);
+    }
+    if let Some(is_false) = keys.is_false {
+        record.session_lock_key_false = Some(is_false);
+    }
+}
+
 fn push_detail(record: &mut ExerciseRecord, detail: &str) {
     if record.detail.is_empty() {
         record.detail = detail.to_string();
@@ -397,27 +414,27 @@ fn helper(action: HelperAction, permission: KitPermission, dir: &Path) -> i32 {
     }
     let facts = collect(false);
     let outcome = helper_lock(&facts);
+    let nonce = std::env::var(HELPER_NONCE_ENV).unwrap_or_default();
     let body = match &outcome {
-        Ok(label) => format!("helper-end={label}\n"),
+        Ok(label) => format!("helper-end={label}\nnonce={nonce}\n"),
         Err(error) => format!(
-            "helper-end=never-unlocked\ndetail={}\n",
+            "helper-end=never-unlocked\ndetail={}\nnonce={nonce}\n",
             one_line(&sanitize(error))
         ),
     };
-    let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::write(dir.join("helper-result.txt"), body);
+    let _ = write_helper_result(dir, &body);
     if outcome.is_ok() { 0 } else { 4 }
 }
 
 fn helper_lock(facts: &Facts) -> Result<&'static str, String> {
     let end = fail_closed_after_error(facts.symbol_present, false, false, immediate(facts));
     match end {
-        FailClosedEnd::LockPrivate => match attempt_private() {
+        FailClosedEnd::LockPrivate => match attempt_private().attempt {
             Attempt::Locked { .. } => Ok("lock-private"),
             Attempt::Unobserved { .. } => fallback_after_unobserved(facts),
             other => fallback_after_failure(facts, other),
         },
-        FailClosedEnd::LockDocumented => match attempt_documented(facts) {
+        FailClosedEnd::LockDocumented => match attempt_documented(facts).attempt {
             Attempt::Locked { .. } => Ok("lock-documented"),
             Attempt::Unobserved { .. } => Err("lock-check-unavailable".to_string()),
             other => Err(attempt_error(other)),
@@ -430,7 +447,7 @@ fn fallback_after_unobserved(facts: &Facts) -> Result<&'static str, String> {
     if !immediate(facts) {
         return Err("lock-check-unavailable".to_string());
     }
-    match attempt_documented(facts) {
+    match attempt_documented(facts).attempt {
         Attempt::Locked { .. } => Ok("lock-documented"),
         Attempt::Unobserved { .. } => Err("lock-check-unavailable".to_string()),
         other => Err(attempt_error(other)),
@@ -439,7 +456,7 @@ fn fallback_after_unobserved(facts: &Facts) -> Result<&'static str, String> {
 
 fn fallback_after_failure(facts: &Facts, attempt: Attempt) -> Result<&'static str, String> {
     if immediate(facts) {
-        match attempt_documented(facts) {
+        match attempt_documented(facts).attempt {
             Attempt::Locked { .. } => Ok("lock-documented"),
             Attempt::Unobserved { .. } => Err("lock-check-unavailable".to_string()),
             other => Err(attempt_error(other)),
@@ -464,37 +481,71 @@ fn attempt_error(attempt: Attempt) -> String {
     }
 }
 
-fn attempt_private() -> Attempt {
+struct KeyNote {
+    present: Option<bool>,
+    is_false: Option<bool>,
+}
+
+struct Tried {
+    attempt: Attempt,
+    keys: KeyNote,
+}
+
+fn tried(attempt: Attempt, poll: Poll) -> Tried {
+    Tried {
+        attempt,
+        keys: KeyNote {
+            present: poll.key_present,
+            is_false: poll.key_false,
+        },
+    }
+}
+
+fn attempt_private() -> Tried {
     let started = Instant::now();
     let call = wait_private();
     if signals::tripped() {
-        return judge(CallWait::Failed("interrupted".to_string()), LockSeen::No);
+        return tried(
+            judge(CallWait::Failed("interrupted".to_string()), LockSeen::No),
+            Poll::none(),
+        );
     }
-    let seen = match &call {
+    let poll = match &call {
         CallWait::Returned(_) => poll_locked(started),
-        _ => LockSeen::No,
+        _ => Poll::none(),
     };
     if signals::tripped() {
-        return judge(CallWait::Failed("interrupted".to_string()), LockSeen::No);
+        return tried(
+            judge(CallWait::Failed("interrupted".to_string()), LockSeen::No),
+            poll,
+        );
     }
-    judge(call, seen)
+    let seen = poll.seen;
+    tried(judge(call, seen), poll)
 }
 
-fn attempt_documented(facts: &Facts) -> Attempt {
+fn attempt_documented(facts: &Facts) -> Tried {
     let started = Instant::now();
     match start_engine(facts) {
-        Err(error) => Attempt::Failed {
-            detail: error,
-            returned_ms: None,
-        },
+        Err(error) => tried(
+            Attempt::Failed {
+                detail: error,
+                returned_ms: None,
+            },
+            Poll::none(),
+        ),
         Ok(returned_ms) => {
             if signals::tripped() {
-                return Attempt::Failed {
-                    detail: "interrupted".to_string(),
-                    returned_ms: Some(returned_ms),
-                };
+                return tried(
+                    Attempt::Failed {
+                        detail: "interrupted".to_string(),
+                        returned_ms: Some(returned_ms),
+                    },
+                    Poll::none(),
+                );
             }
-            match poll_locked(started) {
+            let poll = poll_locked(started);
+            let attempt = match poll.seen {
                 LockSeen::Yes(until_locked_ms) => Attempt::Locked {
                     returned_ms: Some(returned_ms),
                     until_locked_ms,
@@ -506,7 +557,8 @@ fn attempt_documented(facts: &Facts) -> Attempt {
                     detail: "the screen saver started and the session was not locked".to_string(),
                     returned_ms: Some(returned_ms),
                 },
-            }
+            };
+            tried(attempt, poll)
         }
     }
 }
@@ -535,29 +587,59 @@ fn wait_private() -> CallWait {
     }
 }
 
-fn poll_locked(started: Instant) -> LockSeen {
+struct Poll {
+    seen: LockSeen,
+    key_present: Option<bool>,
+    key_false: Option<bool>,
+}
+
+impl Poll {
+    fn none() -> Self {
+        Self {
+            seen: LockSeen::No,
+            key_present: None,
+            key_false: None,
+        }
+    }
+
+    fn from_view(seen: LockSeen, view: &SessionView) -> Self {
+        Self {
+            seen,
+            key_present: Some(view.key_present),
+            key_false: Some(view.key_false),
+        }
+    }
+}
+
+fn poll_locked(started: Instant) -> Poll {
     if !session_check_available() {
-        return LockSeen::Unavailable;
+        return Poll {
+            seen: LockSeen::Unavailable,
+            key_present: Some(false),
+            key_false: Some(false),
+        };
     }
     let deadline = Instant::now() + LOCK_POLL;
     loop {
         if signals::tripped() {
-            return LockSeen::No;
+            return Poll::none();
         }
         match read_session() {
-            SessionView {
+            view @ SessionView {
                 available: false, ..
-            } => return LockSeen::Unavailable,
-            SessionView { locked: true, .. } => {
-                return LockSeen::Yes(elapsed_ms(started.elapsed()));
+            } => {
+                return Poll::from_view(LockSeen::Unavailable, &view);
             }
-            SessionView {
+            view @ SessionView { locked: true, .. } => {
+                return Poll::from_view(LockSeen::Yes(elapsed_ms(started.elapsed())), &view);
+            }
+            view @ SessionView {
                 available: true,
                 locked: false,
                 ..
             } => {
                 if Instant::now() >= deadline {
-                    return LockSeen::No;
+                    return Poll::from_view(LockSeen::No, &view);
                 }
                 thread::sleep(Duration::from_millis(50));
             }

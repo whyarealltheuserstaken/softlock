@@ -6,8 +6,9 @@
 //! the window before its `main` starts. The parent's handler closes the
 //! helper's stdin. End of input without `complete` is the helper's order to
 //! lock. The parent then waits for `helper-result.txt` and records
-//! `helper-end`. It does not write `complete`, and it does not claim
-//! `never-unlocked` when that file was not read.
+//! `helper-end` only when the file carries this run's nonce. A stale file is
+//! removed before the helper starts. If it cannot be removed, the helper is
+//! not armed. An unread or wrong-nonce file is not `never-unlocked`.
 
 use std::io::{Read, Write};
 use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
@@ -19,13 +20,16 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::helper::{COMPLETE_LINE, HELPER_ENV};
+use crate::helper::{
+    COMPLETE_LINE, HELPER_ENV, HELPER_NONCE_ENV, prepare_helper_slot, write_helper_result,
+};
 
 static INTERRUPT: AtomicBool = AtomicBool::new(false);
 static HELPER_FD: AtomicI32 = AtomicI32::new(-1);
 
 pub struct Armed {
     pub child: Child,
+    pub nonce: String,
     finished: bool,
 }
 
@@ -80,12 +84,14 @@ pub fn detach_helper_session() {
 /// Spawn the fail-closed helper. `sim` selects the signal simulation, which
 /// uses the dry-run action `none` and never calls a lock path.
 pub fn arm_helper(action: &str, dir: &Path, sim: bool) -> Option<Armed> {
+    let nonce = prepare_helper_slot(dir)?;
     let exe = std::env::current_exe().ok()?;
     let dir_text = dir.display().to_string();
     let mut command = Command::new(exe);
     command
         .args(["--helper", action, "--output-dir", &dir_text])
         .env(HELPER_ENV, "1")
+        .env(HELPER_NONCE_ENV, &nonce)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -105,6 +111,7 @@ pub fn arm_helper(action: &str, dir: &Path, sim: bool) -> Option<Armed> {
     install(stdin.into_raw_fd());
     Some(Armed {
         child,
+        nonce,
         finished: false,
     })
 }
@@ -178,8 +185,9 @@ fn sim_helper() -> i32 {
     };
     let sid = unsafe { libc::getsid(0) };
     let action = helper_action_arg();
-    let body = format!("outcome={outcome}\naction={action}\nsid={sid}\n");
-    let _ = std::fs::write(std::path::Path::new(&dir).join("helper-result.txt"), body);
+    let nonce = std::env::var(HELPER_NONCE_ENV).unwrap_or_default();
+    let body = format!("outcome={outcome}\naction={action}\nsid={sid}\nnonce={nonce}\n");
+    let _ = write_helper_result(std::path::Path::new(&dir), &body);
     0
 }
 
@@ -217,4 +225,21 @@ fn sim_parent(complete: bool) -> i32 {
     }
     armed.stand_down();
     3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::arm_helper;
+
+    #[test]
+    fn a_result_path_that_cannot_be_removed_refuses_to_arm() {
+        let dir = std::env::temp_dir().join(format!(
+            "macos-lock-kit-blocked-result-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("helper-result.txt")).expect("blocked path");
+        assert!(arm_helper("none", &dir, true).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

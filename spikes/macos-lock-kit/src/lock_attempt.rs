@@ -82,6 +82,20 @@ pub fn signal_end(already_locked: bool, helper_end: Option<&str>) -> SignalEnd {
     }
 }
 
+/// State the parent records. An unread or wrong-nonce helper file is not `os-locked`.
+pub fn signal_state(already_locked: bool, helper_end: Option<&str>) -> &'static str {
+    match signal_end(already_locked, helper_end) {
+        SignalEnd::AlreadyLocked | SignalEnd::HelperLocked => "os-locked",
+        SignalEnd::HelperNeverUnlocked => "never-unlocked",
+        SignalEnd::HelperOther => "lock-unconfirmed",
+        SignalEnd::Unread => "helper-unread",
+    }
+}
+
+pub fn helper_locked_again(helper_end: &str) -> String {
+    format!("the helper locked again: {helper_end}")
+}
+
 /// A signal during an exercise never unlocks. If the session is not locked
 /// yet, the parent runs the fail-closed fallback and then exits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +173,11 @@ mod tests {
         assert_eq!(
             signal_end(true, Some("never-unlocked")),
             SignalEnd::AlreadyLocked
+        );
+        assert_eq!(signal_state(false, None), "helper-unread");
+        assert_eq!(
+            helper_locked_again("lock-private"),
+            "the helper locked again: lock-private"
         );
     }
 
