@@ -1142,6 +1142,15 @@ pub fn run_service_host() -> i32 {
     thread::spawn(move || host_write_loop(write_file, report_rx, nonce));
     thread::spawn(move || host_read_loop(read_file, command_tx));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    // A panic while unwinding can stall in a hook-thread join. Report the
+    // guard down and exit before that unwind, so the service sees host-lost.
+    let hook_shared = Arc::clone(&shared);
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("lock host panic: {info}");
+        emergency(&hook_shared);
+        publish(&hook_shared, PipeReport::GuardDown);
+        std::process::exit(1);
+    }));
     ui_main(Arc::clone(&shared), ready_tx);
     drop(ready_rx);
     shutdown(&shared);
