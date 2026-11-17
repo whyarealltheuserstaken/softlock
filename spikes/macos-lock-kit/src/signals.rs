@@ -1,23 +1,71 @@
 //! Ctrl-C, closing the terminal, and SIGTERM must end locked.
 //!
-//! The helper calls `setsid` and ignores SIGINT, SIGHUP, and SIGTERM, so a
-//! signal aimed at the parent's process group does not kill it. The parent's
-//! handler closes the helper's stdin. End of input without `complete` is the
-//! helper's order to lock. The parent then runs the fail-closed fallback, if
-//! the session is not locked yet, and exits. It does not write `complete`.
+//! `arm_helper` detaches the helper in `pre_exec`, before `exec`. `setsid`
+//! and the ignores for SIGINT, SIGHUP, and SIGTERM run in the child, so a
+//! signal aimed at the parent's process group does not kill the helper in
+//! the window before its `main` starts. The parent's handler closes the
+//! helper's stdin. End of input without `complete` is the helper's order to
+//! lock. The parent then waits for `helper-result.txt` and records
+//! `helper-end`. It does not write `complete`, and it does not claim
+//! `never-unlocked` when that file was not read.
 
 use std::io::{Read, Write};
 use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
-use std::process::{Command, Stdio};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::helper::COMPLETE_LINE;
+use crate::helper::{COMPLETE_LINE, HELPER_ENV};
 
 static INTERRUPT: AtomicBool = AtomicBool::new(false);
 static HELPER_FD: AtomicI32 = AtomicI32::new(-1);
+
+pub struct Armed {
+    pub child: Child,
+    finished: bool,
+}
+
+impl Armed {
+    pub fn stand_down(&mut self) {
+        if self.finished {
+            return;
+        }
+        if !tripped()
+            && let Some(fd) = take_fd()
+        {
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let _ = writeln!(file, "{COMPLETE_LINE}");
+        }
+        let _ = self.child.wait();
+        self.finished = true;
+    }
+
+    pub fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        let _ = self.child.wait();
+        self.finished = true;
+    }
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Some(fd) = take_fd() {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+        let _ = self.child.wait();
+    }
+}
 
 pub fn tripped() -> bool {
     INTERRUPT.load(Ordering::SeqCst)
@@ -25,11 +73,40 @@ pub fn tripped() -> bool {
 
 pub fn detach_helper_session() {
     unsafe {
-        libc::setsid();
-        ignore(libc::SIGINT);
-        ignore(libc::SIGHUP);
-        ignore(libc::SIGTERM);
+        detach_in_child();
     }
+}
+
+/// Spawn the fail-closed helper. `sim` selects the signal simulation, which
+/// uses the dry-run action `none` and never calls a lock path.
+pub fn arm_helper(action: &str, dir: &Path, sim: bool) -> Option<Armed> {
+    let exe = std::env::current_exe().ok()?;
+    let dir_text = dir.display().to_string();
+    let mut command = Command::new(exe);
+    command
+        .args(["--helper", action, "--output-dir", &dir_text])
+        .env(HELPER_ENV, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if sim {
+        command
+            .env("MACOS_LOCK_KIT_SIGNAL_SIM", "helper")
+            .env("MACOS_LOCK_KIT_SIGNAL_DIR", &dir_text);
+    }
+    unsafe {
+        command.pre_exec(|| {
+            detach_in_child();
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().ok()?;
+    let stdin = child.stdin.take()?;
+    install(stdin.into_raw_fd());
+    Some(Armed {
+        child,
+        finished: false,
+    })
 }
 
 pub fn install(helper_stdin: RawFd) {
@@ -49,6 +126,15 @@ pub fn install(helper_stdin: RawFd) {
 pub fn take_fd() -> Option<RawFd> {
     let fd = HELPER_FD.swap(-1, Ordering::SeqCst);
     if fd >= 0 { Some(fd) } else { None }
+}
+
+unsafe fn detach_in_child() {
+    unsafe {
+        libc::setsid();
+    }
+    ignore(libc::SIGINT);
+    ignore(libc::SIGHUP);
+    ignore(libc::SIGTERM);
 }
 
 fn ignore(signal: libc::c_int) {
@@ -74,7 +160,8 @@ pub fn simulate_from_env() -> Option<i32> {
     let role = std::env::var("MACOS_LOCK_KIT_SIGNAL_SIM").ok()?;
     Some(match role.as_str() {
         "helper" => sim_helper(),
-        "parent" => sim_parent(),
+        "parent" => sim_parent(false),
+        "complete" => sim_parent(true),
         _ => 2,
     })
 }
@@ -90,51 +177,44 @@ fn sim_helper() -> i32 {
         "locked"
     };
     let sid = unsafe { libc::getsid(0) };
-    let body = format!("outcome={outcome}\nsid={sid}\n");
+    let action = helper_action_arg();
+    let body = format!("outcome={outcome}\naction={action}\nsid={sid}\n");
     let _ = std::fs::write(std::path::Path::new(&dir).join("helper-result.txt"), body);
     0
 }
 
-fn sim_parent() -> i32 {
-    let dir = std::env::var("MACOS_LOCK_KIT_SIGNAL_DIR").unwrap_or_default();
-    let exe =
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("macos-lock-kit"));
-    let mut child = match Command::new(exe)
-        .env("MACOS_LOCK_KIT_SIGNAL_SIM", "helper")
-        .env("MACOS_LOCK_KIT_SIGNAL_DIR", &dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = std::fs::write(
-                std::path::Path::new(&dir).join("parent-error.txt"),
-                error.to_string(),
-            );
-            return 2;
+fn helper_action_arg() -> String {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--helper" {
+            return args.next().unwrap_or_default();
         }
-    };
-    let Some(stdin) = child.stdin.take() else {
+    }
+    String::new()
+}
+
+fn sim_parent(complete: bool) -> i32 {
+    let dir = std::env::var("MACOS_LOCK_KIT_SIGNAL_DIR").unwrap_or_default();
+    let path = std::path::Path::new(&dir);
+    let Some(mut armed) = arm_helper("none", path, true) else {
+        let _ = std::fs::write(path.join("parent-error.txt"), "helper did not start");
         return 2;
     };
-    let fd = stdin.into_raw_fd();
-    install(fd);
     let sid = unsafe { libc::getsid(0) };
-    let ready = format!("pid={}\nsid={sid}\n", std::process::id());
-    let _ = std::fs::write(std::path::Path::new(&dir).join("ready"), ready);
+    let pgid = unsafe { libc::getpgrp() };
+    let ready = format!("pid={}\nsid={sid}\npgid={pgid}\n", std::process::id());
+    let _ = std::fs::write(path.join("ready"), ready);
+    if complete {
+        armed.stand_down();
+        return 0;
+    }
     for _ in 0..400 {
         if tripped() {
-            let _ = child.wait();
+            armed.finish();
             return 0;
         }
         thread::sleep(Duration::from_millis(25));
     }
-    if let Some(fd) = take_fd() {
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let _ = writeln!(file, "{COMPLETE_LINE}");
-    }
-    let _ = child.wait();
+    armed.stand_down();
     3
 }

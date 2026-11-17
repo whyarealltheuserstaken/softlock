@@ -67,6 +67,7 @@ jobs:
           grep -E "^screen-lock-status=(immediate|off|delayed|unavailable)$" lock-kit-output/stdout.txt
           grep -E "^screen-lock-disagreement=(true|false)$" lock-kit-output/stdout.txt
           grep -F "external-display-covered=not-asked" lock-kit-output/stdout.txt
+          grep -Fx "session-lock-check=available" lock-kit-output/stdout.txt
           if grep -E "private-call=(returned|failed|still-running)" lock-kit-output/stdout.txt; then
             echo "read-only run invoked the private call"
             exit 1
@@ -98,8 +99,11 @@ jobs:
           assert report["external-display-covered"] == "not-asked"
           assert report["ms-until-locked"] is None
           assert report["screen-lock-status"] in {"immediate", "off", "delayed", "unavailable"}
+          assert report["session-lock-check"] == "available"
+          assert report["session-lock-key-present"] is True
+          assert report["session-lock-key-false"] is True
           symbol = report["private-symbol"] == "present"
-          immediate = report["immediate-password"] is True
+          immediate = report["immediate-lock-required"] is True
           def choose(symbol_present, call_succeeded, immediate_password):
               if call_succeeded:
                   return "private" if symbol_present else "refuse"
@@ -108,7 +112,7 @@ jobs:
           assert report["chooser-if-call-failed"] == choose(symbol, False, immediate)
           assert report["chooser-if-call-succeeded"] == choose(symbol, True, immediate)
           if report["screen-lock-disagreement"]:
-              assert report["immediate-password"] is False
+              assert report["immediate-lock-required"] is False
           text = Path("lock-kit-output/stdout.txt").read_text()
           body = text + Path("lock-kit-output/result.json").read_text()
           for banned in (

@@ -3,9 +3,8 @@
 
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
-use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,15 +17,15 @@ use softlock_macos::{
 
 use crate::args::{Args, ExercisePath, Mode};
 use crate::commands::{engine_path_allowed, observation_argv_allowed, read_only_argv_allowed};
-use crate::helper::{COMPLETE_LINE, HELPER_ENV, HelperAction, helper_should_lock};
+use crate::helper::{HelperAction, helper_should_lock};
 use crate::kit_gate::{KitInvocation, KitPermission, may_lock, permit};
-use crate::lock_attempt::{Attempt, CallWait, InterruptPlan, interrupt_plan, judge};
+use crate::lock_attempt::{Attempt, CallWait, LockSeen, SignalEnd, judge, signal_end};
 use crate::redact::sanitize;
 use crate::report::{
     ExerciseRecord, Facts, KitReport, MISSING_SYMBOL_CI_TEST, build_report, render,
     safety_violation,
 };
-use crate::signals::{self, detach_helper_session};
+use crate::signals::{self, Armed, detach_helper_session};
 use crate::text::one_line;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -88,7 +87,9 @@ fn exercise_private(dir: &Path) -> i32 {
         );
         return publish(dir, &build_report(&facts, Some(&record)));
     }
-    let mut armed = arm_helper(HelperAction::Private, dir);
+    let Some(mut armed) = arm_helper(HelperAction::Private, dir) else {
+        return refuse_unarmed(dir, &facts, ExercisePath::Private);
+    };
     let mut record = ExerciseRecord::blank(ExercisePath::Private.label());
     if signals::tripped() {
         return stop_for_signal(dir, &facts, &mut record, &mut armed);
@@ -122,7 +123,9 @@ fn exercise_documented(dir: &Path) -> i32 {
         record.detail = "the screen lock setting is unknown or cannot require an immediate password, so the documented path was not started".to_string();
         return publish(dir, &build_report(&facts, Some(&record)));
     }
-    let mut armed = arm_helper(HelperAction::Documented, dir);
+    let Some(mut armed) = arm_helper(HelperAction::Documented, dir) else {
+        return refuse_unarmed(dir, &facts, ExercisePath::Documented);
+    };
     let mut record = ExerciseRecord::blank(ExercisePath::Documented.label());
     if signals::tripped() {
         return stop_for_signal(dir, &facts, &mut record, &mut armed);
@@ -146,24 +149,89 @@ fn exercise_documented(dir: &Path) -> i32 {
     exit_code(code, &record)
 }
 
+fn refuse_unarmed(dir: &Path, facts: &Facts, which: ExercisePath) -> i32 {
+    let mut record = ExerciseRecord::blank(which.label());
+    record.result = "refuse".to_string();
+    record.fail_closed = FailClosedEnd::NeverUnlocked.as_str().to_string();
+    record.detail = "the helper did not start, so the exercise was refused".to_string();
+    let code = publish(dir, &build_report(facts, Some(&record)));
+    if code == 0 { 1 } else { code }
+}
+
+const HELPER_WAIT: Duration = Duration::from_secs(15);
+
 fn stop_for_signal(
     dir: &Path,
     facts: &Facts,
     record: &mut ExerciseRecord,
-    armed: &mut Option<Armed>,
+    armed: &mut Armed,
 ) -> i32 {
-    if interrupt_plan(record.state == "os-locked") == InterruptPlan::FallbackThenExit {
-        let private_failed = record.private_call != "returned";
-        apply_fallback(facts, private_failed, record);
-    }
-    if record.detail.is_empty() {
-        record.detail = "a signal arrived; the kit did not unlock".to_string();
+    let helper_end = wait_helper_end(dir, armed, HELPER_WAIT);
+    record.helper_end = helper_end.clone().unwrap_or_else(|| "unread".to_string());
+    match signal_end(record.state == "os-locked", helper_end.as_deref()) {
+        SignalEnd::AlreadyLocked => {
+            push_detail(record, "a signal arrived; the session was already locked");
+        }
+        SignalEnd::HelperLocked => {
+            record.state = "os-locked".to_string();
+            record.result = "os-locked".to_string();
+            record.fail_closed = record.helper_end.clone();
+            record.detail = format!("a signal arrived; the helper ended {}", record.helper_end);
+        }
+        SignalEnd::HelperNeverUnlocked => {
+            never_unlocked(record);
+            record.detail = "a signal arrived; the helper result said never-unlocked".to_string();
+        }
+        SignalEnd::HelperOther => {
+            record.state = "lock-unconfirmed".to_string();
+            record.result = record.helper_end.clone();
+            record.fail_closed = record.helper_end.clone();
+            if record.helper_end == "lock-check-unavailable" {
+                record.lock_check = "unavailable".to_string();
+            }
+            record.detail = format!("a signal arrived; the helper ended {}", record.helper_end);
+        }
+        SignalEnd::Unread => {
+            record.state = "helper-unread".to_string();
+            record.result = "helper-unread".to_string();
+            record.fail_closed = "unread".to_string();
+            record.detail = "a signal arrived; helper-result.txt was not read, so this result does not say never-unlocked".to_string();
+        }
     }
     let code = publish(dir, &build_report(facts, Some(record)));
-    if let Some(armed) = armed.as_mut() {
-        armed.finished = true;
-    }
     std::process::exit(exit_code(code, record));
+}
+
+fn wait_helper_end(dir: &Path, armed: &mut Armed, budget: Duration) -> Option<String> {
+    let path = dir.join("helper-result.txt");
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(end) = read_helper_end(&path) {
+            armed.finish();
+            return Some(end);
+        }
+        let exited = armed
+            .child
+            .try_wait()
+            .ok()
+            .is_some_and(|status| status.is_some());
+        if exited {
+            armed.finish();
+            return read_helper_end(&path);
+        }
+        if Instant::now() >= deadline {
+            return read_helper_end(&path);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn read_helper_end(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("helper-end="))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn apply_fallback(facts: &Facts, private_failed: bool, record: &mut ExerciseRecord) {
@@ -178,17 +246,30 @@ fn apply_fallback(facts: &Facts, private_failed: bool, record: &mut ExerciseReco
     match end {
         FailClosedEnd::LockDocumented => {
             note_documented(record, attempt_documented(facts));
-            if record.state != "os-locked" {
-                never_unlocked(record);
-            }
+            settle_after_fallback(record);
         }
         FailClosedEnd::LockPrivate => {
             note_private(record, attempt_private());
-            if record.state != "os-locked" {
-                never_unlocked(record);
-            }
+            settle_after_fallback(record);
         }
         FailClosedEnd::NeverUnlocked => never_unlocked(record),
+    }
+}
+
+fn settle_after_fallback(record: &mut ExerciseRecord) {
+    if record.state == "os-locked" {
+        return;
+    }
+    if record.lock_check == "unavailable" {
+        record.state = "lock-unconfirmed".to_string();
+        record.result = "lock-check-unavailable".to_string();
+        record.fail_closed = "lock-check-unavailable".to_string();
+        push_detail(
+            record,
+            "the session-lock check was unavailable, so this is not a failed call",
+        );
+    } else {
+        never_unlocked(record);
     }
 }
 
@@ -209,6 +290,7 @@ fn note_private(record: &mut ExerciseRecord, attempt: Attempt) {
             record.ms_until_locked = Some(until_locked_ms);
             record.state = "os-locked".to_string();
             record.result = "os-locked".to_string();
+            record.lock_check = "available".to_string();
             record.detail = "ms-until-locked is how long until the session reported locked. private-call-returned-ms is only how long the call took to return.".to_string();
         }
         Attempt::StillRunning => {
@@ -218,12 +300,24 @@ fn note_private(record: &mut ExerciseRecord, attempt: Attempt) {
                 "the private call was still running when the wait ended",
             );
         }
+        Attempt::Unobserved { returned_ms } => {
+            record.private_call = "returned".to_string();
+            record.private_call_returned_ms = returned_ms;
+            record.lock_check = "unavailable".to_string();
+            push_detail(
+                record,
+                "the session-lock check was unavailable, so this is not a failed call",
+            );
+        }
         Attempt::Failed {
             detail,
             returned_ms,
         } => {
             record.private_call = "failed".to_string();
             record.private_call_returned_ms = returned_ms;
+            if detail.contains("session was not locked") {
+                record.lock_check = "available".to_string();
+            }
             push_detail(record, &detail);
         }
     }
@@ -240,10 +334,20 @@ fn note_documented(record: &mut ExerciseRecord, attempt: Attempt) {
             record.ms_until_locked = Some(until_locked_ms);
             record.state = "os-locked".to_string();
             record.result = "os-locked".to_string();
+            record.lock_check = "available".to_string();
         }
         Attempt::StillRunning => {
             record.documented_path = "failed".to_string();
             push_detail(record, "the screen saver wait timed out");
+        }
+        Attempt::Unobserved { returned_ms } => {
+            record.documented_path = "unconfirmed".to_string();
+            record.documented_started_ms = returned_ms;
+            record.lock_check = "unavailable".to_string();
+            push_detail(
+                record,
+                "the session-lock check was unavailable, so this is not a failed call",
+            );
         }
         Attempt::Failed {
             detail,
@@ -251,6 +355,9 @@ fn note_documented(record: &mut ExerciseRecord, attempt: Attempt) {
         } => {
             record.documented_path = "failed".to_string();
             record.documented_started_ms = returned_ms;
+            if detail.contains("session was not locked") {
+                record.lock_check = "available".to_string();
+            }
             push_detail(record, &detail);
         }
     }
@@ -267,7 +374,10 @@ fn push_detail(record: &mut ExerciseRecord, detail: &str) {
 fn exit_code(publish_code: i32, record: &ExerciseRecord) -> i32 {
     if publish_code != 0 {
         publish_code
-    } else if record.result == "error-never-unlocked" {
+    } else if record.result == "error-never-unlocked"
+        || record.result == "lock-check-unavailable"
+        || record.result == "helper-unread"
+    {
         4
     } else {
         0
@@ -300,22 +410,38 @@ fn helper_lock(facts: &Facts) -> Result<&'static str, String> {
     match end {
         FailClosedEnd::LockPrivate => match attempt_private() {
             Attempt::Locked { .. } => Ok("lock-private"),
-            _ => {
-                if immediate(facts) {
-                    match attempt_documented(facts) {
-                        Attempt::Locked { .. } => Ok("lock-documented"),
-                        other => Err(attempt_error(other)),
-                    }
-                } else {
-                    Err("never-unlocked".to_string())
-                }
-            }
+            Attempt::Unobserved { .. } => fallback_after_unobserved(facts),
+            other => fallback_after_failure(facts, other),
         },
         FailClosedEnd::LockDocumented => match attempt_documented(facts) {
             Attempt::Locked { .. } => Ok("lock-documented"),
+            Attempt::Unobserved { .. } => Err("lock-check-unavailable".to_string()),
             other => Err(attempt_error(other)),
         },
         FailClosedEnd::NeverUnlocked => Err("never-unlocked".to_string()),
+    }
+}
+
+fn fallback_after_unobserved(facts: &Facts) -> Result<&'static str, String> {
+    if !immediate(facts) {
+        return Err("lock-check-unavailable".to_string());
+    }
+    match attempt_documented(facts) {
+        Attempt::Locked { .. } => Ok("lock-documented"),
+        Attempt::Unobserved { .. } => Err("lock-check-unavailable".to_string()),
+        other => Err(attempt_error(other)),
+    }
+}
+
+fn fallback_after_failure(facts: &Facts, attempt: Attempt) -> Result<&'static str, String> {
+    if immediate(facts) {
+        match attempt_documented(facts) {
+            Attempt::Locked { .. } => Ok("lock-documented"),
+            Attempt::Unobserved { .. } => Err("lock-check-unavailable".to_string()),
+            other => Err(attempt_error(other)),
+        }
+    } else {
+        Err(attempt_error(attempt))
     }
 }
 
@@ -323,7 +449,14 @@ fn attempt_error(attempt: Attempt) -> String {
     match attempt {
         Attempt::Locked { .. } => "locked".to_string(),
         Attempt::StillRunning => "still-running".to_string(),
-        Attempt::Failed { detail, .. } => detail,
+        Attempt::Unobserved { .. } => "lock-check-unavailable".to_string(),
+        Attempt::Failed { detail, .. } => {
+            if detail.contains("session was not locked") {
+                "never-unlocked".to_string()
+            } else {
+                detail
+            }
+        }
     }
 }
 
@@ -331,16 +464,16 @@ fn attempt_private() -> Attempt {
     let started = Instant::now();
     let call = wait_private();
     if signals::tripped() {
-        return judge(CallWait::Failed("interrupted".to_string()), None);
+        return judge(CallWait::Failed("interrupted".to_string()), LockSeen::No);
     }
-    let locked = match &call {
+    let seen = match &call {
         CallWait::Returned(_) => poll_locked(started),
-        _ => None,
+        _ => LockSeen::No,
     };
     if signals::tripped() {
-        return judge(CallWait::Failed("interrupted".to_string()), None);
+        return judge(CallWait::Failed("interrupted".to_string()), LockSeen::No);
     }
-    judge(call, locked)
+    judge(call, seen)
 }
 
 fn attempt_documented(facts: &Facts) -> Attempt {
@@ -358,11 +491,14 @@ fn attempt_documented(facts: &Facts) -> Attempt {
                 };
             }
             match poll_locked(started) {
-                Some(until_locked_ms) => Attempt::Locked {
+                LockSeen::Yes(until_locked_ms) => Attempt::Locked {
                     returned_ms: Some(returned_ms),
                     until_locked_ms,
                 },
-                None => Attempt::Failed {
+                LockSeen::Unavailable => Attempt::Unobserved {
+                    returned_ms: Some(returned_ms),
+                },
+                LockSeen::No => Attempt::Failed {
                     detail: "the screen saver started and the session was not locked".to_string(),
                     returned_ms: Some(returned_ms),
                 },
@@ -395,20 +531,41 @@ fn wait_private() -> CallWait {
     }
 }
 
-fn poll_locked(started: Instant) -> Option<u64> {
+fn poll_locked(started: Instant) -> LockSeen {
+    if !session_check_available() {
+        return LockSeen::Unavailable;
+    }
     let deadline = Instant::now() + LOCK_POLL;
     loop {
         if signals::tripped() {
-            return None;
+            return LockSeen::No;
         }
-        if session_is_locked() {
-            return Some(elapsed_ms(started.elapsed()));
+        match read_session() {
+            SessionView {
+                available: false, ..
+            } => return LockSeen::Unavailable,
+            SessionView { locked: true, .. } => {
+                return LockSeen::Yes(elapsed_ms(started.elapsed()));
+            }
+            SessionView {
+                available: true,
+                locked: false,
+                ..
+            } => {
+                if Instant::now() >= deadline {
+                    return LockSeen::No;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
         }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(50));
     }
+}
+
+struct SessionView {
+    available: bool,
+    key_present: bool,
+    key_false: bool,
+    locked: bool,
 }
 
 struct SessionApi {
@@ -424,21 +581,40 @@ struct SessionApi {
     key: usize,
 }
 
-fn session_is_locked() -> bool {
+fn session_check_available() -> bool {
+    read_session().available
+}
+
+fn read_session() -> SessionView {
     let Some(api) = session_api() else {
-        return false;
+        return SessionView {
+            available: false,
+            key_present: false,
+            key_false: false,
+            locked: false,
+        };
     };
     unsafe {
         let dict = (api.copy)();
         if dict.is_null() {
-            return false;
+            return SessionView {
+                available: false,
+                key_present: false,
+                key_false: false,
+                locked: false,
+            };
         }
         let value = (api.get)(dict, api.key as *const std::ffi::c_void);
-        let locked = !value.is_null()
-            && (api.type_id)(value) == (api.bool_type)()
-            && (api.bool_value)(value) != 0;
+        let key_present = !value.is_null() && (api.type_id)(value) == (api.bool_type)();
+        let key_false = key_present && (api.bool_value)(value) == 0;
+        let locked = key_present && !key_false;
         (api.release)(dict);
-        locked
+        SessionView {
+            available: true,
+            key_present,
+            key_false,
+            locked,
+        }
     }
 }
 
@@ -479,8 +655,18 @@ fn load_session_api() -> Option<SessionApi> {
             *mut std::ffi::c_void,
             unsafe extern "C" fn() -> libc::c_ulong,
         >(dlsym_name(cf, "CFBooleanGetTypeID")?);
-        let key_slot = dlsym_name(cg, "kCGSSessionScreenIsLocked")?;
-        let key = *(key_slot as *const *const std::ffi::c_void);
+        let create = std::mem::transmute::<
+            *mut std::ffi::c_void,
+            unsafe extern "C" fn(
+                *const std::ffi::c_void,
+                *const libc::c_char,
+                u32,
+            ) -> *const std::ffi::c_void,
+        >(dlsym_name(cf, "CFStringCreateWithCString")?);
+        let key_name = CString::new("CGSSessionScreenIsLocked").ok()?;
+        // kCFStringEncodingUTF8. The call copies the bytes, so the CString
+        // does not have to outlive the string it creates.
+        let key = create(std::ptr::null(), key_name.as_ptr(), 0x0800_0100);
         if key.is_null() {
             return None;
         }
@@ -508,68 +694,12 @@ fn dlsym_name(handle: *mut std::ffi::c_void, name: &str) -> Option<*mut std::ffi
     if symbol.is_null() { None } else { Some(symbol) }
 }
 
-struct Armed {
-    child: Child,
-    finished: bool,
-}
-
-impl Armed {
-    fn stand_down(&mut self) {
-        if self.finished {
-            return;
-        }
-        if !signals::tripped()
-            && let Some(fd) = signals::take_fd()
-        {
-            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-            let _ = writeln!(file, "{COMPLETE_LINE}");
-        }
-        let _ = self.child.wait();
-        self.finished = true;
-    }
-}
-
-impl Drop for Armed {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        if let Some(fd) = signals::take_fd() {
-            unsafe {
-                libc::close(fd);
-            }
-        }
-        let _ = self.child.wait();
-    }
-}
-
 fn arm_helper(action: HelperAction, dir: &Path) -> Option<Armed> {
-    let exe = std::env::current_exe().ok()?;
-    let mut child = Command::new(exe)
-        .args([
-            "--helper",
-            action.as_str(),
-            "--output-dir",
-            &dir.display().to_string(),
-        ])
-        .env(HELPER_ENV, "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let stdin = child.stdin.take()?;
-    signals::install(stdin.into_raw_fd());
-    Some(Armed {
-        child,
-        finished: false,
-    })
+    signals::arm_helper(action.as_str(), dir, false)
 }
 
-fn stand_down(armed: &mut Option<Armed>) {
-    if let Some(armed) = armed.as_mut() {
-        armed.stand_down();
-    }
+fn stand_down(armed: &mut Armed) {
+    armed.stand_down();
 }
 
 fn publish(dir: &Path, report: &KitReport) -> i32 {
@@ -596,6 +726,7 @@ fn collect(root: bool) -> Facts {
     let exe_text = exe.to_string_lossy().into_owned();
     let otool = capture("/usr/bin/otool", &["-L", &exe_text]);
     let (symbol_present, symbol_detail) = probe_symbol();
+    let session = read_session();
     Facts {
         sw_vers: capture("/usr/bin/sw_vers", &[]).stdout,
         uname_m: capture("/usr/bin/uname", &["-m"]).stdout,
@@ -641,6 +772,14 @@ fn collect(root: bool) -> Facts {
         symbol_present,
         symbol_detail,
         engine_path: find_engine(),
+        session_lock_check: if session.available {
+            "available"
+        } else {
+            "unavailable"
+        }
+        .to_string(),
+        session_lock_key_present: session.key_present,
+        session_lock_key_false: session.key_false,
         otool_checked: otool.exit_code == 0,
         otool: if otool.stdout.is_empty() {
             otool.stderr
@@ -814,8 +953,8 @@ fn ask_observations(record: &mut ExerciseRecord) {
     if record.lock_screen_appeared == "not-asked" {
         record.lock_screen_appeared = ask("Did the real lock screen appear?");
     }
-    if record.input_reached_desktop_without_password == "not-asked" {
-        record.input_reached_desktop_without_password =
+    if record.input_reached_desktop_without_login == "not-asked" {
+        record.input_reached_desktop_without_login =
             ask("Did a click or a key reach the desktop without the account password?");
     }
     if record.external_display_covered == "not-asked" {
@@ -835,8 +974,10 @@ fn ask_words(prompt: &str, words: &[&str]) -> String {
         return "unanswered".to_string();
     }
     let _ = writeln!(io::stderr(), "{prompt} [{}]", words.join("/"));
-    let mut line = String::new();
-    if io::stdin().read_line(&mut line).is_err() || signals::tripped() {
+    let Ok(line) = read_line_retrying_eintr() else {
+        return "unanswered".to_string();
+    };
+    if signals::tripped() {
         return "unanswered".to_string();
     }
     let trimmed = line.trim();
@@ -845,6 +986,32 @@ fn ask_words(prompt: &str, words: &[&str]) -> String {
     } else {
         "unanswered".to_string()
     }
+}
+
+fn read_line_retrying_eintr() -> Result<String, ()> {
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        if signals::tripped() {
+            return Err(());
+        }
+        let read = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(());
+        }
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..read as usize]);
+        if bytes.contains(&b'\n') {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn is_root() -> bool {

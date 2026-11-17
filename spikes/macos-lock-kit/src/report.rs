@@ -32,6 +32,9 @@ pub struct Facts {
     pub otool: String,
     pub otool_checked: bool,
     pub root: bool,
+    pub session_lock_check: String,
+    pub session_lock_key_present: bool,
+    pub session_lock_key_false: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -44,10 +47,12 @@ pub struct ExerciseRecord {
     pub ms_until_locked: Option<u64>,
     pub lock_screen_appeared: String,
     pub external_display_covered: String,
-    pub input_reached_desktop_without_password: String,
+    pub input_reached_desktop_without_login: String,
     pub state: String,
     pub result: String,
     pub fail_closed: String,
+    pub lock_check: String,
+    pub helper_end: String,
     pub detail: String,
 }
 
@@ -62,10 +67,12 @@ impl ExerciseRecord {
             ms_until_locked: None,
             lock_screen_appeared: "not-asked".to_string(),
             external_display_covered: "not-asked".to_string(),
-            input_reached_desktop_without_password: "not-asked".to_string(),
+            input_reached_desktop_without_login: "not-asked".to_string(),
             state: "never-unlocked".to_string(),
             result: "recorded-miss".to_string(),
             fail_closed: "not-needed".to_string(),
+            lock_check: "not-checked".to_string(),
+            helper_end: "not-armed".to_string(),
             detail: String::new(),
         }
     }
@@ -85,9 +92,9 @@ pub struct KitReport {
     pub documented_engine: String,
     pub documented_started_ms: Option<u64>,
     pub screen_saver_engine_present: bool,
-    pub immediate_password: bool,
-    pub ask_for_password: String,
-    pub ask_for_password_delay: String,
+    pub immediate_lock_required: bool,
+    pub ask_for_lock: String,
+    pub ask_for_lock_delay: String,
     pub screen_lock_status: String,
     pub screen_lock_detail: String,
     pub screen_lock_disagreement: bool,
@@ -118,7 +125,12 @@ pub struct KitReport {
     pub ms_until_locked: Option<u64>,
     pub lock_screen_appeared: String,
     pub external_display_covered: String,
-    pub input_reached_desktop_without_password: String,
+    pub input_reached_desktop_without_login: String,
+    pub session_lock_check: String,
+    pub session_lock_key_present: bool,
+    pub session_lock_key_false: bool,
+    pub lock_check: String,
+    pub helper_end: String,
     pub fail_closed: String,
     pub missing_symbol_ci_test: String,
     pub hardware_only: String,
@@ -161,6 +173,8 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
         arm,
         until_locked,
         external_display,
+        lock_check,
+        helper_end,
     ) = match exercise {
         None => (
             "read-only".to_string(),
@@ -177,6 +191,8 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
             "not-applied".to_string(),
             None,
             "not-asked".to_string(),
+            "not-checked".to_string(),
+            "not-armed".to_string(),
         ),
         Some(record) => (
             format!("exercise-{}", record.which),
@@ -187,12 +203,14 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
             record.documented_path.clone(),
             record.documented_started_ms,
             record.lock_screen_appeared.clone(),
-            record.input_reached_desktop_without_password.clone(),
+            record.input_reached_desktop_without_login.clone(),
             record.fail_closed.clone(),
             sanitize(&record.detail),
             exercise_arm(record, symbol, immediate),
             record.ms_until_locked,
             record.external_display_covered.clone(),
+            record.lock_check.clone(),
+            record.helper_end.clone(),
         ),
     };
     KitReport {
@@ -211,9 +229,9 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
             .unwrap_or_else(|| "missing".to_string()),
         documented_started_ms: documented_ms,
         screen_saver_engine_present: facts.engine_path.is_some(),
-        immediate_password: immediate,
-        ask_for_password: preference_label(ask.ask),
-        ask_for_password_delay: preference_label(ask.delay_seconds),
+        immediate_lock_required: immediate,
+        ask_for_lock: preference_label(ask.ask),
+        ask_for_lock_delay: preference_label(ask.delay_seconds),
         screen_lock_status: screen.as_str().to_string(),
         screen_lock_detail: command_body(&facts.screen_lock),
         screen_lock_disagreement: setting.disagreement,
@@ -244,7 +262,12 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
         ms_until_locked: until_locked,
         lock_screen_appeared: appeared,
         external_display_covered: external_display,
-        input_reached_desktop_without_password: input,
+        input_reached_desktop_without_login: input,
+        session_lock_check: facts.session_lock_check.clone(),
+        session_lock_key_present: facts.session_lock_key_present,
+        session_lock_key_false: facts.session_lock_key_false,
+        lock_check,
+        helper_end,
         fail_closed,
         missing_symbol_ci_test: MISSING_SYMBOL_CI_TEST.to_string(),
         hardware_only: HARDWARE_ONLY.to_string(),
@@ -259,15 +282,14 @@ fn exercise_arm(record: &ExerciseRecord, symbol: bool, immediate: bool) -> Strin
     if record.result == "refuse" {
         return LockArm::RefuseToArm.as_str().to_string();
     }
-    if record.private_call == "returned" && record.documented_path == "not-started" {
+    let confirmed = record.state == "os-locked";
+    if confirmed && record.private_call == "returned" && record.documented_path == "not-started" {
         return LockArm::PrivateCall.as_str().to_string();
     }
-    if record.documented_path == "started" {
+    if confirmed && record.documented_path == "started" {
         return LockArm::DocumentedPath.as_str().to_string();
     }
-    choose(symbol, record.private_call == "returned", immediate)
-        .as_str()
-        .to_string()
+    choose(symbol, false, immediate).as_str().to_string()
 }
 
 pub fn safety_violation(report: &KitReport) -> Option<&'static str> {
@@ -336,13 +358,13 @@ pub fn render(report: &KitReport) -> String {
         "screen-saver-engine-present",
         report.screen_saver_engine_present,
     );
-    push_bool(&mut lines, "immediate-password", report.immediate_password);
-    push(&mut lines, "ask-for-password", &report.ask_for_password);
-    push(
+    push_bool(
         &mut lines,
-        "ask-for-password-delay",
-        &report.ask_for_password_delay,
+        "immediate-lock-required",
+        report.immediate_lock_required,
     );
+    push(&mut lines, "ask-for-lock", &report.ask_for_lock);
+    push(&mut lines, "ask-for-lock-delay", &report.ask_for_lock_delay);
     push(&mut lines, "screen-lock-status", &report.screen_lock_status);
     push(&mut lines, "screen-lock-detail", &report.screen_lock_detail);
     push_bool(
@@ -408,6 +430,19 @@ pub fn render(report: &KitReport) -> String {
     push(&mut lines, "build-version", &report.build_version);
     push(&mut lines, "uname-m", &report.uname_m);
     push(&mut lines, "hw-model", &report.hw_model);
+    push(&mut lines, "session-lock-check", &report.session_lock_check);
+    push_bool(
+        &mut lines,
+        "session-lock-key-present",
+        report.session_lock_key_present,
+    );
+    push_bool(
+        &mut lines,
+        "session-lock-key-false",
+        report.session_lock_key_false,
+    );
+    push(&mut lines, "lock-check", &report.lock_check);
+    push(&mut lines, "helper-end", &report.helper_end);
     push_opt(&mut lines, "ms-until-locked", report.ms_until_locked);
     push(
         &mut lines,
@@ -421,8 +456,8 @@ pub fn render(report: &KitReport) -> String {
     );
     push(
         &mut lines,
-        "input-reached-desktop-without-password",
-        &report.input_reached_desktop_without_password,
+        "input-reached-desktop-without-login",
+        &report.input_reached_desktop_without_login,
     );
     push(&mut lines, "fail-closed", &report.fail_closed);
     push(
@@ -542,6 +577,9 @@ mod tests {
             otool: "/usr/lib/libSystem.B.dylib\n".to_string(),
             otool_checked: true,
             root: false,
+            session_lock_check: "available".to_string(),
+            session_lock_key_present: true,
+            session_lock_key_false: true,
         }
     }
 
@@ -562,7 +600,11 @@ mod tests {
         assert!(text.contains("runner-lock-allowed=false\n"));
         assert!(text.contains("filevault-pre-boot-observed=false\n"));
         assert!(text.contains("filevault=on\n"));
-        assert!(text.contains("immediate-password=true\n"));
+        assert!(text.contains("immediate-lock-required=true\n"));
+        assert!(text.contains("session-lock-check=available\n"));
+        assert!(text.contains("session-lock-key-present=true\n"));
+        assert!(text.contains("session-lock-key-false=true\n"));
+        assert!(text.contains("lock-check=not-checked\n"));
         assert!(text.contains("screen-lock-status=immediate\n"));
         assert!(text.contains("screen-lock-disagreement=false\n"));
         assert!(text.contains("external-display-covered=not-asked\n"));
@@ -590,7 +632,7 @@ mod tests {
         facts.hw_model = format!("Mac14,0 {}=SECRET\n", crate::redact::NEEDLES[0]);
         let report = build_report(&facts, None);
         assert!(report.serial_collected);
-        assert!(!report.immediate_password);
+        assert!(!report.immediate_lock_required);
         assert_eq!(report.chooser_if_symbol_missing, "refuse");
         assert_eq!(report.filevault, "unknown");
         assert!(safety_violation(&report).is_some());
@@ -648,7 +690,9 @@ mod tests {
             ms_until_locked: None,
             lock_screen_appeared: "not-asked".to_string(),
             external_display_covered: "not-asked".to_string(),
-            input_reached_desktop_without_password: "not-asked".to_string(),
+            input_reached_desktop_without_login: "not-asked".to_string(),
+            lock_check: "not-checked".to_string(),
+            helper_end: "not-armed".to_string(),
             state: "unlocked".to_string(),
             result: "pass".to_string(),
             fail_closed: FailClosedEnd::NeverUnlocked.as_str().to_string(),
@@ -662,5 +706,16 @@ mod tests {
         assert_eq!(miss.mode, "exercise-private");
         assert_eq!(miss.arm, "not-applied");
         assert_eq!(miss.private_call, "not-called");
+    }
+
+    #[test]
+    fn the_session_lock_key_is_a_string_not_an_exported_constant() {
+        let src = include_str!("mac/mod.rs");
+        assert!(src.contains("CFStringCreateWithCString"));
+        assert!(src.contains("\"CGSSessionScreenIsLocked\""));
+        assert!(!src.contains("kCGSSessionScreenIsLocked"));
+        let spawn = include_str!("signals.rs");
+        assert!(spawn.contains("pre_exec"));
+        assert!(spawn.contains("setsid"));
     }
 }
