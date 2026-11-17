@@ -1,4 +1,6 @@
-//! One-word physical answers.
+//! One-word physical answers. Stdin is polled so Ctrl-C does not wait for Enter.
+
+use std::os::unix::io::RawFd;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Answer {
@@ -11,6 +13,68 @@ pub enum PromptRead {
     Go,
     Skip(String),
     Stop,
+}
+
+const POLL_MS: i32 = 100;
+
+/// Poll `fd` and `read` until a line, EOF, or the interrupt flag.
+/// Rust's `read_line` retries on EINTR, so it cannot see Ctrl-C.
+pub fn read_line_interruptible(fd: RawFd, interrupted: impl Fn() -> bool) -> PromptRead {
+    if interrupted() {
+        return PromptRead::Stop;
+    }
+    let mut buf = Vec::new();
+    loop {
+        if interrupted() {
+            return PromptRead::Stop;
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, POLL_MS) };
+        if interrupted() {
+            return PromptRead::Stop;
+        }
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return PromptRead::Skip("no-input".into());
+        }
+        if ready == 0 {
+            continue;
+        }
+        let hangup = pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+        if hangup && pollfd.revents & libc::POLLIN == 0 {
+            return interpret_read(interrupted(), Ok(buf.len()), &lossy(&buf));
+        }
+        if pollfd.revents & libc::POLLIN == 0 {
+            continue;
+        }
+        let mut tmp = [0u8; 256];
+        let n = unsafe { libc::read(fd, tmp.as_mut_ptr().cast(), tmp.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return PromptRead::Skip("no-input".into());
+        }
+        if n == 0 {
+            return interpret_read(interrupted(), Ok(buf.len()), &lossy(&buf));
+        }
+        buf.extend_from_slice(&tmp[..n as usize]);
+        if buf.contains(&b'\n') {
+            return interpret_read(interrupted(), Ok(buf.len()), &lossy(&buf));
+        }
+    }
+}
+
+fn lossy(buf: &[u8]) -> String {
+    String::from_utf8_lossy(buf).into_owned()
 }
 
 /// EOF is `no-input`, not Enter. An interrupt flag or EINTR stops the suite.
@@ -51,7 +115,9 @@ pub fn parse_answer(line: &str) -> Result<Answer, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answer, PromptRead, interpret_read, parse_answer};
+    use super::{Answer, PromptRead, interpret_read, parse_answer, read_line_interruptible};
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn enter_means_go() {
@@ -79,5 +145,13 @@ mod tests {
             interpret_read(false, Err(std::io::ErrorKind::Interrupted), ""),
             PromptRead::Stop
         );
+    }
+
+    #[test]
+    fn poll_sees_the_interrupt_flag_without_enter() {
+        let flag = AtomicBool::new(true);
+        let file = std::fs::File::open("/dev/null").expect("null");
+        let decision = read_line_interruptible(file.as_raw_fd(), || flag.load(Ordering::SeqCst));
+        assert_eq!(decision, PromptRead::Stop);
     }
 }

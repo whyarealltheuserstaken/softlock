@@ -258,10 +258,11 @@ pub fn run(args: Args) -> i32 {
     }
 
     let failed = tests.iter().any(|row| row.status == "fail");
-    if failed && !is_armed() {
+    let stop = failed || interrupted();
+    if stop && !is_armed() {
         arm();
     }
-    if failed && is_armed() {
+    if stop && is_armed() {
         let _ = fail_closed_if_armed();
     } else {
         disarm();

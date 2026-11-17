@@ -1,7 +1,7 @@
 //! Batched physical rows. Skips are decided before the prompt.
 //! A step that was attempted and not seen is a failure.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::detect::DetectedConfig;
 use crate::display::{connected_names, parse_drm_dir};
 use crate::power::{parse_lid_closed_property, parse_locked_hint, parse_prepare_for_sleep};
-use crate::prompt::{PromptRead, interpret_read};
+use crate::prompt::{PromptRead, read_line_interruptible};
 use crate::report::{TestRow, empty_measurements};
 use crate::restore::{hold_sleep_inhibit, interrupted, release_sleep_inhibit};
 
@@ -44,12 +44,13 @@ pub fn precheck(id: &str, facts: &PhysicalFacts) -> Option<&'static str> {
     }
 }
 
-pub fn journalctl_since_args(since: &str) -> Vec<String> {
+/// journalctl treats a bare datetime as local time. `@<epoch>` is UTC.
+pub fn journalctl_since_args(epoch: u64) -> Vec<String> {
     vec![
         "-u".into(),
         "systemd-logind".into(),
         "--since".into(),
-        since.into(),
+        format!("@{epoch}"),
         "-o".into(),
         "cat".into(),
         "--no-pager".into(),
@@ -62,32 +63,6 @@ pub fn journal_has_power_key(text: &str) -> bool {
         line.to_ascii_lowercase().contains("power key")
             || parse_prepare_for_sleep(line) == Some(true)
     })
-}
-
-pub fn format_utc(secs: u64) -> String {
-    let days = secs / 86_400;
-    let tod = secs % 86_400;
-    let hour = tod / 3_600;
-    let min = (tod % 3_600) / 60;
-    let sec = tod % 60;
-    let (year, month, day) = civil_from_days(days as i64);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02}")
-}
-
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    if month <= 2 {
-        year += 1;
-    }
-    (year as i32, month as u32, day as u32)
 }
 
 pub fn lock_session_args(session: &str) -> Vec<String> {
@@ -155,16 +130,14 @@ pub fn run_batch(config: &DetectedConfig, ask: bool) -> Vec<TestRow> {
             }
             PromptRead::Go => {
                 let started = Instant::now();
-                let since = format_utc(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                );
+                let since = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 let result = match kind {
                     Step::Lid => detect_lid(),
                     Step::Hotplug => detect_hotplug(),
-                    Step::Power => detect_power(&since),
+                    Step::Power => detect_power(since),
                     Step::Unlock => detect_unlock(facts.session_id.as_deref().unwrap_or("")),
                 };
                 release_sleep_inhibit();
@@ -223,13 +196,7 @@ fn read_prompt(prompt: &str) -> PromptRead {
     }
     eprint!("{prompt}: ");
     let _ = io::stderr().flush();
-    let mut line = String::new();
-    let read = io::stdin().lock().read_line(&mut line);
-    let kind = match &read {
-        Ok(n) => Ok(*n),
-        Err(err) => Err(err.kind()),
-    };
-    let decision = interpret_read(interrupted(), kind, &line);
+    let decision = read_line_interruptible(libc::STDIN_FILENO, interrupted);
     if decision == PromptRead::Stop {
         crate::restore::INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -274,7 +241,7 @@ fn detect_hotplug() -> Result<String, String> {
     Err("no DRM connector change".into())
 }
 
-fn detect_power(since: &str) -> Result<String, String> {
+fn detect_power(since: u64) -> Result<String, String> {
     let pid = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
     let (tx, rx) = mpsc::channel();
     let watch = pid.clone();
@@ -432,7 +399,7 @@ fn skipped(id: &str, name: &str, reason: &str, detail: &str) -> TestRow {
 #[cfg(test)]
 mod tests {
     use super::{
-        PhysicalFacts, format_utc, journal_has_power_key, journalctl_since_args, lock_session_args,
+        PhysicalFacts, journal_has_power_key, journalctl_since_args, lock_session_args,
         locked_hint_args, precheck,
     };
     use crate::report::TestRow;
@@ -486,17 +453,25 @@ mod tests {
     }
 
     #[test]
-    fn journal_since_ignores_an_old_cursor() {
-        let args = journalctl_since_args("2026-11-17 18:00:00");
-        assert!(
+    fn journal_since_is_unix_epoch() {
+        let args = journalctl_since_args(1_763_402_400);
+        assert_eq!(
             args.windows(2)
-                .any(|w| w[0] == "--since" && w[1] == "2026-11-17 18:00:00")
+                .find(|w| w[0] == "--since")
+                .map(|w| w[1].as_str()),
+            Some("@1763402400")
         );
+        assert!(!args.iter().any(|arg| arg.contains(' ')));
         assert!(!args.iter().any(|arg| arg == "-n"));
         assert!(!journal_has_power_key(""));
         assert!(journal_has_power_key("Power key pressed\n"));
         assert!(journal_has_power_key("PrepareForSleep boolean true\n"));
         assert!(!journal_has_power_key("System resumed.\n"));
+    }
+
+    #[test]
+    fn journal_since_epoch_zero_is_at_sign() {
+        assert_eq!(journalctl_since_args(0)[3], "@0");
     }
 
     #[test]
@@ -509,10 +484,5 @@ mod tests {
         assert_eq!(hint[0], "show-session");
         assert_eq!(hint[1], "7");
         assert_eq!(hint[2], "--property=LockedHint");
-    }
-
-    #[test]
-    fn utc_epoch_is_1970() {
-        assert_eq!(format_utc(0), "1970-01-01 00:00:00");
     }
 }
