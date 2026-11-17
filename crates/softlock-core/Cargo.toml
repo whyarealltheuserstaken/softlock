@@ -56,4 +56,7 @@ name = "macos_spike_isolation"
 name = "macos_keep_awake_isolation"
 
 [[test]]
+name = "macos_lock_kit"
+
+[[test]]
 name = "universal_ci"

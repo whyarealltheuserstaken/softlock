@@ -1,0 +1,132 @@
+name: macOS lock kit
+
+# Read-only. The desktop spike did not show that a runner comes back after a lock,
+# so this job must not lock the session.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'spikes/macos-lock-kit/**'
+      - 'crates/softlock-macos/**'
+      - '.github/workflows/macos-lock-kit.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-lock-kit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  read-only:
+    name: macos lock kit read-only
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: spikes/macos-lock-kit -> spikes/macos-lock-kit/target
+      - name: Record the runner
+        run: |
+          sw_vers
+          uname -m
+          echo "uid=$(id -u)"
+      - name: Format
+        run: cargo fmt --manifest-path spikes/macos-lock-kit/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path spikes/macos-lock-kit/Cargo.toml --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --manifest-path spikes/macos-lock-kit/Cargo.toml
+      - name: Read-only kit
+        run: |
+          set -euo pipefail
+          mkdir -p lock-kit-output
+          cargo run --release --manifest-path spikes/macos-lock-kit/Cargo.toml -- --read-only --output-dir lock-kit-output | tee lock-kit-output/stdout.txt
+          grep -F "result=pass" lock-kit-output/stdout.txt
+          grep -F "mode=read-only" lock-kit-output/stdout.txt
+          grep -F "private-call=not-called" lock-kit-output/stdout.txt
+          grep -F "documented-path=not-started" lock-kit-output/stdout.txt
+          grep -F "state=never-unlocked" lock-kit-output/stdout.txt
+          grep -F "serial-collected=false" lock-kit-output/stdout.txt
+          grep -F "settings-changed=false" lock-kit-output/stdout.txt
+          grep -F "filevault-changed=false" lock-kit-output/stdout.txt
+          grep -F "linked-login-framework=false" lock-kit-output/stdout.txt
+          grep -F "otool-checked=true" lock-kit-output/stdout.txt
+          grep -F "uid-is-root=false" lock-kit-output/stdout.txt
+          grep -F "runner-lock-allowed=false" lock-kit-output/stdout.txt
+          grep -F "filevault-pre-boot-observed=false" lock-kit-output/stdout.txt
+          grep -F "uname-m=arm64" lock-kit-output/stdout.txt
+          grep -E "private-symbol=(present|missing)" lock-kit-output/stdout.txt
+          grep -E "^fdesetup-status=" lock-kit-output/stdout.txt
+          grep -E "^fdesetup-isactive=" lock-kit-output/stdout.txt
+          grep -E "^screen-lock-status=(immediate|off|delayed|unavailable)$" lock-kit-output/stdout.txt
+          grep -E "^screen-lock-disagreement=(true|false)$" lock-kit-output/stdout.txt
+          grep -F "external-display-covered=not-asked" lock-kit-output/stdout.txt
+          grep -Fx "session-lock-check=available" lock-kit-output/stdout.txt
+          if grep -E "private-call=(returned|failed|still-running)" lock-kit-output/stdout.txt; then
+            echo "read-only run invoked the private call"
+            exit 1
+          fi
+          if grep -E "documented-path=(started|failed)" lock-kit-output/stdout.txt; then
+            echo "read-only run started the screen saver"
+            exit 1
+          fi
+          if grep -F "state=unlocked" lock-kit-output/stdout.txt; then
+            echo "read-only run reported unlocked"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("lock-kit-output/result.json").read_text())
+          assert report["mode"] == "read-only"
+          assert report["private-call"] == "not-called"
+          assert report["documented-path"] == "not-started"
+          assert report["state"] == "never-unlocked"
+          assert report["serial-collected"] is False
+          assert report["settings-changed"] is False
+          assert report["filevault-changed"] is False
+          assert report["linked-login-framework"] is False
+          assert report["runner-lock-allowed"] is False
+          assert report["filevault-pre-boot-observed"] is False
+          assert report["uname-m"] == "arm64"
+          assert report["result"] == "pass"
+          assert report["external-display-covered"] == "not-asked"
+          assert report["ms-until-locked"] is None
+          assert report["screen-lock-status"] in {"immediate", "off", "delayed", "unavailable"}
+          assert report["session-lock-check"] == "available"
+          assert isinstance(report["session-lock-key-present"], bool)
+          assert isinstance(report["session-lock-key-false"], bool)
+          symbol = report["private-symbol"] == "present"
+          immediate = report["immediate-lock-required"] is True
+          def choose(symbol_present, call_succeeded, immediate_password):
+              if call_succeeded:
+                  return "private" if symbol_present else "refuse"
+              return "documented" if immediate_password else "refuse"
+          assert report["chooser-if-symbol-missing"] == choose(False, False, immediate)
+          assert report["chooser-if-call-failed"] == choose(symbol, False, immediate)
+          assert report["chooser-if-call-succeeded"] == choose(symbol, True, immediate)
+          if report["screen-lock-disagreement"]:
+              assert report["immediate-lock-required"] is False
+          text = Path("lock-kit-output/stdout.txt").read_text()
+          body = text + Path("lock-kit-output/result.json").read_text()
+          for banned in (
+              "IOPlatformSerialNumber",
+              "IOPlatformUUID",
+              "Serial Number",
+              "hw.serialnumber",
+              "/Users/",
+              "/home/",
+              "@",
+              "ComputerName",
+              "AppleID",
+              "system_profiler",
+          ):
+              if banned in body:
+                  raise SystemExit(banned)
+          PY

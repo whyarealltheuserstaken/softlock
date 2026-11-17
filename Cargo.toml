@@ -16,6 +16,7 @@ exclude = [
     "spikes/input-hook",
     "spikes/macos-desktop-proof",
     "spikes/macos-keep-awake",
+    "spikes/macos-lock-kit",
 ]
 
 [workspace.package]
