@@ -11,6 +11,7 @@
 //! integrity and has no linked token. This dev launch installs the hooks in
 //! the calling process. Ticket 13 is the SYSTEM-in-session launch.
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -310,7 +311,16 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     catch_hook(|| unsafe { keyboard_event(code, wparam, lparam) })
 }
 
+thread_local! {
+    static IN_HOOK_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn in_hook_callback() -> bool {
+    IN_HOOK_CALLBACK.with(|flag| flag.get())
+}
+
 fn catch_hook(run: impl FnOnce() -> LRESULT) -> LRESULT {
+    IN_HOOK_CALLBACK.with(|flag| flag.set(true));
     let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
             Ok(result) => result,
@@ -322,6 +332,7 @@ fn catch_hook(run: impl FnOnce() -> LRESULT) -> LRESULT {
             }
         }
     }));
+    IN_HOOK_CALLBACK.with(|flag| flag.set(false));
     match outer {
         Ok(result) => result,
         Err(payload) => {

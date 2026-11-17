@@ -697,6 +697,30 @@ fn host_panic_hook(shared: &Shared, info: &std::panic::PanicHookInfo) {
             .panic_hook_on_hook_thread
             .store(true, Ordering::Release);
     }
+    // OS lock before any join. `remove` joins the hook thread, and this hook
+    // is that thread when a callback panics. Unhooking from inside the
+    // callback also leaves SendInput broken, so the callback path only asks
+    // the hook thread to exit after it returns.
+    let _ = failclosed::lock_or_disconnect(failclosed::console_session());
+    if guard::in_hook_callback() {
+        shared.stop.store(true, Ordering::Release);
+        let thread_id = shared.hook_thread_id.load(Ordering::Acquire);
+        if thread_id != 0 {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                    thread_id,
+                    windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+        }
+        if shared.pipe_mode.load(Ordering::Acquire) {
+            publish(shared, PipeReport::GuardDown);
+            std::process::exit(1);
+        }
+        return;
+    }
     emergency(shared);
     if shared.pipe_mode.load(Ordering::Acquire) {
         publish(shared, PipeReport::GuardDown);

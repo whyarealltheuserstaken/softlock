@@ -12,6 +12,8 @@
 
 #[cfg(feature = "simulated-physical")]
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "simulated-physical")]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -65,22 +67,30 @@ const IMPOSTOR_NONCE: u64 = 0x51F7_10C5_A11E_0002;
 use super::session::Shared;
 use crate::real_lock::{RealLock, decide};
 
+/// Last stub seen by a test build. A panic can clear the installed session
+/// before a second lock attempt. The default is failure, so that attempt
+/// cannot call `LockWorkStation` and lock the runner.
+#[cfg(feature = "simulated-physical")]
+static OS_LOCK_STUB: AtomicU8 = AtomicU8::new(1);
+
 pub(crate) fn lock_or_disconnect(session: u32) -> RealLock {
     note_os_lock_attempt();
+    let mut stub = os_lock_stub_fallback();
     if let Some(shared) = super::session::installed_session() {
         shared
             .os_lock_attempts
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        match shared
+        stub = shared
             .os_lock_stub
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            0 => {}
-            // Confirmed workstation lock, without calling Windows.
-            2 => return decide(true, false),
-            // The Windows calls are not made. Neither path confirmed.
-            _ => return decide(false, false),
-        }
+            .load(std::sync::atomic::Ordering::Acquire);
+        remember_os_lock_stub(stub);
+    }
+    match stub {
+        0 => {}
+        // Confirmed workstation lock, without calling Windows.
+        2 => return decide(true, false),
+        // The Windows calls are not made. Neither path confirmed.
+        _ => return decide(false, false),
     }
     let _ = unsafe { LockWorkStation() };
     let session = if session == u32::MAX {
@@ -109,6 +119,26 @@ pub fn current_session_id() -> Option<u32> {
 
 pub(crate) fn console_session() -> u32 {
     unsafe { WTSGetActiveConsoleSessionId() }
+}
+
+fn os_lock_stub_fallback() -> u8 {
+    #[cfg(feature = "simulated-physical")]
+    {
+        OS_LOCK_STUB.load(Ordering::Acquire)
+    }
+    #[cfg(not(feature = "simulated-physical"))]
+    {
+        0
+    }
+}
+
+fn remember_os_lock_stub(stub: u8) {
+    #[cfg(feature = "simulated-physical")]
+    OS_LOCK_STUB.store(stub, Ordering::Release);
+    #[cfg(not(feature = "simulated-physical"))]
+    {
+        let _ = stub;
+    }
 }
 
 fn note_os_lock_attempt() {
