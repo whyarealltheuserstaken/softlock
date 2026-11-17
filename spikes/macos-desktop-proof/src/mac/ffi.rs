@@ -4,10 +4,11 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
 use crate::classify::{disable_event_name, fail_closed_end};
+use crate::labels::SCREEN_CAPTURE_ENTRY;
 use crate::report::{
-    CaptureReport, ClassifyReport, MarkerObservation, PostedObservation, SlowObservation, TapBits,
-    TapReport, WindowReport, active_tap, capture_detail, capture_opened, capture_unavailable,
-    prompt_token, tap_from_bits,
+    CaptureReport, ClassifyReport, MarkerObservation, PostedObservation, SharingWindowReport,
+    SlowObservation, TapBits, TapReport, WindowReport, active_tap, capture_detail, capture_opened,
+    capture_unavailable, prompt_token, tap_from_bits,
 };
 
 #[repr(C)]
@@ -37,6 +38,7 @@ struct CaptureOut {
     height: i32,
     nonblack: i32,
     marker: i32,
+    control: i32,
     prompt: i32,
     detail: [u8; 768],
 }
@@ -97,8 +99,36 @@ struct M03Out {
     error: [u8; 512],
 }
 
+#[repr(C)]
+struct SharingWindowOut {
+    ordered_front: i32,
+    ignores_mouse_events: i32,
+    shielding_called: i32,
+    window_area: i32,
+    level: [u8; 64],
+    collection: [u8; 128],
+    sharing_default: [u8; 64],
+    display_image_api: [u8; 128],
+    error: [u8; 768],
+}
+
+#[repr(C)]
+struct SharingPresenceOut {
+    visible: i32,
+    occlusion: i32,
+    listed: i32,
+    detail: [u8; 256],
+}
+
 unsafe extern "C" {
     fn macos_window_open(out: *mut WindowOut) -> i32;
+    fn macos_sharing_open(out: *mut SharingWindowOut) -> i32;
+    fn macos_sharing_set_none(buf: *mut c_char, len: usize) -> i32;
+    fn macos_sharing_control_open() -> i32;
+    fn macos_sharing_presence(out: *mut SharingPresenceOut) -> i32;
+    fn macos_sharing_order_out() -> i32;
+    fn macos_sharing_close() -> i32;
+    fn macos_prove_sc_stream(out: *mut CaptureOut) -> i32;
     fn macos_window_close() -> i32;
     fn macos_prove_window(out: *mut WindowOut) -> i32;
     fn macos_prove_tap(location: *const c_char, out: *mut TapOut) -> i32;
@@ -106,7 +136,12 @@ unsafe extern "C" {
     fn macos_prove_cg_window_list(out: *mut CaptureOut) -> i32;
     fn macos_prove_cg_display(out: *mut CaptureOut) -> i32;
     fn macos_prove_screen_capture_kit(out: *mut CaptureOut) -> i32;
-    fn macos_inspect_png(path: *const c_char, nonblack: *mut i32, marker: *mut i32) -> i32;
+    fn macos_inspect_png(
+        path: *const c_char,
+        nonblack: *mut i32,
+        marker: *mut i32,
+        control: *mut i32,
+    ) -> i32;
     fn macos_prompt_code() -> i32;
     fn macos_session_info(out: *mut SessionOut) -> i32;
     fn macos_classify_post(source: *const c_char, dir: *const c_char) -> i32;
@@ -133,6 +168,92 @@ pub fn window_open() -> WindowReport {
 
 pub fn window_close() {
     unsafe { macos_window_close() };
+}
+
+pub fn sharing_open() -> SharingWindowReport {
+    let mut out = SharingWindowOut {
+        ordered_front: 0,
+        ignores_mouse_events: 0,
+        shielding_called: 0,
+        window_area: 0,
+        level: [0; 64],
+        collection: [0; 128],
+        sharing_default: [0; 64],
+        display_image_api: [0; 128],
+        error: [0; 768],
+    };
+    let rc = unsafe { macos_sharing_open(&mut out) };
+    let error = text(&out.error);
+    SharingWindowReport {
+        ordered_front: out.ordered_front != 0,
+        level: text(&out.level),
+        collection: text(&out.collection),
+        ignores_mouse_events: out.ignores_mouse_events != 0,
+        shielding_called: out.shielding_called != 0,
+        sharing_default: text(&out.sharing_default),
+        sharing_none: String::new(),
+        window_area: out.window_area,
+        visible_after_none: false,
+        occlusion_after_none: false,
+        listed_on_screen: false,
+        display_image_api: text(&out.display_image_api),
+        screen_capture_entry: SCREEN_CAPTURE_ENTRY.to_string(),
+        error: if rc != 0 {
+            Some("NSWindow sharing probe was not called".to_string())
+        } else if error.is_empty() {
+            None
+        } else {
+            Some(error)
+        },
+    }
+}
+
+pub fn sharing_set_none() -> String {
+    let mut buf = [0u8; 64];
+    let rc = unsafe { macos_sharing_set_none(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    text(&buf)
+}
+
+pub struct SharingPresence {
+    pub visible: bool,
+    pub occlusion: bool,
+    pub listed: bool,
+    pub detail: String,
+}
+
+pub fn sharing_control_open() -> bool {
+    unsafe { macos_sharing_control_open() == 0 }
+}
+
+pub fn sharing_presence() -> SharingPresence {
+    let mut out = SharingPresenceOut {
+        visible: 0,
+        occlusion: 0,
+        listed: 0,
+        detail: [0; 256],
+    };
+    let rc = unsafe { macos_sharing_presence(&mut out) };
+    SharingPresence {
+        visible: out.visible != 0,
+        occlusion: out.occlusion != 0,
+        listed: out.listed != 0,
+        detail: if rc != 0 {
+            "NSWindow presence was not called".to_string()
+        } else {
+            text(&out.detail)
+        },
+    }
+}
+
+pub fn sharing_order_out() {
+    unsafe { macos_sharing_order_out() };
+}
+
+pub fn sharing_close() {
+    unsafe { macos_sharing_close() };
 }
 
 fn window_from_out(rc: i32, out: &WindowOut) -> WindowReport {
@@ -251,17 +372,22 @@ pub fn prove_screen_capture_kit() -> CaptureReport {
     map_capture("ScreenCaptureKit", macos_prove_screen_capture_kit)
 }
 
-pub fn inspect_png(path: &std::path::Path) -> Option<(i32, i32)> {
+pub fn prove_sc_stream() -> CaptureReport {
+    map_capture("SCStream", macos_prove_sc_stream)
+}
+
+pub fn inspect_png(path: &std::path::Path) -> Option<(i32, i32, i32)> {
     let Ok(path) = CString::new(path.to_string_lossy().as_bytes()) else {
         return None;
     };
     let mut nonblack = -1;
     let mut marker = -1;
-    let rc = unsafe { macos_inspect_png(path.as_ptr(), &mut nonblack, &mut marker) };
-    if rc != 0 || nonblack < 0 || marker < 0 {
+    let mut control = -1;
+    let rc = unsafe { macos_inspect_png(path.as_ptr(), &mut nonblack, &mut marker, &mut control) };
+    if rc != 0 || nonblack < 0 || marker < 0 || control < 0 {
         None
     } else {
-        Some((nonblack, marker))
+        Some((nonblack, marker, control))
     }
 }
 
@@ -304,7 +430,11 @@ fn map_capture(api: &str, prove: unsafe extern "C" fn(*mut CaptureOut) -> i32) -
             report.marker_pixels = None;
             return report;
         }
-        return capture_opened(api, out.width, out.height, out.nonblack, out.marker);
+        let mut report = capture_opened(api, out.width, out.height, out.nonblack, out.marker);
+        if out.control >= 0 {
+            report.control_pixels = Some(out.control);
+        }
+        return report;
     }
     let detail = text(&out.detail);
     let detail = if detail.is_empty() {
@@ -374,6 +504,7 @@ fn zero_capture() -> CaptureOut {
         height: 0,
         nonblack: -1,
         marker: -1,
+        control: -1,
         prompt: 0,
         detail: [0; 768],
     }

@@ -55,6 +55,11 @@ jobs:
           grep -E '^slow .* reenabled=false error=none$' "$log"
           grep -E '^marker .* dead-within-1s=true healthy-within-heartbeat=true reenabled=false error=none$' "$log"
           grep -E '^fail-closed=Locked$' "$log"
+          grep -Fx 'sharing-m14-CGWindowListCreateImage=do-not-claim removed=true' "$log"
+          grep -Fx 'sharing-m14-CGDisplayCreateImage=do-not-claim removed=true' "$log"
+          grep -Fx 'sharing-m14-screencapture=do-not-claim removed=true' "$log"
+          grep -Fx 'sharing-m14-ScreenCaptureKit=do-not-claim removed=true' "$log"
+          grep -Fx 'sharing-m14-SCStream=do-not-claim removed=true' "$log"
           grep -E '^result=pass$' "$log"
           test "$(grep -cE '^post .* tap-saw=true .* error=none$' "$log")" -eq 6
           ! grep -E 'tap-saw=false|^m03=no-tap' "$log"

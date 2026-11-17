@@ -111,7 +111,7 @@ The daemon is root and has no graphic session, so it did not create a window. A 
 ## Which later tickets stay on the runner
 
 - **m03** stays for the taps this log created. The listen-only session tap, the user HID tap, the root HID tap, and one active `kCGEventTapOptionDefault` session tap all came up. A listen-only tap saw keyCode 0 when no Default tap was installed. The active tap then deleted keyCode 0 and the listen-only tap did not see it. `accessibility=true` is pre-granted on this runner and says nothing about the TCC prompts on Henry's Mac (m10).
-- **m04** stays for this one 1024x768 display only as a positive capture. All four paths showed non-black pixels and the marker colour. Capture exclusion was not tested. A second monitor is not present.
+- **m04** stays on this runner for the one 1024x768 display. The positive capture above is the control. The sharing-type measurement is `docs/findings/m04-sharingtype-none.md`. A second monitor is not present.
 - **m07** moves entirely to Henry's Intel Mac. The runner has no lid, no App Nap from a closed lid, and no real idle the way a laptop does.
 - **m08** keeps its chooser rows on the existing verify job. Those rows are a pure function and do not lock. The sheet (lock timing, the screensaver, FileVault, and the password after the screensaver) is Henry's Mac. This spike did not lock the runner.
 - **m11** runs on GitHub `macos-15-intel` and `macos-26-intel` (still listed on the hosted-runners page on 16 November 2026), downloading the fat binaries m01 uploaded. This m02 run is arm64. A Rosetta run on this runner is not the x86_64 slice test. CI is the primary m11 evidence. His Intel Mac stays as an optional kit.
@@ -129,4 +129,4 @@ On that Mac:
 - m08: the lock sheet, the screensaver, and FileVault.
 - m11: optional `--smoke` of the same fat probe on this machine.
 - m15: a product LaunchAgent in the Aqua session, and locking from a second process.
-- m04: capture exclusion, which this runner did not test, and a second display if one is attached. The runner only showed the positive capture on 1024x768.
+- m06: the same marker counts on his OS, and a second display if one is attached. The runner only has the one 1024x768 display measured in `docs/findings/m04-sharingtype-none.md`.
