@@ -19,8 +19,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HLOCAL, HWND, INVALID_HANDLE_VALUE,
-    LocalFree, STILL_ACTIVE, WAIT_OBJECT_0,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS, GetLastError,
+    HANDLE, HLOCAL, HWND, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, SetLastError,
+    WAIT_OBJECT_0, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
@@ -68,6 +69,9 @@ static DEAD_PID: AtomicU32 = AtomicU32::new(0);
 /// The dead PID was passed to `trust_new_process` after the handle was dropped.
 #[cfg(feature = "simulated-physical")]
 static REOPENED_DEAD_PID: AtomicBool = AtomicBool::new(false);
+/// Why the last armed-event check failed. 1 open, 2 dacl, 3 signal.
+#[cfg(feature = "simulated-physical")]
+static EVENT_FAIL: AtomicU8 = AtomicU8::new(0);
 const ARMED_SLOT_BYTES: usize = 16;
 
 use super::session::Shared;
@@ -422,6 +426,9 @@ fn create_armed_event(nonce: u64) -> Option<HANDLE> {
         bInheritHandle: false.into(),
     };
     let name = armed_event_name(nonce);
+    // CreateEvent leaves the previous error in place when it creates a new
+    // object. Clear it so a stale ERROR_ALREADY_EXISTS cannot refuse publish.
+    unsafe { SetLastError(WIN32_ERROR(0)) };
     let event = unsafe { CreateEventW(Some(&sa), true, false, PCWSTR(name.as_ptr())) };
     // Captured before any other call. An existing object may be a squatter.
     let already = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
@@ -438,13 +445,64 @@ fn confirmed_event(nonce: u64) -> Option<HANDLE> {
     if nonce == 0 {
         return None;
     }
+    // This host already holds the event it published. Re-opening by name can
+    // fail even for the creator; the held handle is the one that was signaled.
+    if nonce == PUBLISHED_NONCE.load(Ordering::Acquire) {
+        let raw = ARMED_EVENT.load(Ordering::Acquire);
+        if raw.is_null() {
+            note_event_fail(1);
+            return None;
+        }
+        let event = HANDLE(raw);
+        if !mapping_is_system_only(event) {
+            note_event_fail(2);
+            return None;
+        }
+        if !event_is_signaled(event) {
+            note_event_fail(3);
+            return None;
+        }
+        return duplicate_handle(event);
+    }
     let name = armed_event_name(nonce);
-    let event = unsafe { OpenEventW(EVENT_ALL_ACCESS, false, PCWSTR(name.as_ptr())) }.ok()?;
-    if !mapping_is_system_only(event) || !event_is_signaled(event) {
+    let Ok(event) = (unsafe { OpenEventW(EVENT_ALL_ACCESS, false, PCWSTR(name.as_ptr())) }) else {
+        note_event_fail(1);
+        return None;
+    };
+    if !mapping_is_system_only(event) {
         close_handle(event);
+        note_event_fail(2);
+        return None;
+    }
+    if !event_is_signaled(event) {
+        close_handle(event);
+        note_event_fail(3);
         return None;
     }
     Some(event)
+}
+
+fn note_event_fail(code: u8) {
+    #[cfg(feature = "simulated-physical")]
+    EVENT_FAIL.store(code, Ordering::Release);
+    let _ = code;
+}
+
+fn duplicate_handle(handle: HANDLE) -> Option<HANDLE> {
+    let mut target = HANDLE::default();
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut target,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+        .ok()?;
+    }
+    Some(target)
 }
 
 fn event_is_signaled(event: HANDLE) -> bool {
@@ -548,13 +606,13 @@ fn impostor_case() -> ImpostorCase {
 #[cfg(feature = "simulated-physical")]
 fn judge_impostor_pid(spawn_other_path: bool) -> bool {
     let Some(nonce) = published_nonce() else {
-        note_impostor("reason=event");
+        note_impostor(event_witness());
         return false;
     };
     let mut creator: Option<HANDLE> = None;
     let pid = if spawn_other_path {
         let Some((process, pid)) = other_path_process() else {
-            note_impostor("reason=event");
+            note_impostor("reason=setup");
             return false;
         };
         creator = Some(process);
@@ -580,8 +638,8 @@ fn judge_impostor_pid(spawn_other_path: bool) -> bool {
         Ok(()) => "released",
         Err(ArmReject::Token) => "reason=token",
         Err(ArmReject::Path) => "reason=path",
-        Err(ArmReject::Event) => "reason=event",
-        Err(ArmReject::Inactive) => "reason=event",
+        Err(ArmReject::Event) => event_witness(),
+        Err(ArmReject::Inactive) => "reason=inactive",
     };
     note_impostor(reason);
     false
@@ -605,6 +663,16 @@ fn note_impostor(text: &str) {
         return;
     };
     let _ = std::fs::write(path, text);
+}
+
+#[cfg(feature = "simulated-physical")]
+fn event_witness() -> &'static str {
+    match EVENT_FAIL.load(Ordering::Acquire) {
+        1 => "reason=event-open",
+        2 => "reason=event-dacl",
+        3 => "reason=event-signal",
+        _ => "reason=event",
+    }
 }
 
 #[cfg(feature = "simulated-physical")]
@@ -634,7 +702,7 @@ fn prepare_reuse_fixture() {
         note_reuse_file(match reject {
             ArmReject::Token => "reason=token",
             ArmReject::Path => "reason=path",
-            ArmReject::Event => "reason=event",
+            ArmReject::Event => event_witness(),
             ArmReject::Inactive => "reason=inactive",
         });
         terminate_handle(process);

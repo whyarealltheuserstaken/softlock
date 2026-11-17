@@ -593,9 +593,9 @@ fn impostor_process_holds() {
 
 #[test]
 fn impostor_pid_does_not_release_the_guard() {
-    // The renamed copy is not SYSTEM. The host's own armed event is signaled,
-    // so this passes only when the token check is what rejects.
-    impostor_case("token", "reason=token", true);
+    // The renamed copy is not SYSTEM. The host is the installed LocalSystem
+    // service, so its armed event opens and only the token check can reject.
+    impostor_case_system("token", "reason=token", true);
 }
 
 #[test]
@@ -603,18 +603,19 @@ fn impostor_path_does_not_release_the_guard() {
     // Foreground hosts are the interactive user, so a child they spawn fails
     // the token check first. The installed service is LocalSystem and the
     // host inherits that token, so only the other path can reject.
-    impostor_case_system("path", "reason=path");
+    impostor_case_system("path", "reason=path", false);
 }
 
 #[test]
 fn reused_pid_is_not_trusted_again() {
     // Same constraint: only a SYSTEM host can hold a same-path process, kill
     // it, and prove that PID is not opened again.
-    impostor_case_system("reuse", "dropped=1 reopened=0 rejected=1");
+    impostor_case_system("reuse", "dropped=1 reopened=0 rejected=1", false);
 }
 
-fn impostor_case_system(case: &str, expect: &str) {
+fn impostor_case_system(case: &str, expect: &str, spawn_user_copy: bool) {
     let _guard = gate();
+    stop_lock_hosts();
     let service = service_exe();
     let (name, display) = service_names(&service);
     let nonce = RunNonce::random().expect("run nonce");
@@ -627,7 +628,8 @@ fn impostor_case_system(case: &str, expect: &str) {
     let mark = root.join("os-lock.txt");
     let probe = root.join("probe.txt");
     let log = root.join("service.log");
-    let env = [
+    let pid_file = root.join("pid");
+    let mut env = vec![
         "SOFTLOCK_STUB_OS_LOCK=fail".to_string(),
         format!("SOFTLOCK_RUN_NONCE={extra}"),
         r"SOFTLOCK_INSTALL_DIR=C:\no\such\install".to_string(),
@@ -636,6 +638,9 @@ fn impostor_case_system(case: &str, expect: &str) {
         format!("SOFTLOCK_IMPOSTOR_WITNESS={}", witness.display()),
         format!("SOFTLOCK_OS_LOCK_MARK={}", mark.display()),
     ];
+    if spawn_user_copy {
+        env.push(format!("SOFTLOCK_IMPOSTOR_PID={}", pid_file.display()));
+    }
     let body = install_service(&service, &name, &display, &probe, &env);
     assert!(body.contains("system=yes"), "not LocalSystem: {body}");
     let probe_window = Probe::open().expect("probe");
@@ -653,6 +658,11 @@ fn impostor_case_system(case: &str, expect: &str) {
         physical_is_blocked(&probe_window, extra),
         "lock did not block physical input"
     );
+    let user_copy = if spawn_user_copy {
+        Some(spawn_user_impostor(&root))
+    } else {
+        None
+    };
     let pid = service_pid(&name).expect("service pid");
     let _ = Command::new("taskkill.exe")
         .args(["/F", "/PID", &pid])
@@ -661,6 +671,9 @@ fn impostor_case_system(case: &str, expect: &str) {
         wait_for(Duration::from_secs(8), || mark.is_file()),
         "Quit did not call the OS lock"
     );
+    if let Some((_, impostor_pid)) = &user_copy {
+        fs::write(&pid_file, impostor_pid.to_string()).expect("pid file");
+    }
     assert!(
         wait_for(Duration::from_secs(8), || witness.is_file()),
         "the host never judged the impostor"
@@ -675,115 +688,44 @@ fn impostor_case_system(case: &str, expect: &str) {
         physical_is_blocked(&probe_window, extra),
         "hooks dropped for an impostor ({case})"
     );
+    if let Some((child, _)) = user_copy {
+        drop(child);
+    }
     remove_service(&name);
     stop_lock_hosts();
     let _ = fs::remove_dir_all(&root);
 }
 
-fn impostor_case(case: &str, expect: &str, spawn_user_copy: bool) {
-    let _guard = gate();
-    let root = std::env::temp_dir().join(format!(
-        "impostor-{}-{}-{}",
-        case,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0)
-    ));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).expect("impostor dir");
+fn spawn_user_impostor(root: &std::path::Path) -> (KillChild, u32) {
     let done = root.join("done");
     let ready = done.with_extension("ready");
-    let pid_file = root.join("pid");
-    let witness = root.join("witness");
-    let _ = fs::remove_file(&ready);
-    let _ = fs::remove_file(&done);
-    let mark = root.join("os-lock.txt");
-    let pid_text = pid_file.display().to_string();
-    let witness_text = witness.display().to_string();
-    // Launch first. It kills every softlock-lockhost.exe, including a copy.
-    let mut session = Session::launch_extra(
-        None,
-        false,
-        "fail",
-        Some(&mark),
-        &[
-            ("SOFTLOCK_IMPOSTOR_CASE", case),
-            ("SOFTLOCK_IMPOSTOR_PID", pid_text.as_str()),
-            ("SOFTLOCK_IMPOSTOR_WITNESS", witness_text.as_str()),
-        ],
-    );
-    let probe = Probe::open().expect("probe");
-    probe.claim_focus();
-    session.lock().expect("lock");
-    let keep = if spawn_user_copy {
-        let image = root.join("softlock-lockhost.exe");
-        fs::copy(std::env::current_exe().expect("test exe"), &image).expect("copy impostor");
-        assert!(
-            image
-                .file_name()
-                .is_some_and(|name| name.eq_ignore_ascii_case("softlock-lockhost.exe")),
-            "the impostor image name is the one the old check trusted"
-        );
-        let impostor = Command::new(&image)
-            .args([
-                "--exact",
-                "impostor_process_holds",
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .env("SOFTLOCK_IMPOSTOR_HOLD", &done)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("impostor process");
-        let impostor_pid = impostor.id();
-        assert!(
-            wait_for(Duration::from_secs(8), || ready.is_file()),
-            "impostor did not stay running"
-        );
-        Some((KillChild(Some(impostor)), impostor_pid))
-    } else {
-        None
-    };
+    let image = root.join("softlock-lockhost.exe");
+    fs::copy(std::env::current_exe().expect("test exe"), &image).expect("copy impostor");
     assert!(
-        physical_is_blocked(&probe, session.extra),
-        "lock did not block physical input"
+        image
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("softlock-lockhost.exe")),
+        "the impostor image name is the one the old check trusted"
     );
-    session.child.kill().expect("kill service");
-    let _ = session.child.wait();
+    let impostor = Command::new(&image)
+        .args([
+            "--exact",
+            "impostor_process_holds",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("SOFTLOCK_IMPOSTOR_HOLD", &done)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("impostor process");
+    let impostor_pid = impostor.id();
     assert!(
-        wait_for(Duration::from_secs(8), || mark.is_file()),
-        "Quit did not call the OS lock"
+        wait_for(Duration::from_secs(8), || ready.is_file()),
+        "impostor did not stay running"
     );
-    if let Some((_, impostor_pid)) = &keep {
-        fs::write(&pid_file, impostor_pid.to_string()).expect("pid file");
-    }
-    let noted = wait_for(Duration::from_secs(8), || witness.is_file());
-    if case == "reuse" {
-        thread::sleep(Duration::from_secs(1));
-    }
-    let decision = fs::read_to_string(&witness).unwrap_or_default();
-    assert!(noted, "the host never judged the impostor ({decision})");
-    assert_eq!(decision, expect, "impostor case {case} released the guard");
-    thread::sleep(Duration::from_secs(1));
-    assert!(
-        physical_is_blocked(&probe, session.extra),
-        "hooks dropped for an impostor ({case})"
-    );
-    if let Ok(status) = session.status() {
-        assert!(
-            !status.contains("Unlocked"),
-            "state reached Unlocked for an impostor: {status}"
-        );
-    }
-    if spawn_user_copy {
-        fs::write(&done, b"done").expect("release impostor");
-    }
-    stop_lock_hosts();
-    let _ = fs::remove_dir_all(&root);
+    (KillChild(Some(impostor)), impostor_pid)
 }
 
 #[test]
