@@ -393,14 +393,8 @@ jobs:
 
   native_x86:
     name: native x86_64 (${{ matrix.image }})
-    needs:
-      - changes
-      - universal
-    if: |
-      always() &&
-      needs.changes.result == 'success' &&
-      needs.universal.result == 'success' &&
-      github.event_name == 'pull_request'
+    needs: universal
+    if: github.event_name != 'push'
     runs-on: ${{ matrix.image }}
     timeout-minutes: 30
     strategy:
