@@ -22,7 +22,6 @@ platform_of() {
     || starts_with "$file" "crates/softlock-seam3/" \
     || starts_with "$file" "spikes/desktop-proof/" \
     || starts_with "$file" "spikes/input-hook/" \
-    || starts_with "$file" "spikes/overlay/" \
     || starts_with "$file" "tests/hardware/windows/"; then
     echo windows
     return
@@ -123,6 +122,7 @@ run_self_check() {
   expect readme false false false false true README.md
   expect hw-schema true false false false false tests/hardware/check-schema.py
   expect desktop-spike false false true false false spikes/desktop-proof/src/main.rs
+  expect overlay-ws true false false false false spikes/overlay/src/main.rs
   expect mixed-macos false false false true false docs/guide.md crates/softlock-macos/src/lib.rs
 
   echo "ci-path-outputs self-check ok"
