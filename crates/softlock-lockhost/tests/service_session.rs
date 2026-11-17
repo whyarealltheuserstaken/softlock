@@ -674,8 +674,8 @@ fn several_pipe_instances_accept_at_once() {
 
 #[test]
 fn standard_user_cannot_plant_the_secret_store() {
-    if let Ok(mode) = std::env::var("SOFTLOCK_PLANT_CHILD") {
-        plant_child(&mode);
+    if let Some(job) = plant_job_from_args() {
+        plant_child(&job);
         return;
     }
     let _guard = gate();
@@ -712,8 +712,10 @@ fn standard_user_cannot_plant_the_secret_store() {
         &["SOFTLOCK_PIN_SELFTEST=1".to_string()],
     );
     fs::write(&done, b"done").expect("done");
+    let mut exits = Vec::new();
     for child in &children {
         wait_process(child.process, Duration::from_secs(20));
+        exits.push(process_exit_code(child.process));
     }
     remove_service(&name);
     let reports: Vec<String> = modes
@@ -723,10 +725,11 @@ fn standard_user_cannot_plant_the_secret_store() {
                 .unwrap_or_else(|error| format!("missing report: {error}"))
         })
         .collect();
-    for (mode, report) in modes.iter().zip(reports.iter()) {
+    for (index, (mode, report)) in modes.iter().zip(reports.iter()).enumerate() {
         assert!(
             report.contains("il=8192"),
-            "{mode} did not run at medium integrity: {report}"
+            "{mode} did not run at medium integrity (exit {}): {report}",
+            exits.get(index).copied().unwrap_or(u32::MAX)
         );
         assert!(
             report.contains("result=denied"),
@@ -1045,8 +1048,8 @@ fn spawn_standard_user(
     done: &Path,
 ) -> PlantChild {
     use windows::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW, LOGON_WITH_PROFILE,
-        PROCESS_INFORMATION, STARTUPINFOW,
+        CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_UNICODE_ENVIRONMENT,
+        CreateProcessWithLogonW, PROCESS_INFORMATION, STARTUPINFOW,
     };
     use windows::core::{PCWSTR, PWSTR};
     // CreateProcessAsUserW needs SeAssignPrimaryToken, which the runner does
@@ -1057,8 +1060,13 @@ fn spawn_standard_user(
     let domain = wide_chars(".");
     let exe = std::env::current_exe().expect("test exe");
     let command = format!(
-        "\"{}\" --exact standard_user_cannot_plant_the_secret_store --test-threads=1 --nocapture",
-        exe.display()
+        "\"{}\" --exact standard_user_cannot_plant_the_secret_store --test-threads=1 --nocapture -- {} \"{}\" \"{}\" \"{}\" \"{}\"",
+        exe.display(),
+        mode,
+        dir.display(),
+        bait.display(),
+        report.display(),
+        done.display()
     );
     let mut command_w = wide_chars(&command);
     let env = plant_environment(mode, dir, bait, report, done);
@@ -1075,7 +1083,7 @@ fn spawn_standard_user(
             PCWSTR(user_w.as_ptr()),
             PCWSTR(domain.as_ptr()),
             PCWSTR(password_w.as_ptr()),
-            LOGON_WITH_PROFILE,
+            CREATE_PROCESS_LOGON_FLAGS(0),
             PCWSTR::null(),
             Some(PWSTR(command_w.as_mut_ptr())),
             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
@@ -1119,12 +1127,48 @@ fn plant_environment(mode: &str, dir: &Path, bait: &Path, report: &Path, done: &
     block.encode_utf16().collect()
 }
 
-fn plant_child(mode: &str) {
-    let dir = PathBuf::from(std::env::var("SOFTLOCK_PLANT_DIR").unwrap_or_default());
-    let bait = PathBuf::from(std::env::var("SOFTLOCK_PLANT_BAIT").unwrap_or_default());
-    let report = PathBuf::from(std::env::var("SOFTLOCK_PLANT_REPORT").unwrap_or_default());
-    let done = PathBuf::from(std::env::var("SOFTLOCK_PLANT_DONE").unwrap_or_default());
+struct PlantJob {
+    mode: String,
+    dir: PathBuf,
+    bait: PathBuf,
+    report: PathBuf,
+    done: PathBuf,
+}
+
+fn plant_job_from_args() -> Option<PlantJob> {
+    let mut args = std::env::args().skip_while(|arg| arg != "--");
+    if args.next().is_none() {
+        return None;
+    }
+    Some(PlantJob {
+        mode: args.next()?,
+        dir: PathBuf::from(args.next()?),
+        bait: PathBuf::from(args.next()?),
+        report: PathBuf::from(args.next()?),
+        done: PathBuf::from(args.next()?),
+    })
+}
+
+fn process_exit_code(process: HANDLE) -> u32 {
+    use windows::Win32::System::Threading::GetExitCodeProcess;
+    let mut code = 0u32;
+    unsafe {
+        let _ = GetExitCodeProcess(process, &mut code);
+    }
+    code
+}
+
+fn plant_child(job: &PlantJob) {
+    let dir = &job.dir;
+    let bait = &job.bait;
+    let report = &job.report;
+    let done = &job.done;
+    let mode = job.mode.as_str();
     let il = integrity_rid();
+    let _ = fs::write(
+        report,
+        format!("il={il}\nresult=running\ncode=0\nmode={mode}\n"),
+    );
     let mut opened = false;
     let mut code = 0i32;
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1140,21 +1184,21 @@ fn plant_child(mode: &str) {
                 }
                 Err(error) => code = error.raw_os_error().unwrap_or(code),
             },
-            "junction" => match create_junction(&dir, &bait) {
+            "junction" => match create_junction(dir, bait) {
                 Ok(()) => {
                     opened = true;
                     break None;
                 }
                 Err(error) => code = error.raw_os_error().unwrap_or(code),
             },
-            "replant" => match plant_pin(&dir) {
+            "replant" => match plant_pin(dir) {
                 Ok(()) => {
                     opened = true;
                     break None;
                 }
                 Err(error) => code = error.raw_os_error().unwrap_or(code),
             },
-            "hold-dir" => match open_dir_for_write(&dir) {
+            "hold-dir" => match open_dir_for_write(dir) {
                 Ok(handle) => {
                     opened = true;
                     break Some(handle);
