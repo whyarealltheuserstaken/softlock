@@ -219,9 +219,7 @@ fn sample_timers(args: &Args) -> Result<TimerReport, String> {
         crate::report::write_stdout(
             "STEP hands-off App Nap: the 300 s sample covers only the timer window (the overlay-down/up pair is 60 s each). All three processes are named macos-keep-awake; find the timer by the printed timer-pid=. Keep your hands off after you press Return. Control-C ends it any time.",
         );
-        if let Err(error) = wait_for_app_nap_ready() {
-            return Err(error);
-        }
+        wait_for_app_nap_ready()?;
         let nap = run_app_nap_timer(&exe, args, "timer-app-nap.json", APP_NAP_SAMPLE_MS)?;
         app_nap_count = nap.0.ticks;
         app_nap_occlusion = nap.0.occlusion_visible;
