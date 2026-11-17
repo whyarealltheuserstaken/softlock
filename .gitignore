@@ -12,3 +12,4 @@
 *.log
 **/*.snap.new
 proof-output/
+proof.log

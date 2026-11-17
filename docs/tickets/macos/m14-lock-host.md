@@ -2,7 +2,7 @@
 
 **What to build:** The first half of the macOS tracer bullet, same shape as Windows ticket 12. A developer starts the lock host directly in a dev-only mode that release builds do not contain. It arms the session tap (or the HID tap, if m05's finding said the session tap misses physical keys) on its own thread, shows the overlay on every display the spikes could cover, and checks a dev-supplied PIN through Core's Argon2id. The PIN check moves to the service in m15. Guard arms before the overlay. The whole arm is under 500 ms.
 
-Capture exclusion is claimed only for the paths m04 and m06 measured as omitting the marker (decision D6). Other paths are named in the finding and are not acceptance criteria.
+Capture exclusion is claimed only for the paths m04 and m06 measured as omitting the marker (decision D6). Other paths are named in the finding and are not acceptance criteria. m14 and m22 apply `.none` only when the m22 detection hook positively reports no remote session. Unknown or failed detection means no `.none`. That holds until the remote pass.
 
 If CI needs a swallow path, the test-only nonce in `kCGEventSourceUserData` is added in this ticket together with the release-binary scan, not as a follow-up. That is the rule already in SPEC.md Testing Decisions. The scan is the one m01 extended to both slices. Once PR #48 merges, that scan also names `softlock-dev-launch-marker` and `softlock_dev_launch_marker`.
 

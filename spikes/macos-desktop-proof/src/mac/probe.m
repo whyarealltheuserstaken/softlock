@@ -84,7 +84,8 @@ static NSWindow *g_control = nil;
 static void stage_named(const char *name) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    fprintf(stderr, "stage=%s t=%lld.%03d\n", name, (long long)tv.tv_sec, (int)(tv.tv_usec / 1000));
+    long long millis = (long long)tv.tv_sec * 1000 + (long long)tv.tv_usec / 1000;
+    fprintf(stderr, "stage=%s t=%lld\n", name, millis);
     fflush(stderr);
 }
 

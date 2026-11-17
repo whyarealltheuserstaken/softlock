@@ -140,6 +140,9 @@ pub struct SharingSample {
     /// Pixels of the second window. Required on the `.none` captures.
     #[serde(default)]
     pub control_pixels: Option<i32>,
+    /// Set only when this phase records that the marker window stayed in the image.
+    #[serde(default)]
+    pub not_removed_reason: Option<String>,
     pub error: Option<String>,
 }
 
@@ -552,6 +555,7 @@ pub fn sharing_sample(sharing: &str, capture: &CaptureReport) -> SharingSample {
         height: capture.height,
         marker_pixels: capture.marker_pixels,
         control_pixels: capture.control_pixels,
+        not_removed_reason: None,
         error: capture.error.clone(),
     }
 }
@@ -641,33 +645,51 @@ fn sharing_failures(sharing: Option<&SharingReport>) -> Vec<String> {
 }
 
 fn sharing_removed_failure(sharing: &SharingReport, api: &str) -> Option<String> {
-    let default = find_sharing(sharing, "default", api)?;
-    let none = find_sharing(sharing, "none", api)?;
-    let baseline = find_sharing(sharing, "baseline", api)?;
-    if !default.opened || !none.opened || !baseline.opened {
-        return None;
-    }
-    let (Some(default_count), Some(none_count), Some(baseline_count)) = (
-        default.marker_pixels,
-        none.marker_pixels,
-        baseline.marker_pixels,
+    let (Some(default), Some(none), Some(baseline)) = (
+        find_sharing(sharing, "default", api),
+        find_sharing(sharing, "none", api),
+        find_sharing(sharing, "baseline", api),
     ) else {
-        return None;
+        return Some(format!("sharing {api} is missing a phase"));
     };
-    if !window_removed(
-        default_count,
-        none_count,
-        baseline_count,
-        sharing.window.window_area,
-    ) {
+    let (Some(default_count), Some(none_count), Some(baseline_count)) = (
+        default.marker_pixels.filter(|_| default.opened),
+        none.marker_pixels.filter(|_| none.opened),
+        baseline.marker_pixels.filter(|_| baseline.opened),
+    ) else {
         return Some(format!(
-            "sharing {api} .none count {none_count} is not the baseline {baseline_count} under a default of {default_count}"
+            "sharing {api} did not open with a marker count on every phase"
+        ));
+    };
+    let area = sharing.window.window_area;
+    if !window_removed(default_count, none_count, baseline_count, area) {
+        let named = none
+            .not_removed_reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty());
+        if named {
+            return None;
+        }
+        return Some(format!(
+            "sharing {api} was not removed and no reason was recorded (.none {none_count}, baseline {baseline_count}, default {default_count})"
         ));
     }
-    let control = none.control_pixels.unwrap_or(0);
-    if control < sharing.window.window_area {
+    let (Some(background), Some(baseline_control), Some(none_control)) = (
+        default.control_pixels,
+        baseline.control_pixels,
+        none.control_pixels,
+    ) else {
+        return Some(format!("sharing {api} is missing a control count"));
+    };
+    if (baseline_control - background).abs() > BASELINE_NOISE {
         return Some(format!(
-            "sharing {api} control window was absent from the .none capture (pixels={control})"
+            "sharing {api} baseline control {baseline_control} is not the background {background}"
+        ));
+    }
+    let floor = baseline_control.saturating_add(area) - BASELINE_NOISE;
+    if none_control < floor {
+        return Some(format!(
+            "sharing {api} control count {none_control} is below baseline {baseline_control} plus the window area"
         ));
     }
     None
@@ -678,18 +700,13 @@ fn sharing_sample_failure(sample: &SharingSample) -> Option<String> {
     if probe_crashed(sample.error.as_deref()) {
         return Some(format!("{who} probe crashed"));
     }
-    if sample.opened {
-        if sample.marker_pixels.is_none() {
-            return Some(format!("{who} opened without a marker count"));
-        }
-        return None;
+    if !sample.opened || sample.marker_pixels.is_none() {
+        return Some(format!("{who} did not open with a marker count"));
     }
-    match sample.error.as_deref() {
-        Some(error) if !error.is_empty() => None,
-        _ => Some(format!(
-            "{who} recorded neither a marker count nor an error"
-        )),
+    if sample.sharing == "none" && sample.control_pixels.is_none() {
+        return Some(format!("{who} opened without a control count"));
     }
+    None
 }
 
 pub fn render(report: &ProofReport) -> String {
@@ -1153,7 +1170,17 @@ fn sharing_lines(sharing: Option<&SharingReport>) -> Vec<String> {
             }
             _ => "do-not-claim",
         };
-        lines.push(format!("sharing-m14-{api}={claim} removed={removed}"));
+        let reason = find_sharing(sharing, "none", api).and_then(|sample| {
+            sample
+                .not_removed_reason
+                .as_ref()
+                .filter(|reason| removed == "false" && !reason.is_empty())
+                .map(|reason| format!(" reason={reason}"))
+        });
+        lines.push(format!(
+            "sharing-m14-{api}={claim} removed={removed}{}",
+            reason.unwrap_or_default()
+        ));
     }
     lines
 }
@@ -1459,7 +1486,8 @@ fn measured_sharing() -> SharingReport {
                 width: 1024,
                 height: 768,
                 marker_pixels: Some(marker),
-                control_pixels: (sharing == "none").then_some(76800),
+                control_pixels: Some(if sharing == "none" { 77615 } else { 815 }),
+                not_removed_reason: None,
                 error: None,
             });
         }
@@ -1575,7 +1603,7 @@ mod tests {
         assert!(text.contains("sharing-none-screencapture=marker pixels=34"));
         assert!(text.contains("sharing-baseline-screencapture=marker pixels=34"));
         assert!(text.contains(
-            "sharing-none-ScreenCaptureKit=marker pixels=34 control pixels=76800 width=1024 height=768 entry=SCScreenshotManager excludingWindows empty"
+            "sharing-none-ScreenCaptureKit=marker pixels=34 control pixels=77615 width=1024 height=768 entry=SCScreenshotManager excludingWindows empty"
         ));
         assert!(text.contains("sharing-m14-ScreenCaptureKit=do-not-claim removed=true"));
         assert!(text.contains("sharing-m14-SCStream=do-not-claim removed=true"));
@@ -2036,7 +2064,21 @@ mod tests {
         assert!(
             failure_reasons(&report)
                 .iter()
-                .any(|reason| reason.contains("is not the baseline"))
+                .any(|reason| reason.contains("was not removed and no reason was recorded"))
+        );
+        let sample = report
+            .sharing
+            .as_mut()
+            .unwrap()
+            .samples
+            .iter_mut()
+            .find(|sample| sample.sharing == "none" && sample.api == "screencapture")
+            .unwrap();
+        sample.not_removed_reason = Some("marker still in the image".to_string());
+        assert!(
+            !failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("screencapture was not removed"))
         );
 
         let mut sharing = measured_sharing();
@@ -2050,7 +2092,7 @@ mod tests {
         assert!(
             failure_reasons(&report)
                 .iter()
-                .any(|reason| reason.contains("control window was absent"))
+                .any(|reason| reason.contains("below baseline"))
         );
 
         let mut sharing = measured_sharing();
@@ -2078,12 +2120,15 @@ mod tests {
         }
         let mut report = passing_fixture();
         report.sharing = Some(sharing);
-        assert!(failure_reasons(&report).is_empty());
-        let text = render(&report);
-        assert!(text.contains(
+        let reasons = failure_reasons(&report);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("did not open with a marker count"))
+        );
+        assert!(render(&report).contains(
             "sharing-default-ScreenCaptureKit=unavailable error=ScreenCaptureKit: NSError SCStreamErrorDomain -3801 entry=SCScreenshotManager excludingWindows empty"
         ));
-        assert!(text.contains("sharing-m14-ScreenCaptureKit=do-not-claim"));
     }
 
     #[test]
@@ -2116,7 +2161,7 @@ mod tests {
         assert!(
             failure_reasons(&report)
                 .iter()
-                .any(|reason| reason.contains("without a marker count"))
+                .any(|reason| reason.contains("did not open with a marker count"))
         );
     }
 
