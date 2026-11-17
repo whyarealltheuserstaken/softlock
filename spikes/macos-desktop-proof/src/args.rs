@@ -16,6 +16,7 @@ pub enum Mode {
     M03,
     ClassifyTarget,
     ClassifyPost,
+    Smoke,
 }
 
 impl Mode {
@@ -55,10 +56,12 @@ where
     let mut m03 = false;
     let mut classify_target = false;
     let mut post_source = None;
+    let mut smoke = false;
     let mut tokens = tokens.into_iter();
     while let Some(token) = tokens.next() {
         match token.as_str() {
             "--allow-local-service" => allow_local_service = true,
+            "--smoke" => smoke = true,
             "--runner-image" => {
                 runner_image = tokens
                     .next()
@@ -112,6 +115,7 @@ where
         m03,
         classify_target,
         post_source.is_some(),
+        smoke,
     ]
     .into_iter()
     .filter(|selected| *selected)
@@ -135,6 +139,8 @@ where
         Mode::ClassifyTarget
     } else if post_source.is_some() {
         Mode::ClassifyPost
+    } else if smoke {
+        Mode::Smoke
     } else {
         Mode::Orchestrator
     };
@@ -215,6 +221,10 @@ mod tests {
         let active = parse(tokens(&["--active-tap"])).unwrap();
         assert_eq!(active.mode, Mode::ActiveTap);
         assert!(!active.mode.installs_daemon());
+        let smoke = parse(tokens(&["--smoke"])).unwrap();
+        assert_eq!(smoke.mode, Mode::Smoke);
+        assert!(!smoke.mode.installs_daemon());
+        assert!(parse(tokens(&["--smoke", "--window-only"])).is_err());
         assert!(parse(tokens(&["--capture-only", "camera"])).is_err());
         assert!(parse(tokens(&["--window-only", "--tap-only", "kCGHIDEventTap"])).is_err());
         let m03 = parse(tokens(&["--m03"])).unwrap();

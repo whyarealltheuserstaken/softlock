@@ -47,6 +47,8 @@ GitHub lists `macos-15-intel` and `macos-26-intel` as well as the arm64 `macos-l
 
 **Accepted by the lead, 16 November 2026,** as written.
 
+On 16 November 2026 the hosted-runners page still listed `macos-15-intel` and `macos-26-intel`. Ticket m11 uses those labels for the native x86_64 smoke. m01 still does not.
+
 ## D5. Private API for the real lock
 
 `SACLockScreenImmediate` has no Apple documentation page. It is a private symbol in `login.framework`. The public pages we have do not offer a "lock the screen now" call. The screen-saver-plus-password path is weaker and is the documented lock path.

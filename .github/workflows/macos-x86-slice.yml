@@ -1,0 +1,124 @@
+name: macOS x86_64 slice
+
+# Native Intel smoke of the m02 probe as a Universal 2 binary.
+# GitHub still lists macos-15-intel and macos-26-intel (hosted runners
+# reference, read 16 November 2026). This is not a Rosetta run on macos-latest.
+# The smoke path does not load a throwaway agent or daemon.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'spikes/macos-desktop-proof/**'
+      - '.github/workflows/macos-x86-slice.yml'
+      - 'docs/findings/m11-x86-slice.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-x86-slice-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: native x86_64 (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [macos-15-intel, macos-26-intel]
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: spikes/macos-desktop-proof -> spikes/macos-desktop-proof/target
+
+      - name: Record the Intel runner
+        run: |
+          set -euo pipefail
+          sw_vers
+          machine="$(uname -m)"
+          echo "uname -m is ${machine}"
+          if [ "${machine}" != "x86_64" ]; then
+            echo "native x86_64 requires an Intel runner, not Rosetta"
+            exit 1
+          fi
+          if translated="$(sysctl -n sysctl.proc_translated 2>/dev/null)"; then
+            echo "sysctl.proc_translated=${translated}"
+            if [ "${translated}" != "0" ]; then
+              echo "sysctl.proc_translated is not 0; this is Rosetta"
+              exit 1
+            fi
+          else
+            echo "sysctl.proc_translated absent"
+          fi
+          if arm="$(sysctl -n hw.optional.arm64 2>/dev/null)"; then
+            echo "hw.optional.arm64=${arm}"
+            if [ "${arm}" != "0" ]; then
+              echo "hw.optional.arm64 is not 0; this host is Apple silicon"
+              exit 1
+            fi
+          else
+            echo "hw.optional.arm64 absent"
+          fi
+
+      - name: Install both Apple targets
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          rustup target list --installed
+
+      - name: Build the probe for both slices
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path spikes/macos-desktop-proof/Cargo.toml \
+            --target x86_64-apple-darwin
+          cargo build --release --locked --manifest-path spikes/macos-desktop-proof/Cargo.toml \
+            --target aarch64-apple-darwin
+
+      - name: Lipo the probe and smoke the fat binary
+        run: |
+          set -euo pipefail
+          x86="spikes/macos-desktop-proof/target/x86_64-apple-darwin/release/macos-desktop-proof"
+          arm="spikes/macos-desktop-proof/target/aarch64-apple-darwin/release/macos-desktop-proof"
+          mkdir -p spikes/macos-desktop-proof/target/universal
+          fat="spikes/macos-desktop-proof/target/universal/macos-desktop-proof"
+          lipo -create "${x86}" "${arm}" -output "${fat}"
+          chmod +x "${fat}"
+          # Ad-hoc signature. Decision D2.
+          codesign --force --sign - "${fat}"
+          echo "=== lipo -info ${fat} ==="
+          info="$(lipo -info "${fat}")"
+          echo "${info}"
+          echo "=== lipo -archs ${fat} ==="
+          archs="$(lipo -archs "${fat}")"
+          echo "${archs}"
+          case "${info}" in
+            *x86_64*) ;;
+            *) echo "lipo -info missing x86_64: ${info}"; exit 1 ;;
+          esac
+          case "${info}" in
+            *arm64*) ;;
+            *) echo "lipo -info missing arm64: ${info}"; exit 1 ;;
+          esac
+          case "${archs}" in
+            *x86_64*) ;;
+            *) echo "lipo -archs missing x86_64: ${archs}"; exit 1 ;;
+          esac
+          case "${archs}" in
+            *arm64*) ;;
+            *) echo "lipo -archs missing arm64: ${archs}"; exit 1 ;;
+          esac
+          "${fat}" --smoke --runner-image "${{ matrix.image }}" --output-dir proof-output \
+            | tee proof-smoke.txt
+          grep -F "uname -m" proof-smoke.txt
+          grep -Fx "x86_64" proof-smoke.txt
+          grep -F "native-intel=true" proof-smoke.txt
+          grep -F "rosetta=false" proof-smoke.txt
+          grep -F "smoke=pass" proof-smoke.txt

@@ -45,6 +45,7 @@ pub fn dispatch(args: Args) -> i32 {
             };
             ffi::classify_post(source, &args.output_dir)
         }
+        Mode::Smoke => crate::smoke::run(&args),
         Mode::Orchestrator => run_orchestrator(&args),
     }
 }
