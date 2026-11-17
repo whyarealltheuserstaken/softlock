@@ -76,8 +76,12 @@ impl RunNonce {
 static RUN_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// The nonce installed for this process, or zero when none is installed.
-#[cfg(feature = "simulated-physical")]
-pub fn current_run_nonce() -> u64 {
+///
+/// Only the Windows lock guard reads this (mouse hooks surface 32-bit
+/// `dwExtraInfo`). CI runs `simulated-physical` without `dev-launch`, so the
+/// accessor stays cfg-gated instead of using `allow(dead_code)`.
+#[cfg(all(windows, feature = "dev-launch", feature = "simulated-physical"))]
+pub(crate) fn current_run_nonce() -> u64 {
     RUN_NONCE.load(Ordering::SeqCst)
 }
 
