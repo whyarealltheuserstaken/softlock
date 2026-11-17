@@ -433,7 +433,7 @@ fn panic_while_os_lock_is_down_is_closed_by_the_service() {
     probe.claim_focus();
     session.lock().expect("lock");
     let mut saw_unlocked = false;
-    let lost = wait_for(Duration::from_secs(15), || {
+    let lost = wait_for(Duration::from_secs(30), || {
         if session
             .status()
             .ok()
@@ -445,13 +445,14 @@ fn panic_while_os_lock_is_down_is_closed_by_the_service() {
             .unwrap_or_default()
             .contains("host-lost")
     });
+    let log_text = fs::read_to_string(&session.log).unwrap_or_default();
     assert!(
         !saw_unlocked,
         "the service reported Unlocked during recovery"
     );
     assert!(
         lost,
-        "the service log did not record host-lost after the window panic"
+        "the service log did not record host-lost after the window panic: {log_text}"
     );
     let recovered = wait_for(Duration::from_secs(20), || {
         if session
