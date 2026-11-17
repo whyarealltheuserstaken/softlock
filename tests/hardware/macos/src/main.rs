@@ -1,6 +1,7 @@
 //! Runs the macOS v1 kits and writes one suite-output folder.
 
 use std::fs;
+use std::io::{self, BufRead, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,15 +87,15 @@ fn run() -> i32 {
         rows.push(decided_skip(
             "m03-posted-input",
             "Posted input",
-            "needs-admin",
-            "Accessibility and Input Monitoring are not granted",
+            "not-applicable",
+            "grant Accessibility and Input Monitoring, then restart Terminal",
             false,
         ));
         rows.push(decided_skip(
             "m04-sharing",
             "Sharing probe",
-            "needs-admin",
-            "Accessibility and Input Monitoring are not granted",
+            "not-applicable",
+            "grant Accessibility and Input Monitoring, then restart Terminal",
             false,
         ));
     } else {
@@ -388,9 +389,37 @@ fn access_ready(ci: bool) -> bool {
     println!(
         "Grant Accessibility and Input Monitoring for this terminal in System Settings, then press Enter."
     );
+    match read_line_interruptible() {
+        LineRead::Line(_) => !interrupted() && access_granted(),
+        LineRead::Interrupted => false,
+        LineRead::Eof => false,
+    }
+}
+
+enum LineRead {
+    Line(String),
+    Eof,
+    Interrupted,
+}
+
+fn read_line_interruptible() -> LineRead {
     let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
-    !interrupted() && access_granted()
+    loop {
+        if interrupted() {
+            return LineRead::Interrupted;
+        }
+        match io::stdin().lock().read_line(&mut line) {
+            Ok(0) => return LineRead::Eof,
+            Ok(_) => return LineRead::Line(line.trim().to_string()),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {
+                if interrupted() {
+                    return LineRead::Interrupted;
+                }
+                line.clear();
+            }
+            Err(_) => return LineRead::Eof,
+        }
+    }
 }
 
 fn access_granted() -> bool {

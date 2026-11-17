@@ -59,11 +59,9 @@ build_all() {
     local host_bin="$CARGO_TARGET_DIR/$(host_target)/release/macos-desktop-proof"
     local other_bin="$CARGO_TARGET_DIR/$other/release/macos-desktop-proof"
     local fat="$fat_dir/macos-desktop-proof"
-    local thin="$fat_dir/macos-desktop-proof-x86_64"
     lipo -create "$host_bin" "$other_bin" -output "$fat"
-    lipo -thin x86_64 "$fat" -output "$thin"
-    chmod +x "$fat" "$thin"
-    codesign --force --sign - "$thin" >/dev/null
+    chmod +x "$fat"
+    codesign --force --sign - "$fat" >/dev/null
     export SUITE_SMOKE_BIN="$fat"
     export SUITE_DESKTOP_BIN="$host_bin"
   fi

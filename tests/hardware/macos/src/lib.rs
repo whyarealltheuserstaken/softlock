@@ -263,7 +263,7 @@ pub fn lock_exercise_row(id: &str, text: &str, ran: bool) -> Row {
     let locked = field(text, "state").as_deref() == Some("os-locked")
         && field(text, "lock-screen-appeared").as_deref() == Some("yes")
         && field(text, "input-reached-desktop-without-login").as_deref() == Some("no");
-    let status = if result == "pass" && locked {
+    let status = if result == "os-locked" && locked {
         "pass"
     } else {
         "fail"
@@ -623,13 +623,19 @@ power-key=not-run-on-runner
         );
         let locked = lock_exercise_row(
             "m08-private",
-            "result=pass\nstate=os-locked\nlock-screen-appeared=yes\ninput-reached-desktop-without-login=no\n",
+            "result=os-locked\nstate=os-locked\nlock-screen-appeared=yes\ninput-reached-desktop-without-login=no\n",
             true,
         );
         assert_eq!(locked.status, "pass");
+        let recorded_miss = lock_exercise_row(
+            "m08-private",
+            "result=recorded-miss\nstate=never-unlocked\nlock-screen-appeared=not-asked\ninput-reached-desktop-without-login=not-asked\n",
+            true,
+        );
+        assert_eq!(recorded_miss.status, "fail");
         let unconfirmed = lock_exercise_row(
             "m08-private",
-            "result=pass\nstate=lock-unconfirmed\nlock-screen-appeared=no\ninput-reached-desktop-without-login=unknown\n",
+            "result=os-locked\nstate=lock-unconfirmed\nlock-screen-appeared=no\ninput-reached-desktop-without-login=unknown\n",
             true,
         );
         assert_eq!(unconfirmed.status, "fail");
