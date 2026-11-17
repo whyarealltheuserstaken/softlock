@@ -3228,6 +3228,14 @@ name = "softlock-service"
 version = "0.1.0"
 
 [[package]]
+name = "softlock-spike-overlay"
+version = "0.1.0"
+dependencies = [
+ "softlock-core",
+ "windows",
+]
+
+[[package]]
 name = "softlock-windows"
 version = "0.1.0"
 
