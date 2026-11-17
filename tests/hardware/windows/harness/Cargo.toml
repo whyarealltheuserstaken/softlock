@@ -1,0 +1,12 @@
+[package]
+name = "softlock-win-hwsuite"
+description = "Plan, redaction, and report for the Windows hardware suite. No device identifiers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
