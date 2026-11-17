@@ -5,7 +5,19 @@ name: Linux hardware suite
 on:
   push:
     branches: [main]
+    paths:
+      - 'tests/hardware/linux/**'
+      - 'tests/hardware/check-schema.py'
+      - 'docs/hardware-suite-schema.md'
+      - '.github/workflows/linux-hardware-suite.yml'
+      - 'crates/softlock-core/tests/linux_hardware_suite.rs'
   pull_request:
+    paths:
+      - 'tests/hardware/linux/**'
+      - 'tests/hardware/check-schema.py'
+      - 'docs/hardware-suite-schema.md'
+      - '.github/workflows/linux-hardware-suite.yml'
+      - 'crates/softlock-core/tests/linux_hardware_suite.rs'
 
 permissions:
   contents: read

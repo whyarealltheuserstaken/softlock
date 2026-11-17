@@ -91,6 +91,10 @@ fn the_ci_workflow_runs_ci_mode_on_ubuntu_and_pins_actions() {
     assert!(text.contains("tests/hardware/check-schema.py"));
     assert!(text.contains("docs/hardware-suite-schema.md"));
     assert!(text.contains("contents: read"));
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml");
+    assert!(ci.contains("linux hardware suite --ci"));
+    assert!(ci.contains("linux-hardware"));
+    assert!(ci.contains("check linux-hardware"));
     let mut uses = 0;
     for line in text.lines() {
         let Some(rest) = line.trim().strip_prefix("- uses:") else {
