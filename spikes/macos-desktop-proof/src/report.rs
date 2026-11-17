@@ -1186,12 +1186,20 @@ mod tests {
         classify.marker.healthy_seen = false;
         let reasons = classify_failures(&classify);
         assert!(reasons.iter().any(|reason| reason == "m03=no-tap"));
-        assert!(reasons.iter().all(|reason| !reason.contains("slow callback")));
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains("slow callback"))
+        );
         assert!(reasons.iter().all(|reason| !reason.contains("marker")));
         let mut report = passing_fixture();
         report.classify = Some(classify);
         assert!(render(&report).contains("m03=no-tap"));
-        assert!(failure_reasons(&report).iter().any(|reason| reason == "m03=no-tap"));
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason == "m03=no-tap")
+        );
     }
 
     #[test]
@@ -1199,7 +1207,11 @@ mod tests {
         let mut classify = passing_classify();
         classify.posts[0].tap_saw = false;
         let reasons = classify_failures(&classify);
-        assert!(reasons.iter().any(|reason| reason.contains("tap-saw=false")));
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("tap-saw=false"))
+        );
     }
 
     #[test]

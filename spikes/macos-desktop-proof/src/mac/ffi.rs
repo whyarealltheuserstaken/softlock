@@ -448,7 +448,11 @@ pub fn prove_m03(exe: &std::path::Path, dir: &std::path::Path) -> ClassifyReport
             },
         },
         end_state: fail_closed_end().to_string(),
-        tap_status: if out.no_tap != 0 { "no-tap".to_string() } else { "created".to_string() },
+        tap_status: if out.no_tap != 0 {
+            "no-tap".to_string()
+        } else {
+            "created".to_string()
+        },
     }
 }
 
