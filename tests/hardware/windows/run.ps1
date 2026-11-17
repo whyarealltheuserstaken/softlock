@@ -226,6 +226,24 @@ function Latest-PowerRecord {
     }
 }
 
+function Escape-JsonString([string]$text) {
+    if ($null -eq $text) { return '' }
+    $builder = New-Object System.Text.StringBuilder ($text.Length + 8)
+    foreach ($ch in $text.ToCharArray()) {
+        $code = [int]$ch
+        if ($code -eq 8) { [void]$builder.Append('\b') }
+        elseif ($code -eq 9) { [void]$builder.Append('\t') }
+        elseif ($code -eq 10) { [void]$builder.Append('\n') }
+        elseif ($code -eq 12) { [void]$builder.Append('\f') }
+        elseif ($code -eq 13) { [void]$builder.Append('\r') }
+        elseif ($code -eq 34) { [void]$builder.Append('\"') }
+        elseif ($code -eq 92) { [void]$builder.Append('\\') }
+        elseif ($code -lt 32) { [void]$builder.Append(('\u{0:x4}' -f $code)) }
+        else { [void]$builder.Append($ch) }
+    }
+    return $builder.ToString()
+}
+
 function Read-Native([scriptblock]$command) {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
@@ -290,12 +308,11 @@ function ConvertTo-ResultJson {
             } elseif ($value -is [int] -or $value -is [long]) {
                 $encoded = "$value"
             } else {
-                $text = ([string]$value).Replace('\', '\\').Replace('"', "'")
-                $encoded = '"' + $text + '"'
+                $encoded = '"' + (Escape-JsonString ([string]$value)) + '"'
             }
             $bits += '"' + $key + '":' + $encoded
         }
-        $reason = ([string]$row.reason).Replace('\', '\\').Replace('"', "'")
+        $reason = Escape-JsonString ([string]$row.reason)
         $rows += '{"id":"' + $row.id + '","status":"' + $row.status + '","reason":"' + $reason + '","measurements":{' + ($bits -join ',') + '}}'
     }
     return '[' + ($rows -join ',') + ']'
@@ -338,17 +355,15 @@ try {
     $bioJson = if ($null -eq $biometric) { 'null' } else { if ($biometric) { 'true' } else { 'false' } }
     $pinJson = if ($pin) { 'true' } else { 'false' }
     $laptopJson = if ($null -eq $laptop) { 'null' } else { if ($laptop) { 'true' } else { 'false' } }
-    $powerFile = Join-Path $env:TEMP ("softlock-hw-power-{0}.txt" -f $PID)
-    Write-Utf8 $powerFile $powerText
-    $powerEscaped = ([System.IO.File]::ReadAllText($powerFile)).Replace('\', '\\').Replace('"', '\"').Replace("`r", '\r').Replace("`n", '\n')
+    $powerEscaped = Escape-JsonString $powerText
     $factsPath = Join-Path $env:TEMP ("softlock-hw-facts-{0}.json" -f $PID)
     $facts = '{' +
         '"ci":' + $(if ($ci) { 'true' } else { 'false' }) +
         ',"admin":' + $(if ($admin) { 'true' } else { 'false' }) +
         ',"elevated":' + $(if ($detect.elevated) { 'true' } else { 'false' }) +
         ',"github_actions":' + $(if ($env:GITHUB_ACTIONS -eq 'true') { 'true' } else { 'false' }) +
-        ',"current_build":"' + [string]$version.CurrentBuild + '"' +
-        ',"installation_type":"' + [string]$version.InstallationType + '"' +
+        ',"current_build":"' + (Escape-JsonString ([string]$version.CurrentBuild)) + '"' +
+        ',"installation_type":"' + (Escape-JsonString ([string]$version.InstallationType)) + '"' +
         ',"powercfg_a":"' + $powerEscaped + '"' +
         ',"monitor_count":' + [int]$detect.monitors +
         ',"biometric":' + $bioJson +
@@ -669,7 +684,7 @@ try {
     & $exe report --bundle $bundlePath --out-dir $outDir
     $code = $LASTEXITCODE
     if ($script:Interrupted) { $code = 130 }
-    Remove-Item -LiteralPath $factsPath, $planPath, $bundlePath, $powerFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $factsPath, $planPath, $bundlePath -Force -ErrorAction SilentlyContinue
     exit $code
 } finally {
     Restore-Suite
