@@ -16,14 +16,15 @@ cargo build --release --manifest-path spikes/macos-lock-kit/Cargo.toml
 cargo run --release --manifest-path spikes/macos-lock-kit/Cargo.toml -- --read-only --output-dir lock-kit-output
 ```
 
-Run it as yourself, not as root. Paste `lock-kit-output/result.json` into the finding. The file records:
+Run it as yourself, not as root. Commit `lock-kit-output/result.json` and `lock-kit-output/result.txt` as the finding. The kit writes only:
 
 - whether `dlsym` resolved `SACLockScreenImmediate` (the symbol is not called)
-- `fdesetup status` and `fdesetup isactive`
+- the on/off/unknown reading of `fdesetup status` and `fdesetup isactive`
 - `askForPassword` and `askForPasswordDelay`
-- `sw_vers`, `uname -m`, and `hw.model`
+- the product name, version, and build from `sw_vers`, plus `uname -m` and the model identifier from `hw.model`
+- the numeric user id, so the run can show it was not root
 
-`hw.model` is a model identifier. Do not add a hardware serial, and do not paste one from About This Mac.
+That file is safe to commit. It does not record an account name, a home directory, an Apple ID, a hardware serial, a list of other apps, or the name of another device. If a command prints one of those, the kit replaces it before it writes the file. Do not add output from About This Mac, `system_profiler`, or `fdesetup` with any verb other than `status` and `isactive`.
 
 ## Private lock path
 

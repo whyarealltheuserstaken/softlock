@@ -43,7 +43,7 @@ Only that Mac can show:
 - `fdesetup status` and `fdesetup isactive` as his console user.
 - Whether a FileVault-on pre-boot screen appeared. The T2 chip means that screen is the Secure Enclave path. If FileVault is off, it stays unproven. The kit does not reboot and does not change FileVault.
 
-Instructions: [spikes/macos-lock-kit/README.md](../../spikes/macos-lock-kit/README.md). Run read-only first. Exercise the private path, unlock with the account password, then exercise the documented path. The kit never unlocks. If the symbol is present, a missing-symbol row cannot be forced; write that here and point at `symbol_missing_requests_the_documented_path`. Do not record a hardware serial.
+Instructions: [spikes/macos-lock-kit/README.md](../../spikes/macos-lock-kit/README.md). Run read-only first. Exercise the private path, unlock with the account password, then exercise the documented path. The kit never unlocks. If the symbol is present, a missing-symbol row cannot be forced; write that here and point at `symbol_missing_requests_the_documented_path`. Commit the kit's `result.json`. It does not contain an account name, a home directory, an Apple ID, a hardware serial, other apps, or other devices. Do not paste About This Mac or `system_profiler` beside it.
 
 ## Sheet
 

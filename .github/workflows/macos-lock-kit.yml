@@ -35,7 +35,7 @@ jobs:
         run: |
           sw_vers
           uname -m
-          echo "uid=$(id -u) user=$(whoami)"
+          echo "uid=$(id -u)"
       - name: Format
         run: cargo fmt --manifest-path spikes/macos-lock-kit/Cargo.toml -- --check
       - name: Clippy
@@ -96,7 +96,19 @@ jobs:
           assert report["uname-m"] == "arm64"
           assert report["result"] == "pass"
           text = Path("lock-kit-output/stdout.txt").read_text()
-          for banned in ("IOPlatformSerialNumber", "IOPlatformUUID", "Serial Number", "hw.serialnumber"):
-              if banned in text or banned in Path("lock-kit-output/result.json").read_text():
+          body = text + Path("lock-kit-output/result.json").read_text()
+          for banned in (
+              "IOPlatformSerialNumber",
+              "IOPlatformUUID",
+              "Serial Number",
+              "hw.serialnumber",
+              "/Users/",
+              "/home/",
+              "@",
+              "ComputerName",
+              "AppleID",
+              "system_profiler",
+          ):
+              if banned in body:
                   raise SystemExit(banned)
           PY

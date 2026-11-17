@@ -7,7 +7,7 @@ use softlock_macos::{
     refuse_to_arm_message,
 };
 
-use crate::redact::{contains_marker, sanitize};
+use crate::redact::{contains_marker, leaks_personal, model_identifier, numeric_uid, sanitize};
 use crate::text::one_line;
 
 pub const MISSING_SYMBOL_CI_TEST: &str = "symbol_missing_requests_the_documented_path";
@@ -212,14 +212,14 @@ pub fn build_report(facts: &Facts, exercise: Option<&ExerciseRecord>) -> KitRepo
         serial_collected: serial,
         linked_login_framework: links_login_framework(&facts.otool),
         otool_checked: facts.otool_checked,
-        uid: sanitize(facts.uid_text.trim()),
+        uid: numeric_uid(&facts.uid_text),
         uid_is_root: facts.root,
         runner_lock_allowed: false,
         product_name: version.0,
         product_version: version.1,
         build_version: version.2,
         uname_m: sanitize(facts.uname_m.trim()),
-        hw_model: sanitize(one_line(facts.hw_model.trim()).as_str()),
+        hw_model: model_identifier(&facts.hw_model),
         lock_screen_appeared: appeared,
         input_reached_desktop_without_password: input,
         fail_closed,
@@ -277,8 +277,9 @@ pub fn safety_violation(report: &KitReport) -> Option<&'static str> {
     {
         return Some("the read-only run invoked a lock path");
     }
-    if contains_marker(&render(report)) {
-        return Some("the rendered result still contains a serial marker");
+    let rendered = render(report);
+    if contains_marker(&rendered) || leaks_personal(&rendered) {
+        return Some("the rendered result still contains a serial or a personal detail");
     }
     None
 }
@@ -553,6 +554,35 @@ mod tests {
         assert!(text.contains("redacted"));
         assert!(text.contains("refuse-message="));
         assert!(text.contains("state=never-unlocked"));
+        assert!(!crate::redact::leaks_personal(&text));
+    }
+
+    #[test]
+    fn a_name_a_home_path_and_another_device_are_not_in_the_result() {
+        let mut facts = sample();
+        facts.status = CommandText::new(
+            0,
+            "FileVault is On.\nDeferred enablement appears to be active for user 'Henry'\n",
+            "",
+        );
+        facts.symbol_detail =
+            "resolved /Users/Henry/Library henry@example.com 550e8400-e29b-41d4-a716-446655440000"
+                .to_string();
+        facts.hw_model = "MacBookPro16,2\n".to_string();
+        let report = build_report(&facts, None);
+        assert!(!report.serial_collected);
+        assert!(safety_violation(&report).is_none(), "{report:?}");
+        let text = render(&report);
+        let json = serde_json::to_string(&report).expect("json");
+        for body in [text.as_str(), json.as_str()] {
+            assert!(!body.contains("Henry"), "{body}");
+            assert!(!body.contains("/Users/"), "{body}");
+            assert!(!body.contains('@'), "{body}");
+            assert!(!body.contains("550e8400"), "{body}");
+            assert!(!crate::redact::leaks_personal(body), "{body}");
+        }
+        assert!(text.contains("filevault=on"));
+        assert!(text.contains("hw-model=MacBookPro16,2"));
     }
 
     #[test]
