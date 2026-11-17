@@ -17,7 +17,7 @@ use softlock_macos::{
 
 use crate::args::{Args, ExercisePath, Mode};
 use crate::commands::{engine_path_allowed, observation_argv_allowed, read_only_argv_allowed};
-use crate::helper::{HelperAction, helper_should_lock};
+use crate::helper::{HELPER_ENV, HelperAction, helper_should_lock};
 use crate::kit_gate::{KitInvocation, KitPermission, may_lock, permit};
 use crate::lock_attempt::{Attempt, CallWait, LockSeen, SignalEnd, judge, signal_end};
 use crate::redact::sanitize;
