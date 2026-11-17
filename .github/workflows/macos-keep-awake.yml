@@ -56,7 +56,7 @@ jobs:
         run: |
           set -euo pipefail
           ./tests/hardware/macos/run.sh --ci
-          result="$(find suite-output -name result.txt | head -n 1)"
+          result="$(find suite-output -name result.txt -print -quit)"
           test -n "$result"
           grep -F "softlock-hardware-suite/1" "$result"
           grep -E "pass=[0-9]+ fail=[0-9]+ skip=[0-9]+" "$result"

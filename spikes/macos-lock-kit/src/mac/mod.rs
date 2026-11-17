@@ -98,7 +98,7 @@ fn refusal(permission: KitPermission) -> &'static str {
 /// Drop closes the helper stdin, and the helper locks. It never unlocks.
 fn forced_failure(dir: &Path) -> i32 {
     let facts = collect(false);
-    let Some(armed) = arm_helper(HelperAction::Private, dir) else {
+    let Some(mut armed) = arm_helper(HelperAction::Private, dir) else {
         return refuse_unarmed(dir, &facts, ExercisePath::Private);
     };
     let mut record = ExerciseRecord::blank("fail-closed");
@@ -108,6 +108,9 @@ fn forced_failure(dir: &Path) -> i32 {
     record.detail =
         "forced failure; the helper is left armed so the session ends locked".to_string();
     let code = publish(dir, &build_report(&facts, Some(&record)));
+    if crate::lock_attempt::stand_down_on_forced_failure() {
+        stand_down(&mut armed);
+    }
     drop(armed);
     if code == 0 { 1 } else { code }
 }
