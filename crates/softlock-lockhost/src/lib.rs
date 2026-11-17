@@ -14,14 +14,9 @@ pub use real_lock::{RealLock, decide};
 #[cfg(feature = "dev-launch")]
 mod dev_marker;
 
-// The Windows modules are the real caller. This keeps the dependency in use
-// on hosts that do not compile those modules.
-#[cfg(feature = "dev-launch")]
-const _: fn(&softlock_core::Secret, &str) -> softlock_core::Verdict =
-    softlock_core::verify_softlock_pin;
 #[cfg(feature = "simulated-physical")]
 mod marker;
-#[cfg(all(feature = "dev-launch", windows))]
+#[cfg(windows)]
 mod win;
 
 pub use classify::{HookInput, InputClass, classify};
@@ -29,7 +24,13 @@ pub use classify::{HookInput, InputClass, classify};
 pub use classify::{RunNonce, clear_run_nonce, set_run_nonce};
 #[cfg(feature = "dev-launch")]
 pub use dev_marker::dev_launch_marker_bytes;
-#[cfg(all(feature = "dev-launch", windows))]
+#[cfg(windows)]
 pub use win::{
     DevConfig, DevError, DevLock, OVERLAY_MARKER, current_session_id, disconnect_session,
 };
+
+/// Private-channel entry point. The service spawns this process.
+#[cfg(windows)]
+pub fn run_service_host() -> i32 {
+    win::run_service_host()
+}

@@ -10,20 +10,28 @@ rust-version.workspace = true
 [features]
 # Test-only. Release builds do not enable this. Injected events whose
 # extra-info matches the per-run nonce are classified as simulated-physical.
-simulated-physical = ["dep:getrandom"]
-# Dev-only launch. Release builds do not enable this.
-dev-launch = ["dep:softlock-core", "dep:zeroize", "dep:windows"]
+simulated-physical = []
+# Dev-only marker. Release builds do not enable this. The lock host no longer
+# hashes a PIN or draws its own nonce.
+dev-launch = []
 
 [dependencies]
-getrandom = { version = "0.2.16", optional = true }
-softlock-core = { path = "../softlock-core", optional = true }
-zeroize = { version = "1.8.2", default-features = false, features = ["alloc"], optional = true }
+getrandom = "0.2.16"
+
+[dev-dependencies]
+softlock-seam3 = { path = "../softlock-seam3" }
+softlock-service = { path = "../softlock-service" }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", optional = true, features = [
+softlock-core = { path = "../softlock-core" }
+zeroize = { version = "1.8.2", default-features = false, features = ["alloc"] }
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Power",
     "Win32_System_RemoteDesktop",
     "Win32_System_Shutdown",
@@ -37,4 +45,3 @@ windows = { version = "0.62", optional = true, features = [
 [[bin]]
 name = "softlock-lockhost"
 path = "src/main.rs"
-required-features = ["dev-launch"]

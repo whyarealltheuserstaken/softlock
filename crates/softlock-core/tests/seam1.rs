@@ -187,8 +187,8 @@ fn locked_leaves_only_on_a_verified_broker_verdict() {
                 if hard_lock {
                     matches!(
                         controller.state(),
-                        LockState::FailingClosed {
-                            reason: FailReason::HardLock
+                        LockState::OsLocked {
+                            after_fail: Some(FailReason::HardLock)
                         }
                     )
                 } else {
@@ -416,8 +416,8 @@ fn arming_or_locked_failure_ends_in_os_locked_never_unlocked() {
             source: LockSource::Hotkey,
         });
         assert!(
-            matches!(controller.state(), LockState::FailingClosed { .. }),
-            "{step:?} should stop in FailingClosed, got {:?}",
+            matches!(controller.state(), LockState::OsLocked { .. }),
+            "{step:?} should stop in OsLocked, got {:?}",
             controller.state()
         );
         controller.handle(Event::OsLockConfirmed);
@@ -475,10 +475,16 @@ fn arming_or_locked_failure_ends_in_os_locked_never_unlocked() {
             "missing {reason:?} in {:?}",
             controller.failure_events()
         );
-        assert!(matches!(
-            controller.state(),
-            LockState::FailingClosed { .. }
-        ));
+        assert!(
+            matches!(
+                controller.state(),
+                LockState::OsLocked {
+                    after_fail: Some(failed)
+                } if failed == &reason
+            ),
+            "got {:?}",
+            controller.state()
+        );
         controller.handle(Event::OsLockConfirmed);
         assert!(matches!(
             controller.state(),
@@ -551,7 +557,7 @@ fn config_writes_are_rejected_outside_unlocked_with_the_session_not_os_locked() 
     failing.handle(Event::LockRequested {
         source: LockSource::Hotkey,
     });
-    assert!(matches!(failing.state(), LockState::FailingClosed { .. }));
+    assert!(matches!(failing.state(), LockState::OsLocked { .. }));
     reject_config(&mut failing);
     failing.handle(Event::OsLockConfirmed);
     assert!(matches!(failing.state(), LockState::OsLocked { .. }));
@@ -1155,8 +1161,8 @@ fn revert_failure_keeps_the_journal_and_does_not_unlock() {
     verify(&mut unlocking);
     assert!(matches!(
         unlocking.state(),
-        LockState::FailingClosed {
-            reason: FailReason::RevertFailed
+        LockState::OsLocked {
+            after_fail: Some(FailReason::RevertFailed)
         }
     ));
     assert!(!unlocking.journal().is_empty());
@@ -1203,14 +1209,18 @@ fn flush_persists_failure_count_and_locked_flag_and_recovery_restores_backoff() 
     assert_eq!(saved.failures(), 4);
     assert!(saved.says_locked());
 
-    let mut controller = started(FakePlatform::new());
+    let mut platform = FakePlatform::new();
+    platform.fail_os_lock(true);
+    let mut controller = started(platform);
     controller.handle(Event::ServiceStarted {
         journal: saved,
         session_active: true,
     });
     assert_eq!(controller.failure_count(), 4);
     assert_eq!(controller.journal().failures(), 4);
-    let mut restarted = started(FakePlatform::new());
+    let mut again = FakePlatform::new();
+    again.fail_os_lock(true);
+    let mut restarted = started(again);
     restarted.handle(Event::ServiceStarted {
         journal: controller.journal().persisted(),
         session_active: true,
@@ -1320,8 +1330,8 @@ fn service_stop_during_arming_fails_closed() {
     controller.handle(Event::ServiceStopRequested);
     assert!(matches!(
         controller.state(),
-        LockState::FailingClosed {
-            reason: FailReason::ServiceStop
+        LockState::OsLocked {
+            after_fail: Some(FailReason::ServiceStop)
         }
     ));
     assert!(!controller.returned_to_unlocked());
@@ -1364,7 +1374,12 @@ fn prompt_events_do_not_clear_the_backoff_deadline() {
 
 #[test]
 fn failing_closed_counts_wrong_secrets_and_applies_backoff() {
-    let mut controller = locked_started();
+    let mut platform = FakePlatform::new();
+    platform.fail_os_lock(true);
+    let mut controller = started(platform);
+    controller.handle(Event::LockRequested {
+        source: LockSource::Hotkey,
+    });
     controller.handle(Event::HostExited);
     assert!(matches!(
         controller.state(),
@@ -1446,8 +1461,9 @@ fn failing_closed_unlocks_only_through_a_matching_nonce() {
         nonce: counter_nonce(1),
     });
     assert!(
-        matches!(available.state(), LockState::FailingClosed { .. }),
-        "a nonce unlock ran while the OS lock was still available"
+        matches!(available.state(), LockState::OsLocked { .. }),
+        "a nonce unlock ran while the OS lock was still available: {:?}",
+        available.state()
     );
 
     let mut platform = FakePlatform::new();
@@ -1733,8 +1749,8 @@ fn hard_lock_from_the_app_while_locked_fails_closed() {
     });
     assert!(matches!(
         controller.state(),
-        LockState::FailingClosed {
-            reason: FailReason::HardLock
+        LockState::OsLocked {
+            after_fail: Some(FailReason::HardLock)
         }
     ));
     assert!(!controller.returned_to_unlocked());
@@ -1830,8 +1846,8 @@ fn service_stop_requested_while_locked_fails_closed() {
     controller.handle(Event::ServiceStopRequested);
     assert!(matches!(
         controller.state(),
-        LockState::FailingClosed {
-            reason: FailReason::ServiceStop
+        LockState::OsLocked {
+            after_fail: Some(FailReason::ServiceStop)
         }
     ));
     assert!(!controller.returned_to_unlocked());
@@ -1891,13 +1907,13 @@ fn recovering_with_an_active_session_fails_closed() {
     );
     assert!(matches!(
         controller.state(),
-        LockState::FailingClosed {
-            reason: FailReason::SessionActive
+        LockState::OsLocked {
+            after_fail: Some(FailReason::SessionActive)
         }
     ));
     assert!(
-        !controller.journal().is_empty(),
-        "fail-closed recovery keeps the journal until the OS lock is confirmed"
+        controller.journal().is_empty(),
+        "a confirmed OS lock reverts the journal"
     );
     assert!(!controller.returned_to_unlocked());
 }
@@ -2302,4 +2318,81 @@ proptest! {
             );
         }
     }
+}
+
+#[test]
+fn a_matching_nonce_is_consumed_and_cannot_unlock_again() {
+    let mut controller = locked_started();
+    controller.handle(Event::RequestHello);
+    let nonce = controller.broker_nonce().expect("broker nonce");
+    let replay = LaunchNonce::from_bytes(*nonce.as_bytes());
+    controller.handle(Event::Verified { nonce });
+    assert!(matches!(controller.state(), LockState::Unlocked));
+    assert!(controller.broker_nonce().is_none());
+
+    controller.handle(Event::LockRequested {
+        source: LockSource::Hotkey,
+    });
+    assert!(matches!(controller.state(), LockState::Locked { .. }));
+    controller.handle(Event::Verified { nonce: replay });
+    assert!(
+        matches!(controller.state(), LockState::Locked { .. }),
+        "a consumed nonce unlocked a second time"
+    );
+    assert!(
+        controller
+            .rejection_log()
+            .iter()
+            .any(|rejection| rejection.event == "Verified")
+    );
+}
+
+#[test]
+fn adopt_uses_the_service_nonce_and_a_self_issued_one_is_not_required() {
+    let mut controller = locked_started();
+    let nonce = LaunchNonce::generate().expect("nonce");
+    let bytes = *nonce.as_bytes();
+    controller.handle(Event::AdoptLaunchNonce { nonce });
+    controller.handle(Event::Verified {
+        nonce: LaunchNonce::from_bytes(bytes),
+    });
+    assert!(matches!(controller.state(), LockState::Unlocked));
+    assert!(controller.broker_nonce().is_none());
+}
+
+#[test]
+fn host_loss_while_the_os_lock_is_down_retries_and_never_unlocks() {
+    let mut platform = FakePlatform::new();
+    platform.fail_os_lock(true);
+    let mut controller = started(platform);
+    controller.handle(Event::LockRequested {
+        source: LockSource::LocalApi,
+    });
+    let first = controller.os_lock_attempts();
+    controller.handle(Event::HostExited);
+    assert!(controller.os_lock_unavailable());
+    assert!(controller.recovery_due());
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed {
+            reason: FailReason::HostExited
+        }
+    ));
+    let after_exit = controller.os_lock_attempts();
+    assert!(after_exit > first);
+
+    controller.acknowledge_recovery();
+    assert!(!controller.recovery_due());
+    controller.handle(Event::GuardDown);
+    assert!(controller.recovery_due());
+    assert!(controller.os_lock_attempts() > after_exit);
+    controller.handle(Event::HostSilent);
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed { .. }
+    ));
+    assert!(
+        !controller.returned_to_unlocked(),
+        "host loss while the OS lock is down ended Unlocked"
+    );
 }

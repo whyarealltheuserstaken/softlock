@@ -119,7 +119,7 @@ fn contaminated_build_fails_the_release_binary_check() {
     let root = unique_dir("builds");
     let clean_dir = root.join("clean");
     let dirty_dir = root.join("dirty");
-    build(&clean_dir, None).expect("release build without the test feature");
+    build(&clean_dir, "softlock-lockhost", None).expect("release build without the test feature");
     let clean_hits = scan(&clean_dir.join("release"), "");
     assert!(
         clean_hits.is_empty(),
@@ -129,6 +129,7 @@ fn contaminated_build_fails_the_release_binary_check() {
 
     build(
         &dirty_dir,
+        "softlock-lockhost",
         Some("softlock-lockhost/simulated-physical,softlock-lockhost/dev-launch"),
     )
     .expect("release build with the test features");
@@ -153,6 +154,15 @@ fn contaminated_build_fails_the_release_binary_check() {
         "contaminated build must contain the dev-launch marker symbol:\n{}",
         format_hits(&dirty_hits)
     );
+    let service_dir = root.join("service");
+    build(&service_dir, "softlock-service", Some("simulated-physical"))
+        .expect("service release build with the test feature");
+    let service_hits = scan(&service_dir.join("release"), "");
+    assert!(
+        service_hits.iter().any(|hit| hit.string && hit.symbol),
+        "a service binary with the test feature must fail the scan:\n{}",
+        format_hits(&service_hits)
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -176,7 +186,7 @@ fn product_release_binaries_omit_simulated_physical_markers() {
     println!("scanned release binaries: {count}");
 }
 
-fn build(target_dir: &Path, features: Option<&str>) -> Result<(), String> {
+fn build(target_dir: &Path, package: &str, features: Option<&str>) -> Result<(), String> {
     let manifest = repo_root().join("Cargo.toml");
     let mut command = Command::new(env!("CARGO"));
     command
@@ -186,7 +196,7 @@ fn build(target_dir: &Path, features: Option<&str>) -> Result<(), String> {
         .arg("--manifest-path")
         .arg(&manifest)
         .arg("-p")
-        .arg("softlock-lockhost")
+        .arg(package)
         .arg("--target-dir")
         .arg(target_dir)
         .env("CARGO_TARGET_DIR", target_dir)

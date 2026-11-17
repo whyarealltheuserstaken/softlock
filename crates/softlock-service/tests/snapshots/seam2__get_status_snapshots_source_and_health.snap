@@ -1,0 +1,66 @@
+---
+source: crates/softlock-service/tests/seam2.rs
+expression: rows
+---
+[
+  {
+    "kind": "Status",
+    "state": "Locked",
+    "lock_source": "Hotkey",
+    "guard": {
+      "hook_alive": true,
+      "last_physical_input_ms": 12
+    },
+    "overlay": {
+      "covered_monitors": 2,
+      "capture_excluded": true,
+      "topmost": true
+    },
+    "last_fallback": null
+  },
+  {
+    "kind": "Status",
+    "state": "Locked",
+    "lock_source": "Tray",
+    "guard": {
+      "hook_alive": true,
+      "last_physical_input_ms": 12
+    },
+    "overlay": {
+      "covered_monitors": 2,
+      "capture_excluded": true,
+      "topmost": true
+    },
+    "last_fallback": null
+  },
+  {
+    "kind": "Status",
+    "state": "Locked",
+    "lock_source": "App",
+    "guard": {
+      "hook_alive": true,
+      "last_physical_input_ms": 12
+    },
+    "overlay": {
+      "covered_monitors": 2,
+      "capture_excluded": true,
+      "topmost": true
+    },
+    "last_fallback": null
+  },
+  {
+    "kind": "Status",
+    "state": "Locked",
+    "lock_source": "LocalApi",
+    "guard": {
+      "hook_alive": true,
+      "last_physical_input_ms": 12
+    },
+    "overlay": {
+      "covered_monitors": 2,
+      "capture_excluded": true,
+      "topmost": true
+    },
+    "last_fallback": null
+  }
+]

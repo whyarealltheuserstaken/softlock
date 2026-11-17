@@ -183,7 +183,7 @@ impl Credentials for WinPlatform {
         // with no Broker nonce. The dev launch therefore never returns one.
         // The PIN compare and the `RequestHello` / `Event::Verified` path live
         // in the window thread.
-        let _ = (method, secret, &self.shared.pin_hash);
+        let _ = (method, secret);
         Verdict::Rejected
     }
 }

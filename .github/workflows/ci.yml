@@ -156,7 +156,7 @@ jobs:
   seam3:
     name: seam 3 (${{ matrix.image }})
     runs-on: ${{ matrix.image }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -236,7 +236,18 @@ jobs:
                pending && /^test / { exit 1 }
                pending && /^ok$/ { pending = 0; exit 0 }
                END { exit (found && !pending ? 0 : 1) }' target/seam3-lock-host.txt
-          grep -F "a_callback_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
+          # The service panic hook prints before libtest's "ok", so the result
+          # is on the same line or the next one. Either shape is a pass.
+          awk '{ gsub(/\r/, "") }
+               /^test a_callback_panic_tries_the_os_lock_then_drops_the_hooks \.\.\./ {
+                 found = 1
+                 if ($0 ~ / ok$/) { exit 0 }
+                 pending = 1
+                 next
+               }
+               pending && /^test / { exit 1 }
+               pending && /^ok$/ { pending = 0; exit 0 }
+               END { exit (found && !pending ? 0 : 1) }' target/seam3-lock-host.txt
       - name: Callback panic loop
         shell: bash
         run: |
@@ -253,6 +264,152 @@ jobs:
             passes=$((passes + 1))
           done
           echo "callback panic loop: ${passes} passed"
+          test "$passes" -eq 20
+      - name: Service authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          cargo test --locked -p softlock-service --target x86_64-pc-windows-msvc -- --test-threads=8 \
+            2>&1 | tee target/seam2-service.txt
+          grep -F "public_requests_never_unlock_from_locked ... ok" target/seam2-service.txt
+          grep -F "private_message_on_the_public_pipe_is_rejected ... ok" target/seam2-service.txt
+          grep -F "forged_launch_nonce_is_rejected ... ok" target/seam2-service.txt
+          grep -F "forged_host_ready_does_not_arm_the_host ... ok" target/seam2-service.txt
+          grep -F "forged_host_ready_leaves_the_host_not_ready ... ok" target/seam2-service.txt
+          grep -F "verified_nonce_is_single_use ... ok" target/seam2-service.txt
+          grep -F "non_console_client_is_rejected ... ok" target/seam2-service.txt
+          grep -F "get_status_snapshots_source_and_health ... ok" target/seam2-service.txt
+          grep -F "correct_pin_consumes_the_service_nonce ... ok" target/seam2-service.txt
+          grep -F "spec_invariant_3_names_the_emergency_path ... ok" target/seam2-service.txt
+          grep -F "os_lock_success_moves_to_os_locked_until_the_session_unlocks ... ok" target/seam2-service.txt
+          grep -F "another_sessions_lock_does_not_move_the_console ... ok" target/seam2-service.txt
+          cargo build --locked -p softlock-service -p softlock-lockhost \
+            --features softlock-service/simulated-physical,softlock-lockhost/simulated-physical \
+            --target x86_64-pc-windows-msvc
+          # A file, not a pipe. A lock-host child that outlives cargo keeps a
+          # pipe open and tee never sees EOF, so the job sits until timeout.
+          set +e
+          cargo test --locked -p softlock-lockhost --features simulated-physical \
+            --target x86_64-pc-windows-msvc --test service_session -- --test-threads=1 --nocapture \
+            > target/seam3-service.txt 2>&1
+          status=$?
+          set -e
+          cat target/seam3-service.txt
+          taskkill //IM softlock-lockhost.exe //F || true
+          test "$status" -eq 0
+          grep -F "lock_client_lock_blocks_physical_input_and_passes_injected ... ok" target/seam3-service.txt
+          grep -F "lock_host_idles_before_lock_and_arms_within_500ms ... service arming took" target/seam3-service.txt
+          arming=$(grep -E "lock_host_idles_before_lock_and_arms_within_500ms \.\.\. service arming took [0-9]+ ms ok" target/seam3-service.txt)
+          echo "$arming"
+          arming_ms=$(printf '%s\n' "$arming" | grep -oE "service arming took [0-9]+" | grep -oE "[0-9]+")
+          test "$arming_ms" -lt 500
+          grep -F "private_pin_unlocks_and_the_hash_is_not_user_readable ... ok" target/seam3-service.txt
+          grep -F "service_log_omits_the_pin_and_the_note ... ok" target/seam3-service.txt
+          grep -F "panic_while_os_lock_is_down_is_closed_by_the_service ... ok" target/seam3-service.txt
+          grep -F "emergency_after_both_os_locks_fail_is_closed_by_the_service ... ok" target/seam3-service.txt
+          grep -F "installed_service_runs_as_local_system_and_rejects_session_zero ... ok" target/seam3-service.txt
+          grep -F "lock_host_token_is_system_in_the_console_session ... ok" target/seam3-service.txt
+          grep -F "service_stop_while_locked_keeps_input_blocked ... ok" target/seam3-service.txt
+          grep -F "local_system_pin_file_is_rewritten_and_unreadable ... ok" target/seam3-service.txt
+          grep -F "standard_user_cannot_plant_the_secret_store ... ok" target/seam3-service.txt
+          grep -F "standard_user_cannot_create_the_service_pipe ... ok" target/seam3-service.txt
+          grep -F "service_kill_while_locked_stays_guarded_when_os_lock_fails ... ok" target/seam3-service.txt
+          grep -F "service_kill_while_locked_releases_only_after_os_lock ... ok" target/seam3-service.txt
+          grep -F "impostor_pid_does_not_release_the_guard ... ok" target/seam3-service.txt
+          grep -F "impostor_path_does_not_release_the_guard ... ok" target/seam3-service.txt
+          grep -F "reused_pid_is_not_trusted_again ... ok" target/seam3-service.txt
+          grep -F "several_pipe_instances_accept_at_once ... ok" target/seam3-service.txt
+      - name: Service race loops
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p softlock-lockhost --features simulated-physical \
+            --target x86_64-pc-windows-msvc --test service_session --no-run \
+            --message-format=json > target/service-session-build.json
+          exe_win=$(python .github/lock-host-test-exe.py target/service-session-build.json)
+          exe=$(cygpath -u "$exe_win")
+          test -f "$exe"
+          case "$exe" in
+            *service_session*) ;;
+            *) echo "unexpected test executable: $exe"; exit 1 ;;
+          esac
+          run_exact() {
+            "$exe" --exact "$1" --test-threads=1 --nocapture
+          }
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact panic_while_os_lock_is_down_is_closed_by_the_service
+            passes=$((passes + 1))
+          done
+          echo "panic loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact emergency_after_both_os_locks_fail_is_closed_by_the_service
+            passes=$((passes + 1))
+          done
+          echo "emergency loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            set +e
+            # A file, not a command substitution. A guarded host that outlives
+            # the test keeps a pipe open and the loop never reaches the next run.
+            run_exact lock_host_idles_before_lock_and_arms_within_500ms > target/arming-one.txt 2>&1
+            status=$?
+            set -e
+            out=$(cat target/arming-one.txt)
+            printf '%s\n' "$out"
+            test "$status" -eq 0
+            ms=$(printf '%s\n' "$out" | grep -oE "service arming took [0-9]+" | grep -oE "[0-9]+" | head -1)
+            test -n "$ms"
+            test "$ms" -lt 500
+            passes=$((passes + 1))
+          done
+          echo "arming loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact service_kill_while_locked_stays_guarded_when_os_lock_fails
+            passes=$((passes + 1))
+          done
+          echo "kill-fail loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact service_kill_while_locked_releases_only_after_os_lock
+            passes=$((passes + 1))
+          done
+          echo "kill-succeed loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact standard_user_cannot_plant_the_secret_store
+            passes=$((passes + 1))
+          done
+          echo "plant loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact impostor_pid_does_not_release_the_guard
+            passes=$((passes + 1))
+          done
+          echo "impostor loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact impostor_path_does_not_release_the_guard
+            passes=$((passes + 1))
+          done
+          echo "impostor-path loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact reused_pid_is_not_trusted_again
+            passes=$((passes + 1))
+          done
+          echo "reuse loop: ${passes} passed"
           test "$passes" -eq 20
       - name: Release build of the Windows target omits the test feature
         shell: bash

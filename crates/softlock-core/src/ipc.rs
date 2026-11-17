@@ -159,6 +159,31 @@ pub fn checked_body_len(prefix: &[u8]) -> Result<usize, IpcError> {
     Ok(length)
 }
 
+/// Reads one length-prefixed frame. The body is not allocated when the
+/// prefix asks for more than [`MAX_FRAME`].
+pub fn read_prefixed_frame(reader: &mut impl std::io::Read) -> Result<Vec<u8>, IpcError> {
+    let mut prefix = [0u8; 4];
+    reader
+        .read_exact(&mut prefix)
+        .map_err(|_| IpcError::Malformed)?;
+    let length = checked_body_len(&prefix)?;
+    let mut frame = vec![0u8; 4 + length];
+    frame[..4].copy_from_slice(&prefix);
+    reader
+        .read_exact(&mut frame[4..])
+        .map_err(|_| IpcError::Malformed)?;
+    Ok(frame)
+}
+
+pub fn write_prefixed_frame(
+    writer: &mut impl std::io::Write,
+    frame: &[u8],
+) -> Result<(), IpcError> {
+    writer.write_all(frame).map_err(|_| IpcError::Malformed)?;
+    writer.flush().map_err(|_| IpcError::Malformed)?;
+    Ok(())
+}
+
 pub fn encode_frame(json: &str) -> Result<Vec<u8>, IpcError> {
     if json.len() > MAX_FRAME {
         return Err(IpcError::Malformed);

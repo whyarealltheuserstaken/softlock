@@ -33,6 +33,7 @@ pub fn desktop_supported() -> bool {
 fn dev_launch_dependencies() {
     let _ = softlock_lockhost::dev_launch_marker_bytes();
     let _ = std::any::type_name::<softlock_core::Secret>();
+    let _ = std::any::type_name::<softlock_service::PinChecker>();
 }
 
 #[cfg(all(windows, feature = "simulated-physical"))]

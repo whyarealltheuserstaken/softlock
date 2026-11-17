@@ -50,6 +50,10 @@ pub enum Event {
         method: MethodId,
     },
     RequestHello,
+    /// Stores a nonce the Service already drew. Does not draw a new one.
+    AdoptLaunchNonce {
+        nonce: LaunchNonce,
+    },
     Session(SessionEvent),
     OsLockConfirmed,
     SubmitSecret {
@@ -58,6 +62,10 @@ pub enum Event {
     },
     AdvanceTime(Duration),
     HostExited,
+    /// The guard is down and the host can no longer hold the session.
+    GuardDown,
+    /// Heartbeats stopped. Same recovery as a dead host.
+    HostSilent,
     Heartbeat(HeartbeatReport),
     ServiceStarted {
         journal: Journal,
@@ -88,6 +96,10 @@ pub struct LockController<P> {
     /// same nonce-checked unlock as `Locked`. A call that succeeded leaves
     /// this false, and `FailingClosed` waits for the OS lock instead.
     os_lock_unavailable: bool,
+    os_lock_attempts: u32,
+    /// The OS lock did not engage and the host is not holding the session.
+    /// The Service respawns the Lock Host. This never means Unlocked.
+    recovery_due: bool,
     config: ConfigStore,
     awake: Option<AwakeGuard>,
     last_response: Option<ResponseKind>,
@@ -115,6 +127,8 @@ impl<P: Platform> LockController<P> {
             broker_launched: false,
             broker_nonce: None,
             os_lock_unavailable: false,
+            os_lock_attempts: 0,
+            recovery_due: false,
             config: ConfigStore::new(),
             awake: None,
             last_response: None,
@@ -137,11 +151,14 @@ impl<P: Platform> LockController<P> {
                 self.on_prompt(PromptState::Verifying { method });
             }
             Event::RequestHello => self.on_request_hello(),
+            Event::AdoptLaunchNonce { nonce } => self.on_adopt_nonce(nonce),
             Event::Session(notification) => self.on_session(notification),
             Event::OsLockConfirmed => self.on_os_lock_confirmed(),
             Event::SubmitSecret { method, secret } => self.on_submit_secret(method, secret),
             Event::AdvanceTime(by) => self.advance(by),
-            Event::HostExited => self.on_host_exited(),
+            Event::HostExited => self.on_host_lost(FailReason::HostExited),
+            Event::GuardDown => self.on_host_lost(FailReason::GuardUnhealthy),
+            Event::HostSilent => self.on_host_lost(FailReason::HeartbeatMissed),
             Event::Heartbeat(report) => self.on_heartbeat(report),
             Event::ServiceStarted {
                 journal,
@@ -165,6 +182,20 @@ impl<P: Platform> LockController<P> {
     /// True after `os_lock` has failed and until a later call succeeds.
     pub fn os_lock_unavailable(&self) -> bool {
         self.os_lock_unavailable
+    }
+
+    /// True after an OS lock failed while the host is not holding the session.
+    /// The Service respawns the Lock Host and retries the OS lock.
+    pub fn recovery_due(&self) -> bool {
+        self.recovery_due
+    }
+
+    pub fn acknowledge_recovery(&mut self) {
+        self.recovery_due = false;
+    }
+
+    pub fn os_lock_attempts(&self) -> u32 {
+        self.os_lock_attempts
     }
 
     pub fn visited(&self) -> &VecDeque<LockState> {
@@ -378,6 +409,10 @@ impl<P: Platform> LockController<P> {
             self.reject("Verified");
             return;
         }
+        // One use. A replay cannot match, including when teardown fails and
+        // the machine is still in a locked state.
+        self.broker_nonce = None;
+        self.broker_launched = false;
         self.begin_unlock();
     }
 
@@ -429,6 +464,7 @@ impl<P: Platform> LockController<P> {
     }
 
     fn request_os_lock(&mut self) {
+        self.os_lock_attempts = self.os_lock_attempts.saturating_add(1);
         let session = SessionControl::console_session(&self.platform);
         if SessionControl::os_lock(&mut self.platform, session).is_err() {
             self.os_lock_unavailable = true;
@@ -442,6 +478,15 @@ impl<P: Platform> LockController<P> {
         push_bounded(&mut self.failure_events, reason);
         self.request_os_lock();
         self.enter(LockState::FailingClosed { reason });
+        // A successful OS lock is confirmation, not another guarded state.
+        // Sitting in FailingClosed here would arm a replacement host while
+        // the workstation is already locked.
+        if self.os_lock_unavailable {
+            self.recovery_due = true;
+        } else {
+            self.recovery_due = false;
+            self.on_os_lock_confirmed();
+        }
     }
 
     fn on_os_lock_confirmed(&mut self) {
@@ -455,6 +500,15 @@ impl<P: Platform> LockController<P> {
         self.enter(LockState::OsLocked {
             after_fail: Some(reason),
         });
+    }
+
+    fn on_adopt_nonce(&mut self, nonce: LaunchNonce) {
+        if !self.nonce_unlock_allowed() {
+            self.reject("AdoptLaunchNonce");
+            return;
+        }
+        self.broker_launched = true;
+        self.broker_nonce = Some(nonce);
     }
 
     fn on_request_hello(&mut self) {
@@ -475,25 +529,51 @@ impl<P: Platform> LockController<P> {
         }
     }
 
-    fn on_host_exited(&mut self) {
-        if matches!(
-            self.state,
-            LockState::Locked { .. } | LockState::Arming { .. }
-        ) {
-            self.fail_closed(FailReason::HostExited);
-        } else {
-            self.reject("HostExited");
+    /// Host gone, heartbeats missed, or the guard dropped. A repeat while
+    /// already `FailingClosed` retries the OS lock. Success leaves `OsLocked`
+    /// and does not ask for another armed host. Failure stays guarded.
+    /// Neither path enters `Unlocked`.
+    fn on_host_lost(&mut self, reason: FailReason) {
+        let label = match reason {
+            FailReason::GuardUnhealthy => "GuardDown",
+            FailReason::HeartbeatMissed => "HeartbeatMissed",
+            _ => "HostExited",
+        };
+        match self.state.clone() {
+            LockState::Locked { .. } | LockState::Arming { .. } => self.fail_closed(reason),
+            LockState::FailingClosed { .. } => {
+                push_bounded(&mut self.failure_events, reason);
+                self.request_os_lock();
+                if self.os_lock_unavailable {
+                    self.recovery_due = true;
+                } else {
+                    self.recovery_due = false;
+                    self.on_os_lock_confirmed();
+                }
+            }
+            _ => self.reject(label),
         }
     }
 
+    /// Stop is not an unlock. `Locked` and `Arming` fail closed, which confirms
+    /// the OS lock when that call works. `FailingClosed` confirms it too, and
+    /// stays guarded when the call still fails.
     fn on_stop(&mut self) {
-        if matches!(
-            self.state,
-            LockState::Locked { .. } | LockState::Arming { .. }
-        ) {
-            self.fail_closed(FailReason::ServiceStop);
-        } else {
-            self.reject("ServiceStopRequested");
+        match self.state.clone() {
+            LockState::Locked { .. } | LockState::Arming { .. } => {
+                self.fail_closed(FailReason::ServiceStop);
+            }
+            LockState::FailingClosed { .. } => {
+                self.request_os_lock();
+                if self.os_lock_unavailable {
+                    self.recovery_due = true;
+                    self.reject("ServiceStopRequested");
+                } else {
+                    self.recovery_due = false;
+                    self.on_os_lock_confirmed();
+                }
+            }
+            _ => self.reject("ServiceStopRequested"),
         }
     }
 

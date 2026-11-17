@@ -10,8 +10,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use softlock_core::{
-    Event, FailReason, GuardHealth, HEARTBEAT_INTERVAL, HeartbeatReport, LockController,
-    LockSource, LockState, MethodId, Overlay, Secret, Verdict, verify_softlock_pin,
+    Event, FailReason, GuardHealth, HEARTBEAT_INTERVAL, HeartbeatReport, LaunchNonce,
+    LockController, LockSource, LockState, MethodId, Overlay, OverlayHealth, PinAuthority,
+    PinDecision, Secret,
 };
 use zeroize::Zeroize;
 
@@ -33,9 +34,37 @@ pub(crate) static SESSION: AtomicPtr<Shared> = AtomicPtr::new(std::ptr::null_mut
 const PIN_CHAR_LIMIT: u32 = 128;
 
 pub struct DevConfig {
-    pub pin_hash: String,
+    /// Decides a PIN. The host does not hash it and does not draw the nonce.
+    pub authority: Box<dyn PinAuthority>,
     /// Runs after the guard is installed and before the overlay is shown.
     pub while_arming: Option<Box<dyn FnOnce() + Send>>,
+}
+
+pub(crate) enum PipeCommand {
+    Arm,
+    Disarm,
+    Quit,
+}
+
+pub(crate) enum PipeReport {
+    Ready {
+        monitors: u32,
+    },
+    Heartbeat {
+        seq: u64,
+        guard: GuardHealth,
+        overlay: OverlayHealth,
+    },
+    Secret(Secret),
+    GuardDown,
+}
+
+struct NeverGrant;
+
+impl PinAuthority for NeverGrant {
+    fn decide(&mut self, _secret: &Secret, _allow_grant: bool) -> PinDecision {
+        PinDecision::Deny
+    }
 }
 
 pub struct DevError {
@@ -75,8 +104,9 @@ pub struct DevLock {
 
 impl DevLock {
     pub fn arm(config: DevConfig) -> Result<Self, DevError> {
+        #[cfg(feature = "dev-launch")]
         let _ = crate::dev_launch_marker_bytes();
-        let shared = Shared::new(config.pin_hash, config.while_arming);
+        let shared = Shared::new(config.authority, config.while_arming);
         let worker = Arc::clone(&shared);
         let (tx, rx) = std::sync::mpsc::channel();
         let ui = thread::spawn(move || {
@@ -87,6 +117,10 @@ impl DevLock {
                 // overlay or take a PIN. Try the OS lock, then drop the hooks.
                 // Leaving them installed would swallow input with no UI.
                 emergency(&on_panic);
+                if on_panic.pipe_mode.load(Ordering::Acquire) {
+                    publish(&on_panic, PipeReport::GuardDown);
+                    std::process::exit(1);
+                }
             }
         });
         match rx.recv_timeout(Duration::from_secs(8)) {
@@ -223,6 +257,31 @@ impl DevLock {
         self.shared.panic_in_callback.store(true, Ordering::Release);
     }
 
+    /// Installs the service panic hook. A panic on the hook thread tries the
+    /// OS lock and then releases the guard without joining that thread.
+    /// Panics on any other thread are forwarded to the hook that was current.
+    #[cfg(feature = "simulated-physical")]
+    pub fn install_service_panic_hook(&self) {
+        let previous = std::panic::take_hook();
+        let shared = Arc::clone(&self.shared);
+        std::panic::set_hook(Box::new(move |info| {
+            if guard::current_thread_is_hook(&shared) {
+                host_panic_hook(&shared, info);
+            } else {
+                previous(info);
+            }
+        }));
+    }
+
+    /// The service panic hook ran on the hook thread. The callback-panic test
+    /// uses this to prove the self-join path returned.
+    #[cfg(feature = "simulated-physical")]
+    pub fn panic_hook_ran_on_hook_thread(&self) -> bool {
+        self.shared
+            .panic_hook_on_hook_thread
+            .load(Ordering::Acquire)
+    }
+
     /// The hook thread has been joined. Its id is 0 only after `remove`.
     /// Tests wait for this before sending a key that must reach the probe.
     /// The product path tries the OS lock first and drops the hooks only
@@ -280,7 +339,8 @@ pub(crate) struct Shared {
     pub cursor_y: AtomicI32,
     pub cursor_gen: AtomicU64,
     pub snap_gen: AtomicU64,
-    /// `0` calls Windows. Anything else makes both OS lock paths fail.
+    /// `0` calls Windows. `1` makes both OS lock paths fail. `2` reports a
+    /// confirmed workstation lock without calling Windows.
     pub os_lock_stub: AtomicU8,
     pub os_lock_attempts: AtomicU32,
     pub os_lock_unavailable: AtomicBool,
@@ -293,20 +353,32 @@ pub(crate) struct Shared {
     pub hook_poisoned: AtomicBool,
     #[cfg(feature = "simulated-physical")]
     pub panic_in_callback: AtomicBool,
+    /// Panic only on F13. The liveness marker and stray mouse input stay
+    /// quiet, so a service test can fire `emergency()` after the host is ready.
+    #[cfg(feature = "simulated-physical")]
+    pub panic_callback_on_f13: AtomicBool,
+    #[cfg(feature = "simulated-physical")]
+    pub panic_hook_on_hook_thread: AtomicBool,
     pub failing_closed: AtomicBool,
     pub heartbeat_missed: AtomicBool,
     pub emergency_ran: AtomicBool,
     pub windows: Mutex<Vec<isize>>,
     pub hook: Mutex<Option<JoinHandle<()>>>,
     pub liveness: Mutex<Option<JoinHandle<()>>>,
-    pub pin_hash: String,
+    pub authority: Mutex<Box<dyn PinAuthority>>,
+    pub pipe_mode: AtomicBool,
+    pub reports: Mutex<Option<std::sync::mpsc::Sender<PipeReport>>>,
+    pub commands: Mutex<Option<std::sync::mpsc::Receiver<PipeCommand>>>,
     pub while_arming: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     events_tx: Mutex<std::sync::mpsc::Sender<softlock_core::SessionEvent>>,
     events_rx: Mutex<Option<std::sync::mpsc::Receiver<softlock_core::SessionEvent>>>,
 }
 
 impl Shared {
-    fn new(pin_hash: String, while_arming: Option<Box<dyn FnOnce() + Send>>) -> Arc<Self> {
+    fn new(
+        authority: Box<dyn PinAuthority>,
+        while_arming: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Arc<Self> {
         let (tx, rx) = std::sync::mpsc::channel();
         Arc::new(Self {
             queue: EventQueue::new(),
@@ -343,13 +415,20 @@ impl Shared {
             hook_poisoned: AtomicBool::new(false),
             #[cfg(feature = "simulated-physical")]
             panic_in_callback: AtomicBool::new(false),
+            #[cfg(feature = "simulated-physical")]
+            panic_callback_on_f13: AtomicBool::new(false),
+            #[cfg(feature = "simulated-physical")]
+            panic_hook_on_hook_thread: AtomicBool::new(false),
             failing_closed: AtomicBool::new(false),
             heartbeat_missed: AtomicBool::new(false),
             emergency_ran: AtomicBool::new(false),
             windows: Mutex::new(Vec::new()),
             hook: Mutex::new(None),
             liveness: Mutex::new(None),
-            pin_hash,
+            authority: Mutex::new(authority),
+            pipe_mode: AtomicBool::new(false),
+            reports: Mutex::new(None),
+            commands: Mutex::new(None),
             while_arming: Mutex::new(while_arming),
             events_tx: Mutex::new(tx),
             events_rx: Mutex::new(Some(rx)),
@@ -381,6 +460,7 @@ impl Shared {
 }
 
 fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, DevError>>) {
+    apply_simulated_environment(&shared);
     unsafe {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -389,6 +469,10 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             windows::Win32::System::Threading::GetCurrentThreadId(),
             Ordering::Release,
         );
+    }
+    if shared.pipe_mode.load(Ordering::Acquire) && !wait_for_arm(&shared) {
+        let _ = ready.send(Err(DevError::new("lock host stopped before arming")));
+        return;
     }
     let mut controller = LockController::new(WinPlatform::new(Arc::clone(&shared)));
     let started = Instant::now();
@@ -402,6 +486,19 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
         return;
     }
     shared.locked.store(true, Ordering::Release);
+    failclosed::publish_armed_host();
+    // Before Ready. Lock returns only after Ready, and the test then sends
+    // F13. Liveness and mouse input do not trip this flag.
+    #[cfg(feature = "simulated-physical")]
+    if std::env::var("SOFTLOCK_PANIC").ok().as_deref() == Some("callback") {
+        shared.panic_callback_on_f13.store(true, Ordering::Release);
+    }
+    publish(
+        &shared,
+        PipeReport::Ready {
+            monitors: shared.monitors.load(Ordering::Acquire),
+        },
+    );
     if ready.send(Ok(elapsed)).is_err() {
         shutdown(&shared);
         return;
@@ -418,6 +515,8 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
     let mut last_minute = overlay::minute_now();
     let mut clock = Instant::now();
     let mut os_retry_at: Option<Instant> = None;
+    let mut service_gone = false;
+    let mut quit_tried = false;
     loop {
         if shared.panic_window.load(Ordering::Acquire) {
             panic!("lock host window thread");
@@ -426,6 +525,20 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
         note_controller(&controller, &shared);
         guard::restore_cursor(&shared);
         if shared.stop.load(Ordering::Acquire) {
+            break;
+        }
+        match next_command(&shared) {
+            Some(PipeCommand::Disarm) => break,
+            Some(PipeCommand::Quit) => service_gone = true,
+            _ => {}
+        }
+        if service_gone && !quit_tried {
+            quit_tried = true;
+            if quit_reaches_os_lock(&shared, &mut controller) {
+                break;
+            }
+        }
+        if service_gone && failclosed::replacement_host_armed() {
             break;
         }
         if shared.fail.swap(false, Ordering::AcqRel) {
@@ -519,14 +632,24 @@ fn beat(controller: &mut LockController<WinPlatform>, shared: &Shared) {
         return;
     }
     let seq = controller.next_heartbeat_seq();
+    let guard = GuardHealth {
+        hook_alive: true,
+        last_physical_input_ms: shared.physical_ms(),
+    };
+    let overlay = Overlay::health(controller.platform());
     controller.handle(Event::Heartbeat(HeartbeatReport {
         seq,
-        guard: GuardHealth {
-            hook_alive: true,
-            last_physical_input_ms: shared.physical_ms(),
-        },
-        overlay: Overlay::health(controller.platform()),
+        guard,
+        overlay,
     }));
+    publish(
+        shared,
+        PipeReport::Heartbeat {
+            seq,
+            guard,
+            overlay,
+        },
+    );
 }
 
 fn note_controller(controller: &LockController<WinPlatform>, shared: &Shared) {
@@ -561,6 +684,47 @@ fn retry_os_lock(
             shared.os_lock_error.store(false, Ordering::Release);
             controller.handle(Event::OsLockConfirmed);
         }
+    }
+}
+
+/// OS lock, then hooks. The hook thread must not join itself; `remove` skips
+/// that join. The OS lock attempt stays first.
+fn host_panic_hook(shared: &Shared, info: &std::panic::PanicHookInfo) {
+    eprintln!("lock host panic: {info}");
+    #[cfg(feature = "simulated-physical")]
+    if guard::current_thread_is_hook(shared) {
+        shared
+            .panic_hook_on_hook_thread
+            .store(true, Ordering::Release);
+    }
+    // OS lock before any join. `remove` joins the hook thread, and this hook
+    // is that thread when a callback panics. Unhooking from inside the
+    // callback also leaves SendInput broken, so the callback path only asks
+    // the hook thread to exit after it returns.
+    let _ = failclosed::lock_or_disconnect(failclosed::console_session());
+    if guard::in_hook_callback() {
+        shared.stop.store(true, Ordering::Release);
+        let thread_id = shared.hook_thread_id.load(Ordering::Acquire);
+        if thread_id != 0 {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                    thread_id,
+                    windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+        }
+        if shared.pipe_mode.load(Ordering::Acquire) {
+            publish(shared, PipeReport::GuardDown);
+            std::process::exit(1);
+        }
+        return;
+    }
+    emergency(shared);
+    if shared.pipe_mode.load(Ordering::Acquire) {
+        publish(shared, PipeReport::GuardDown);
+        std::process::exit(1);
     }
 }
 
@@ -609,7 +773,38 @@ fn report_guard_down(controller: &mut LockController<WinPlatform>, shared: &Shar
 
 fn shutdown(shared: &Shared) {
     release_session(shared);
+    failclosed::clear_armed_host();
     shared.locked.store(false, Ordering::Release);
+}
+
+/// Quit is the service pipe closing. Release only after the OS lock is
+/// confirmed. Otherwise the hooks stay until another host has armed.
+fn quit_reaches_os_lock(shared: &Shared, controller: &mut LockController<WinPlatform>) -> bool {
+    let guarded = matches!(
+        controller.state(),
+        LockState::Locked { .. } | LockState::Arming { .. } | LockState::FailingClosed { .. }
+    );
+    if !guarded {
+        return false;
+    }
+    match failclosed::lock_or_disconnect(failclosed::console_session()) {
+        RealLock::Workstation | RealLock::Disconnected => {
+            if matches!(
+                controller.state(),
+                LockState::Locked { .. } | LockState::Arming { .. }
+            ) {
+                report_guard_down(controller, shared);
+            }
+            if !matches!(controller.state(), LockState::OsLocked { .. }) {
+                controller.handle(Event::OsLockConfirmed);
+            }
+            matches!(controller.state(), LockState::OsLocked { .. })
+        }
+        RealLock::Unavailable => {
+            shared.os_lock_unavailable.store(true, Ordering::Release);
+            false
+        }
+    }
 }
 
 pub(crate) fn release_session(shared: &Shared) {
@@ -744,6 +939,11 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
         shared.pin_chars.store(0, Ordering::Release);
         overlay::invalidate(shared);
     };
+    if shared.pipe_mode.load(Ordering::Acquire) {
+        publish(shared, PipeReport::Secret(secret));
+        finish(shared);
+        return;
+    }
     // Any PIN, right or wrong, is refused while the controller's backoff is
     // running. `SubmitSecret` is how that refusal is recorded: the controller
     // drops the secret and does not start an unlock.
@@ -755,49 +955,48 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
         finish(shared);
         return;
     }
-    // Argon2id compare, constant time, spec parameters. `Verdict::Verified`
-    // here is the credential verdict and carries no nonce.
-    let matched = verify_softlock_pin(&secret, &shared.pin_hash) == Verdict::Verified;
-    // Backoff already returned above. `Locked`, and `FailingClosed` after the
-    // OS lock call failed, both release through `RequestHello` and `Verified`.
+    // The service crate decides. A grant carries its nonce. This process does
+    // not hash the PIN and does not call `RequestHello`.
     let releasing = matches!(controller.state(), LockState::Locked { .. })
         || (matches!(controller.state(), LockState::FailingClosed { .. })
             && shared.os_lock_unavailable.load(Ordering::Acquire));
-    if matched && releasing {
-        drop(secret);
-        unlock_with_broker_nonce(controller, shared);
-        finish(shared);
-        return;
+    let decision = shared
+        .authority
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .decide(&secret, releasing);
+    match decision {
+        PinDecision::Grant(nonce) => {
+            drop(secret);
+            apply_granted_nonce(controller, shared, nonce);
+            finish(shared);
+        }
+        PinDecision::Hold => {
+            drop(secret);
+            finish(shared);
+        }
+        PinDecision::Deny => {
+            controller.handle(Event::SubmitSecret {
+                method: MethodId::softlock_pin(),
+                secret,
+            });
+            finish(shared);
+        }
     }
-    if matched {
-        drop(secret);
-        finish(shared);
-        return;
-    }
-    // Wrong PIN, or a PIN the controller will not accept. `verify_secret`
-    // stays `Rejected`, so a `Locked` or `FailingClosed` controller records
-    // the failure and starts backoff.
-    controller.handle(Event::SubmitSecret {
-        method: MethodId::softlock_pin(),
-        secret,
-    });
-    finish(shared);
 }
 
-fn unlock_with_broker_nonce(controller: &mut LockController<WinPlatform>, shared: &Shared) {
-    // Dev launch only. `RequestHello` makes this process draw the nonce with
-    // `LaunchNonce::generate` (32 bytes from `getrandom`) and store it here.
-    // `Locked` and `FailingClosed` (only while the OS lock is unavailable)
-    // both accept it, and `Verified` moves through `Unlocking` on `eq_ct`.
-    // Ticket 13 must not do that. The Broker owns the nonce, and the lock
-    // host has to receive that nonce across the process boundary before
-    // `Event::Verified`. Production code does not call `LaunchNonce::from_bytes`.
-    controller.handle(Event::RequestHello);
-    let Some(nonce) = controller.broker_nonce() else {
-        overlay::invalidate(shared);
-        return;
-    };
-    controller.handle(Event::Verified { nonce });
+fn apply_granted_nonce(
+    controller: &mut LockController<WinPlatform>,
+    shared: &Shared,
+    nonce: LaunchNonce,
+) {
+    let bytes = *nonce.as_bytes();
+    controller.handle(Event::AdoptLaunchNonce {
+        nonce: LaunchNonce::from_bytes(bytes),
+    });
+    controller.handle(Event::Verified {
+        nonce: LaunchNonce::from_bytes(bytes),
+    });
     if matches!(controller.state(), LockState::Unlocked) {
         shared.prompt_open.store(false, Ordering::Release);
         shared.locked.store(false, Ordering::Release);
@@ -897,5 +1096,183 @@ fn owner_layout() -> windows::Win32::UI::Input::KeyboardAndMouse::HKL {
         } else {
             layout
         }
+    }
+}
+
+fn publish(shared: &Shared, report: PipeReport) {
+    if let Some(sender) = shared
+        .reports
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+    {
+        let _ = sender.send(report);
+    }
+}
+
+fn next_command(shared: &Shared) -> Option<PipeCommand> {
+    shared
+        .commands
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_mut()
+        .and_then(|commands| commands.try_recv().ok())
+}
+
+fn wait_for_arm(shared: &Shared) -> bool {
+    loop {
+        if shared.stop.load(Ordering::Acquire) {
+            return false;
+        }
+        match next_command(shared) {
+            Some(PipeCommand::Arm) => return true,
+            Some(PipeCommand::Disarm) => return false,
+            // Hooks are installed only after Arm. Quit before that is not
+            // Locked, Arming, or FailingClosed, so it must not call the OS lock.
+            Some(PipeCommand::Quit) => return false,
+            None => {
+                if !pump_message() && shared.stop.load(Ordering::Acquire) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+fn apply_simulated_environment(shared: &Shared) {
+    #[cfg(feature = "simulated-physical")]
+    {
+        match std::env::var("SOFTLOCK_STUB_OS_LOCK").ok().as_deref() {
+            Some("succeed") => shared.os_lock_stub.store(2, Ordering::Release),
+            // This feature is the test build. A missing stub must not call
+            // LockWorkStation; production builds do not compile this branch.
+            _ => shared.os_lock_stub.store(1, Ordering::Release),
+        }
+        if std::env::var("SOFTLOCK_PANIC").ok().as_deref() == Some("after-arm") {
+            shared.panic_window.store(true, Ordering::Release);
+        }
+        if let Ok(text) = std::env::var("SOFTLOCK_RUN_NONCE")
+            && let Ok(raw) = text.parse::<u64>()
+            && let Some(nonce) = crate::RunNonce::from_extra(raw)
+        {
+            crate::set_run_nonce(nonce);
+        }
+    }
+    #[cfg(not(feature = "simulated-physical"))]
+    {
+        let _ = shared;
+    }
+}
+
+pub fn run_service_host() -> i32 {
+    use std::os::windows::io::FromRawHandle;
+
+    let mut read_handle = None;
+    let mut write_handle = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--read" => read_handle = args.next().and_then(|value| value.parse::<usize>().ok()),
+            "--write" => write_handle = args.next().and_then(|value| value.parse::<usize>().ok()),
+            _ => {}
+        }
+    }
+    let (Some(read_handle), Some(write_handle)) = (read_handle, write_handle) else {
+        eprintln!("usage: softlock-lockhost --service-host --read HANDLE --write HANDLE");
+        return 2;
+    };
+    let mut read_file =
+        unsafe { std::fs::File::from_raw_handle(read_handle as *mut std::ffi::c_void) };
+    let write_file =
+        unsafe { std::fs::File::from_raw_handle(write_handle as *mut std::ffi::c_void) };
+    let mut welcome = match softlock_core::read_prefixed_frame(&mut read_file) {
+        Ok(frame) => frame,
+        Err(_) => return 1,
+    };
+    let nonce = match softlock_core::decode_service_frame(&welcome) {
+        Ok(softlock_core::ServiceToHost::Welcome { nonce }) => nonce.to_nonce().ok(),
+        _ => None,
+    };
+    welcome.fill(0);
+    let Some(nonce) = nonce else {
+        return 1;
+    };
+    let (report_tx, report_rx) = std::sync::mpsc::channel();
+    let (command_tx, command_rx) = std::sync::mpsc::channel();
+    let shared = Shared::new(Box::new(NeverGrant), None);
+    shared.pipe_mode.store(true, Ordering::Release);
+    *shared
+        .reports
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(report_tx);
+    *shared
+        .commands
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(command_rx);
+    thread::spawn(move || host_write_loop(write_file, report_rx, nonce));
+    thread::spawn(move || host_read_loop(read_file, command_tx));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    // A panic while unwinding can stall in a hook-thread join. Report the
+    // guard down and exit before that unwind, so the service sees host-lost.
+    let hook_shared = Arc::clone(&shared);
+    std::panic::set_hook(Box::new(move |info| {
+        host_panic_hook(&hook_shared, info);
+    }));
+    ui_main(Arc::clone(&shared), ready_tx);
+    drop(ready_rx);
+    shutdown(&shared);
+    0
+}
+
+fn host_read_loop(mut file: std::fs::File, commands: std::sync::mpsc::Sender<PipeCommand>) {
+    while let Ok(frame) = softlock_core::read_prefixed_frame(&mut file) {
+        let command = match softlock_core::decode_service_frame(&frame) {
+            Ok(softlock_core::ServiceToHost::Arm) => Some(PipeCommand::Arm),
+            Ok(softlock_core::ServiceToHost::Disarm) => Some(PipeCommand::Disarm),
+            Ok(softlock_core::ServiceToHost::PromptResult { .. }) => None,
+            _ => None,
+        };
+        if let Some(command) = command
+            && commands.send(command).is_err()
+        {
+            break;
+        }
+    }
+    let _ = commands.send(PipeCommand::Quit);
+}
+
+fn host_write_loop(
+    mut file: std::fs::File,
+    reports: std::sync::mpsc::Receiver<PipeReport>,
+    nonce: LaunchNonce,
+) {
+    use softlock_core::{
+        host_guard_down_frame, host_heartbeat_frame, host_hello_frame, host_ready_frame,
+        host_secret_frame, write_prefixed_frame,
+    };
+    let mut id = 1u64;
+    if let Ok(mut frame) = host_hello_frame(id, &nonce) {
+        let _ = write_prefixed_frame(&mut file, &frame);
+        frame.fill(0);
+    }
+    while let Ok(report) = reports.recv() {
+        id = id.saturating_add(1);
+        let frame = match &report {
+            PipeReport::Ready { monitors } => host_ready_frame(id, *monitors, &nonce).ok(),
+            PipeReport::Heartbeat {
+                seq,
+                guard,
+                overlay,
+            } => host_heartbeat_frame(id, *seq, *guard, *overlay, &nonce).ok(),
+            PipeReport::Secret(secret) => {
+                host_secret_frame(id, MethodId::softlock_pin().as_str(), secret, &nonce).ok()
+            }
+            PipeReport::GuardDown => host_guard_down_frame(id, &nonce).ok(),
+        };
+        if let Some(mut frame) = frame {
+            let _ = write_prefixed_frame(&mut file, &frame);
+            frame.fill(0);
+        }
+        drop(report);
     }
 }

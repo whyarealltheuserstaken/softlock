@@ -11,6 +11,7 @@
 //! integrity and has no linked token. This dev launch installs the hooks in
 //! the calling process. Ticket 13 is the SYSTEM-in-session launch.
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -86,13 +87,17 @@ pub(crate) fn remove(shared: &Shared) {
     shared
         .stop
         .store(true, std::sync::atomic::Ordering::Release);
+    // A panic hook running on this thread must not join it. Joining the
+    // liveness thread from here can also stall: that thread's SendInput waits
+    // for this hook to return.
+    let on_hook_thread = current_thread_is_hook(shared);
     if let Some(liveness) = shared
         .liveness
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .take()
     {
-        let _ = liveness.join();
+        join_or_detach(liveness, on_hook_thread);
     }
     let thread_id = shared
         .hook_thread_id
@@ -108,12 +113,31 @@ pub(crate) fn remove(shared: &Shared) {
         .unwrap_or_else(|poison| poison.into_inner())
         .take()
     {
-        let _ = hook.join();
+        join_or_detach(hook, on_hook_thread);
     }
-    shared
-        .hook_thread_id
-        .store(0, std::sync::atomic::Ordering::Release);
+    if !on_hook_thread {
+        shared
+            .hook_thread_id
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
     SESSION.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn current_thread_is_hook(shared: &Shared) -> bool {
+    let thread_id = shared
+        .hook_thread_id
+        .load(std::sync::atomic::Ordering::Acquire);
+    thread_id != 0 && thread_id == unsafe { GetCurrentThreadId() }
+}
+
+/// `detach` is set when the caller is the hook thread. Dropping the handle
+/// detaches instead of waiting. Joining the current thread would wait forever.
+fn join_or_detach(handle: thread::JoinHandle<()>, detach: bool) {
+    if detach || handle.thread().id() == thread::current().id() {
+        drop(handle);
+        return;
+    }
+    let _ = handle.join();
 }
 
 pub(crate) fn liveness(shared: Arc<Shared>) {
@@ -272,6 +296,10 @@ fn hook_thread(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<u32, (
         let _ = UnhookWindowsHookEx(keyboard);
         let _ = UnhookWindowsHookEx(mouse);
     }
+    // `remove` skips this store when it is already running on this thread.
+    // The id stays set until the hooks are actually gone.
+    keep.hook_thread_id
+        .store(0, std::sync::atomic::Ordering::Release);
 }
 
 /// A panic inside either callback is caught here. Unwinding out of
@@ -283,7 +311,16 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     catch_hook(|| unsafe { keyboard_event(code, wparam, lparam) })
 }
 
+thread_local! {
+    static IN_HOOK_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn in_hook_callback() -> bool {
+    IN_HOOK_CALLBACK.with(|flag| flag.get())
+}
+
 fn catch_hook(run: impl FnOnce() -> LRESULT) -> LRESULT {
+    IN_HOOK_CALLBACK.with(|flag| flag.set(true));
     let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
             Ok(result) => result,
@@ -295,6 +332,7 @@ fn catch_hook(run: impl FnOnce() -> LRESULT) -> LRESULT {
             }
         }
     }));
+    IN_HOOK_CALLBACK.with(|flag| flag.set(false));
     match outer {
         Ok(result) => result,
         Err(payload) => {
@@ -349,6 +387,14 @@ unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
             }
             return LRESULT(1);
+        }
+        #[cfg(feature = "simulated-physical")]
+        if shared
+            .panic_callback_on_f13
+            .load(std::sync::atomic::Ordering::Acquire)
+            && vk == 0x7C
+        {
+            panic!("lock host hook callback");
         }
         let injected = info.flags.contains(LLKHF_INJECTED);
         if !blocks(injected, extra) {
@@ -465,7 +511,7 @@ fn mouse_extra(info: &MSLLHOOKSTRUCT, injected: bool) -> u64 {
     if blocks(injected, reported) {
         return reported;
     }
-    #[cfg(feature = "simulated-physical")]
+    #[cfg(all(feature = "dev-launch", feature = "simulated-physical"))]
     {
         let nonce = crate::classify::current_run_nonce();
         let low = nonce & 0xFFFF_FFFF;
