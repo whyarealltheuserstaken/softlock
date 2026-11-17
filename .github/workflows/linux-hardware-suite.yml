@@ -1,0 +1,62 @@
+name: Linux hardware suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-hardware-suite-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    name: linux hardware suite --ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: tests/hardware/linux -> tests/hardware/linux/target
+      - name: Format
+        run: cargo fmt --manifest-path tests/hardware/linux/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path tests/hardware/linux/Cargo.toml --all-targets -- -D warnings
+      - name: Suite
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/linux-hw-out
+          ./tests/hardware/linux/run.sh --ci --output-dir /tmp/linux-hw-out
+          test -f /tmp/linux-hw-out/result.json
+          test -f /tmp/linux-hw-out/result.txt
+          grep -F 'softlock-hardware-suite/1' /tmp/linux-hw-out/result.json
+          grep -F '"suite": "linux"' /tmp/linux-hw-out/result.json
+          grep -F '"serial_collected": false' /tmp/linux-hw-out/result.json
+          grep -F 'never-unlocked' /tmp/linux-hw-out/result.json
+          grep -F 'serial-collected=false' /tmp/linux-hw-out/result.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("/tmp/linux-hw-out/result.json").read_text())
+          assert report["schema"] == "softlock-hardware-suite/1"
+          assert report["suite"] == "linux"
+          assert report["serial_collected"] is False
+          assert report["summary"]["fail"] == 0
+          assert report["state"] == "never-unlocked"
+          banned = ("product_serial", "board_serial", "chassis_serial", "Serial Number", "IOPlatformSerialNumber")
+          blob = Path("/tmp/linux-hw-out/result.json").read_text() + Path("/tmp/linux-hw-out/result.txt").read_text()
+          for needle in banned:
+              if needle in blob:
+                  raise SystemExit(f"serial marker {needle}")
+          statuses = {row["status"] for row in report["tests"]}
+          assert statuses <= {"pass", "fail", "skip"}
+          print("ci suite ok", report["summary"])
+          PY

@@ -63,3 +63,6 @@ name = "universal_ci"
 
 [[test]]
 name = "macos_x86_slice"
+
+[[test]]
+name = "linux_hardware_suite"

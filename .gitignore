@@ -12,4 +12,5 @@
 *.log
 **/*.snap.new
 proof-output/
+**/suite-output/
 proof.log
