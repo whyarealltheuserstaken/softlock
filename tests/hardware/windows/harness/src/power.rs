@@ -210,7 +210,7 @@ None.
 
 SYSTEM:
 [PROCESS] \\Device\\HarddiskVolume3\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe
-SoftLock hardware suite
+hardware suite
 
 AWAYMODE:
 None.
@@ -218,13 +218,13 @@ None.
         assert!(!section_contains(
             text,
             "DISPLAY",
-            "SoftLock hardware suite"
+            "hardware suite"
         ));
-        assert!(section_contains(text, "SYSTEM", "SoftLock hardware suite"));
+        assert!(section_contains(text, "SYSTEM", "hardware suite"));
         assert!(!section_contains(
             text,
             "AWAYMODE",
-            "SoftLock hardware suite"
+            "hardware suite"
         ));
         assert!(!section_contains(text, "SYSTEM", ""));
     }

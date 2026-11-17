@@ -237,7 +237,7 @@ namespace SoftLock.Hardware
             {
                 ReleaseKeepAwake();
                 SetThreadExecutionState(EsContinuous | EsSystemRequired);
-                reasonText = Marshal.StringToHGlobalUni("SoftLock hardware suite");
+                reasonText = Marshal.StringToHGlobalUni("hardware suite");
                 ReasonContext context = new ReasonContext();
                 context.Version = 0;
                 context.Flags = 0x1;
@@ -411,8 +411,10 @@ namespace SoftLock.Hardware
             if (listenerHwnd != IntPtr.Zero)
             {
                 WTSRegisterSessionNotification(listenerHwnd, 0);
-                RegisterPowerSettingNotification(listenerHwnd, ref LidGuid, 0);
-                RegisterPowerSettingNotification(listenerHwnd, ref DisplayGuid, 0);
+                Guid lid = LidGuid;
+                Guid display = DisplayGuid;
+                RegisterPowerSettingNotification(listenerHwnd, ref lid, 0);
+                RegisterPowerSettingNotification(listenerHwnd, ref display, 0);
             }
             ListenerReady.Set();
             Msg msg;

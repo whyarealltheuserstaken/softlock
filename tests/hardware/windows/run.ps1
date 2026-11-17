@@ -429,7 +429,7 @@ try {
                 $requests = ($merged | ForEach-Object { "$_" }) -join "`n"
                 $requestFile = Join-Path $env:TEMP ("softlock-hw-requests-{0}.txt" -f $PID)
                 Write-Utf8 $requestFile $requests
-                $seenRaw = & $exe requests --text $requestFile --needle 'SoftLock hardware suite'
+                $seenRaw = & $exe requests --text $requestFile --needle 'hardware suite'
                 $native::ReleaseKeepAwake()
                 $seen = $seenRaw | ConvertFrom-Json
                 Remove-Item -LiteralPath $requestFile -Force -ErrorAction SilentlyContinue
