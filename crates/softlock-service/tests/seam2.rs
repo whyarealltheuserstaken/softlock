@@ -11,6 +11,8 @@ use softlock_service::{
     Authority, Capture, HostAction, HostFault, HostLoss, OsLock, ServicePlatform, admit_client,
     role_for_image,
 };
+#[cfg(not(windows))]
+use softlock_service::{PinStore, pin_directory};
 
 const PIN: &str = "z9-pin-4e7c1b";
 const NOTE: &str = "Quarterly Report - Notepad";
@@ -372,6 +374,32 @@ fn public_kind(index: u8) -> RequestKind {
         4 => RequestKind::HardLock,
         _ => RequestKind::ClearPin,
     }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn dev_clear_pin_removes_the_on_disk_hash() {
+    let dir = pin_directory();
+    std::fs::create_dir_all(&dir).expect("pin dir");
+    let store = PinStore::in_dir(&dir);
+    store.save(&hash_pin(PIN)).expect("save");
+    assert!(dir.join("pin.phc").is_file());
+    let mut authority = authority();
+    assert_eq!(
+        authority.handle_public(Role::App, RequestKind::ClearPin),
+        ResponseKind::Ok
+    );
+    assert!(!dir.join("pin.phc").exists(), "clear left the hash on disk");
+}
+
+#[cfg(windows)]
+#[test]
+fn clear_pin_refuses_without_localsystem() {
+    let mut authority = authority();
+    assert_eq!(
+        authority.handle_public(Role::App, RequestKind::ClearPin),
+        ResponseKind::Unsupported
+    );
 }
 
 fn hash_pin(pin: &str) -> String {

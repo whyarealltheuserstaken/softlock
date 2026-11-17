@@ -314,7 +314,8 @@ pub(crate) struct Shared {
     pub cursor_y: AtomicI32,
     pub cursor_gen: AtomicU64,
     pub snap_gen: AtomicU64,
-    /// `0` calls Windows. Anything else makes both OS lock paths fail.
+    /// `0` calls Windows. `1` makes both OS lock paths fail. `2` reports a
+    /// confirmed workstation lock without calling Windows.
     pub os_lock_stub: AtomicU8,
     pub os_lock_attempts: AtomicU32,
     pub os_lock_unavailable: AtomicBool,
@@ -430,6 +431,7 @@ impl Shared {
 }
 
 fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, DevError>>) {
+    apply_simulated_environment(&shared);
     unsafe {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -443,7 +445,6 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
         let _ = ready.send(Err(DevError::new("lock host stopped before arming")));
         return;
     }
-    apply_simulated_environment(&shared);
     let mut controller = LockController::new(WinPlatform::new(Arc::clone(&shared)));
     let started = Instant::now();
     controller.handle(Event::LockRequested {
@@ -456,6 +457,7 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
         return;
     }
     shared.locked.store(true, Ordering::Release);
+    failclosed::publish_armed_host();
     // Before Ready. Lock returns only after Ready, and the test then sends
     // F13. Liveness and mouse input do not trip this flag.
     #[cfg(feature = "simulated-physical")]
@@ -484,6 +486,8 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
     let mut last_minute = overlay::minute_now();
     let mut clock = Instant::now();
     let mut os_retry_at: Option<Instant> = None;
+    let mut service_gone = false;
+    let mut quit_tried = false;
     loop {
         if shared.panic_window.load(Ordering::Acquire) {
             panic!("lock host window thread");
@@ -494,10 +498,18 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
         if shared.stop.load(Ordering::Acquire) {
             break;
         }
-        if matches!(
-            next_command(&shared),
-            Some(PipeCommand::Disarm | PipeCommand::Quit)
-        ) {
+        match next_command(&shared) {
+            Some(PipeCommand::Disarm) => break,
+            Some(PipeCommand::Quit) => service_gone = true,
+            _ => {}
+        }
+        if service_gone && !quit_tried {
+            quit_tried = true;
+            if quit_reaches_os_lock(&shared, &mut controller) {
+                break;
+            }
+        }
+        if service_gone && failclosed::replacement_host_armed() {
             break;
         }
         if shared.fail.swap(false, Ordering::AcqRel) {
@@ -691,7 +703,38 @@ fn report_guard_down(controller: &mut LockController<WinPlatform>, shared: &Shar
 
 fn shutdown(shared: &Shared) {
     release_session(shared);
+    failclosed::clear_armed_host();
     shared.locked.store(false, Ordering::Release);
+}
+
+/// Quit is the service pipe closing. Release only after the OS lock is
+/// confirmed. Otherwise the hooks stay until another host has armed.
+fn quit_reaches_os_lock(shared: &Shared, controller: &mut LockController<WinPlatform>) -> bool {
+    let guarded = matches!(
+        controller.state(),
+        LockState::Locked { .. } | LockState::Arming { .. } | LockState::FailingClosed { .. }
+    );
+    if !guarded {
+        return false;
+    }
+    match failclosed::lock_or_disconnect(failclosed::console_session()) {
+        RealLock::Workstation | RealLock::Disconnected => {
+            if matches!(
+                controller.state(),
+                LockState::Locked { .. } | LockState::Arming { .. }
+            ) {
+                report_guard_down(controller, shared);
+            }
+            if !matches!(controller.state(), LockState::OsLocked { .. }) {
+                controller.handle(Event::OsLockConfirmed);
+            }
+            matches!(controller.state(), LockState::OsLocked { .. })
+        }
+        RealLock::Unavailable => {
+            shared.os_lock_unavailable.store(true, Ordering::Release);
+            false
+        }
+    }
 }
 
 pub(crate) fn release_session(shared: &Shared) {
@@ -1013,7 +1056,8 @@ fn wait_for_arm(shared: &Shared) -> bool {
         }
         match next_command(shared) {
             Some(PipeCommand::Arm) => return true,
-            Some(PipeCommand::Disarm | PipeCommand::Quit) => return false,
+            Some(PipeCommand::Disarm) => return false,
+            Some(PipeCommand::Quit) => return quit_before_arm(shared),
             None => {
                 if !pump_message() && shared.stop.load(Ordering::Acquire) {
                     return false;
@@ -1023,11 +1067,30 @@ fn wait_for_arm(shared: &Shared) -> bool {
     }
 }
 
+fn quit_before_arm(shared: &Shared) -> bool {
+    match failclosed::lock_or_disconnect(failclosed::console_session()) {
+        RealLock::Workstation | RealLock::Disconnected => false,
+        RealLock::Unavailable => {
+            while !failclosed::replacement_host_armed() {
+                if shared.stop.load(Ordering::Acquire) {
+                    return false;
+                }
+                if !pump_message() && shared.stop.load(Ordering::Acquire) {
+                    return false;
+                }
+            }
+            false
+        }
+    }
+}
+
 fn apply_simulated_environment(shared: &Shared) {
     #[cfg(feature = "simulated-physical")]
     {
-        if std::env::var("SOFTLOCK_STUB_OS_LOCK").ok().as_deref() == Some("1") {
-            shared.os_lock_stub.store(1, Ordering::Release);
+        match std::env::var("SOFTLOCK_STUB_OS_LOCK").ok().as_deref() {
+            Some("1" | "fail") => shared.os_lock_stub.store(1, Ordering::Release),
+            Some("succeed") => shared.os_lock_stub.store(2, Ordering::Release),
+            _ => {}
         }
         if std::env::var("SOFTLOCK_PANIC").ok().as_deref() == Some("after-arm") {
             shared.panic_window.store(true, Ordering::Release);

@@ -45,6 +45,10 @@ struct Session {
 
 impl Session {
     fn start(panic: Option<&str>, dev_app: bool) -> Self {
+        Self::launch(panic, dev_app, "1", None)
+    }
+
+    fn launch(panic: Option<&str>, dev_app: bool, stub: &str, mark: Option<&Path>) -> Self {
         let _ = gate;
         let root = std::env::temp_dir().join(format!("svc-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -65,7 +69,7 @@ impl Session {
         let mut command = Command::new(&service);
         command
             .arg("--foreground")
-            .env("SOFTLOCK_STUB_OS_LOCK", "1")
+            .env("SOFTLOCK_STUB_OS_LOCK", stub)
             .env("SOFTLOCK_PIN_DIR", &pin_dir)
             .env("SOFTLOCK_LOG", &log)
             .env("SOFTLOCK_PIPE", &pipe)
@@ -81,6 +85,9 @@ impl Session {
         }
         if dev_app {
             command.env("SOFTLOCK_DEV_APP", "1");
+        }
+        if let Some(mark) = mark {
+            command.env("SOFTLOCK_OS_LOCK_MARK", mark);
         }
         let child = command.spawn().expect("service process");
         let session = Self {
@@ -117,6 +124,12 @@ impl Session {
 
     fn transact(&self, json: &str) -> Result<String, String> {
         let handle = open_pipe(&self.pipe)?;
+        if let Err(error) = reject_untrusted_lock(&self.pipe, handle, json) {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
+            return Err(error);
+        }
         let mut frame = (json.len() as u32).to_le_bytes().to_vec();
         frame.extend_from_slice(json.as_bytes());
         write_all(handle, &frame)?;
@@ -442,6 +455,59 @@ fn panic_while_os_lock_is_down_is_closed_by_the_service() {
 }
 
 #[test]
+fn service_kill_while_locked_stays_guarded_when_os_lock_fails() {
+    kill_while_locked("fail", true);
+}
+
+#[test]
+fn service_kill_while_locked_releases_only_after_os_lock() {
+    kill_while_locked("succeed", false);
+}
+
+fn kill_while_locked(stub: &str, stay_blocked: bool) {
+    let _guard = gate();
+    let mark =
+        std::env::temp_dir().join(format!("svc-os-lock-{}-{}.txt", stub, std::process::id()));
+    let _ = fs::remove_file(&mark);
+    let mut session = Session::launch(None, false, stub, Some(&mark));
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    session.lock().expect("lock");
+    let before = session.status().expect("status");
+    assert!(
+        !before.contains("Unlocked"),
+        "locked session reported Unlocked: {before}"
+    );
+    assert!(
+        physical_is_blocked(&probe, session.extra),
+        "lock did not block physical input"
+    );
+    session.child.kill().expect("kill service");
+    let _ = session.child.wait();
+    assert!(
+        wait_for(Duration::from_secs(8), || mark.is_file()),
+        "Quit did not call the OS lock"
+    );
+    thread::sleep(Duration::from_secs(1));
+    if stay_blocked {
+        assert!(
+            physical_is_blocked(&probe, session.extra),
+            "hooks dropped after the service died without an OS lock"
+        );
+    }
+    if let Ok(status) = session.status() {
+        assert!(
+            !status.contains("Unlocked"),
+            "state reached Unlocked after the service died: {status}"
+        );
+    }
+    let _ = Command::new("taskkill")
+        .args(["/IM", "softlock-lockhost.exe", "/F"])
+        .output();
+    let _ = fs::remove_file(&mark);
+}
+
+#[test]
 fn emergency_after_both_os_locks_fail_is_closed_by_the_service() {
     let _guard = gate();
     let session = Session::start(Some("callback"), false);
@@ -700,7 +766,13 @@ fn standard_user_cannot_plant_the_secret_store() {
         let report = public.join(format!("{mode}.txt"));
         let _ = fs::remove_file(&report);
         children.push(spawn_standard_user(
-            &account, mode, &dir, &bait, &report, &done,
+            &account,
+            "standard_user_cannot_plant_the_secret_store",
+            mode,
+            &dir,
+            &bait,
+            &report,
+            &done,
         ));
     }
     thread::sleep(Duration::from_millis(500));
@@ -737,6 +809,10 @@ fn standard_user_cannot_plant_the_secret_store() {
         assert!(
             report.contains("result=denied"),
             "{mode} planted the secret store: {report}"
+        );
+        assert!(
+            report.contains("code=5"),
+            "{mode} was not access denied: {report}"
         );
     }
     assert!(
@@ -787,6 +863,59 @@ fn standard_user_cannot_plant_the_secret_store() {
     drop(children);
     let _ = fs::remove_file(&done);
     reclaim_data_dir(&dir);
+}
+
+#[test]
+fn standard_user_cannot_create_the_service_pipe() {
+    if let Some(job) = plant_job_from_args() {
+        plant_child(&job);
+        return;
+    }
+    let _guard = gate();
+    let account = StandardAccount::create();
+    let service = service_exe();
+    let (name, display) = service_names(&service);
+    let probe = std::env::temp_dir().join(format!("svc-pipe-{}.txt", std::process::id()));
+    let body = install_service(&service, &name, &display, &probe, &[]);
+    assert!(body.contains("system=yes"), "not LocalSystem: {body}");
+    let public = std::env::temp_dir().join(format!("sl-pipe-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&public);
+    fs::create_dir_all(&public).expect("report dir");
+    grant_users_modify(&public);
+    let report = public.join("pipe.txt");
+    let done = public.join("done.txt");
+    let _ = fs::remove_file(&report);
+    let _ = fs::remove_file(&done);
+    let child = spawn_standard_user(
+        &account,
+        "standard_user_cannot_create_the_service_pipe",
+        "pipe",
+        Path::new(&pipe_name()),
+        &public,
+        &report,
+        &done,
+    );
+    thread::sleep(Duration::from_millis(500));
+    fs::write(&done, b"done").expect("done");
+    wait_process(child.process, Duration::from_secs(20));
+    let exit = process_exit_code(child.process);
+    let text =
+        fs::read_to_string(&report).unwrap_or_else(|error| format!("missing report: {error}"));
+    remove_service(&name);
+    assert!(
+        text.contains("il=8192"),
+        "pipe squat did not run at medium integrity (exit {exit}): {text}"
+    );
+    assert!(
+        text.contains("result=denied"),
+        "standard user created the service pipe: {text}"
+    );
+    assert!(
+        text.contains("code=5"),
+        "CreateNamedPipeW was not access denied: {text}"
+    );
+    drop(child);
+    let _ = fs::remove_dir_all(&public);
 }
 
 impl Drop for PlantChild {
@@ -927,8 +1056,30 @@ fn service_pid(name: &str) -> Option<String> {
     None
 }
 
+fn reject_untrusted_lock(pipe: &str, handle: HANDLE, json: &str) -> Result<(), String> {
+    if !json.contains("\"kind\":\"Lock\"") {
+        return Ok(());
+    }
+    let trusted = if pipe == pipe_name() {
+        softlock_service::server_is_system_agent(handle)
+    } else {
+        softlock_service::server_image_is_agent(handle)
+    };
+    if trusted {
+        Ok(())
+    } else {
+        Err("lock server is not the system agent".to_string())
+    }
+}
+
 fn transact(pipe: &str, json: &str) -> Result<String, String> {
     let handle = open_pipe(pipe)?;
+    if let Err(error) = reject_untrusted_lock(pipe, handle, json) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+        }
+        return Err(error);
+    }
     let mut frame = (json.len() as u32).to_le_bytes().to_vec();
     frame.extend_from_slice(json.as_bytes());
     write_all(handle, &frame)?;
@@ -1044,6 +1195,7 @@ struct PlantChild {
 
 fn spawn_standard_user(
     account: &StandardAccount,
+    test_name: &str,
     mode: &str,
     dir: &Path,
     bait: &Path,
@@ -1063,8 +1215,9 @@ fn spawn_standard_user(
     let domain = wide_chars(".");
     let exe = std::env::current_exe().expect("test exe");
     let command = format!(
-        "\"{}\" --exact standard_user_cannot_plant_the_secret_store --test-threads=1 --nocapture -- {} \"{}\" \"{}\" \"{}\" \"{}\"",
+        "\"{}\" --exact {} --test-threads=1 --nocapture -- {} \"{}\" \"{}\" \"{}\" \"{}\"",
         exe.display(),
+        test_name,
         mode,
         dir.display(),
         bait.display(),
@@ -1179,6 +1332,7 @@ fn plant_child(job: &PlantJob) {
     );
     let mut opened = false;
     let mut code = 0i32;
+    let mut saw_denied = false;
     let deadline = Instant::now() + Duration::from_secs(60);
     let held = loop {
         if done.exists() || Instant::now() > deadline {
@@ -1190,28 +1344,41 @@ fn plant_child(job: &PlantJob) {
                     opened = true;
                     break Some(handle);
                 }
-                Err(error) => code = error.raw_os_error().unwrap_or(code),
+                Err(error) => record_plant_error(&mut code, &mut saw_denied, error),
             },
             "junction" => match create_junction(dir, bait) {
                 Ok(()) => {
                     opened = true;
                     break None;
                 }
-                Err(error) => code = error.raw_os_error().unwrap_or(code),
+                Err(error) => record_plant_error(&mut code, &mut saw_denied, error),
             },
             "replant" => match plant_pin(dir) {
                 Ok(()) => {
                     opened = true;
                     break None;
                 }
-                Err(error) => code = error.raw_os_error().unwrap_or(code),
+                Err(error) => record_plant_error(&mut code, &mut saw_denied, error),
             },
             "hold-dir" => match open_dir_for_write(dir) {
                 Ok(handle) => {
                     opened = true;
                     break Some(handle);
                 }
-                Err(error) => code = error.raw_os_error().unwrap_or(code),
+                Err(error) => record_plant_error(&mut code, &mut saw_denied, error),
+            },
+            "pipe" => match create_pipe_instance(dir) {
+                Ok(handle) => {
+                    opened = true;
+                    unsafe {
+                        let _ = windows::Win32::Foundation::CloseHandle(handle);
+                    }
+                    break None;
+                }
+                Err(error) => {
+                    record_plant_error(&mut code, &mut saw_denied, error);
+                    break None;
+                }
             },
             _ => break None,
         }
@@ -1221,14 +1388,48 @@ fn plant_child(job: &PlantJob) {
         thread::sleep(Duration::from_millis(50));
     }
     let result = if opened { "opened" } else { "denied" };
+    let reported = if saw_denied { 5 } else { code };
     let _ = fs::write(
         report,
-        format!("il={il}\nresult={result}\ncode={code}\nmode={mode}\n"),
+        format!("il={il}\nresult={result}\ncode={reported}\nmode={mode}\n"),
     );
     if let Some(handle) = held {
         unsafe {
             let _ = windows::Win32::Foundation::CloseHandle(handle);
         }
+    }
+}
+
+fn record_plant_error(code: &mut i32, saw_denied: &mut bool, error: std::io::Error) {
+    *code = error.raw_os_error().unwrap_or(*code);
+    if *code == 5 {
+        *saw_denied = true;
+    }
+}
+
+fn create_pipe_instance(name: &Path) -> std::io::Result<HANDLE> {
+    use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+    let text = name.to_string_lossy();
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(wide.as_ptr()),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            4096,
+            4096,
+            0,
+            None,
+        )
+    };
+    if handle.is_invalid() {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(handle)
     }
 }
 

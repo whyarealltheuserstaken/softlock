@@ -441,9 +441,22 @@ impl Authority {
         if !matches!(self.controller.state(), LockState::Unlocked) {
             return ResponseKind::Locked;
         }
-        self.pin_hash = None;
-        audit("pin-cleared", &[("result", "stored")]);
-        ResponseKind::Ok
+        match crate::secrets::PinStore::in_dir(&pin_directory()).remove() {
+            Ok(()) => {
+                self.pin_hash = None;
+                audit("pin-cleared", &[("result", "stored")]);
+                ResponseKind::Ok
+            }
+            Err(error) => {
+                let reason = if error.to_string().contains("LocalSystem") {
+                    "localsystem"
+                } else {
+                    "io"
+                };
+                audit("pin-cleared", &[("result", "rejected"), ("reason", reason)]);
+                ResponseKind::Unsupported
+            }
+        }
     }
 
     fn remember_lock(&mut self, source: LockSource, note: Option<&str>) {

@@ -28,7 +28,10 @@ zeroize = { version = "1.8.2", default-features = false, features = ["alloc"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Power",
     "Win32_System_RemoteDesktop",
     "Win32_System_Shutdown",

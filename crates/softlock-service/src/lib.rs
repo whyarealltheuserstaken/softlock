@@ -6,6 +6,7 @@
 
 mod authority;
 mod log;
+#[cfg(feature = "simulated-physical")]
 mod pincheck;
 mod platform;
 mod secrets;
@@ -18,7 +19,10 @@ pub use authority::{
     log_path, pin_directory, pipe_path, role_for_image, service_data_directory, stub_os_lock,
 };
 pub use log::{Capture, FileLog, allowed_field, audit};
+#[cfg(feature = "simulated-physical")]
 pub use pincheck::PinChecker;
+#[cfg(feature = "simulated-physical")]
+pub use pincheck::marker_bytes;
 pub use platform::{ArmWait, OsLock, ServicePlatform};
 pub use secrets::PinStore;
 
@@ -26,7 +30,9 @@ pub use secrets::PinStore;
 pub use secrets::{SYSTEM_ONLY_SDDL, dacl_sddl, is_reparse_point, user_read_denied};
 
 #[cfg(windows)]
-pub use windows::{run_foreground, run_service, run_session_probe};
+pub use windows::{
+    run_foreground, run_service, run_session_probe, server_image_is_agent, server_is_system_agent,
+};
 
 #[cfg(not(windows))]
 pub fn run_foreground() -> i32 {

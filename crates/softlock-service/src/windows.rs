@@ -26,16 +26,16 @@ use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
 use windows::Win32::Security::{
-    CheckTokenMembership, CreateWellKnownSid, DuplicateTokenEx, GetTokenInformation,
-    PSECURITY_DESCRIPTOR, SE_ASSIGNPRIMARYTOKEN_NAME, SE_INCREASE_QUOTA_NAME, SE_TCB_NAME,
+    CheckTokenMembership, CreateWellKnownSid, DuplicateTokenEx, EqualSid, GetTokenInformation,
+    PSECURITY_DESCRIPTOR, PSID, SE_ASSIGNPRIMARYTOKEN_NAME, SE_INCREASE_QUOTA_NAME, SE_TCB_NAME,
     SECURITY_ATTRIBUTES, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_QUERY, TOKEN_USER,
     TokenPrimary, TokenSessionId, TokenUser, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, CreatePipe, DisconnectNamedPipe,
-    GetNamedPipeClientProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::RemoteDesktop::{
     WTSDisconnectSession, WTSGetActiveConsoleSessionId, WTSSESSION_NOTIFICATION,
@@ -778,7 +778,7 @@ fn enable_privilege(name: PCWSTR) -> std::io::Result<()> {
 fn environment_block(allow_panic: bool) -> Vec<u16> {
     let mut block = Vec::new();
     for (key, value) in std::env::vars() {
-        if !allow_panic && key == "SOFTLOCK_PANIC" {
+        if !host_env_allowed(&key, allow_panic) {
             continue;
         }
         for unit in key.encode_utf16() {
@@ -792,6 +792,38 @@ fn environment_block(allow_panic: bool) -> Vec<u16> {
     }
     block.push(0);
     block
+}
+
+fn host_env_allowed(key: &str, allow_panic: bool) -> bool {
+    const SYSTEM: &[&str] = &[
+        "SystemRoot",
+        "SystemDrive",
+        "windir",
+        "ComSpec",
+        "PATHEXT",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "PROCESSOR_LEVEL",
+        "PROCESSOR_REVISION",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "ALLUSERSPROFILE",
+        "ProgramData",
+        "ProgramFiles",
+        "CommonProgramFiles",
+        "APPDATA",
+        "LOCALAPPDATA",
+    ];
+    if SYSTEM.iter().any(|name| key.eq_ignore_ascii_case(name)) {
+        return true;
+    }
+    match key {
+        "SOFTLOCK_STUB_OS_LOCK" | "SOFTLOCK_RUN_NONCE" | "SOFTLOCK_OS_LOCK_MARK" => true,
+        "SOFTLOCK_PANIC" => allow_panic,
+        _ => false,
+    }
 }
 
 fn lock_host_exe() -> std::io::Result<PathBuf> {
@@ -958,9 +990,10 @@ fn client_identity(pipe: HANDLE) -> std::io::Result<(u32, String)> {
 }
 
 fn create_public_pipe(name: &str, first: bool) -> std::io::Result<HANDLE> {
-    // IU gets read and write (FILE_GENERIC_READ | FILE_GENERIC_WRITE), not
-    // generic-all. SYSTEM keeps full control of the pipe.
-    let descriptor = security_descriptor("D:P(A;;GA;;;SY)(A;;0x12019f;;;IU)")?;
+    // IU gets read and write, without FILE_CREATE_PIPE_INSTANCE (0x4).
+    // 0x12019b is FILE_GENERIC_READ|FILE_GENERIC_WRITE with that bit cleared.
+    // SYSTEM keeps full control of the pipe.
+    let descriptor = security_descriptor("D:P(A;;GA;;;SY)(A;;0x12019b;;;IU)")?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0.0,
@@ -1163,6 +1196,98 @@ fn probe_arg() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// The pipe server's image is the service executable.
+pub fn server_image_is_agent(pipe: HANDLE) -> bool {
+    server_pid(pipe).is_some_and(image_is_service)
+}
+
+/// The pipe server is LocalSystem and its image is the service executable.
+pub fn server_is_system_agent(pipe: HANDLE) -> bool {
+    match server_pid(pipe) {
+        Some(pid) => image_is_service(pid) && pid_is_system(pid),
+        None => false,
+    }
+}
+
+fn server_pid(pipe: HANDLE) -> Option<u32> {
+    let mut pid = 0u32;
+    unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) }.ok()?;
+    (pid != 0).then_some(pid)
+}
+
+fn image_is_service(pid: u32) -> bool {
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+    else {
+        return false;
+    };
+    let mut buffer = vec![0u16; 1024];
+    let mut len = buffer.len() as u32;
+    let queried = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            windows::Win32::System::Threading::PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    if queried.is_err() {
+        return false;
+    }
+    let image = String::from_utf16_lossy(&buffer[..len as usize]);
+    image
+        .rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("softlock-service.exe"))
+}
+
+fn pid_is_system(pid: u32) -> bool {
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut token = HANDLE::default();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
+        let _ = CloseHandle(process);
+        if opened.is_err() {
+            return false;
+        }
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        if needed == 0 {
+            let _ = CloseHandle(token);
+            return false;
+        }
+        let mut buffer = vec![0u8; needed as usize];
+        let read = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        );
+        if read.is_err() {
+            let _ = CloseHandle(token);
+            return false;
+        }
+        let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
+        let mut sid_buf = vec![0u8; 64];
+        let mut len = sid_buf.len() as u32;
+        let created = CreateWellKnownSid(
+            WinLocalSystemSid,
+            None,
+            Some(PSID(sid_buf.as_mut_ptr().cast())),
+            &mut len,
+        );
+        let equal =
+            created.is_ok() && EqualSid(user.User.Sid, PSID(sid_buf.as_mut_ptr().cast())).is_ok();
+        let _ = CloseHandle(token);
+        equal
+    }
 }
 
 fn is_local_system() -> bool {

@@ -48,13 +48,28 @@ impl PinStore {
         self.write_hash(parent, hash)
     }
 
+    pub fn remove(&self) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            remove_pin(&self.path)
+        }
+        #[cfg(not(windows))]
+        {
+            match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
     #[cfg(windows)]
     fn write_hash(&self, parent: &Path, hash: &str) -> io::Result<()> {
         if !running_as_system() {
             return write_hash_without_system(parent, &self.path, hash);
         }
         verify_service_directory(parent)?;
-        let dir = open_directory(parent, true)?;
+        let dir = open_verified_directory(parent)?;
         let outcome = write_hash_in_directory(dir, hash);
         drop_handle(dir);
         outcome
@@ -217,7 +232,7 @@ pub(crate) fn open_secured_log(path: &Path) -> io::Result<fs::File> {
         return Err(io::Error::other("log path has no file name"));
     };
     verify_service_directory(parent)?;
-    let dir = open_directory(parent, true)?;
+    let dir = open_verified_directory(parent)?;
     let opened = open_log_in_directory(dir, name);
     drop_handle(dir);
     opened
@@ -778,6 +793,71 @@ fn handle_is_directory(handle: windows::Win32::Foundation::HANDLE) -> io::Result
         .map_err(os_error)?;
     }
     Ok(info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0)
+}
+
+#[cfg(windows)]
+fn open_verified_directory(path: &Path) -> io::Result<windows::Win32::Foundation::HANDLE> {
+    let dir = open_directory(path, true)?;
+    if let Err(error) = verify_handle(dir) {
+        drop_handle(dir);
+        return Err(error);
+    }
+    Ok(dir)
+}
+
+#[cfg(windows)]
+fn remove_pin(path: &Path) -> io::Result<()> {
+    if !running_as_system() {
+        return remove_pin_without_system(path);
+    }
+    let Some(parent) = path.parent() else {
+        return Err(io::Error::other("pin path has no directory"));
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(io::Error::other("pin path has no file name"));
+    };
+    verify_service_directory(parent)?;
+    let dir = open_verified_directory(parent)?;
+    let file = match open_relative(dir, name) {
+        Ok(file) => file,
+        Err(error) if not_found(&error) => {
+            drop_handle(dir);
+            return Ok(());
+        }
+        Err(error) => {
+            drop_handle(dir);
+            return Err(error);
+        }
+    };
+    if let Err(error) = verify_handle(file) {
+        drop_handle(file);
+        drop_handle(dir);
+        return Err(error);
+    }
+    let deleted = delete_by_handle(file);
+    drop_handle(file);
+    drop_handle(dir);
+    deleted
+}
+
+#[cfg(windows)]
+fn remove_pin_without_system(path: &Path) -> io::Result<()> {
+    #[cfg(not(feature = "simulated-physical"))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "pin store requires LocalSystem",
+        ))
+    }
+    #[cfg(feature = "simulated-physical")]
+    {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if not_found(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[cfg(windows)]

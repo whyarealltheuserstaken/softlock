@@ -3,6 +3,10 @@
 //! Control Manager to start it.
 
 fn main() {
+    #[cfg(feature = "simulated-physical")]
+    {
+        let _ = softlock_service::marker_bytes();
+    }
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("--print-names") => {

@@ -18,6 +18,7 @@ dev-launch = [
     "dep:softlock-service",
     "softlock-lockhost/dev-launch",
     "softlock-lockhost/simulated-physical",
+    "softlock-service/simulated-physical",
 ]
 
 [dependencies]

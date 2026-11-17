@@ -126,7 +126,7 @@ jobs:
   seam3:
     name: seam 3 (${{ matrix.image }})
     runs-on: ${{ matrix.image }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -262,6 +262,9 @@ jobs:
           grep -F "service_stop_while_locked_keeps_input_blocked ... ok" target/seam3-service.txt
           grep -F "local_system_pin_file_is_rewritten_and_unreadable ... ok" target/seam3-service.txt
           grep -F "standard_user_cannot_plant_the_secret_store ... ok" target/seam3-service.txt
+          grep -F "standard_user_cannot_create_the_service_pipe ... ok" target/seam3-service.txt
+          grep -F "service_kill_while_locked_stays_guarded_when_os_lock_fails ... ok" target/seam3-service.txt
+          grep -F "service_kill_while_locked_releases_only_after_os_lock ... ok" target/seam3-service.txt
           grep -F "several_pipe_instances_accept_at_once ... ok" target/seam3-service.txt
       - name: Service race loops
         shell: bash
@@ -308,6 +311,27 @@ jobs:
             passes=$((passes + 1))
           done
           echo "arming loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact service_kill_while_locked_stays_guarded_when_os_lock_fails
+            passes=$((passes + 1))
+          done
+          echo "kill-fail loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact service_kill_while_locked_releases_only_after_os_lock
+            passes=$((passes + 1))
+          done
+          echo "kill-succeed loop: ${passes} passed"
+          test "$passes" -eq 20
+          passes=0
+          for i in $(seq 1 20); do
+            run_exact standard_user_cannot_plant_the_secret_store
+            passes=$((passes + 1))
+          done
+          echo "plant loop: ${passes} passed"
           test "$passes" -eq 20
       - name: Release build of the Windows target omits the test feature
         shell: bash
