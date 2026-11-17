@@ -39,13 +39,17 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - name: Build the front end
         working-directory: crates/softlock-app
+        shell: bash
         run: |
+          set -euo pipefail
           npm ci
           npm run build
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
+        shell: bash
         run: |
+          set -euo pipefail
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy --workspace --all-targets --features softlock-core/test-support -- -D warnings
           cargo clippy --workspace --all-targets --features softlock-lockhost/simulated-physical -- -D warnings
@@ -92,6 +96,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          . "${{ github.workspace }}/.github/ps-strict.ps1"
           $output = cargo run -p softlock-spike-overlay -- tour --only Fullscreen --no-prompt --pause-secs 2 --timeout-secs 30 --allow-admin 2>&1 | Out-String
           Write-Host $output
           if ($LASTEXITCODE -ne 0) { Write-Error $output; exit $LASTEXITCODE }
