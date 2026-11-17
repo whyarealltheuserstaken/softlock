@@ -717,6 +717,19 @@ fn record_physical(args: &Args, spec: PhysicalSpec<'_>) -> HardwareRow {
             "pre-prompt",
         );
     }
+    let since = match local_stamp() {
+        Some(stamp) => stamp,
+        None => {
+            return hardware_row(
+                "error".to_string(),
+                Some("not-detected".to_string()),
+                None,
+                held,
+                "no clock stamp before the prompt",
+                "none",
+            );
+        }
+    };
     crate::report::write_stdout(instruction);
     if stop_requested() {
         return hardware_row(
@@ -734,7 +747,7 @@ fn record_physical(args: &Args, spec: PhysicalSpec<'_>) -> HardwareRow {
             outcome: value.to_string(),
             method: "preset".to_string(),
         },
-        None => wait_for_sleep_or_skip(timeout, kind),
+        None => wait_for_sleep_or_skip(timeout, kind, &since),
     };
     let gap = stop_heartbeat(beat);
     if choice.outcome == "interrupted" || stop_requested() {
@@ -810,7 +823,7 @@ fn stop_heartbeat(beat: Option<HeartbeatChild>) -> Option<u64> {
     heartbeat_gap(&beat.path)
 }
 
-fn wait_for_sleep_or_skip(timeout: Duration, kind: LidKind) -> Choice {
+fn wait_for_sleep_or_skip(timeout: Duration, kind: LidKind, since: &str) -> Choice {
     if stop_requested() {
         return Choice {
             outcome: "interrupted".to_string(),
@@ -830,7 +843,7 @@ fn wait_for_sleep_or_skip(timeout: Duration, kind: LidKind) -> Choice {
         LineRead::Line(line) => {
             let word = line.trim().to_ascii_lowercase();
             if word.is_empty() || word == "enter" || word == "y" || word == "yes" {
-                watch_after_prompt(timeout, kind)
+                watch_after_prompt(timeout, kind, since)
             } else {
                 Choice {
                     outcome: "skip".to_string(),
@@ -841,8 +854,7 @@ fn wait_for_sleep_or_skip(timeout: Duration, kind: LidKind) -> Choice {
     }
 }
 
-fn watch_after_prompt(timeout: Duration, kind: LidKind) -> Choice {
-    let since = local_stamp();
+fn watch_after_prompt(timeout: Duration, kind: LidKind, since: &str) -> Choice {
     let (watch, watch_ok) = ffi::PowerWatch::start();
     ffi::PowerWatch::reset();
     let started = Instant::now();
@@ -906,17 +918,20 @@ fn watch_after_prompt(timeout: Duration, kind: LidKind) -> Choice {
     }
 }
 
-fn local_stamp() -> String {
-    match Command::new("date").arg("+%Y-%m-%d %H:%M:%S").output() {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if text.len() >= 19 {
-                return text;
-            }
-        }
-        _ => {}
+fn local_stamp() -> Option<String> {
+    let output = Command::new("date")
+        .arg("+%Y-%m-%d %H:%M:%S")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    "9999-12-31 23:59:59".to_string()
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.len() >= 19 && crate::sleep_detect::line_stamp(&text).is_some() {
+        Some(text)
+    } else {
+        None
+    }
 }
 
 enum LineRead {

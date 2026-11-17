@@ -63,6 +63,7 @@ jobs:
           grep -F "softlock-hardware-suite/1" "$result"
           grep -E "pass=[0-9]+ fail=[0-9]+ skip=[0-9]+" "$result"
           grep -F "serial-collected=false" "$result"
+          python3 tests/hardware/check-schema.py "${result%.txt}.json"
           echo "----- suite result.txt -----"
           cat "$result"
       - name: Runner slice

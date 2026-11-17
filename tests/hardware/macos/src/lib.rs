@@ -7,7 +7,15 @@ use serde_json::{Value, json};
 
 pub const SCHEMA: &str = "softlock-hardware-suite/1";
 
-pub const SKIP_REASONS: &[&str] = &["no-input", "budget", "needs-admin", "not-applicable", "ci"];
+pub const SKIP_REASONS: &[&str] = &[
+    "no-input",
+    "budget",
+    "needs-admin",
+    "not-applicable",
+    "ci",
+    "operator",
+    "interrupted",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
@@ -54,6 +62,8 @@ pub struct SuiteResult {
     pub restored: bool,
     pub interrupted: bool,
     pub state: String,
+    pub build_ms: u64,
+    pub test_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,14 +117,19 @@ pub fn keep_awake_rows(text: &str) -> Vec<Row> {
     } else {
         "pass"
     };
-    let mut rows = vec![row(
+    let mut assertion = row(
         "m07-assertions",
         "Idle-sleep assertions",
         assertions,
         None,
         false,
         format!("result={result} created={created} released={released}"),
-    )];
+    );
+    assertion.measurements.insert(
+        "assertion-released".into(),
+        json!(if released { "true" } else { "false" }),
+    );
+    let mut rows = vec![assertion];
     if mode == "runner" {
         rows.push(row(
             "m07-app-nap",
@@ -128,7 +143,8 @@ pub fn keep_awake_rows(text: &str) -> Vec<Row> {
         let verdict = field(text, "app-nap-verdict").unwrap_or_else(|| "missing".into());
         let (status, reason) = match verdict.as_str() {
             "napped" | "not-napped" => ("pass", None),
-            "not-claimed" | "" => ("skip", Some("not-applicable")),
+            "not-claimed" => ("skip", Some("not-applicable")),
+            "" | "missing" => ("fail", None),
             _ => ("fail", None),
         };
         rows.push(row(
@@ -181,11 +197,10 @@ fn hardware_row(id: &str, name: &str, key: &str, text: &str, mode: &str) -> Row 
             row(id, name, "pass", None, physical, detail)
         }
         "no-external-display" => row(id, name, "skip", Some("not-applicable"), physical, detail),
-        "skip" => row(id, name, "skip", Some("not-applicable"), physical, detail),
+        "skip" => row(id, name, "skip", Some("operator"), physical, detail),
         "no-input" => row(id, name, "skip", Some("no-input"), physical, detail),
-        "not-detected" | "missing" | "interrupted" | "error" => {
-            row(id, name, "fail", None, physical, detail)
-        }
+        "interrupted" => row(id, name, "skip", Some("interrupted"), physical, detail),
+        "not-detected" | "missing" | "error" => row(id, name, "fail", None, physical, detail),
         _ => row(id, name, "fail", None, physical, detail),
     }
 }
@@ -245,10 +260,13 @@ pub fn lock_exercise_row(id: &str, text: &str, ran: bool) -> Row {
             format!("result={result} documented-path={documented}"),
         );
     }
-    let status = if result == "fail" || result == "missing" {
-        "fail"
-    } else {
+    let locked = field(text, "state").as_deref() == Some("os-locked")
+        && field(text, "lock-screen-appeared").as_deref() == Some("yes")
+        && field(text, "input-reached-desktop-without-login").as_deref() == Some("no");
+    let status = if result == "pass" && locked {
         "pass"
+    } else {
+        "fail"
     };
     row(
         id,
@@ -264,7 +282,7 @@ pub fn lock_exercise_row(id: &str, text: &str, ran: bool) -> Row {
     )
 }
 
-pub fn smoke_row(text: &str, arch: &str) -> Row {
+pub fn smoke_row(text: &str, exit_code: i32, arch: &str) -> Row {
     if arch != "x86_64" {
         return row(
             "m11-smoke",
@@ -275,17 +293,21 @@ pub fn smoke_row(text: &str, arch: &str) -> Row {
             format!("host arch is {arch}"),
         );
     }
-    let native = field(text, "native-intel").as_deref() == Some("true");
+    let passed = exit_code == 0
+        && field(text, "smoke").as_deref() == Some("pass")
+        && field(text, "fat").as_deref() == Some("true")
+        && field(text, "native-intel").as_deref() == Some("true");
     row(
         "m11-smoke",
         "Native Intel smoke",
-        if native { "pass" } else { "fail" },
+        if passed { "pass" } else { "fail" },
         None,
         false,
         format!(
-            "native-intel={} fat={}",
-            field(text, "native-intel").unwrap_or_else(|| "missing".into()),
-            field(text, "fat").unwrap_or_else(|| "missing".into())
+            "exit={exit_code} smoke={} fat={} native-intel={}",
+            field(text, "smoke").unwrap_or_else(|| "missing".into()),
+            field(text, "fat").unwrap_or_else(|| "missing".into()),
+            field(text, "native-intel").unwrap_or_else(|| "missing".into())
         ),
     )
 }
@@ -338,26 +360,42 @@ pub fn summary_of(rows: &[Row]) -> Summary {
 
 /// A failure on a real Mac locks. CI and an interrupt do not start a new lock.
 /// The argv never unlocks.
-pub fn fail_closed(any_fail: bool, ci: bool, interrupted: bool) -> FailClosedPlan {
-    if interrupted {
+pub fn fail_closed(
+    any_fail: bool,
+    ci: bool,
+    interrupted: bool,
+    session_locked: bool,
+) -> FailClosedPlan {
+    let state = if session_locked || (any_fail && !ci && !interrupted) {
+        "os-locked"
+    } else {
+        "never-unlocked"
+    };
+    if interrupted || ci || !any_fail {
         return FailClosedPlan {
-            state: "interrupted",
+            state,
             lock: false,
             argv: Vec::new(),
         };
     }
-    if any_fail && !ci {
-        return FailClosedPlan {
-            state: "os-locked",
-            lock: true,
-            argv: vec!["--fail-closed"],
-        };
-    }
     FailClosedPlan {
-        state: "never-unlocked",
-        lock: false,
-        argv: Vec::new(),
+        state: "os-locked",
+        lock: true,
+        argv: vec!["--fail-closed"],
     }
+}
+
+/// Assertions the kit released, and no fail-closed lock left the session held.
+pub fn restored_from(rows: &[Row], fail_closed_lock: bool) -> bool {
+    if fail_closed_lock {
+        return false;
+    }
+    rows.iter().all(|row| {
+        row.measurements
+            .get("assertion-released")
+            .and_then(Value::as_str)
+            != Some("false")
+    })
 }
 
 pub fn suite_exit(summary: &Summary, interrupted: bool) -> i32 {
@@ -379,11 +417,13 @@ impl SuiteResult {
             "macOS hardware suite  schema={SCHEMA}  suite=macos"
         ));
         lines.push(format!(
-            "pass={} fail={} skip={} duration={}s state={} serial-collected=false restored={} interrupted={}",
+            "pass={} fail={} skip={} duration={}s build={}s test={}s state={} serial-collected=false restored={} interrupted={}",
             self.summary.pass,
             self.summary.fail,
             self.summary.skip,
             self.duration_ms / 1000,
+            self.build_ms / 1000,
+            self.test_ms / 1000,
             self.state,
             self.restored,
             self.interrupted
@@ -520,7 +560,7 @@ power-key-detection=iokit-power-notification
         assert_eq!(rows[2].status, "fail");
         assert!(rows[2].skip_reason.is_none());
         assert_eq!(rows[3].status, "skip");
-        assert_eq!(rows[3].skip_reason.as_deref(), Some("not-applicable"));
+        assert_eq!(rows[3].skip_reason.as_deref(), Some("operator"));
         assert_eq!(rows[4].status, "pass");
     }
 
@@ -562,33 +602,67 @@ power-key=not-run-on-runner
     }
 
     #[test]
-    fn smoke_passes_only_a_native_intel_host() {
+    fn smoke_passes_only_when_the_x86_64_slice_passes() {
         assert_eq!(
-            smoke_row("native-intel=false\n", "arm64")
+            smoke_row("native-intel=false\n", 1, "arm64")
                 .skip_reason
                 .as_deref(),
             Some("not-applicable")
         );
         assert_eq!(
-            smoke_row("native-intel=true\nfat=false\n", "x86_64").status,
+            smoke_row("smoke=pass\nfat=true\nnative-intel=true\n", 0, "x86_64").status,
             "pass"
         );
-        assert_eq!(smoke_row("native-intel=false\n", "x86_64").status, "fail");
+        assert_eq!(
+            smoke_row("native-intel=true\nfat=false\nsmoke=pass\n", 0, "x86_64").status,
+            "fail"
+        );
+        assert_eq!(
+            smoke_row("smoke=pass\nfat=true\nnative-intel=true\n", 1, "x86_64").status,
+            "fail"
+        );
+        let locked = lock_exercise_row(
+            "m08-private",
+            "result=pass\nstate=os-locked\nlock-screen-appeared=yes\ninput-reached-desktop-without-login=no\n",
+            true,
+        );
+        assert_eq!(locked.status, "pass");
+        let unconfirmed = lock_exercise_row(
+            "m08-private",
+            "result=pass\nstate=lock-unconfirmed\nlock-screen-appeared=no\ninput-reached-desktop-without-login=unknown\n",
+            true,
+        );
+        assert_eq!(unconfirmed.status, "fail");
+        let empty = keep_awake_rows(
+            "mode=kit\nassertion-created=true\nassertion-released=true\nresult=pass\napp-nap-verdict=\nlid-on-power=no-input\nlid-external=no-external-display\npower-key=no-input\n",
+        );
+        assert_eq!(empty[1].status, "fail");
+        assert!(restored_from(&empty, false));
+        assert!(!restored_from(
+            &keep_awake_rows(
+                "mode=kit\nassertion-created=true\nassertion-released=false\nresult=fail\napp-nap-verdict=not-claimed\nlid-on-power=no-input\nlid-external=no-input\npower-key=no-input\n"
+            ),
+            false
+        ));
         assert_eq!(scrub_model("MacBookPro16,2"), "MacBookPro16,2");
         assert_eq!(scrub_model("serial number"), "");
     }
 
     #[test]
     fn a_forced_failure_locks_and_ci_does_not() {
-        let plan = fail_closed(true, false, false);
+        let plan = fail_closed(true, false, false, false);
         assert!(plan.lock);
         assert_eq!(plan.state, "os-locked");
         assert_eq!(plan.argv, ["--fail-closed"]);
         assert!(plan.argv.iter().all(|arg| !arg.contains("unlock")));
-        let ci = fail_closed(true, true, false);
+        let ci = fail_closed(true, true, false, false);
         assert!(!ci.lock);
         assert_eq!(ci.state, "never-unlocked");
-        assert!(!fail_closed(false, false, false).lock);
+        let stopped = fail_closed(false, false, true, false);
+        assert_eq!(stopped.state, "never-unlocked");
+        assert!(!stopped.lock);
+        assert_eq!(fail_closed(false, false, true, true).state, "os-locked");
+        assert!(!fail_closed(false, false, false, false).lock);
         assert_eq!(suite_exit(&summary_of(&[plan_row("fail")]), false), 1);
         assert_eq!(suite_exit(&summary_of(&[plan_row("skip")]), true), 1);
         assert_eq!(suite_exit(&summary_of(&[plan_row("pass")]), false), 0);
@@ -647,12 +721,15 @@ power-key=not-run-on-runner
             restored: true,
             interrupted: false,
             state: "never-unlocked".into(),
+            build_ms: 2_000,
+            test_ms: 1_000,
         };
         let json = result.to_json();
         let value: Value = serde_json::from_str(&json).unwrap();
         assert!(conformance_errors(&value).is_empty(), "{json}");
         let txt = result.to_txt();
         assert!(txt.contains("pass=1 fail=0 skip=1"));
+        assert!(txt.contains("build=2s test=1s"));
         assert!(txt.contains(SCHEMA));
         assert!(txt.contains("config:"));
         assert!(!txt.to_ascii_lowercase().contains("serial number"));
