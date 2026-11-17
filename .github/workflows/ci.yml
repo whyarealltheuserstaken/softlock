@@ -206,7 +206,18 @@ jobs:
                pending && /^test / { exit 1 }
                pending && /^ok$/ { pending = 0; exit 0 }
                END { exit (found && !pending ? 0 : 1) }' target/seam3-lock-host.txt
-          grep -F "a_callback_panic_tries_the_os_lock_then_drops_the_hooks ... ok" target/seam3-lock-host.txt
+          # The service panic hook prints before libtest's "ok", so the result
+          # is on the same line or the next one. Either shape is a pass.
+          awk '{ gsub(/\r/, "") }
+               /^test a_callback_panic_tries_the_os_lock_then_drops_the_hooks \.\.\./ {
+                 found = 1
+                 if ($0 ~ / ok$/) { exit 0 }
+                 pending = 1
+                 next
+               }
+               pending && /^test / { exit 1 }
+               pending && /^ok$/ { pending = 0; exit 0 }
+               END { exit (found && !pending ? 0 : 1) }' target/seam3-lock-host.txt
       - name: Callback panic loop
         shell: bash
         run: |
