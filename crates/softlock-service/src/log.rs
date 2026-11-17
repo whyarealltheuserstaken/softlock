@@ -38,7 +38,43 @@ pub fn audit(event: &'static str, fields: &[(&str, &str)]) {
         line.push('=');
         line.push_str(value);
     }
+    // The tracing callsite caches Interest::never if the first emission
+    // happens with no subscriber. Register that callsite once under a
+    // subscriber that enables it, so a later `with_default(Capture)` still
+    // receives the line.
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        let _guard = tracing::subscriber::set_default(AuditInterest);
+        emit_audit("audit-ready");
+    });
+    emit_audit(&line);
+}
+
+fn emit_audit(line: &str) {
     tracing::info!(target: "service", "{line}");
+}
+
+/// Enables the audit callsite. Events dispatched here are discarded.
+struct AuditInterest;
+
+impl Subscriber for AuditInterest {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, _event: &Event<'_>) {}
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
 }
 
 pub fn source_name(source: softlock_core::LockSource) -> &'static str {
@@ -185,4 +221,33 @@ impl Subscriber for FileLog {
     fn enter(&self, _span: &Id) {}
 
     fn exit(&self, _span: &Id) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Capture, audit};
+
+    #[test]
+    fn audit_reaches_a_subscriber_installed_after_a_bare_call() {
+        audit(
+            "pin-set",
+            &[("result", "rejected"), ("reason", "localsystem")],
+        );
+        let capture = Capture::new();
+        tracing::subscriber::with_default(capture.clone(), || {
+            audit(
+                "pin-set",
+                &[("result", "rejected"), ("reason", "localsystem")],
+            );
+        });
+        let text = capture.text();
+        assert!(
+            text.contains("reason=localsystem"),
+            "audit line was dropped: {text}"
+        );
+        assert!(
+            !text.contains("audit-ready"),
+            "registration line leaked: {text}"
+        );
+    }
 }

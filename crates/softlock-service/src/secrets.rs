@@ -424,7 +424,7 @@ fn finish_created_handle(handle: windows::Win32::Foundation::HANDLE) -> io::Resu
     verify_handle(handle)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "simulated-physical"))]
 fn write_handle(handle: windows::Win32::Foundation::HANDLE, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     use std::os::windows::io::FromRawHandle;
@@ -561,7 +561,7 @@ fn create_file_new_user(path: &Path) -> io::Result<windows::Win32::Foundation::H
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "simulated-physical"))]
 fn already_exists(error: &windows::core::Error) -> bool {
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
     let code = error.code().0 as u32;

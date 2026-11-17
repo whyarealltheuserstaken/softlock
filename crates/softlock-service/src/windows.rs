@@ -212,7 +212,7 @@ fn serve(probe: Option<PathBuf>) -> i32 {
     }
     if !logged {
         crate::secrets::report_event(
-            "SoftLock could not open a verified service log; PIN unlock stays unavailable when the store does not verify",
+            "service log unverified; PIN unlock stays unavailable when the store does not verify",
         );
     }
     let mode = if stub_os_lock() {
