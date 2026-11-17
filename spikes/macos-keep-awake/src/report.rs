@@ -69,7 +69,8 @@ pub struct TimerReport {
     pub app_nap_count: Option<u64>,
     pub app_nap_occlusion_visible: Option<bool>,
     pub app_nap_ran: bool,
-    pub slowed: bool,
+    /// `None` means slowing is not claimed (baseline below expected, or counts missing).
+    pub slowed: Option<bool>,
     pub sentence: String,
     pub error: Option<String>,
 }
@@ -178,16 +179,16 @@ pub fn pmset_shows(excerpt: &str, needle: &str) -> bool {
     excerpt.contains(needle)
 }
 
-pub fn slowed_sentence(down: u64, up: u64, expected: u64) -> (bool, String) {
+pub fn slowed_sentence(down: u64, up: u64, expected: u64) -> (Option<bool>, String) {
     if down == 0 {
         return (
-            false,
+            None,
             "No overlay-down count was recorded, so slowing is not claimed.".to_string(),
         );
     }
     if expected > 0 && down * 100 < expected * 80 {
         return (
-            false,
+            None,
             format!(
                 "not claimed: baseline below expected ({down} uncovered ticks, expected {expected})"
             ),
@@ -201,7 +202,23 @@ pub fn slowed_sentence(down: u64, up: u64, expected: u64) -> (bool, String) {
             "The covered process did not slow in this sample ({up} ticks with the overlay up, {down} with it down)."
         )
     };
-    (slowed, sentence)
+    (Some(slowed), sentence)
+}
+
+pub fn fmt_slowed(slowed: Option<bool>) -> &'static str {
+    match slowed {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "not-claimed",
+    }
+}
+
+pub fn hardware_row_filled(row: &HardwareRow) -> bool {
+    row.status == "recorded"
+        && matches!(
+            row.outcome.as_deref(),
+            Some("slept" | "awake" | "no-external-display" | "restart-panel" | "nothing")
+        )
 }
 
 pub fn keep_awake_claim(assertions_held: bool, lid_on_power: &HardwareRow) -> String {
@@ -239,7 +256,7 @@ pub fn instructions(kit: bool) -> &'static str {
         "step=1 Stay at the Mac. This kit does not lock it and does not swallow the keyboard. Control-C ends it any time; Terminal still has keyboard focus behind the black screen.\n\
          step=2 It holds both IOPMAssertionCreateWithName idle-system and idle-display assertions through the lid and power-key steps (QA1340). They are released afterwards.\n\
          step=3 A timer process ticks for 60 s with the overlay down, then 60 s covering that window. The overlay is fully opaque, ignores the mouse, and does not become key. Escape ends it early only if Terminal has Accessibility permission; otherwise it closes by itself after about 60 s. Control-C ends it any time; Terminal still has keyboard focus behind the black screen.\n\
-         step=4 Hands-off App Nap: --kit then covers only the timer window for 300 s. Activity Monitor stays visible. Do not touch the Mac. Check the App Nap column for the timer process. Control-C ends it any time; Terminal still has keyboard focus behind the black screen.\n\
+         step=4 Before this step, open Activity Monitor and add the App Nap column (View → Columns), then keep your hands off. --kit covers only the timer window for 300 s. All three processes are named macos-keep-awake; find the timer by the printed timer-pid=. Control-C ends it any time.\n\
          step=5 Lid closed on power, no external display if you can unplug it. Stay next to the machine. After about 20 seconds, open the lid. Type slept, awake, or skip. \"no lid\" is not a row on this laptop. Both assertions stay held.\n\
          step=6 If you use an external display, plug it in, wait until it shows the desktop, close the lid, wait, open the lid. Type slept, awake, no-external-display, or skip. Both assertions stay held.\n\
          step=7 On this 2020 MacBook Pro the power key is the Touch ID button. A tap may sleep the display or lock the screen: unlock with Touch ID or your password, then answer. Type slept, restart-panel, nothing, or skip. Both assertions are still held for this row (assertion-held=true). They are released after this step. Nothing is left armed. Paste the filtered JSON onto the sheet."
@@ -303,6 +320,15 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
     if report.timer.overlay_down_count.is_none() || report.timer.overlay_up_count.is_none() {
         reasons.push("timer counts for overlay down and overlay up are missing".to_string());
     }
+    if report.timer.occlusion_visible_down != Some(true) {
+        reasons.push("timer-occlusion-visible-down is not true".to_string());
+    }
+    if report.timer.occlusion_visible_up != Some(false) {
+        reasons.push("timer-occlusion-visible-up is not false".to_string());
+    }
+    if !report.timer.overlay_opaque {
+        reasons.push("overlay-opaque is not true".to_string());
+    }
     if !report.timer.overlay_ordered_front {
         reasons.push("overlay did not order front over the timer window".to_string());
     }
@@ -333,6 +359,35 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
         reasons.push("this Mac is a laptop, so \"no lid\" is not the row".to_string());
     }
     reasons
+}
+
+pub fn incomplete_reasons(report: &KitReport) -> Vec<String> {
+    if report.mode != "kit" {
+        return Vec::new();
+    }
+    let mut reasons = Vec::new();
+    if !report.timer.app_nap_ran {
+        reasons.push("app-nap-ran=false".to_string());
+    }
+    if report.timer.app_nap_count.is_none() {
+        reasons.push("App Nap count is missing".to_string());
+    }
+    if !hardware_row_filled(&report.lid_on_power) {
+        reasons.push("lid-on-power row was skipped".to_string());
+    }
+    if !hardware_row_filled(&report.lid_external) {
+        reasons.push("lid-external row was skipped".to_string());
+    }
+    if !hardware_row_filled(&report.power_key) {
+        reasons.push("power-key row was skipped".to_string());
+    }
+    reasons
+}
+
+pub fn exit_nonzero(report: &KitReport) -> bool {
+    report.interrupted
+        || !failure_reasons(report).is_empty()
+        || !incomplete_reasons(report).is_empty()
 }
 
 pub fn render(report: &KitReport) -> String {
@@ -449,7 +504,10 @@ pub fn render(report: &KitReport) -> String {
         "timer-overlay-up={}\n",
         fmt_count(report.timer.overlay_up_count)
     ));
-    out.push_str(&format!("timer-slowed={}\n", report.timer.slowed));
+    out.push_str(&format!(
+        "timer-slowed={}\n",
+        fmt_slowed(report.timer.slowed)
+    ));
     out.push_str(&format!(
         "timer-sentence={}\n",
         one_line(&report.timer.sentence)
@@ -473,10 +531,14 @@ pub fn render(report: &KitReport) -> String {
     ));
     out.push_str(&format!("app-nap-ran={}\n", report.timer.app_nap_ran));
     out.push_str(&format!("app-nap-ms={}\n", report.timer.app_nap_ms));
-    out.push_str(&format!(
-        "app-nap-count={}\n",
-        fmt_count(report.timer.app_nap_count)
-    ));
+    if report.mode == "runner" {
+        out.push_str("app-nap=not-run-on-runner\n");
+    } else {
+        out.push_str(&format!(
+            "app-nap-count={}\n",
+            fmt_count(report.timer.app_nap_count)
+        ));
+    }
     out.push_str(&format!(
         "lid-on-power={}\n",
         row_token(&report.lid_on_power)
@@ -501,14 +563,20 @@ pub fn render(report: &KitReport) -> String {
     if let Some(crash) = &report.probe_crash {
         out.push_str(&format!("probe-crash={}\n", one_line(crash)));
     }
-    let reasons = failure_reasons(report);
-    if reasons.is_empty() {
-        out.push_str("result=pass\n");
-    } else {
+    let failures = failure_reasons(report);
+    let incomplete = incomplete_reasons(report);
+    if !failures.is_empty() {
         out.push_str("result=fail\n");
-        for reason in reasons {
+        for reason in failures {
             out.push_str(&format!("fail={}\n", one_line(&reason)));
         }
+    } else if !incomplete.is_empty() {
+        out.push_str("result=incomplete\n");
+        for reason in incomplete {
+            out.push_str(&format!("incomplete={}\n", one_line(&reason)));
+        }
+    } else {
+        out.push_str("result=pass\n");
     }
     out
 }
@@ -658,16 +726,40 @@ mod tests {
         ));
     }
 
+    fn recorded(outcome: &str) -> HardwareRow {
+        hardware_row(
+            "recorded".to_string(),
+            Some(outcome.to_string()),
+            None,
+            true,
+            "operator",
+        )
+    }
+
+    fn passing_kit_fixture() -> KitReport {
+        let mut report = passing_runner_fixture();
+        report.mode = "kit".to_string();
+        report.timer.app_nap_ran = true;
+        report.timer.app_nap_count = Some(400);
+        report.timer.app_nap_ms = APP_NAP_SAMPLE_MS;
+        report.lid_on_power = recorded("slept");
+        report.lid_external = recorded("no-external-display");
+        report.power_key = recorded("nothing");
+        report.keep_awake_claim = keep_awake_claim(true, &report.lid_on_power);
+        report
+    }
+
     #[test]
     fn covered_process_slowing_uses_an_eighty_percent_bar() {
         let (slowed, sentence) = slowed_sentence(100, 90, 100);
-        assert!(!slowed);
+        assert_eq!(slowed, Some(false));
         assert!(sentence.contains("did not slow"));
         let (slowed, sentence) = slowed_sentence(100, 50, 100);
-        assert!(slowed);
+        assert_eq!(slowed, Some(true));
         assert!(sentence.contains("slowed"));
         let (slowed, sentence) = slowed_sentence(50, 50, 133);
-        assert!(!slowed);
+        assert_eq!(slowed, None);
+        assert_eq!(fmt_slowed(slowed), "not-claimed");
         assert!(sentence.contains("not claimed: baseline below expected"));
         assert!(sentence.contains("50 uncovered ticks, expected 133"));
     }
@@ -707,6 +799,10 @@ mod tests {
         assert!(text.contains("step=7"));
         assert!(text.contains("IOPMAssertionCreateWithName"));
         assert!(text.contains("overlay-opaque=true"));
+        assert!(text.contains("timer-occlusion-visible-down=true"));
+        assert!(text.contains("timer-occlusion-visible-up=false"));
+        assert!(text.contains("app-nap=not-run-on-runner"));
+        assert!(!text.contains("app-nap-count=missing"));
         assert_eq!(
             report.timer.expected_ticks,
             expected_ticks(RUNNER_SAMPLE_MS, DEFAULT_INTERVAL_MS)
@@ -755,6 +851,127 @@ mod tests {
         );
         report.mode = "kit".to_string();
         assert!(failure_reasons(&report).is_empty());
+        assert!(!incomplete_reasons(&report).is_empty());
+    }
+
+    #[test]
+    fn pass_requires_printed_occlusion_and_opaque_flags() {
+        let mut down = passing_runner_fixture();
+        down.timer.occlusion_visible_down = Some(false);
+        assert!(
+            failure_reasons(&down)
+                .iter()
+                .any(|reason| reason.contains("timer-occlusion-visible-down"))
+        );
+        assert!(render(&down).contains("result=fail"));
+
+        let mut missing_down = passing_runner_fixture();
+        missing_down.timer.occlusion_visible_down = None;
+        assert!(
+            failure_reasons(&missing_down)
+                .iter()
+                .any(|reason| reason.contains("timer-occlusion-visible-down"))
+        );
+
+        let mut up = passing_runner_fixture();
+        up.timer.occlusion_visible_up = Some(true);
+        assert!(
+            failure_reasons(&up)
+                .iter()
+                .any(|reason| reason.contains("timer-occlusion-visible-up"))
+        );
+        assert!(render(&up).contains("result=fail"));
+
+        let mut missing_up = passing_runner_fixture();
+        missing_up.timer.occlusion_visible_up = None;
+        assert!(
+            failure_reasons(&missing_up)
+                .iter()
+                .any(|reason| reason.contains("timer-occlusion-visible-up"))
+        );
+
+        let mut opaque = passing_runner_fixture();
+        opaque.timer.overlay_opaque = false;
+        assert!(
+            failure_reasons(&opaque)
+                .iter()
+                .any(|reason| reason.contains("overlay-opaque"))
+        );
+        assert!(render(&opaque).contains("result=fail"));
+    }
+
+    #[test]
+    fn kit_is_incomplete_when_app_nap_or_hardware_rows_are_missing() {
+        let ok = passing_kit_fixture();
+        assert!(failure_reasons(&ok).is_empty());
+        assert!(incomplete_reasons(&ok).is_empty());
+        assert!(render(&ok).contains("result=pass"));
+        assert!(render(&ok).contains("app-nap-count=400"));
+        assert!(!render(&ok).contains("app-nap=not-run-on-runner"));
+
+        let mut no_nap = passing_kit_fixture();
+        no_nap.timer.app_nap_ran = false;
+        let text = render(&no_nap);
+        assert!(text.contains("result=incomplete"));
+        assert!(
+            incomplete_reasons(&no_nap)
+                .iter()
+                .any(|reason| reason.contains("app-nap-ran=false"))
+        );
+
+        let mut missing_count = passing_kit_fixture();
+        missing_count.timer.app_nap_count = None;
+        assert!(
+            incomplete_reasons(&missing_count)
+                .iter()
+                .any(|reason| reason.contains("App Nap count is missing"))
+        );
+        assert!(render(&missing_count).contains("result=incomplete"));
+
+        let mut lid = passing_kit_fixture();
+        lid.lid_on_power = recorded("skip");
+        assert!(
+            incomplete_reasons(&lid)
+                .iter()
+                .any(|reason| reason.contains("lid-on-power"))
+        );
+
+        let mut external = passing_kit_fixture();
+        external.lid_external = runner_hardware_row("lid close with an external display", true);
+        assert!(
+            incomplete_reasons(&external)
+                .iter()
+                .any(|reason| reason.contains("lid-external"))
+        );
+
+        let mut power = passing_kit_fixture();
+        power.power_key = hardware_row(
+            "needs-terminal".to_string(),
+            Some("needs-terminal".to_string()),
+            None,
+            true,
+            "stdin",
+        );
+        assert!(
+            incomplete_reasons(&power)
+                .iter()
+                .any(|reason| reason.contains("power-key"))
+        );
+        assert!(exit_nonzero(&power));
+    }
+
+    #[test]
+    fn a_low_baseline_prints_timer_slowed_not_claimed() {
+        let mut report = passing_runner_fixture();
+        let (slowed, sentence) = slowed_sentence(73, 72, 133);
+        report.timer.overlay_down_count = Some(73);
+        report.timer.overlay_up_count = Some(72);
+        report.timer.slowed = slowed;
+        report.timer.sentence = sentence;
+        let text = render(&report);
+        assert!(text.contains("timer-slowed=not-claimed"));
+        assert!(text.contains("timer-sentence=not claimed: baseline below expected"));
+        assert!(!text.contains("timer-slowed=false"));
     }
 
     #[test]

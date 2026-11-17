@@ -172,6 +172,16 @@ fn macos_keep_awake_does_not_record_a_serial_or_lock_the_session() {
 }
 
 #[test]
+fn stop_handler_covers_hangup_and_the_overlay_follows_its_parent() {
+    let root = common::repo_root();
+    let proof =
+        fs::read_to_string(root.join("spikes/macos-keep-awake/src/mac/proof.rs")).expect("proof");
+    assert!(proof.contains("SIGHUP"));
+    assert!(proof.contains("parent_alive(parent)"));
+    assert!(proof.contains("timer-pid="));
+}
+
+#[test]
 fn the_finding_names_m16_and_idle_sleep_only() {
     let root = common::repo_root();
     let text = fs::read_to_string(root.join(FINDING)).expect("finding");

@@ -76,7 +76,7 @@ Rows that CI cannot fill:
 1. **Lid closed on power**, no external display if he can unplug it: slept or stayed awake, with `assertion-held=true` from filtered `pmset`. This Mac is a laptop, so the row is one of those two (or skip).
 2. **Lid closed with an external display** (clamshell): slept, stayed awake, or no-external-display.
 3. **Power key tap** (Touch ID button): slept, showed the restart panel, or did nothing. Unlock first if the tap locked the screen, then answer. Assertions are still held for this row, then released (`step=7`).
-4. **App Nap**: numbered `step=4`, overlay covering **only the timer window** for 300 s so Activity Monitor stays visible. Compare the 60 s overlay-down vs overlay-up counts on a real idle.
+4. **App Nap**: numbered `step=4`. Before that step, open Activity Monitor and add the App Nap column (View → Columns), then keep your hands off. Overlay covering **only the timer window** for 300 s. Find the timer by `timer-pid=` (all three processes are named `macos-keep-awake`). Compare the 60 s overlay-down vs overlay-up counts on a real idle.
 
 QA1340 says a lid close is forced sleep and an assertion cannot prevent it. The product condition for the m16 idle-sleep claim is that both assertions are held during that measurement. Clamshell-with-display is the extra measurement. Neither result turns into a takeover feature in this phase.
 

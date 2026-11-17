@@ -14,9 +14,9 @@ use crate::args::{APP_NAP_SAMPLE_MS, Args, Mode};
 use crate::mac::ffi::{self, HeldAssertions};
 use crate::report::{
     AssertionReport, CaffeinateReport, DISPLAY_ASSERTION, HardwareRow, KIT_ID, KitReport,
-    SYSTEM_ASSERTION, TimerReport, expected_ticks, failure_reasons, hardware_only_list,
-    hardware_row, keep_awake_claim, laptop_lid_row, lid_external_row, pmset_shows, power_key_row,
-    render, runner_hardware_row, slowed_sentence,
+    SYSTEM_ASSERTION, TimerReport, exit_nonzero, expected_ticks, hardware_only_list, hardware_row,
+    keep_awake_claim, laptop_lid_row, lid_external_row, pmset_shows, power_key_row, render,
+    runner_hardware_row, slowed_sentence,
 };
 use crate::scrub::{contains_serial, filter_pmset};
 use crate::version::parse_sw_vers;
@@ -141,11 +141,7 @@ fn run_orchestrator(args: &Args) -> i32 {
         eprintln!("{error}");
         return 1;
     }
-    if interrupted || !failure_reasons(&report).is_empty() {
-        1
-    } else {
-        0
-    }
+    if exit_nonzero(&report) { 1 } else { 0 }
 }
 
 fn empty_timer(args: &Args, error: &str) -> TimerReport {
@@ -168,7 +164,7 @@ fn empty_timer(args: &Args, error: &str) -> TimerReport {
         app_nap_count: None,
         app_nap_occlusion_visible: None,
         app_nap_ran: false,
-        slowed: false,
+        slowed: None,
         sentence: error.to_string(),
         error: Some(error.to_string()),
     }
@@ -214,7 +210,7 @@ fn sample_timers(args: &Args) -> Result<TimerReport, String> {
     let (slowed, sentence) = match (down.ticks, up.ticks) {
         (Some(down_n), Some(up_n)) => slowed_sentence(down_n, up_n, expected),
         _ => (
-            false,
+            None,
             "Timer counts are incomplete, so slowing is not claimed.".to_string(),
         ),
     };
@@ -223,7 +219,7 @@ fn sample_timers(args: &Args) -> Result<TimerReport, String> {
     let mut app_nap_ran = false;
     if args.mode == Mode::Kit && !stop_requested() {
         println!(
-            "STEP hands-off App Nap: --kit covers only the timer window for 300 s (the overlay-down/up pair is 60 s each). Activity Monitor stays visible. Do not touch the Mac. Check the App Nap column for the timer process. Control-C ends it any time; Terminal still has keyboard focus behind the black screen."
+            "STEP hands-off App Nap: before this step, open Activity Monitor and add the App Nap column (View → Columns), then keep your hands off. --kit covers only the timer window for 300 s (the overlay-down/up pair is 60 s each). All three processes are named macos-keep-awake; find the timer by the printed timer-pid=. Control-C ends it any time."
         );
         let _ = io::stdout().flush();
         let nap = run_app_nap_timer(&exe, args, "timer-app-nap.json", APP_NAP_SAMPLE_MS)?;
@@ -391,6 +387,8 @@ fn run_app_nap_timer(
             count_file,
         ],
     )?;
+    println!("timer-pid={}", timer.id());
+    let _ = io::stdout().flush();
     let frame = match wait_for_frame(&frame_path) {
         Ok(frame) => frame,
         Err(error) => {
@@ -524,6 +522,7 @@ fn run_timer(args: &Args) -> i32 {
 
 fn run_overlay(args: &Args) -> i32 {
     install_stop_handler();
+    let parent = unsafe { libc::getppid() };
     let overlay = ffi::Overlay::open_rect(args.cover_frame);
     let path = args.output_dir.join("overlay.json");
     let marker = OverlayFile {
@@ -541,7 +540,7 @@ fn run_overlay(args: &Args) -> i32 {
     }
     let started = Instant::now();
     let limit = Duration::from_millis(args.sample_ms + 500);
-    while started.elapsed() < limit && !stop_requested() {
+    while started.elapsed() < limit && !stop_requested() && parent_alive(parent) {
         ffi::Overlay::pump(50);
         if ffi::Overlay::escape_seen() {
             break;
@@ -962,6 +961,7 @@ fn install_stop_handler() {
         action.sa_flags = 0;
         libc::sigemptyset(&mut action.sa_mask);
         libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
         libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
     }
 }
