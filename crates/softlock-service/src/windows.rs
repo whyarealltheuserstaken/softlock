@@ -1034,8 +1034,9 @@ fn client_identity(pipe: HANDLE) -> std::io::Result<(u32, String)> {
 fn create_public_pipe(name: &str, first: bool) -> std::io::Result<HANDLE> {
     // IU gets read and write, without FILE_CREATE_PIPE_INSTANCE (0x4).
     // 0x12019b is FILE_GENERIC_READ|FILE_GENERIC_WRITE with that bit cleared.
-    // SYSTEM keeps full control of the pipe.
-    let descriptor = security_descriptor("D:P(A;;GA;;;SY)(A;;0x12019b;;;IU)")?;
+    // SYSTEM keeps full control. OW is the owner, so the service that created
+    // the first instance can add more. Another user in IU cannot.
+    let descriptor = security_descriptor("D:P(A;;GA;;;SY)(A;;0x4;;;OW)(A;;0x12019b;;;IU)")?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0.0,
