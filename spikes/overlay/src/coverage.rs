@@ -25,14 +25,13 @@ pub fn windows_for(monitors: &[MonitorRect]) -> Result<Vec<MonitorRect>, String>
             return Err(format!("monitor {index} has no area"));
         }
     }
-    let mut seen = monitors.to_vec();
-    seen.sort_by_key(|rect| (rect.x, rect.y, rect.width, rect.height));
-    for pair in seen.windows(2) {
-        if pair[0] == pair[1] {
-            return Err("two monitors have the same rectangle".into());
+    let mut unique = Vec::new();
+    for monitor in monitors {
+        if !unique.contains(monitor) {
+            unique.push(*monitor);
         }
     }
-    Ok(monitors.to_vec())
+    Ok(unique)
 }
 
 /// Diff the windows we already have against the monitors we should cover.
@@ -84,6 +83,13 @@ mod tests {
     #[test]
     fn no_monitors_is_an_error() {
         assert!(windows_for(&[]).is_err());
+    }
+
+    #[test]
+    fn identical_rectangles_cover_one_window_and_a_new_screen_is_kept() {
+        let same = rect(0, 0, 1920, 1080);
+        let extra = rect(1920, 0, 1280, 720);
+        assert_eq!(windows_for(&[same, same, extra]).unwrap(), vec![same, extra]);
     }
 
     #[test]

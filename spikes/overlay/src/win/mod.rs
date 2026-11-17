@@ -41,7 +41,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindow, LWA_ALPHA, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage,
     PostThreadMessageW, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_SHOWWINDOW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowDisplayAffinity,
-    SetWindowPos, ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WINDOWPOS, WM_DESTROY,
+    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WINDOWPOS,
+    WM_DESTROY, HWND_MESSAGE, KillTimer,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_NCHITTEST, WM_PAINT,
     WM_QUIT, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
@@ -64,6 +65,7 @@ static GUI_THREAD: AtomicU32 = AtomicU32::new(0);
 static FINISHED: AtomicBool = AtomicBool::new(false);
 static REASSERTING: AtomicBool = AtomicBool::new(false);
 static PROBE_SAW_F13: AtomicBool = AtomicBool::new(false);
+static TIMER_TICKS: AtomicU32 = AtomicU32::new(0);
 static FULLSCREEN_CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
 static CLEANUP_ONCE: Once = Once::new();
 static STATUS: Mutex<OverlayNote> = Mutex::new(OverlayNote::Intro);
@@ -86,6 +88,9 @@ thread_local! {
 }
 
 struct Gui {
+    /// Message-only window that owns the exit hotkey and the reassert timer.
+    /// Monitor recovery never destroys it.
+    host: HWND,
     windows: Vec<LiveWindow>,
     lines: Vec<String>,
     brush: HBRUSH,
@@ -113,6 +118,13 @@ impl Drop for Cleanup {
 }
 
 pub fn run(config: Config) -> Result<(), String> {
+    if matches!(
+        config.command,
+        Command::Run | Command::Tour | Command::Smoke | Command::RestoreToasts
+    ) {
+        let elevated = unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool();
+        config::elevated_command_allowed(config.command, elevated, config.allow_admin)?;
+    }
     if config.command == Command::RestoreToasts {
         toast::remove_shortcut();
         println!("{}", registry::restore()?);
@@ -120,10 +132,6 @@ pub fn run(config: Config) -> Result<(), String> {
     }
     if config.command == Command::Fullscreen {
         return fullscreen::run(config.fullscreen_secs);
-    }
-    if config.command == Command::Tour {
-        let elevated = unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool();
-        config::tour_allowed(elevated, config.allow_admin)?;
     }
     config.ensure_timeout_covers_tour()?;
     if config.command == Command::Tour
@@ -239,8 +247,16 @@ fn show_and_pump(
         }
     }
     let lines = overlay_lines(config);
+    let host = match create_host(instance, &class_name) {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            destroy_windows();
+            return Err(error);
+        }
+    };
     GUI.with(|slot| {
         *slot.borrow_mut() = Some(Gui {
+            host,
             windows: Vec::new(),
             lines,
             brush,
@@ -254,44 +270,22 @@ fn show_and_pump(
             alpha: config.alpha,
         });
     });
+    arm_controls(host, config);
     let mut created = Vec::new();
     for rect in &rects {
-        created.push(create_overlay(instance, rect, config.alpha)?);
+        match create_overlay(instance, rect, config.alpha) {
+            Ok(window) => created.push(window),
+            Err(error) => {
+                destroy_windows();
+                return Err(error);
+            }
+        }
     }
     GUI.with(|slot| {
         if let Some(gui) = slot.borrow_mut().as_mut() {
             gui.windows = created;
         }
     });
-    let timer_hwnd = GUI.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .and_then(|gui| gui.windows.first().map(|window| window.hwnd))
-    });
-    if let Some(hwnd) = timer_hwnd {
-        if let Err(error) = unsafe {
-            RegisterHotKey(
-                Some(hwnd),
-                HOTKEY_ID,
-                MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
-                VK_Q.0 as u32,
-            )
-        } {
-            eprintln!(
-                "Hotkey {HOTKEY_LABEL} is unavailable ({error}). Ctrl+C in this window still closes it, and it still closes itself."
-            );
-        }
-        if config.reassert_timer || config.close_shell_surfaces {
-            unsafe {
-                windows::Win32::UI::WindowsAndMessaging::SetTimer(
-                    Some(hwnd),
-                    TIMER_ID,
-                    REASSERT_INTERVAL_MS,
-                    None,
-                );
-            }
-        }
-    }
     remember_hwnds();
     set_note(OverlayNote::Intro);
     println!(
@@ -402,20 +396,27 @@ fn pump_for(duration: Duration) {
 }
 
 fn destroy_windows() {
-    let hwnds = GUI.with(|slot| {
+    let (host, hwnds) = GUI.with(|slot| {
         slot.borrow()
             .as_ref()
             .map(|gui| {
-                gui.windows
-                    .iter()
-                    .map(|window| window.hwnd)
-                    .collect::<Vec<_>>()
+                (
+                    gui.host,
+                    gui.windows
+                        .iter()
+                        .map(|window| window.hwnd)
+                        .collect::<Vec<_>>(),
+                )
             })
             .unwrap_or_default()
     });
     unsafe {
+        if !host.is_invalid() {
+            let _ = UnregisterHotKey(Some(host), HOTKEY_ID);
+            let _ = KillTimer(Some(host), TIMER_ID);
+            let _ = DestroyWindow(host);
+        }
         for hwnd in hwnds {
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
             let _ = DestroyWindow(hwnd);
         }
     }
@@ -885,6 +886,7 @@ fn note_text(note: OverlayNote) -> String {
 }
 
 fn on_timer() {
+    TIMER_TICKS.fetch_add(1, Ordering::SeqCst);
     let (reassert, close) = GUI
         .with(|slot| {
             slot.borrow().as_ref().map(|gui| {
@@ -933,6 +935,11 @@ fn recover_monitors() {
     let Ok(rects) = windows_for(&monitors) else {
         return;
     };
+    apply_coverage(&rects);
+}
+
+/// Close and recreate overlay windows. The message-only host is left alone.
+fn apply_coverage(rects: &[MonitorRect]) {
     let Some((instance, alpha)) = GUI.with(|slot| {
         let gui = slot.borrow();
         let gui = gui.as_ref()?;
@@ -952,7 +959,7 @@ fn recover_monitors() {
             })
             .unwrap_or_default()
     });
-    let plan = crate::coverage::reconcile(&current, &rects);
+    let plan = crate::coverage::reconcile(&current, rects);
     for rect in plan.close {
         let hwnd = GUI.with(|slot| {
             let mut gui = slot.borrow_mut();
@@ -978,6 +985,46 @@ fn recover_monitors() {
     remember_hwnds();
 }
 
+fn create_host(instance: HINSTANCE, class_name: &[u16]) -> Result<HWND, String> {
+    unsafe {
+        CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(wide("overlay spike host").as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            Some(instance),
+            None,
+        )
+    }
+    .map_err(|error| error.to_string())
+}
+
+fn arm_controls(hwnd: HWND, config: &Config) {
+    if let Err(error) = unsafe {
+        RegisterHotKey(
+            Some(hwnd),
+            HOTKEY_ID,
+            MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
+            VK_Q.0 as u32,
+        )
+    } {
+        eprintln!(
+            "Hotkey {HOTKEY_LABEL} is unavailable ({error}). Ctrl+C in this window still closes it, and it still closes itself."
+        );
+    }
+    if config.reassert_timer || config.close_shell_surfaces {
+        unsafe {
+            let _ = SetTimer(Some(hwnd), TIMER_ID, REASSERT_INTERVAL_MS, None);
+        }
+    }
+}
+
 struct SmokeReport {
     checks_ok: bool,
     capture_excluded: bool,
@@ -991,12 +1038,13 @@ struct SmokeReport {
     reassert_pos: &'static str,
     reassert_timer: &'static str,
     shell_fixture: &'static str,
+    controls: &'static str,
 }
 
 impl SmokeReport {
     fn json(&self) -> String {
         format!(
-            r#"{{"checks_ok":{},"capture_excluded":{},"click_through":{},"topmost":{},"blocks_input":{},"monitors":{},"covered":{},"capture_sample":"{}","input_probe":"{}","reassert_pos":"{}","reassert_timer":"{}","shell_fixture":"{}","exited":"{}"}}"#,
+            r#"{{"checks_ok":{},"capture_excluded":{},"click_through":{},"topmost":{},"blocks_input":{},"monitors":{},"covered":{},"capture_sample":"{}","input_probe":"{}","reassert_pos":"{}","reassert_timer":"{}","shell_fixture":"{}","controls":"{}","exited":"{}"}}"#,
             self.checks_ok,
             self.capture_excluded,
             self.click_through,
@@ -1009,6 +1057,7 @@ impl SmokeReport {
             self.reassert_pos,
             self.reassert_timer,
             self.shell_fixture,
+            self.controls,
             if self.checks_ok {
                 "checks-passed"
             } else {
@@ -1037,7 +1086,8 @@ fn smoke_report(config: &Config) -> SmokeReport {
     let mut capture_excluded = !windows.is_empty();
     let mut click_through = !windows.is_empty();
     let mut topmost = !windows.is_empty();
-    let mut covered = windows.len() == monitors.len() && !monitors.is_empty();
+    let expected = windows_for(&monitors).unwrap_or_default();
+    let mut covered = windows.len() == expected.len() && !expected.is_empty();
     for window in &windows {
         unsafe {
             let mut affinity = 0u32;
@@ -1075,7 +1125,7 @@ fn smoke_report(config: &Config) -> SmokeReport {
             }
         }
     }
-    for monitor in &monitors {
+    for monitor in &expected {
         if !windows.iter().any(|window| window.rect == *monitor) {
             covered = false;
         }
@@ -1110,6 +1160,11 @@ fn smoke_report(config: &Config) -> SmokeReport {
     } else {
         "not-requested"
     };
+    let controls = if controls_survive_recovery(config) {
+        "armed"
+    } else {
+        "failed"
+    };
     let checks_ok = capture_excluded
         && click_through
         && topmost
@@ -1119,7 +1174,8 @@ fn smoke_report(config: &Config) -> SmokeReport {
         && capture_sample != "visible"
         && reassert_pos != "failed"
         && reassert_timer != "failed"
-        && shell_fixture != "failed";
+        && shell_fixture != "failed"
+        && controls != "failed";
     SmokeReport {
         checks_ok,
         capture_excluded,
@@ -1133,6 +1189,7 @@ fn smoke_report(config: &Config) -> SmokeReport {
         reassert_pos,
         reassert_timer,
         shell_fixture,
+        controls,
     }
 }
 
@@ -1296,8 +1353,91 @@ fn reassert_pos_check(windows: &[LiveWindow]) -> bool {
     }
 }
 
+fn host_hwnd() -> Option<HWND> {
+    GUI.with(|slot| {
+        slot.borrow().as_ref().and_then(|gui| {
+            if gui.host.is_invalid() {
+                None
+            } else {
+                Some(gui.host)
+            }
+        })
+    })
+}
+
+/// Destroy the first overlay rectangle and recreate it. The hotkey and timer stay on the host.
+fn controls_survive_recovery(config: &Config) -> bool {
+    let Some(host) = host_hwnd() else {
+        return false;
+    };
+    if !unsafe { IsWindow(Some(host)).as_bool() } {
+        return false;
+    }
+    let rects = GUI.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|gui| {
+                gui.windows
+                    .iter()
+                    .map(|window| window.rect)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    let Some(first) = rects.first().copied() else {
+        return false;
+    };
+    let reduced = rects
+        .iter()
+        .copied()
+        .filter(|rect| *rect != first)
+        .collect::<Vec<_>>();
+    apply_coverage(&reduced);
+    apply_coverage(&rects);
+    let host_alive = unsafe { IsWindow(Some(host)).as_bool() };
+    let hotkey = hotkey_still_armed(host);
+    let timer_ok = if config.reassert_timer || config.close_shell_surfaces {
+        let before = TIMER_TICKS.load(Ordering::SeqCst);
+        let start = Instant::now();
+        while TIMER_TICKS.load(Ordering::SeqCst) == before
+            && start.elapsed() < Duration::from_millis(800)
+        {
+            pump_for(Duration::from_millis(50));
+        }
+        TIMER_TICKS.load(Ordering::SeqCst) > before
+    } else {
+        true
+    };
+    let first_back = GUI.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|gui| gui.windows.iter().any(|window| window.rect == first))
+    });
+    host_alive && hotkey && timer_ok && first_back
+}
+
+fn hotkey_still_armed(hwnd: HWND) -> bool {
+    match unsafe {
+        RegisterHotKey(
+            Some(hwnd),
+            HOTKEY_ID,
+            MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
+            VK_Q.0 as u32,
+        )
+    } {
+        Ok(()) => {
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID) };
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 fn reassert_timer_check(windows: &[LiveWindow]) -> bool {
     let Some(window) = windows.first() else {
+        return false;
+    };
+    let Some(host) = host_hwnd() else {
         return false;
     };
     let competitor = match create_competitor() {
@@ -1305,7 +1445,7 @@ fn reassert_timer_check(windows: &[LiveWindow]) -> bool {
         Err(_) => return false,
     };
     unsafe {
-        let _ = PostMessageW(Some(window.hwnd), WM_TIMER, WPARAM(TIMER_ID), LPARAM(0));
+        let _ = PostMessageW(Some(host), WM_TIMER, WPARAM(TIMER_ID), LPARAM(0));
     }
     pump_for(Duration::from_millis(200));
     let above = z_above(window.hwnd, competitor);

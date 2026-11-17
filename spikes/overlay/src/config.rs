@@ -45,7 +45,7 @@ pub struct Config {
     pub prompt: bool,
     /// Smoke-only: prove a shell-looking window this process owns is not closed.
     pub shell_fixture: bool,
-    /// The tour refuses to run elevated unless this is set.
+    /// Run, tour, smoke, and restore-toasts refuse elevation unless this is set.
     pub allow_admin: bool,
     pub fullscreen_secs: u64,
 }
@@ -164,11 +164,20 @@ impl Config {
     }
 }
 
-/// An elevated tour is refused unless the operator passed `--allow-admin`.
+/// Run, tour, smoke, and restore-toasts refuse elevation unless `--allow-admin` was passed.
+/// The fullscreen child stays allowed so a tour can still open the green window.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn tour_allowed(elevated: bool, allow_admin: bool) -> Result<(), String> {
-    if elevated && !allow_admin {
-        Err("this tour is running as admin. Close it and open a normal PowerShell. Do not choose Run as administrator. Pass --allow-admin only if school IT told you to.".into())
+pub fn elevated_command_allowed(
+    command: Command,
+    elevated: bool,
+    allow_admin: bool,
+) -> Result<(), String> {
+    let gated = matches!(
+        command,
+        Command::Run | Command::Tour | Command::Smoke | Command::RestoreToasts
+    );
+    if gated && elevated && !allow_admin {
+        Err("this program is running as admin. Close it and open a normal PowerShell. Do not choose Run as administrator. Pass --allow-admin only if school IT told you to.".into())
     } else {
         Ok(())
     }
@@ -317,11 +326,14 @@ mod tests {
     }
 
     #[test]
-    fn an_elevated_tour_needs_allow_admin() {
-        assert!(tour_allowed(false, false).is_ok());
-        assert!(tour_allowed(true, true).is_ok());
-        let error = tour_allowed(true, false).unwrap_err();
-        assert!(error.contains("--allow-admin"), "{error}");
+    fn an_elevated_session_needs_allow_admin() {
+        for command in [Command::Run, Command::Tour, Command::Smoke, Command::RestoreToasts] {
+            assert!(elevated_command_allowed(command, false, false).is_ok());
+            assert!(elevated_command_allowed(command, true, true).is_ok());
+            let error = elevated_command_allowed(command, true, false).unwrap_err();
+            assert!(error.contains("--allow-admin"), "{error}");
+        }
+        assert!(elevated_command_allowed(Command::Fullscreen, true, false).is_ok());
         let config = Config::parse(["tour", "--allow-admin"]).unwrap();
         assert!(config.allow_admin);
     }

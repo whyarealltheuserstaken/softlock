@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, KEY_READ, REG_DWORD,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_DWORD,
     REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW,
     RegDeleteKeyValueW, RegDeleteKeyW, RegEnumValueW, RegGetValueW, RegOpenKeyExW, RegSetKeyValueW,
 };
@@ -200,7 +200,7 @@ fn set_value(
             None,
             PCWSTR::null(),
             REG_OPTION_NON_VOLATILE,
-            KEY_ALL_ACCESS,
+            KEY_SET_VALUE,
             None,
             &mut key,
             None,

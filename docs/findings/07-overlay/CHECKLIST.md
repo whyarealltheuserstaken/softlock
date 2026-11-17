@@ -32,7 +32,7 @@ Do not install git, rustup, or Visual Studio on the school PC.
 
 If the pink layer is still up and the exit keys do nothing, wait. It closes itself. You can also click the black PowerShell window (clicks go through the pink) and press Ctrl+C.
 
-If the program says it is running as admin, close it and open a normal PowerShell. Do not choose Run as administrator. The tour refuses that unless you pass `--allow-admin`, and you only pass that if school IT told you to.
+If the program says it is running as admin, close it and open a normal PowerShell. Do not choose Run as administrator. Run, the tour, smoke, and restore-toasts refuse that unless you pass `--allow-admin`, and you only pass that if school IT told you to.
 
 ## 3. Get the laptop ready
 
@@ -167,6 +167,8 @@ Watch the toast step again. If a banner still appears, write `not suppressed unt
 
 Do this on the laptop and again on the school PC, from the copied folder. The laptop already confirmed a banner in section 4.2. On the school PC, the second command is how you confirm a banner appears again.
 
+Never delete the copied folder until a toast banner has appeared after `restore-toasts` and both `reg query` commands have failed. The Start Menu shortcut is not inside that folder. Its name is `spike-overlay.lnk`. `restore-toasts` and a normal exit remove it. If the file is still there after the banner, delete that shortcut before you delete the folder.
+
 ```powershell
 cd C:\Users\<you>\softlock-test
 .\spike-overlay.exe restore-toasts
@@ -175,13 +177,23 @@ reg query HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce /v softlock-spi
 reg query HKCU\Software\softlock-spike-overlay
 ```
 
-You should see a banner on the school PC. Photograph it if the earlier toast photos were missing. If no banner appears, write that in the notes and tell school IT. Do not keep trying.
+You should see a banner on the school PC. Photograph it if the earlier toast photos were missing. If no banner appears, write that in the notes and tell school IT. Do not keep trying. Leave the copied folder in place until a banner does appear.
 
-Both `reg query` commands should fail. The first should say it cannot find the value `softlock-spike-overlay`. The second should say it cannot find the key. If either one prints a value, run `.\spike-overlay.exe restore-toasts` again and repeat the two queries.
+Both `reg query` commands should fail. The first should say it cannot find the value `softlock-spike-overlay`. The second should say it cannot find the key. If either one prints a value, run `.\spike-overlay.exe restore-toasts` again and repeat the two queries. Leave the copied folder in place until both commands fail.
 
 Windows may add a notification-settings entry for `com.softlock.spike.overlay`. That entry is harmless. Leave it. It is not the RunOnce entry and it is not the sentinel key.
 
-Then delete the copied folder on both machines. Close PowerShell first if it is still inside that folder.
+The shortcut file is:
+
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\spike-overlay.lnk`
+
+If that file is still there after the banner appeared and both queries failed, delete it:
+
+```powershell
+Remove-Item -Force "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\spike-overlay.lnk"
+```
+
+Only after the banner appeared and both queries failed, delete the copied folder on both machines. Close PowerShell first if it is still inside that folder.
 
 ```powershell
 cd $env:USERPROFILE
