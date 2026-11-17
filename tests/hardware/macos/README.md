@@ -17,3 +17,5 @@ The terminal needs Accessibility and Input Monitoring. System Settings, Privacy 
 6. The Mac may lock twice. Unlock with your password.
 
 A step you confirm that is not detected is a failure. `--ci` skips steps 3–6. Send `suite-output/<timestamp>/result.json` and `result.txt`. The files use schema `softlock-hardware-suite/1`. No serial number is recorded. Ctrl-C releases power assertions and the suite exits non-zero. A failure ends with the session locked.
+
+<!-- path-filter demo -->
