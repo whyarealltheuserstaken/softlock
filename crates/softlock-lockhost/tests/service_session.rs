@@ -190,8 +190,11 @@ fn open_pipe(name: &str) -> Result<HANDLE, String> {
     loop {
         match open_pipe_once(name) {
             Err(error)
-                if error.contains("0x800700E7") && started.elapsed() < Duration::from_secs(2) =>
+                if (error.contains("0x800700E7") || error.contains("0x80070002"))
+                    && started.elapsed() < Duration::from_secs(2) =>
             {
+                // 231: every instance is busy. 2: the name has no instance
+                // while the server is between clients.
                 thread::sleep(Duration::from_millis(20));
             }
             other => return other,

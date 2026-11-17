@@ -568,7 +568,13 @@ pub fn pipe_path() -> String {
 pub fn stub_os_lock() -> bool {
     #[cfg(feature = "simulated-physical")]
     {
-        std::env::var("SOFTLOCK_STUB_OS_LOCK").ok().as_deref() == Some("1")
+        // `1` and `fail` make the host report failure. `succeed` makes the
+        // host report a confirmed lock. None of them may call LockWorkStation
+        // or disconnect the console from this process.
+        matches!(
+            std::env::var("SOFTLOCK_STUB_OS_LOCK").ok().as_deref(),
+            Some("1" | "fail" | "succeed")
+        )
     }
     #[cfg(not(feature = "simulated-physical"))]
     {
