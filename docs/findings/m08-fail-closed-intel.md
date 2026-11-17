@@ -25,7 +25,51 @@ The job is the `macOS lock kit` workflow. It prints `mode=read-only`, `private-c
 
 That FileVault reading is the runner's disk, as the console user. It is not Henry's Mac. The job does not reboot, so a FileVault pre-boot screen was not observed. `uname -m` has to be `arm64`. A missing symbol on that OS is recorded and is not a crash. Forcing the symbol to be missing is not part of the job. The first chooser row is the proof of that branch.
 
-The lines from the read-only job on this head are filled in after that job finishes. Until that block replaces this sentence, there is no measurement for this commit.
+The read-only job on `08a7c21777ed1d396ea86963e2db145e74e7b764` is [run 44011510110](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44011510110), job `macos lock kit read-only`. `sw_vers` printed ProductVersion 26.7.2 and BuildVersion 25G332, and `id -u` printed `uid=501`. The kit printed:
+
+```
+mode=read-only
+result=pass
+state=never-unlocked
+private-symbol=present
+private-symbol-detail=resolved
+private-call=not-called
+documented-path=not-started
+documented-engine=/System/Library/CoreServices/ScreenSaverEngine.app/Contents/MacOS/ScreenSaverEngine
+screen-saver-engine-present=true
+ask-for-password-delay=missing
+screen-lock-status=delayed
+screen-lock-detail=2026-11-17 03:38:17.868 sysadminctl[5132:20310] screenLock delay is 300 seconds
+screen-lock-disagreement=false
+arm=not-applied
+chooser-if-symbol-missing=refuse
+chooser-if-call-failed=refuse
+chooser-if-call-succeeded=private
+fdesetup-status=FileVault is Off.
+fdesetup-status-exit=0
+fdesetup-isactive=false
+fdesetup-isactive-exit=1
+filevault=off
+filevault-pre-boot-observed=false
+settings-changed=false
+filevault-changed=false
+serial-collected=false
+linked-login-framework=false
+otool-checked=true
+uid=501
+uid-is-root=false
+runner-lock-allowed=false
+product-name=macOS
+product-version=26.7.2
+build-version=25G332
+uname-m=arm64
+hw-model=VirtualMac2,1
+lock-screen-appeared=not-asked
+external-display-covered=not-asked
+fail-closed=not-needed
+```
+
+There is no `ms-until-locked` line. The read-only run does not start a lock, so that field stays empty. Actions masks any printed key whose name contains `password`, so the immediate-password line and the ask-for-password line are not copied from the log. The two chooser rows that are not a successful call both printed `refuse`, and `screen-lock-status=delayed` with `screen-lock-disagreement=false`. That is the chooser when the symbol is present and the setting is not an immediate password. `fdesetup isactive` printed `false` and exited 1, so that exit is not itself a successful Off. `fdesetup status` exited 0 with `FileVault is Off.`, and the combined reading is `filevault=off`. This is the runner's disk, not Henry's Mac. A missing symbol was not forced.
 
 ## What only hardware proves
 
