@@ -2,7 +2,7 @@
 
 Measured on 16 November 2026 UTC by the workspace-excluded probe `spikes/macos-desktop-proof`.
 
-The proof run is [macOS desktop proof run 44010674202](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44010674202), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44010674202/job/133796661508). The measured head is `5faa4f7660b9f58b25fbf89bae3599c601426056`. The job printed `result=pass`. macOS 26.7.2, arm64, one 1024x768 display. `CGShieldingWindowLevel()` was not called. The window stayed visible, unoccluded, and listed by `CGWindowListCopyWindowInfo` after `sharingType` was set to `.none`.
+The proof run is [macOS desktop proof run 44011326928](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44011326928), job [macos desktop proof](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44011326928/job/133798759432). The measured head is `fd90080a85d8a363b6a2e99aa9d9b0cb41122901`. The job printed `result=pass`. macOS 26.7.2, arm64, one 1024x768 display. `CGShieldingWindowLevel()` was not called. The window stayed visible, unoccluded, and listed by `CGWindowListCopyWindowInfo` after `sharingType` was set to `.none`.
 
 ```
 ProductName:	macOS
