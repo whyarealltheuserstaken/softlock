@@ -473,7 +473,7 @@ try {
                 if (-not $ok) {
                     $snippet = ($requests -replace '\s+', ' ').Trim()
                     if ($snippet.Length -gt 160) { $snippet = $snippet.Substring(0, 160) }
-                    $reason = "win32=$($probe.system_error) api=$apiOk powercfg=$seenOk $snippet"
+                    $reason = "win32=$($probe.system_error) api=$apiOk powercfg=$seenOk $(Probe-Error $probe) $snippet"
                     $extra.stderr = ((Probe-Error $probe) + ' ' + $snippet).Trim()
                     Write-Host "keep-awake refused: $reason"
                 }
