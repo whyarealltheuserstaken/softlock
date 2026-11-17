@@ -244,9 +244,17 @@ jobs:
           cargo build --locked -p softlock-service -p softlock-lockhost \
             --features softlock-service/simulated-physical,softlock-lockhost/simulated-physical \
             --target x86_64-pc-windows-msvc
+          # A file, not a pipe. A lock-host child that outlives cargo keeps a
+          # pipe open and tee never sees EOF, so the job sits until timeout.
+          set +e
           cargo test --locked -p softlock-lockhost --features simulated-physical \
             --target x86_64-pc-windows-msvc --test service_session -- --test-threads=1 --nocapture \
-            2>&1 | tee target/seam3-service.txt
+            > target/seam3-service.txt 2>&1
+          status=$?
+          set -e
+          cat target/seam3-service.txt
+          taskkill //IM softlock-lockhost.exe //F || true
+          test "$status" -eq 0
           grep -F "lock_client_lock_blocks_physical_input_and_passes_injected ... ok" target/seam3-service.txt
           grep -F "lock_host_idles_before_lock_and_arms_within_500ms ... service arming took" target/seam3-service.txt
           arming=$(grep -E "lock_host_idles_before_lock_and_arms_within_500ms \.\.\. service arming took [0-9]+ ms ok" target/seam3-service.txt)

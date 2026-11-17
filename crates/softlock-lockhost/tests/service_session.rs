@@ -1339,13 +1339,26 @@ fn plant_child(job: &PlantJob) {
             break None;
         }
         match mode {
-            "hold-file" => match create_held_file(&dir.join("pin.phc")) {
-                Ok(handle) => {
-                    opened = true;
-                    break Some(handle);
+            "hold-file" => {
+                // CREATE_NEW on the existing hash returns file-exists (80).
+                // A new name in the same directory is access-denied (5) once
+                // LocalSystem has created it, and path-not-found before that.
+                let attempts = [dir.join("pin.phc"), dir.join("user-plant.phc")];
+                let mut planted = None;
+                for path in &attempts {
+                    match create_held_file(path) {
+                        Ok(handle) => {
+                            opened = true;
+                            planted = Some(handle);
+                            break;
+                        }
+                        Err(error) => record_plant_error(&mut code, &mut saw_denied, error),
+                    }
                 }
-                Err(error) => record_plant_error(&mut code, &mut saw_denied, error),
-            },
+                if planted.is_some() {
+                    break planted;
+                }
+            }
             "junction" => match create_junction(dir, bait) {
                 Ok(()) => {
                     opened = true;
@@ -1401,9 +1414,21 @@ fn plant_child(job: &PlantJob) {
 }
 
 fn record_plant_error(code: &mut i32, saw_denied: &mut bool, error: std::io::Error) {
-    *code = error.raw_os_error().unwrap_or(*code);
+    *code = win32_code(error.raw_os_error().unwrap_or(*code));
     if *code == 5 {
         *saw_denied = true;
+    }
+}
+
+/// `windows::core::Error::code()` is an HRESULT (`0x8007xxxx`). The plant
+/// report has to name the Win32 code, and a later path-not-found must not
+/// erase an access-denied that already happened.
+fn win32_code(raw: i32) -> i32 {
+    let unsigned = raw as u32;
+    if unsigned & 0xFFFF_0000 == 0x8007_0000 {
+        (unsigned & 0xFFFF) as i32
+    } else {
+        raw
     }
 }
 

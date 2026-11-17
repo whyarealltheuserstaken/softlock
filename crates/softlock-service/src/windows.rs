@@ -776,11 +776,53 @@ fn enable_privilege(name: PCWSTR) -> std::io::Result<()> {
 }
 
 fn environment_block(allow_panic: bool) -> Vec<u16> {
-    let mut block = Vec::new();
-    for (key, value) in std::env::vars() {
-        if !host_env_allowed(&key, allow_panic) {
-            continue;
+    // Windows reads a custom environment only while the names stay in
+    // case-insensitive order. A filtered copy of the parent block is not
+    // sorted once a later SetEnvironmentVariable appended a test key, and
+    // the child then loses SOFTLOCK_RUN_NONCE and SOFTLOCK_STUB_OS_LOCK.
+    let mut pairs: Vec<(String, String)> = std::env::vars()
+        .filter(|(key, _)| host_env_allowed(key, allow_panic))
+        .collect();
+    for key in [
+        "SOFTLOCK_STUB_OS_LOCK",
+        "SOFTLOCK_RUN_NONCE",
+        "SOFTLOCK_OS_LOCK_MARK",
+    ] {
+        if let Ok(value) = std::env::var(key)
+            && !pairs
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(key))
+        {
+            pairs.push((key.to_string(), value));
         }
+    }
+    if allow_panic
+        && let Ok(value) = std::env::var("SOFTLOCK_PANIC")
+        && !pairs
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case("SOFTLOCK_PANIC"))
+    {
+        pairs.push(("SOFTLOCK_PANIC".to_string(), value));
+    }
+    if let Some((_, root)) = pairs
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("SystemRoot"))
+        && !pairs
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+    {
+        // System32 only. The parent PATH is not copied.
+        let root = root.clone();
+        pairs.push(("PATH".to_string(), format!("{root}\\System32;{root}")));
+    }
+    pairs.sort_by(|left, right| {
+        left.0
+            .to_ascii_lowercase()
+            .cmp(&right.0.to_ascii_lowercase())
+    });
+    pairs.dedup_by(|left, right| left.0.eq_ignore_ascii_case(&right.0));
+    let mut block = Vec::new();
+    for (key, value) in pairs {
         for unit in key.encode_utf16() {
             block.push(unit);
         }

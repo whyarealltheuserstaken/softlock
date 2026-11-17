@@ -1057,7 +1057,9 @@ fn wait_for_arm(shared: &Shared) -> bool {
         match next_command(shared) {
             Some(PipeCommand::Arm) => return true,
             Some(PipeCommand::Disarm) => return false,
-            Some(PipeCommand::Quit) => return quit_before_arm(shared),
+            // Hooks are installed only after Arm. Quit before that is not
+            // Locked, Arming, or FailingClosed, so it must not call the OS lock.
+            Some(PipeCommand::Quit) => return false,
             None => {
                 if !pump_message() && shared.stop.load(Ordering::Acquire) {
                     return false;
@@ -1067,30 +1069,14 @@ fn wait_for_arm(shared: &Shared) -> bool {
     }
 }
 
-fn quit_before_arm(shared: &Shared) -> bool {
-    match failclosed::lock_or_disconnect(failclosed::console_session()) {
-        RealLock::Workstation | RealLock::Disconnected => false,
-        RealLock::Unavailable => {
-            while !failclosed::replacement_host_armed() {
-                if shared.stop.load(Ordering::Acquire) {
-                    return false;
-                }
-                if !pump_message() && shared.stop.load(Ordering::Acquire) {
-                    return false;
-                }
-            }
-            false
-        }
-    }
-}
-
 fn apply_simulated_environment(shared: &Shared) {
     #[cfg(feature = "simulated-physical")]
     {
         match std::env::var("SOFTLOCK_STUB_OS_LOCK").ok().as_deref() {
-            Some("1" | "fail") => shared.os_lock_stub.store(1, Ordering::Release),
             Some("succeed") => shared.os_lock_stub.store(2, Ordering::Release),
-            _ => {}
+            // This feature is the test build. A missing stub must not call
+            // LockWorkStation; production builds do not compile this branch.
+            _ => shared.os_lock_stub.store(1, Ordering::Release),
         }
         if std::env::var("SOFTLOCK_PANIC").ok().as_deref() == Some("after-arm") {
             shared.panic_window.store(true, Ordering::Release);
