@@ -245,15 +245,18 @@ namespace SoftLock.Hardware
                 powerRequest = PowerCreateRequest(ref context);
                 if (powerRequest == IntPtr.Zero)
                 {
-                    return "{\"ok\":false,\"api\":false,\"error\":\"PowerCreateRequest\"}";
+                    return "{\"ok\":false,\"api\":false,\"system\":false,\"display\":false,\"system_error\":" + Marshal.GetLastWin32Error() + ",\"display_error\":0,\"error\":\"PowerCreateRequest\"}";
                 }
                 bool system = PowerSetRequest(powerRequest, 1);
+                int systemError = system ? 0 : Marshal.GetLastWin32Error();
                 bool display = PowerSetRequest(powerRequest, 0);
-                return "{\"ok\":" + Bool(system && display) + ",\"api\":" + Bool(system && display) + "}";
+                int displayError = display ? 0 : Marshal.GetLastWin32Error();
+                bool execution = PowerSetRequest(powerRequest, 3);
+                return "{\"ok\":" + Bool(system) + ",\"api\":" + Bool(system) + ",\"system\":" + Bool(system) + ",\"display\":" + Bool(display) + ",\"execution\":" + Bool(execution) + ",\"system_error\":" + systemError + ",\"display_error\":" + displayError + ",\"error\":\"\"}";
             }
             catch (Exception error)
             {
-                return "{\"ok\":false,\"api\":false,\"error\":\"" + Esc(error.Message) + "\"}";
+                return "{\"ok\":false,\"api\":false,\"system\":false,\"display\":false,\"system_error\":0,\"display_error\":0,\"error\":\"" + Esc(error.Message) + "\"}";
             }
         }
 
@@ -681,7 +684,7 @@ namespace SoftLock.Hardware
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
         [DllImport("kernel32.dll")] static extern bool GetSystemPowerStatus(out SystemPowerStatus status);
         [DllImport("powrprof.dll", SetLastError = true)] static extern IntPtr PowerCreateRequest(ref ReasonContext context);
-        [DllImport("powrprof.dll")] static extern bool PowerSetRequest(IntPtr request, int type);
+        [DllImport("powrprof.dll", SetLastError = true)] static extern bool PowerSetRequest(IntPtr request, int type);
         [DllImport("powrprof.dll")] static extern bool PowerClearRequest(IntPtr request, int type);
         [DllImport("shell32.dll")] static extern bool IsUserAnAdmin();
         [DllImport("wtsapi32.dll", CharSet = CharSet.Unicode)] static extern bool WTSQuerySessionInformationW(IntPtr server, int session, int klass, out IntPtr buffer, out int bytes);

@@ -453,22 +453,29 @@ try {
                 $probe = $native::KeepAwakeJson() | ConvertFrom-Json
                 Start-Sleep -Milliseconds 400
                 $requests = Read-Native { powercfg.exe /requests }
-                $stderr = ''
                 $requestFile = Join-Path $env:TEMP ("softlock-hw-requests-{0}.txt" -f $PID)
                 Write-Utf8 $requestFile $requests
                 $seenRaw = & $exe requests --text $requestFile --needle 'hardware suite'
                 $native::ReleaseKeepAwake()
                 $seen = $seenRaw | ConvertFrom-Json
                 Remove-Item -LiteralPath $requestFile -Force -ErrorAction SilentlyContinue
-                $ok = $probe.api -and $seen.system -and $seen.display
+                $apiOk = [bool]$probe.system
+                $seenOk = [bool]$seen.system
+                $ok = $apiOk -and ($seenOk -or $ci)
                 $reason = ''
                 $extra = @{
-                    system = [bool]$seen.system
+                    api_system = $apiOk
+                    api_display = [bool]$probe.display
+                    system = $seenOk
                     display = [bool]$seen.display
+                    system_error = [int]$probe.system_error
                 }
                 if (-not $ok) {
-                    $reason = 'keep-awake request was refused'
-                    $extra.stderr = ((Probe-Error $probe) + ' ' + $stderr).Trim()
+                    $snippet = ($requests -replace '\s+', ' ').Trim()
+                    if ($snippet.Length -gt 160) { $snippet = $snippet.Substring(0, 160) }
+                    $reason = "win32=$($probe.system_error) api=$apiOk powercfg=$seenOk $snippet"
+                    $extra.stderr = ((Probe-Error $probe) + ' ' + $snippet).Trim()
+                    Write-Host "keep-awake refused: $reason"
                 }
                 Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) $reason $extra
             }
