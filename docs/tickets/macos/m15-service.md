@@ -12,7 +12,7 @@ If m02 found a daemon cannot start a GUI process in the Aqua session, launchd st
 
 **Where:** CI only for the socket protocol (roles, no unlock verb, wrong nonce stays locked). Henry's Intel Mac for installing the daemon and the agent and locking from a second process.
 
-**Test machine:** MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports). 2 GHz quad-core Intel Core i5. Intel Iris Plus Graphics. 16 GB LPDDR4X. macOS Tahoe 26.7.3. Laptop, with Touch ID and the T2 chip. The number of external displays is still unknown. macOS 11 through 15 are untested: this machine is on 26.x, and arm64 CI is `macos-latest`. Full list: D1 and [Henry's sheet](henry-sheet.md).
+**Test machine:** The paragraph in D1 of [`decisions.md`](decisions.md). [Henry's sheet](henry-sheet.md) points at the same paragraph.
 
 **Status:** waiting for Henry. Not ready-for-agent. Not a GitHub issue.
 

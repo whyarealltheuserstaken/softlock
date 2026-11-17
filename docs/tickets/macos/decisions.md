@@ -4,7 +4,7 @@ Read against `23b5a39bc92c2ee32f470256d78be27d030dc59f`. The addendum is [`docs/
 
 Each item has a recommendation until someone decides it. Changing an answer rewrites the tickets that name it. It does not rewrite the Windows spec.
 
-Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7 on 16 November 2026, as written. The lead also decided D8 the same day. Henry's Intel Mac is recorded in D1. The number of external displays, and whether a second keyboard is available, are still open.
+Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7 on 16 November 2026, as written. The lead also decided D8 the same day. The test-machine paragraph is D1, and the other macOS files link to it. D9 is closed. Henry's decision is SPEC.md Decision 20: a remote viewer sees the SoftLock lock screen until a separate configurable pass, and remote-tool input is blocked until that pass except what the unlock screen needs. The earlier options and the lead recommendation are not the decision.
 
 ## D1. Universal 2, macOS 11, his Intel Mac, arm64 on macos-latest
 
@@ -12,11 +12,7 @@ Henry decided D1 and D5. The lead accepted D2, D3, D4, D6, and D7 on 16 November
 
 GitHub `macos-latest` is an arm64 image of macOS 15 or macOS 26 (the runner docs and the runner-images list disagreed on 16 November 2026). It will not boot macOS 11. Ticket m02 records the runner's `sw_vers`.
 
-**Recorded 16 November 2026, from his About This Mac.** MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports). 2 GHz quad-core Intel Core i5. Intel Iris Plus Graphics. 16 GB LPDDR4X. macOS Tahoe 26.7.3. It is a laptop. It has Touch ID and the T2 chip; that model has both. The hardware tickets' test-machine sections and [Henry's sheet](henry-sheet.md) use this list.
-
-macOS 26.7.3 is well above the macOS 11 floor. Arm64 CI on `macos-latest` plus this Intel machine on 26.x means macOS 11 through 15 are untested. That is a known gap. m02 still prints the runner's `sw_vers`. It does not close the gap.
-
-**Still open:** the number of external displays, and whether a second keyboard is available. The kits say "if the machine has one" only for those two.
+**Test machine, the only copy of this paragraph.** Recorded 16 November 2026, from his About This Mac. MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports). 2 GHz quad-core Intel Core i5. Intel Iris Plus Graphics. 16 GB LPDDR4X. macOS Tahoe 26.7.3. It is a laptop. It has Touch ID and the T2 chip; that model has both. Henry, 16 November 2026: he sometimes uses an external display. How many are attached at once is still unknown. Whether a second keyboard is available is still unknown. macOS 11 through 15 are untested: this machine is on 26.x, and arm64 CI is `macos-latest`. m02 still prints the runner's `sw_vers`. It does not close that gap. [Henry's sheet](henry-sheet.md) points here. Other tickets link here instead of copying this paragraph. The kits say "if the machine has one" for a second keyboard, and for a display, AirPlay receiver, iPad, or DisplayLink device that is not already connected.
 
 ## D2. Developer ID now, or unsigned like Windows
 
@@ -55,7 +51,7 @@ GitHub lists `macos-15-intel` and `macos-26-intel` as well as the arm64 `macos-l
 
 `SACLockScreenImmediate` has no Apple documentation page. It is a private symbol in `login.framework`. The public pages we have do not offer a "lock the screen now" call. The screen-saver-plus-password path is weaker and is the documented lock path.
 
-**Decision, Henry, 16 November 2026:** use `SACLockScreenImmediate`, resolved with `dlopen` and `dlsym`. The binary does not link `login.framework`. If the symbol is missing, or the call fails, use the documented lock path (start the screen saver and require the account password). A missing symbol is not a crash. The login window is not the fallback. When that documented path cannot guarantee a password, D8 applies. His Intel Mac is the machine in D1. The number of external displays is still open.
+**Decision, Henry, 16 November 2026:** use `SACLockScreenImmediate`, resolved with `dlopen` and `dlsym`. The binary does not link `login.framework`. If the symbol is missing, or the call fails, use the documented lock path (start the screen saver and require the account password). A missing symbol is not a crash. The login window is not the fallback. When that documented path cannot guarantee a password, D8 applies. His Intel Mac is the machine in D1.
 
 ## D6. Capture exclusion may be unprovable
 
@@ -83,3 +79,9 @@ Windows does not return to Unlocked when arming fails or the real lock fails. ma
 - At run time, if both lock paths fail, keep the guard and the overlay up, show an error, keep retrying, and release only on a verified unlock.
 
 Tickets m08 and m17 add the chooser row: documented path unavailable or password not required → never Unlocked; refuse to arm. m08's sheet records the password-after-screensaver setting and the delay.
+
+## D9. Remote view and remote input (macOS only)
+
+**Decision, Henry, 16 November 2026.** Closed. The words are in SPEC.md Implementation Decision 20, and they apply on Windows 11, Windows 10, Linux, and both macOS slices. By default only a local viewer sees the real screen. A remote viewer sees the SoftLock lock screen, and sees the real screen only after a configurable pass, a separate remote credential. Remote-tool input is blocked until that pass succeeds, except what the unlock screen needs. Agent input on the local session still follows the normal rules. A crash or failure ends locked.
+
+`NSWindow.SharingType.none` is still the flag under test (D6), on Intel and on Apple Silicon. Screen Sharing and a local capture read the same window-server image, and Apple says `.none` is a legacy constant not to be used to hide content from capture. m21's v1.x or v2 probe records whether a remote path shows the marker and whether its input arrives as a posted event. That measurement is a risk. It does not replace this decision. The display rows on m23 stay in scope. Screen Sharing hardware is v1.x or v2 with m22. v1 only frameworks the detection hook, the remote-pass types, and fail-closed.
