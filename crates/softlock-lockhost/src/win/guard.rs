@@ -511,7 +511,7 @@ fn mouse_extra(info: &MSLLHOOKSTRUCT, injected: bool) -> u64 {
     if blocks(injected, reported) {
         return reported;
     }
-    #[cfg(feature = "simulated-physical")]
+    #[cfg(all(feature = "dev-launch", feature = "simulated-physical"))]
     {
         let nonce = crate::classify::current_run_nonce();
         let low = nonce & 0xFFFF_FFFF;
