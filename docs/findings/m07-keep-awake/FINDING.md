@@ -12,7 +12,7 @@ Each timer tick pumps the run loop for at most 10 ms (`untilDate` capped at `min
 
 ## What the runner can prove
 
-Filled from GitHub Actions run [44011028605](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44011028605/job/133797797666) (`macos keep-awake runner` on this PR at `49e973f`). The job prints `sw_vers` and `uname -m`. `uname -m` must be `arm64`. The runner has no lid and no power key.
+Filled from GitHub Actions run [44011714680](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44011714680/job/133800035277) (`macos keep-awake runner` on this PR at `38808a7`). The job prints `sw_vers` and `uname -m`. `uname -m` must be `arm64`. The runner has no lid and no power key.
 
 Quoted from that job log:
 
@@ -21,14 +21,14 @@ sw_vers-product=macOS
 sw_vers-version=26.7.2
 sw_vers-build=25G332
 uname-m=arm64
-assertion-reason=m07-keep-awake-probe-2027
+assertion-reason=m07-keep-awake-probe-1869
 assertion-created=true
 assertion-released=true
 pmset-shows-reason=true
-timer-overlay-down=73
-timer-overlay-up=76
+timer-overlay-down=74
+timer-overlay-up=75
 timer-slowed=not-claimed
-timer-sentence=not claimed: baseline below expected (73 uncovered ticks, expected 133)
+timer-sentence=not claimed: baseline below expected (74 uncovered ticks, expected 133)
 timer-expected-ticks=133
 overlay-opaque=true
 timer-occlusion-visible-down=true
@@ -41,7 +41,7 @@ interrupted=false
 result=pass
 ```
 
-73 uncovered ticks is below 80% of 133, so slowing is not claimed (`timer-slowed=not-claimed`). That is not evidence the runner was throttled, and it does not prove "did not slow". Pass now requires `timer-occlusion-visible-down=true`, `timer-occlusion-visible-up=false`, and `overlay-opaque=true`.
+74 uncovered ticks is below 80% of 133, so slowing is not claimed (`timer-slowed=not-claimed`). That is not evidence the runner was throttled, and it does not prove "did not slow". Pass now requires `timer-occlusion-visible-down=true`, `timer-occlusion-visible-up=false`, and `overlay-opaque=true`.
 
 | Claim | Runner |
 |---|---|
@@ -51,7 +51,7 @@ result=pass
 | Assertions release, and filtered `pmset` no longer shows the reason | `assertion-released=true`, `pmset-after-shows-reason=false` |
 | `caffeinate -i -t 5 -w <pid>` present or absent, used only as a control | `caffeinate-*` |
 | Timer counts overlay-down and overlay-up, same duration, opaque overlay, occlusion recorded | `timer-overlay-*`, `overlay-opaque`, `timer-occlusion-visible-*`, `timer-expected-ticks` |
-| Short sample is not App Nap | `--runner` is 8 s; log `timer-slowed=not-claimed`, `timer-sentence=not claimed: baseline below expected (73 uncovered ticks, expected 133)`, `app-nap=not-run-on-runner`; `--kit` is 60 s then 300 s over the timer window only |
+| Short sample is not App Nap | `--runner` is 8 s; log `timer-slowed=not-claimed`, `timer-sentence=not claimed: baseline below expected (74 uncovered ticks, expected 133)`, `app-nap=not-run-on-runner`; `--kit` is 60 s then 300 s over the timer window only |
 | Lid closed on power | `not-run-on-runner` |
 | Lid closed with an external display | `not-run-on-runner` |
 | Power key tap | `not-run-on-runner` |
