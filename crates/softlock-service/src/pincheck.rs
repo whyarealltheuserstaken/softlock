@@ -6,19 +6,16 @@
 
 use softlock_core::{LaunchNonce, PinAuthority, PinDecision, Secret, Verdict, verify_softlock_pin};
 
-/// Hyphenated marker. The release-binary check rejects this byte string.
-pub const SIMULATED_PHYSICAL_MARKER: &[u8] = b"softlock-simulated-physical-marker";
+const MARKER_STRING: &[u8] = b"softlock-simulated-physical-marker";
+const MARKER_SYMBOL: &[u8] = b"softlock_simulated_physical_marker";
 
-/// Symbol the release-binary check rejects. Present only with the test feature.
-#[used]
-#[unsafe(no_mangle)]
-pub static softlock_simulated_physical_marker: [u8; SIMULATED_PHYSICAL_MARKER.len()] =
-    *b"softlock-simulated-physical-marker";
-
-/// Keeps the marker bytes reachable from the service binary.
+/// Keeps both release-scan byte strings in a service binary built with this
+/// feature. The symbol is not exported: the lock host already exports that
+/// name, and a second export fails the link.
 #[inline(never)]
 pub fn marker_bytes() -> &'static [u8] {
-    &softlock_simulated_physical_marker
+    let _ = std::hint::black_box(MARKER_SYMBOL);
+    std::hint::black_box(MARKER_STRING)
 }
 
 pub struct PinChecker {
