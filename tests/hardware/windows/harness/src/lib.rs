@@ -22,7 +22,7 @@ pub use plan::{Action as RowAction, BUDGET_MS, Flags, Planned, plan, plan_value,
 pub use policy::{Restore, hkcu_value_allowed, hklm_value_allowed, restore_dword, restore_saved};
 pub use power::{
     PowerAvailability, SettingIndex, parse_powercfg_a, parse_scheme_guid, parse_setting_index,
-    resolve_power_index, section_contains,
+    resolve_power_index, section_contains, should_set_active,
 };
 pub use redact::redact;
 pub use report::{Outcome, Report, SCHEMA, conform, render};

@@ -307,9 +307,10 @@ function Read-PowerIndex([string]$setting, [string]$scheme) {
     return [pscustomobject]@{ setting = $setting; scheme = $scheme; ac = $parsed.ac; dc = $parsed.dc; active = $true }
 }
 
-function Power-WasActive($entry) {
-    if ($entry.PSObject.Properties.Name -contains 'active') { return [bool]$entry.active }
-    return $true
+function Test-ShouldSetActive([string]$saved, [string]$current) {
+    $a = Normalize-Guid $saved
+    $b = Normalize-Guid $current
+    return ($a -ne '' -and $a -eq $b)
 }
 
 function Power-RestoreCommand($entry) {
@@ -318,10 +319,27 @@ function Power-RestoreCommand($entry) {
     if ($entry.PSObject.Properties.Name -contains 'scheme') { $scheme = Normalize-Guid ([string]$entry.scheme) }
     if (-not $scheme) { $scheme = Get-ActiveScheme }
     $cmd = "powercfg /SETACVALUEINDEX $scheme $sub $($entry.setting) $($entry.ac) & powercfg /SETDCVALUEINDEX $scheme $sub $($entry.setting) $($entry.dc)"
-    if ((Power-WasActive $entry) -and $scheme -and ((Get-ActiveScheme) -ne $scheme)) {
+    if (Test-ShouldSetActive $scheme (Get-ActiveScheme)) {
         $cmd += " & powercfg /SETACTIVE $scheme"
     }
     return $cmd
+}
+
+function Invoke-SetActive([string]$scheme) {
+    $text = Read-Native { powercfg /SETACTIVE $scheme }
+    if ($LASTEXITCODE -ne 0) { return "powercfg SETACTIVE $scheme failed: $text" }
+    return ''
+}
+
+function Confirm-LiveIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme) {
+    $parsed = Parse-IndexText (Query-PowerText $scheme $setting) $setting
+    if ($null -eq $parsed) {
+        return "powercfg query of $setting on $scheme did not include AC and DC"
+    }
+    if ($parsed.ac -ne $ac -or $parsed.dc -ne $dc) {
+        return "in-effect ac=$($parsed.ac) dc=$($parsed.dc) wanted ac=$ac dc=$dc scheme=$scheme"
+    }
+    return ''
 }
 
 function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme, [bool]$reactivate) {
@@ -335,8 +353,8 @@ function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme, [
     $dcText = Read-Native { powercfg /SETDCVALUEINDEX $scheme $sub $setting $dc }
     if ($LASTEXITCODE -ne 0) { return "powercfg DC $setting failed: $dcText" }
     if ($reactivate) {
-        $active = Read-Native { powercfg /SETACTIVE $scheme }
-        if ($LASTEXITCODE -ne 0) { return "powercfg SETACTIVE $scheme failed: $active" }
+        $err = Invoke-SetActive $scheme
+        if ($err) { return $err }
     }
     $after = Read-PowerIndex $setting $scheme
     if ($null -eq $after) { return "powercfg read-back failed for $setting scheme $scheme" }
@@ -733,13 +751,21 @@ function Restore-Changes {
             $savedScheme = ''
             if ($entry.PSObject.Properties.Name -contains 'scheme') { $savedScheme = [string]$entry.scheme }
             $current = Read-PowerIndex ([string]$entry.setting) $savedScheme
-            if ($null -ne $current -and $current.ac -eq [int]$entry.ac -and $current.dc -eq [int]$entry.dc) {
-                continue
-            }
             $scheme = Normalize-Guid $savedScheme
             if (-not $scheme) { $scheme = Get-ActiveScheme }
-            $reactivate = (Power-WasActive $entry) -and $scheme -and ((Get-ActiveScheme) -ne $scheme)
-            $err = Set-PowerIndex $entry.setting ([int]$entry.ac) ([int]$entry.dc) $scheme $reactivate
+            $reactivate = Test-ShouldSetActive $scheme (Get-ActiveScheme)
+            $err = ''
+            if ($null -ne $current -and $current.ac -eq [int]$entry.ac -and $current.dc -eq [int]$entry.dc) {
+                if ($reactivate) {
+                    $err = Invoke-SetActive $scheme
+                    if (-not $err) { $err = Confirm-LiveIndex ([string]$entry.setting) ([int]$entry.ac) ([int]$entry.dc) $scheme }
+                }
+            } else {
+                $err = Set-PowerIndex $entry.setting ([int]$entry.ac) ([int]$entry.dc) $scheme $reactivate
+                if (-not $err -and $reactivate) {
+                    $err = Confirm-LiveIndex ([string]$entry.setting) ([int]$entry.ac) ([int]$entry.dc) $scheme
+                }
+            }
             if ($err) {
                 $powerLeft.Add($entry)
                 $line = "power $($entry.setting) was changed and was not put back. $err. Run: $(Power-RestoreCommand $entry)"

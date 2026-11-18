@@ -22,6 +22,9 @@ namespace SoftLock.Hardware
         const uint WsExNoActivate = 0x08000000;
         const uint WsPopup = 0x80000000;
         const uint Marker = 0x00A00ADC;
+        const int MarkerSize = 32;
+        const uint LwaColorKey = 0x00000001;
+        const uint LwaAlpha = 0x00000002;
         const uint WmPaint = 0x000F;
         const uint WmEraseBkgnd = 0x0014;
         const uint WmNcHitTest = 0x0084;
@@ -310,16 +313,15 @@ namespace SoftLock.Hardware
                         continue;
                     }
                     windows.Add(hwnd);
-                    // Stay hidden through the first paint, which is black. The marker
-                    // is painted only after the window is shown, so the capture check
-                    // can see it on screen and then confirm capture excluded it.
+                    // Stay hidden through the first paint. Black is the color key, so
+                    // only the 32x32 marker is visible once the window is shown.
                     paintMarker = false;
-                    SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+                    SetLayeredWindowAttributes(hwnd, 0, 255, LwaColorKey | LwaAlpha);
                     UpdateWindow(hwnd);
-                    ShowWindow(hwnd, 8);
                     paintMarker = true;
                     InvalidateRect(hwnd, IntPtr.Zero, false);
                     UpdateWindow(hwnd);
+                    ShowWindow(hwnd, 8);
                     FlushFrame();
                     painted++;
                     int cx = monitor.left + (width / 2);
@@ -823,9 +825,16 @@ namespace SoftLock.Hardware
                     {
                         client = paint.area;
                     }
-                    IntPtr brush = CreateSolidBrush(paintMarker ? Marker : 0);
-                    FillRect(hdc, ref client, brush);
-                    DeleteObject(brush);
+                    IntPtr black = CreateSolidBrush(0);
+                    FillRect(hdc, ref client, black);
+                    DeleteObject(black);
+                    if (paintMarker)
+                    {
+                        Rect patch = MarkerPatch(client);
+                        IntPtr brush = CreateSolidBrush(Marker);
+                        FillRect(hdc, ref patch, brush);
+                        DeleteObject(brush);
+                    }
                 }
                 EndPaint(hwnd, ref paint);
                 return IntPtr.Zero;
@@ -839,6 +848,21 @@ namespace SoftLock.Hardware
                 return new IntPtr(1);
             }
             return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+
+        static Rect MarkerPatch(Rect client)
+        {
+            int width = client.right - client.left;
+            int height = client.bottom - client.top;
+            int size = MarkerSize;
+            if (size > width) { size = width; }
+            if (size > height) { size = height; }
+            Rect patch = new Rect();
+            patch.left = client.left + ((width - size) / 2);
+            patch.top = client.top + ((height - size) / 2);
+            patch.right = patch.left + size;
+            patch.bottom = patch.top + size;
+            return patch;
         }
 
         static uint ScreenPixel(int x, int y)

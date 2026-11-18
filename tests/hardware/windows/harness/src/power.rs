@@ -122,6 +122,29 @@ pub fn resolve_power_index(
     })
 }
 
+/// Restore writes AC and DC on `saved_scheme`. `/SETACTIVE` that scheme only
+/// when it is the plan in effect now, so those values apply. A different
+/// current scheme means the operator switched plans: write the values and
+/// leave the active plan alone.
+pub fn should_set_active(saved_scheme: &str, current_scheme: &str) -> bool {
+    match (scheme_id(saved_scheme), scheme_id(current_scheme)) {
+        (Some(saved), Some(current)) => saved == current,
+        _ => false,
+    }
+}
+
+fn scheme_id(text: &str) -> Option<String> {
+    let trimmed = text
+        .trim()
+        .trim_matches(|ch| ch == '{' || ch == '}')
+        .to_ascii_lowercase();
+    if is_guid(&trimmed) {
+        Some(trimmed)
+    } else {
+        parse_scheme_guid(text)
+    }
+}
+
 /// `powercfg /q` prints the current indexes as `0x........` after any minimum
 /// or maximum. Labels are localized, so the GUID and those hex values are the
 /// whole parse. Hidden settings omitted from the dump are not found.
@@ -446,5 +469,20 @@ Energieschema-GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Ausbalanciert)
         assert_eq!(resolve_power_index(Some(3), None, None, None), None);
         assert_eq!(resolve_power_index(None, None, None, Some(2)), None);
         assert_eq!(resolve_power_index(None, None, Some(1), None), None);
+    }
+
+    #[test]
+    fn setactive_follows_the_scheme_that_is_active_now() {
+        let balanced = "381b4222-f694-41f0-9685-ff5bb260df2e";
+        let high = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+        assert!(should_set_active(balanced, balanced));
+        assert!(should_set_active(
+            "{381B4222-F694-41F0-9685-FF5BB260DF2E}",
+            "381b4222-f694-41f0-9685-ff5bb260df2e"
+        ));
+        assert!(!should_set_active(balanced, high));
+        assert!(!should_set_active(balanced, ""));
+        assert!(!should_set_active("", balanced));
+        assert!(!should_set_active("SCHEME_CURRENT", balanced));
     }
 }

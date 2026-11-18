@@ -130,6 +130,53 @@ function Read-PowerIndex([string]$setting, [string]$scheme) {
     return [pscustomobject]@{ scheme = $scheme; ac = [int]$ac; dc = [int]$dc }
 }
 
+function Test-ShouldSetActive([string]$saved, [string]$current) {
+    $a = Normalize-Guid $saved
+    $b = Normalize-Guid $current
+    return ($a -ne '' -and $a -eq $b)
+}
+
+function Query-PowerText([string]$scheme, [string]$setting) {
+    $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
+    $hidden = Read-Native { powercfg /qh $scheme $sub }
+    if ($LASTEXITCODE -eq 0 -and $hidden -match [regex]::Escape($setting)) { return $hidden }
+    $named = Read-Native { powercfg /q $scheme $sub $setting }
+    if ($named -match [regex]::Escape($setting)) { return $named }
+    return Read-Native { powercfg /q $scheme $sub }
+}
+
+function Parse-QueryIndex([string]$text, [string]$setting) {
+    if (-not $text -or -not $setting) { return $null }
+    $needle = $setting.Trim().Trim('{}')
+    $at = $text.ToLowerInvariant().IndexOf($needle.ToLowerInvariant())
+    if ($at -lt 0) { return $null }
+    $rest = $text.Substring($at + $needle.Length)
+    $next = [regex]::Match($rest, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+    if ($next.Success) { $rest = $rest.Substring(0, $next.Index) }
+    $found = [regex]::Matches($rest, '0x([0-9a-fA-F]+)')
+    if ($found.Count -lt 2) { return $null }
+    $ac = [Convert]::ToInt32($found[$found.Count - 2].Groups[1].Value, 16)
+    $dc = [Convert]::ToInt32($found[$found.Count - 1].Groups[1].Value, 16)
+    return [pscustomobject]@{ ac = $ac; dc = $dc }
+}
+
+function Invoke-SetActive([string]$scheme) {
+    $text = Read-Native { powercfg /SETACTIVE $scheme }
+    if ($LASTEXITCODE -ne 0) { return "powercfg SETACTIVE failed: $text" }
+    return ''
+}
+
+function Confirm-LiveIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme) {
+    $parsed = Parse-QueryIndex (Query-PowerText $scheme $setting) $setting
+    if ($null -eq $parsed) {
+        return "powercfg query of $setting on $scheme did not include AC and DC"
+    }
+    if ($parsed.ac -ne $ac -or $parsed.dc -ne $dc) {
+        return "in-effect ac=$($parsed.ac) dc=$($parsed.dc) wanted ac=$ac dc=$dc scheme=$scheme"
+    }
+    return ''
+}
+
 function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme, [bool]$reactivate) {
     $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
     if (-not $scheme) { $scheme = Get-ActiveScheme }
@@ -139,8 +186,8 @@ function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme, [
     $dcText = Read-Native { powercfg /SETDCVALUEINDEX $scheme $sub $setting $dc }
     if ($LASTEXITCODE -ne 0) { return "powercfg DC failed: $dcText" }
     if ($reactivate) {
-        $active = Read-Native { powercfg /SETACTIVE $scheme }
-        if ($LASTEXITCODE -ne 0) { return "powercfg SETACTIVE failed: $active" }
+        $err = Invoke-SetActive $scheme
+        if ($err) { return $err }
     }
     $after = Read-PowerIndex $setting $scheme
     if ($null -eq $after -or $after.ac -ne $ac -or $after.dc -ne $dc) {
@@ -238,14 +285,18 @@ foreach ($entry in $power) {
     $savedScheme = ''
     if ($entry.PSObject.Properties.Name -contains 'scheme') { $savedScheme = Normalize-Guid ([string]$entry.scheme) }
     $current = Read-PowerIndex $setting $savedScheme
-    if ($null -ne $current -and $current.ac -eq [int]$entry.ac -and $current.dc -eq [int]$entry.dc) {
-        continue
-    }
     $scheme = if ($savedScheme) { $savedScheme } else { Get-ActiveScheme }
-    $wasActive = $true
-    if ($entry.PSObject.Properties.Name -contains 'active') { $wasActive = [bool]$entry.active }
-    $reactivate = $wasActive -and $scheme -and ((Get-ActiveScheme) -ne $scheme)
-    $err = Set-PowerIndex $setting ([int]$entry.ac) ([int]$entry.dc) $scheme $reactivate
+    $reactivate = Test-ShouldSetActive $scheme (Get-ActiveScheme)
+    $err = ''
+    if ($null -ne $current -and $current.ac -eq [int]$entry.ac -and $current.dc -eq [int]$entry.dc) {
+        if ($reactivate) {
+            $err = Invoke-SetActive $scheme
+            if (-not $err) { $err = Confirm-LiveIndex $setting ([int]$entry.ac) ([int]$entry.dc) $scheme }
+        }
+    } else {
+        $err = Set-PowerIndex $setting ([int]$entry.ac) ([int]$entry.dc) $scheme $reactivate
+        if (-not $err -and $reactivate) { $err = Confirm-LiveIndex $setting ([int]$entry.ac) ([int]$entry.dc) $scheme }
+    }
     if ($err) {
         $failed = $true
         $cmd = "powercfg /SETACVALUEINDEX $scheme $sub $setting $($entry.ac) & powercfg /SETDCVALUEINDEX $scheme $sub $setting $($entry.dc)"
