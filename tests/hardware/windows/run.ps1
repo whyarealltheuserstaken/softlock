@@ -91,24 +91,38 @@ function Get-Items($value) {
     return ,$list
 }
 
+function Copy-List($target, $source) {
+    # Assignment enumerates a List (one entry becomes that object, zero becomes
+    # $null). The comma form stores a one-element Object[] that holds the List,
+    # and the next .hive read then fails. Copy into the List created at startup.
+    if ($null -eq $target -or $target.GetType() -ne [System.Collections.Generic.List[object]]) {
+        $got = if ($null -eq $target) { 'null' } else { $target.GetType().FullName }
+        throw "pending collection is $got"
+    }
+    $copy = New-Object System.Collections.Generic.List[object]
+    foreach ($item in (Get-Items $source)) { $copy.Add($item) }
+    $target.Clear()
+    foreach ($item in $copy) { $target.Add($item) }
+}
+
 function Set-PendingLists($changes, $power) {
-    if ($changes -isnot [System.Collections.Generic.List[object]]) {
-        $changes = Get-Items $changes
-    }
-    if ($power -isnot [System.Collections.Generic.List[object]]) {
-        $power = Get-Items $power
-    }
-    # The comma keeps the List itself. Without it, one entry unrolls.
-    $script:Changes = ,$changes
-    $script:Power = ,$power
+    Copy-List $script:Changes $changes
+    Copy-List $script:Power $power
 }
 
 function Assert-SuiteList($value, [string]$name, [int]$count) {
-    if ($value -isnot [System.Collections.Generic.List[object]]) {
-        $got = if ($null -eq $value) { 'null' } else { $value.GetType().FullName }
-        throw "$name became $got after a one-entry restore"
+    if ($null -eq $value) { throw "$name is null" }
+    $got = $value.GetType()
+    if ($got -ne [System.Collections.Generic.List[object]]) {
+        throw "$name GetType is $($got.FullName)"
     }
     if ($value.Count -ne $count) { throw "$name count is $($value.Count), wanted $count" }
+    if ($count -eq 1) {
+        $entryType = $value[0].GetType().FullName
+        if ($entryType -ne 'System.Management.Automation.PSCustomObject') {
+            throw "$name[0] GetType is $entryType"
+        }
+    }
 }
 
 function Invoke-CiRestoreDrill {
@@ -119,7 +133,7 @@ function Invoke-CiRestoreDrill {
     $probe = 'Software\softlock-hwsuite-citest'
     $backup = $null
     if (Test-Path -LiteralPath $pendingPath) { $backup = [System.IO.File]::ReadAllText($pendingPath) }
-    $body = '{"values":[{"hive":"HKCU","subkey":"' + $probe + '","name":"Absent","present":false,"kind":"DWord","data":"","created_key":false}],"power":[{"setting":"' + $live.setting + '","ac":' + [int]$live.ac + ',"dc":' + [int]$live.dc + ',"scheme":"' + $live.scheme + '","active":false}]}'
+    $body = '{"values":[{"hive":"HKCU","subkey":"' + (Escape-JsonString $probe) + '","name":"Absent","present":false,"kind":"DWord","data":"","created_key":false}],"power":[{"setting":"' + (Escape-JsonString ([string]$live.setting)) + '","ac":' + [int]$live.ac + ',"dc":' + [int]$live.dc + ',"scheme":"' + (Escape-JsonString ([string]$live.scheme)) + '","active":false}]}'
     New-Item -ItemType Directory -Force -Path $pendingDir | Out-Null
     Write-Utf8 $pendingPath $body
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $restoreScript
@@ -130,8 +144,8 @@ function Invoke-CiRestoreDrill {
 
     $bad = [pscustomobject]@{ hive = 'HKCU'; subkey = $probe; name = 'Bad'; present = $true; kind = 'Nope'; data = '1'; created_key = $false }
     $bogus = [pscustomobject]@{ setting = [string]$live.setting; ac = 0; dc = 0; scheme = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'; active = $false }
-    $script:Changes = ,(New-Object System.Collections.Generic.List[object])
-    $script:Power = ,(New-Object System.Collections.Generic.List[object])
+    $script:Changes.Clear()
+    $script:Power.Clear()
     $script:Changes.Add($bad)
     $script:Power.Add($bogus)
     [void]@(Restore-Changes)
@@ -918,15 +932,8 @@ function Restore-Suite {
     return @($errors)
 }
 
-function Invoke-Static([string]$name) {
-    $flags = [System.Reflection.BindingFlags]'Public,Static'
-    $method = [SoftLock.Hardware.SoftLockHw].GetMethod($name, $flags)
-    if ($null -eq $method) { throw "missing $name" }
-    return $method.Invoke($null, $null)
-}
-
 function Read-SessionState {
-    $raw = Invoke-Static 'SessionStateJson'
+    $raw = $native::SessionStateJson()
     if (-not $raw) { return $null }
     return $raw | ConvertFrom-Json
 }
@@ -952,27 +959,34 @@ function Wait-SessionLocked {
 
 function Invoke-FailClosedLock {
     if ($script:LockFired) { return }
-    if ($null -eq $native) { throw 'fail-closed lock has no listener' }
+    if ($null -eq $native) { throw 'LockNow: fail-closed lock has no listener' }
     $nativeError = ''
     try {
-        [void](Invoke-Static 'LockNow')
+        # Direct call. MethodInfo.Invoke($null, $null) is the call Windows
+        # PowerShell 5.1 rejects with "Argument types do not match".
+        [void]$native::LockNow()
     } catch {
-        $nativeError = $_.Exception.Message
-        if (-not $script:LocksEnabled) { throw }
+        $nativeError = "LockNow: $($_.Exception.Message)"
+        if (-not $script:LocksEnabled) { throw $nativeError }
     }
-    # --ci calls LockNow so a binder failure still fails the run, then stops
+    # --ci calls LockNow so a bad call still fails the run, then stops
     # before LockWorkStation or rundll32.
     if (-not $script:LocksEnabled) { return }
-    $state = Wait-SessionLocked
-    if (-not (Test-SessionLocked $state)) {
-        try { Invoke-RundllLock } catch {
-            if (-not $nativeError) { $nativeError = $_.Exception.Message }
-        }
-        $state = Wait-SessionLocked
+    $state = $null
+    try { $state = Wait-SessionLocked } catch {
+        $nativeError = "Wait-SessionLocked: $($_.Exception.Message)"
     }
     if (-not (Test-SessionLocked $state)) {
-        $flags = if ($null -ne $state -and $state.PSObject.Properties.Name -contains 'flags') { $state.flags } else { 'unknown' }
-        $prefix = if ($nativeError) { "native lock failed ($nativeError); " } else { '' }
+        try { Invoke-RundllLock } catch {
+            $nativeError = "rundll32: $($_.Exception.Message)"
+        }
+        try { $state = Wait-SessionLocked } catch {
+            $nativeError = "Wait-SessionLocked: $($_.Exception.Message)"
+        }
+    }
+    if (-not (Test-SessionLocked $state)) {
+        $flags = if ($null -ne $state -and $null -ne $state.PSObject.Properties['flags']) { $state.flags } else { 'unknown' }
+        $prefix = if ($nativeError) { "$nativeError; " } else { '' }
         throw "${prefix}session was not locked (flags=$flags)"
     }
     $script:LockFired = $true
@@ -1481,47 +1495,78 @@ try {
     foreach ($item in (Get-Items $cleanup)) { $restoreErrors += $item }
     if ($script:SuiteError) { $restoreErrors += $script:SuiteError }
     if ($script:ForceLockPath) { $restoreErrors += 'ci-lock-drill' }
+    $step = 'start'
     try {
         $failed = $script:Failed -or $script:ForceLockPath
         foreach ($item in @($restoreErrors)) { if ($item) { $failed = $true } }
         $script:ActuallyLocked = $false
         if ($failed) {
-            if ($null -eq $native) { throw 'fail-closed lock has no listener' }
+            if ($null -eq $native) { throw 'LockNow: fail-closed lock has no listener' }
+            $step = 'Read-SessionState'
             $state = $null
             try { $state = Read-SessionState } catch { $state = $null }
-            if (-not (Test-SessionLocked $state)) {
-                $causes = New-Object System.Collections.Generic.List[string]
+            $step = 'Test-SessionLocked'
+            $already = Test-SessionLocked $state
+            if (-not $already) {
+                $step = 'causes'
+                # Not List[string].Add: on Windows PowerShell 5.1 that call is
+                # rejected with "Argument types do not match".
+                $causes = @()
                 $failedIds = @()
                 foreach ($row in @($results)) {
                     if ($row.status -eq 'fail') { $failedIds += [string]$row.id }
                 }
-                if ($failedIds.Count -gt 0) { $causes.Add('rows ' + ($failedIds -join ', ')) }
-                if ($script:SuiteError) { $causes.Add([string]$script:SuiteError) }
+                if ($failedIds.Count -gt 0) {
+                    $joined = [string]($failedIds -join ', ')
+                    $causes += ('rows ' + $joined)
+                }
+                if ($script:SuiteError) { $causes += [string]$script:SuiteError }
                 foreach ($item in @($restoreErrors)) {
-                    if ($item -and $item -ne $script:SuiteError) { $causes.Add([string]$item) }
+                    if ($item -and [string]$item -ne [string]$script:SuiteError) { $causes += [string]$item }
                 }
-                if ($causes.Count -eq 0) { $causes.Add('a row failed') }
+                if (@($causes).Count -eq 0) { $causes += 'a row failed' }
+                $because = [string](@($causes) -join '; ')
                 if ($script:LocksEnabled) {
-                    Write-Host ("Locking Windows because " + ($causes -join '; ') + '.')
+                    Write-Host ("Locking Windows because " + $because + '.')
                 }
+                $step = 'LockNow'
                 Invoke-FailClosedLock
             }
             if ($script:LocksEnabled) {
-                $state = Read-SessionState
+                $step = 'Wait-SessionLocked'
+                $state = Wait-SessionLocked
+                $step = 'Test-SessionLocked'
                 if (Test-SessionLocked $state) {
                     $script:ActuallyLocked = $true
                 } elseif (-not $script:LockError) {
-                    $flags = if ($null -ne $state) { $state.flags } else { 'unknown' }
-                    $script:LockError = "session was not locked (flags=$flags)"
+                    $flags = if ($null -ne $state -and $null -ne $state.PSObject.Properties['flags']) { $state.flags } else { 'unknown' }
+                    $script:LockError = "Wait-SessionLocked: session was not locked (flags=$flags)"
                 }
             }
         } elseif ($null -ne $native) {
+            $step = 'Read-SessionState'
             $state = Read-SessionState
+            $step = 'Test-SessionLocked'
             if (Test-SessionLocked $state) { $script:ActuallyLocked = $true }
         }
     } catch {
-        $script:LockError = $_.Exception.Message
+        $detail = "$step`: $($_.Exception.Message)"
+        $script:LockError = $detail
         $script:ActuallyLocked = $false
+        # A failed restore must still end locked. --ci stops before rundll32.
+        if ($script:LocksEnabled) {
+            try {
+                Invoke-RundllLock
+                $confirmed = Wait-SessionLocked
+                if (Test-SessionLocked $confirmed) {
+                    $script:ActuallyLocked = $true
+                    $script:LockFired = $true
+                    $script:LockError = ''
+                }
+            } catch {
+                $script:LockError = "$detail; rundll32: $($_.Exception.Message)"
+            }
+        }
     }
     if ($script:LockError) { $restoreErrors += "fail-closed lock: $($script:LockError)" }
     elseif ($script:ForceLockPath) {

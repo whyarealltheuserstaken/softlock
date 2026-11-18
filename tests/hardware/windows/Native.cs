@@ -550,8 +550,8 @@ namespace SoftLock.Hardware
             locksEnabled = enabled;
         }
 
-        // bool, not void: the suite invokes this through MethodInfo so a
-        // PowerShell binder mismatch cannot skip the lock.
+        // bool so the suite can tell a gated call from a lock. Windows
+        // PowerShell calls this directly; MethodInfo.Invoke($null, $null) is not used.
         public static bool LockNow()
         {
             if (!locksEnabled)
