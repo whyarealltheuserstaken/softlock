@@ -59,7 +59,6 @@ unsafe extern "C" {
     fn m07_hw_model(dest: *mut c_char, cap: usize) -> i32;
     fn m07_power_watch_start() -> i32;
     fn m07_power_watch_stop() -> i32;
-    fn m07_power_reset();
     fn m07_power_system_slept() -> i32;
     fn m07_power_display_slept() -> i32;
     fn m07_power_pump(millis: u32);
@@ -273,12 +272,6 @@ impl PowerWatch {
     pub fn start() -> (Self, bool) {
         let ok = unsafe { m07_power_watch_start() == 0 };
         (PowerWatch, ok)
-    }
-
-    pub fn reset() {
-        unsafe {
-            m07_power_reset();
-        }
     }
 
     pub fn system_slept() -> bool {

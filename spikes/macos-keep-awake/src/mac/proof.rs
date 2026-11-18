@@ -886,12 +886,6 @@ fn wait_for_sleep_or_skip(wait: Wait<'_>) -> Choice {
                     method: "no-input".to_string(),
                 };
             }
-            LineRead::Interrupted => {
-                return Choice {
-                    outcome: "interrupted".to_string(),
-                    method: "interrupted".to_string(),
-                };
-            }
             LineRead::Line(line) => {
                 let word = line.trim().to_ascii_lowercase();
                 if word == "skip" {
@@ -1105,7 +1099,6 @@ enum LineRead {
     Line(String),
     Pending,
     Eof,
-    Interrupted,
 }
 
 fn poll_line(pending: &mut String, wait_ms: i32) -> LineRead {
@@ -1147,26 +1140,6 @@ fn next_line(pending: &mut String) -> Option<String> {
     let end = pending.find('\n')?;
     let line = pending.drain(..=end).collect::<String>();
     Some(line.trim().to_string())
-}
-
-fn read_line_blocking() -> LineRead {
-    let mut line = String::new();
-    loop {
-        if stop_requested() {
-            return LineRead::Interrupted;
-        }
-        match io::stdin().lock().read_line(&mut line) {
-            Ok(0) => return LineRead::Eof,
-            Ok(_) => return LineRead::Line(line.trim().to_string()),
-            Err(error) if error.kind() == ErrorKind::Interrupted => {
-                if stop_requested() {
-                    return LineRead::Interrupted;
-                }
-                line.clear();
-            }
-            Err(_) => return LineRead::Eof,
-        }
-    }
 }
 
 fn stdin_is_terminal() -> bool {
