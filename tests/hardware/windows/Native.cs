@@ -24,7 +24,12 @@ namespace SoftLock.Hardware
         const uint Marker = 0x00A00ADC;
         const uint WmNcHitTest = 0x0084;
         const uint WmPowerBroadcast = 0x0218;
+        const uint WmDeviceChange = 0x0219;
+        const uint WmDisplayChange = 0x007E;
         const uint WmWtsSessionChange = 0x02B1;
+        const int DbtDeviceArrival = 0x8000;
+        const int DbtDeviceRemoveComplete = 0x8004;
+        const int DbtDevtypDeviceInterface = 5;
         const int WtsSessionLock = 0x7;
         const int WtsSessionUnlock = 0x8;
         const int PbtApmSuspend = 0x0004;
@@ -50,6 +55,11 @@ namespace SoftLock.Hardware
         static int lidOpens;
         static int displayOff;
         static int displayOn;
+        static int displayAdds;
+        static int displayRemoves;
+        static int displayChanges;
+        static int lastActive = -1;
+        static IntPtr monitorNotify = IntPtr.Zero;
         static int sessionLocks;
         static int sessionUnlocks;
         static IntPtr powerRequest = IntPtr.Zero;
@@ -333,6 +343,29 @@ namespace SoftLock.Hardware
             ListenerReady.WaitOne(3000);
         }
 
+        public static string HotplugJson()
+        {
+            int active = ActivePathCount();
+            int monitors = -1;
+            try
+            {
+                EnsureDpi();
+                monitors = MonitorRects().Count;
+            }
+            catch (Exception)
+            {
+                monitors = -1;
+            }
+            lock (Gate)
+            {
+                return "{\"active\":" + active
+                    + ",\"monitors\":" + monitors
+                    + ",\"adds\":" + displayAdds
+                    + ",\"removes\":" + displayRemoves
+                    + ",\"changes\":" + displayChanges + "}";
+            }
+        }
+
         public static string SnapshotJson()
         {
             lock (Gate)
@@ -506,6 +539,7 @@ namespace SoftLock.Hardware
                 Guid display = DisplayGuid;
                 RegisterPowerSettingNotification(listenerHwnd, ref lid, 0);
                 RegisterPowerSettingNotification(listenerHwnd, ref display, 0);
+                monitorNotify = RegisterMonitorNotify(listenerHwnd);
             }
             ListenerReady.Set();
             Msg msg;
@@ -513,6 +547,11 @@ namespace SoftLock.Hardware
             {
                 TranslateMessage(ref msg);
                 DispatchMessage(ref msg);
+            }
+            if (monitorNotify != IntPtr.Zero)
+            {
+                UnregisterDeviceNotification(monitorNotify);
+                monitorNotify = IntPtr.Zero;
             }
             if (listenerHwnd != IntPtr.Zero)
             {
@@ -539,6 +578,22 @@ namespace SoftLock.Hardware
                     NoteSetting(lParam);
                 }
             }
+            else if (message == WmDisplayChange)
+            {
+                NoteDisplayChange();
+            }
+            else if (message == WmDeviceChange)
+            {
+                int kind = wParam.ToInt32();
+                if (kind == DbtDeviceArrival)
+                {
+                    NoteDevice(true);
+                }
+                else if (kind == DbtDeviceRemoveComplete)
+                {
+                    NoteDevice(false);
+                }
+            }
             else if (message == WmWtsSessionChange)
             {
                 int kind = wParam.ToInt32();
@@ -552,6 +607,80 @@ namespace SoftLock.Hardware
                 }
             }
             return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+
+        static void NoteDisplayChange()
+        {
+            int active = ActivePathCount();
+            lock (Gate)
+            {
+                displayChanges++;
+                if (lastActive >= 0 && active >= 0)
+                {
+                    if (active > lastActive) { displayAdds++; }
+                    else if (active < lastActive) { displayRemoves++; }
+                }
+                if (active >= 0) { lastActive = active; }
+            }
+        }
+
+        static void NoteDevice(bool arrived)
+        {
+            int active = ActivePathCount();
+            lock (Gate)
+            {
+                displayChanges++;
+                if (arrived) { displayAdds++; } else { displayRemoves++; }
+                if (active >= 0) { lastActive = active; }
+            }
+        }
+
+        // QDC_ONLY_ACTIVE_PATHS. Zero paths means no display is attached.
+        static int ActivePathCount()
+        {
+            uint pathCount;
+            uint modeCount;
+            if (GetDisplayConfigBufferSizes(2, out pathCount, out modeCount) != 0)
+            {
+                return -1;
+            }
+            if (pathCount == 0)
+            {
+                return 0;
+            }
+            int modeBytes = (int)modeCount * 128;
+            if (modeBytes < 8) { modeBytes = 8; }
+            IntPtr paths = Marshal.AllocHGlobal((int)pathCount * 128);
+            IntPtr modes = Marshal.AllocHGlobal(modeBytes);
+            try
+            {
+                int rc = QueryDisplayConfig(2, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
+                if (rc != 0) { return -1; }
+                return (int)pathCount;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(paths);
+                Marshal.FreeHGlobal(modes);
+            }
+        }
+
+        static IntPtr RegisterMonitorNotify(IntPtr hwnd)
+        {
+            DevBroadcastDeviceInterface filter = new DevBroadcastDeviceInterface();
+            filter.size = Marshal.SizeOf(typeof(DevBroadcastDeviceInterface));
+            filter.deviceType = DbtDevtypDeviceInterface;
+            filter.classGuid = new Guid("E6F07B5F-EE97-4a90-B076-33F57BF4EAA7");
+            IntPtr memory = Marshal.AllocHGlobal(filter.size);
+            try
+            {
+                Marshal.StructureToPtr(filter, memory, false);
+                return RegisterDeviceNotificationW(hwnd, memory, 0);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(memory);
+            }
         }
 
         static void NoteSetting(IntPtr lParam)
@@ -690,6 +819,16 @@ namespace SoftLock.Hardware
             public string lpszClassName;
         }
 
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct DevBroadcastDeviceInterface
+        {
+            public int size;
+            public int deviceType;
+            public int reserved;
+            public Guid classGuid;
+            public short name;
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         struct Rect
         {
@@ -732,6 +871,8 @@ namespace SoftLock.Hardware
             public long Pad1;
         }
 
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr RegisterDeviceNotificationW(IntPtr hwnd, IntPtr filter, uint flags);
+        [DllImport("user32.dll")] static extern bool UnregisterDeviceNotification(IntPtr handle);
         [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint pathCount, out uint modeCount);
         [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint pathCount, IntPtr paths, ref uint modeCount, IntPtr modes, IntPtr topology);
         [DllImport("user32.dll")] static extern bool SetProcessDPIAware();

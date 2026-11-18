@@ -7,7 +7,8 @@ use std::process::ExitCode;
 
 use serde_json::Value;
 use softlock_win_hwsuite::{
-    Flags, Outcome, Report, conform, plan_value, profile_name, render, section_contains,
+    DisplayStep, DisplayWatch, Flags, Outcome, Report, conform, display_step_seen, plan_value,
+    profile_name, render, section_contains,
 };
 
 fn main() -> ExitCode {
@@ -18,9 +19,10 @@ fn main() -> ExitCode {
         "plan" => finish(plan_main(&rest)),
         "report" => finish(report_main(&rest)),
         "requests" => finish(requests_main(&rest)),
+        "hotplug" => finish(hotplug_main(&rest)),
         "conform" => finish(conform_main(&rest)),
         _ => {
-            eprintln!("usage: softlock-win-hwsuite plan|report|requests|conform");
+            eprintln!("usage: softlock-win-hwsuite plan|report|requests|hotplug|conform");
             ExitCode::from(2)
         }
     }
@@ -109,6 +111,50 @@ fn requests_main(args: &[String]) -> Result<ExitCode, String> {
     });
     println!("{body}");
     Ok(ExitCode::SUCCESS)
+}
+
+fn hotplug_main(args: &[String]) -> Result<ExitCode, String> {
+    let path = required(args, "--json")?;
+    let value = read_json(path)?;
+    let step = match value.get("step").and_then(Value::as_str) {
+        Some("connect") => DisplayStep::Connect,
+        Some("disconnect") => DisplayStep::Disconnect,
+        _ => return Err("step must be connect or disconnect".to_string()),
+    };
+    let seen = display_step_seen(
+        step,
+        watch_field(&value, "before")?,
+        watch_field(&value, "after")?,
+    );
+    println!("{}", serde_json::json!({ "seen": seen }));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn watch_field(value: &Value, name: &str) -> Result<DisplayWatch, String> {
+    let watch = value.get(name).ok_or_else(|| format!("missing {name}"))?;
+    Ok(DisplayWatch {
+        active: i32_field(watch, "active")?,
+        monitors: i32_field(watch, "monitors")?,
+        adds: u32_field(watch, "adds")?,
+        removes: u32_field(watch, "removes")?,
+        changes: u32_field(watch, "changes")?,
+    })
+}
+
+fn i32_field(value: &Value, name: &str) -> Result<i32, String> {
+    value
+        .get(name)
+        .and_then(Value::as_i64)
+        .and_then(|number| i32::try_from(number).ok())
+        .ok_or_else(|| format!("{name} must be an integer"))
+}
+
+fn u32_field(value: &Value, name: &str) -> Result<u32, String> {
+    value
+        .get(name)
+        .and_then(Value::as_u64)
+        .and_then(|number| u32::try_from(number).ok())
+        .ok_or_else(|| format!("{name} must be an integer"))
 }
 
 fn conform_main(args: &[String]) -> Result<ExitCode, String> {

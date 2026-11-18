@@ -116,7 +116,7 @@ function Remember-Dword([string]$hive, [string]$subkey, [string]$name) {
     }
     $present = $false
     $kind = 'DWord'
-    $data = '0'
+    $data = ''
     $key = Open-Hive $hive $subkey $false
     if ($null -ne $key) {
         foreach ($existing in @($key.GetValueNames())) {
@@ -358,19 +358,14 @@ function Write-SuiteReport([bool]$restored) {
 
 function Read-Answer([string]$prompt, [int]$seconds) {
     Write-Host $prompt
-    # prompt_source: a host RawUI waits even when [Console]::IsInputRedirected is true.
-    # powershell -File from cmd.exe hits that case and KeyAvailable throws.
-    $hostUi = $false
+    $redirected = $false
+    try { $redirected = [Console]::IsInputRedirected } catch { $redirected = $true }
+    if ($redirected) { return 'eof' }
+    $previous = $false
     try {
-        $null = $Host.UI.RawUI.WindowSize
-        $hostUi = $true
+        $previous = [Console]::TreatControlCAsInput
+        [Console]::TreatControlCAsInput = $true
     } catch {
-        $hostUi = $false
-    }
-    if (-not $hostUi) {
-        $redirected = $true
-        try { $redirected = [Console]::IsInputRedirected } catch { $redirected = $true }
-        if ($redirected) { return 'eof' }
     }
     $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
     $buf = New-Object System.Text.StringBuilder
@@ -379,45 +374,23 @@ function Read-Answer([string]$prompt, [int]$seconds) {
         Sync-Interrupt
         if ($script:Interrupted) { $kind = 'interrupt'; break }
         if ((Elapsed-Ms) -gt $budgetMs) { $kind = 'budget'; break }
-        $vk = 0
-        $ch = [char]0
-        $ctrl = $false
-        if ($hostUi) {
-            try {
-                if (-not $Host.UI.RawUI.KeyAvailable) {
-                    Start-Sleep -Milliseconds 50
-                    continue
-                }
-                $key = $Host.UI.RawUI.ReadKey('IncludeKeyDown,NoEcho')
-                $vk = [int]$key.VirtualKeyCode
-                $ch = $key.Character
-                $ctrl = (([int]$key.ControlKeyState) -band 12) -ne 0
-            } catch {
-                $kind = 'eof'
-                break
+        try {
+            if (-not [Console]::KeyAvailable) {
+                Start-Sleep -Milliseconds 50
+                continue
             }
-        } else {
-            try {
-                if (-not [Console]::KeyAvailable) {
-                    Start-Sleep -Milliseconds 50
-                    continue
-                }
-                $key = [Console]::ReadKey($true)
-            } catch {
-                $kind = 'eof'
-                break
-            }
-            if ($key.Key -eq 'Enter') { $vk = 13 }
-            elseif ($key.Key -eq 'Backspace') { $vk = 8 }
-            $ch = $key.KeyChar
-            $ctrl = ($ch -eq 3) -or ($key.Key -eq 'C' -and ($key.Modifiers -band [ConsoleModifiers]::Control))
+            $key = [Console]::ReadKey($true)
+        } catch {
+            $kind = 'eof'
+            break
         }
-        if (($ch -eq 3) -or ($vk -eq 67 -and $ctrl)) {
+        $controlC = ($key.KeyChar -eq 3) -or ($key.Key -eq 'C' -and ($key.Modifiers -band [ConsoleModifiers]::Control))
+        if ($controlC) {
             $script:Interrupted = $true
             $kind = 'interrupt'
             break
         }
-        if ($vk -eq 13) {
+        if ($key.Key -eq 'Enter') {
             $text = $buf.ToString().Trim().ToLowerInvariant()
             if ($text -eq '' -or $text -eq 'y' -or $text -eq 'yes' -or $text -eq 'ok' -or $text -eq 'go') {
                 $kind = 'go'
@@ -430,13 +403,31 @@ function Read-Answer([string]$prompt, [int]$seconds) {
             }
             break
         }
-        if ($vk -eq 8) {
+        if ($key.Key -eq 'Backspace') {
             if ($buf.Length -gt 0) { $buf.Length = $buf.Length - 1 }
             continue
         }
-        if ([int]$ch -ge 32) { [void]$buf.Append($ch) }
+        if ($key.KeyChar -ne 0) { [void]$buf.Append($key.KeyChar) }
     }
+    try { [Console]::TreatControlCAsInput = $previous } catch { }
     return $kind
+}
+
+function Test-DisplayStep([string]$prompt, $before, $after) {
+    $step = if ($prompt.StartsWith('Unplug')) { 'disconnect' } else { 'connect' }
+    $path = Join-Path $env:TEMP ("softlock-hw-hotplug-{0}.json" -f $PID)
+    $json = '{"step":"' + $step + '","before":' + (ConvertTo-HotplugJson $before) + ',"after":' + (ConvertTo-HotplugJson $after) + '}'
+    Write-Utf8 $path $json
+    $raw = & $exe hotplug --json $path
+    $code = $LASTEXITCODE
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    if ($code -ne 0 -or -not $raw) { return $false }
+    $parsed = $raw | ConvertFrom-Json
+    return [bool]$parsed.seen
+}
+
+function ConvertTo-HotplugJson($sample) {
+    return '{"active":' + [int]$sample.active + ',"monitors":' + [int]$sample.monitors + ',"adds":' + [int]$sample.adds + ',"removes":' + [int]$sample.removes + ',"changes":' + [int]$sample.changes + '}'
 }
 
 function Power-Since($afterRecord) {
@@ -523,7 +514,7 @@ function Value-Matches($entry) {
         if ($existing -eq [string]$entry.name) { $found = Snapshot-Data $key $existing }
     }
     $key.Close()
-    if (-not $entry.present) { return $null -eq $found }
+    if (-not ($entry.present -eq $true)) { return $null -eq $found }
     if ($null -eq $found) { return $false }
     $kindName = 'DWord'
     if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { $kindName = [string]$entry.kind }
@@ -533,7 +524,7 @@ function Value-Matches($entry) {
 function Restore-Command($entry) {
     $path = "$($entry.hive)\$($entry.subkey)"
     $name = [string]$entry.name
-    if (-not $entry.present) {
+    if (-not ($entry.present -eq $true)) {
         return "reg delete `"$path`" /v $name /f"
     }
     $kindName = 'DWord'
@@ -562,19 +553,25 @@ function Restore-Changes {
         try {
             $key = Open-Hive $entry.hive $entry.subkey $true
             if ($null -eq $key) { throw "cannot open $($entry.hive)\$($entry.subkey)" }
-            if ($entry.present) {
+            $created = -not ($entry.present -eq $true)
+            if ($created) {
+                $key.DeleteValue([string]$entry.name, $false)
+            } else {
                 $kindName = 'DWord'
                 if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { $kindName = [string]$entry.kind }
                 $kind = [Microsoft.Win32.RegistryValueKind]$kindName
                 $value = Convert-RegistryData $kindName ([string]$entry.data)
                 $key.SetValue([string]$entry.name, $value, $kind)
-            } else {
-                $key.DeleteValue([string]$entry.name, $false)
             }
             $key.Close()
+            if (-not (Value-Matches $entry)) {
+                if ($created) { throw 'the suite created this value and it is still present' }
+                throw 'the saved value was not put back'
+            }
         } catch {
             $remaining.Add($entry)
-            $line = "$($entry.hive)\$($entry.subkey) value $($entry.name) was changed and was not put back. $($_.Exception.Message). Run: $(Restore-Command $entry)"
+            $verb = if ($entry.present -eq $true) { 'was changed and was not put back' } else { 'was created by the suite and was not deleted' }
+            $line = "$($entry.hive)\$($entry.subkey) value $($entry.name) $verb. $($_.Exception.Message). Run: $(Restore-Command $entry)"
             $errors.Add($line)
             Write-Host $line
         }
@@ -983,7 +980,7 @@ try {
             }
             'display-hotplug' {
                 if ($row.action -eq 'skip') { continue }
-                $before = [int]($native::DetectJson() | ConvertFrom-Json).monitors
+                $before = $native::HotplugJson() | ConvertFrom-Json
                 $held = $null
                 $missed = $false
                 $prompts = @($row.prompts)
@@ -991,15 +988,16 @@ try {
                     $answer = Read-Answer $prompt 25
                     if ($answer -eq 'interrupt') { break }
                     if ($answer -ne 'go') { $held = $answer; break }
-                    $now = [int]($native::DetectJson() | ConvertFrom-Json).monitors
-                    $rose = $prompt.StartsWith('Plug') -and $now -gt $before
-                    $fell = $prompt.StartsWith('Unplug') -and $now -lt $before
-                    if (-not $rose -and -not $fell) { $missed = $true }
-                    $before = $now
+                    $after = $native::HotplugJson() | ConvertFrom-Json
+                    if (-not (Test-DisplayStep $prompt $before $after)) { $missed = $true }
+                    $before = $after
                 }
                 if ($script:Interrupted) {
                 } elseif ($missed) {
-                    Add-Result $row.id 'fail' 'not detected' @{ displays = $before }
+                    Add-Result $row.id 'fail' 'not detected' @{
+                        active = [int]$before.active
+                        monitors = [int]$before.monitors
+                    }
                 } elseif ($held -eq 'budget') {
                     Add-Result $row.id 'skip' 'budget' @{}
                 } elseif ($held -eq 'operator') {
@@ -1007,7 +1005,10 @@ try {
                 } elseif ($null -ne $held) {
                     Add-Result $row.id 'skip' 'no-input' @{}
                 } else {
-                    Add-Result $row.id 'pass' '' @{ displays = $before }
+                    Add-Result $row.id 'pass' '' @{
+                        active = [int]$before.active
+                        monitors = [int]$before.monitors
+                    }
                 }
             }
             'lid-cycle' {
@@ -1126,6 +1127,7 @@ try {
             if ($null -eq $native) { throw 'fail-closed lock has no listener' }
             $state = $native::SessionStateJson() | ConvertFrom-Json
             if (-not ($state.ok -and $state.locked)) {
+                Write-Host 'Locking Windows because a row failed.'
                 $native::LockNow()
                 $deadline = [DateTime]::UtcNow.AddSeconds(2)
                 do {

@@ -58,7 +58,7 @@ function Value-Matches($entry) {
         else { $data = [string]$raw }
     }
     $key.Close()
-    if (-not $entry.present) { return -not $exists }
+    if (-not ($entry.present -eq $true)) { return -not $exists }
     if (-not $exists) { return $false }
     $kindName = 'DWord'
     if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { $kindName = [string]$entry.kind }
@@ -68,7 +68,7 @@ function Value-Matches($entry) {
 function Restore-Command($entry) {
     $path = "$($entry.hive)\$($entry.subkey)"
     $name = [string]$entry.name
-    if (-not $entry.present) { return "reg delete `"$path`" /v $name /f" }
+    if (-not ($entry.present -eq $true)) { return "reg delete `"$path`" /v $name /f" }
     $kindName = 'DWord'
     if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { $kindName = [string]$entry.kind }
     $type = switch ($kindName) {
@@ -121,19 +121,25 @@ foreach ($entry in $values) {
             if (-not $entry.present) { continue }
             $key = $root.CreateSubKey([string]$entry.subkey)
         }
-        if ($entry.present) {
+        $created = -not ($entry.present -eq $true)
+        if ($created) {
+            $key.DeleteValue([string]$entry.name, $false)
+        } else {
             $kindName = 'DWord'
             if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { $kindName = [string]$entry.kind }
             $data = if ($entry.PSObject.Properties.Name -contains 'data') { [string]$entry.data } else { '0' }
             $kind = [Microsoft.Win32.RegistryValueKind]$kindName
             $key.SetValue([string]$entry.name, (Convert-RegistryData $kindName $data), $kind)
-        } else {
-            $key.DeleteValue([string]$entry.name, $false)
         }
         $key.Close()
+        if (-not (Value-Matches $entry)) {
+            if ($created) { throw 'the suite created this value and it is still present' }
+            throw 'the saved value was not put back'
+        }
     } catch {
         $failed = $true
-        Write-Output "$($entry.hive)\$($entry.subkey) value $($entry.name) was changed and was not put back. $($_.Exception.Message). Run: $(Restore-Command $entry)"
+        $verb = if ($entry.present -eq $true) { 'was changed and was not put back' } else { 'was created by the suite and was not deleted' }
+        Write-Output "$($entry.hive)\$($entry.subkey) value $($entry.name) $verb. $($_.Exception.Message). Run: $(Restore-Command $entry)"
         $held += $entry
     }
 }

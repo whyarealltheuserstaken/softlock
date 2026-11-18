@@ -39,31 +39,6 @@ pub fn profile_name(flags: &Flags) -> &'static str {
     }
 }
 
-/// How a prompt reads a key.
-///
-/// `powershell -File` started from cmd.exe makes `[Console]::IsInputRedirected`
-/// true and `[Console]::KeyAvailable` throw, while `$Host.UI.RawUI` still
-/// reads the keyboard. A pipe with no host UI is real EOF.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PromptSource {
-    Host,
-    Eof,
-}
-
-pub fn prompt_source(
-    console_redirected: bool,
-    console_key_throws: bool,
-    host_raw_ui: bool,
-) -> PromptSource {
-    if host_raw_ui {
-        PromptSource::Host
-    } else if console_redirected || console_key_throws {
-        PromptSource::Eof
-    } else {
-        PromptSource::Host
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Run,
@@ -492,12 +467,5 @@ mod tests {
             assert_eq!(left.action, right.action);
             assert_eq!(left.reason, right.reason);
         }
-    }
-
-    #[test]
-    fn a_cmd_file_launch_still_waits_for_enter() {
-        assert_eq!(prompt_source(true, true, true), PromptSource::Host);
-        assert_eq!(prompt_source(false, true, true), PromptSource::Host);
-        assert_eq!(prompt_source(true, true, false), PromptSource::Eof);
     }
 }
