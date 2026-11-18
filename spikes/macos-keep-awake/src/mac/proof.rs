@@ -1,7 +1,7 @@
 //! Orchestrator, timer child, overlay child, and heartbeat child.
 
 use std::fs;
-use std::io::{self, BufRead, ErrorKind, Write};
+use std::io::{ErrorKind, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
