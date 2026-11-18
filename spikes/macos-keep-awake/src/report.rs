@@ -130,12 +130,8 @@ pub struct KitReport {
 
 pub fn laptop_lid_row(outcome: &str) -> Result<String, String> {
     match outcome {
-        "slept" | "awake" | "skip" | "not-detected" | "not-run-on-runner" | "needs-terminal" => {
-            Ok(outcome.to_string())
-        }
-        "no-lid" | "no lid" | "nolid" => {
-            Err("this Mac is a laptop, so \"no lid\" is not the row".to_string())
-        }
+        "slept" | "awake" | "skip" | "not-detected" | "not-run-on-runner" | "needs-terminal"
+        | "no-lid" | "on-battery" => Ok(outcome.to_string()),
         other => Err(format!("unknown lid outcome {other}")),
     }
 }
@@ -148,10 +144,9 @@ pub fn lid_external_row(outcome: &str) -> Result<String, String> {
         | "skip"
         | "not-detected"
         | "not-run-on-runner"
-        | "needs-terminal" => Ok(outcome.to_string()),
-        "no-lid" | "no lid" => {
-            Err("this Mac is a laptop, so \"no lid\" is not the row".to_string())
-        }
+        | "needs-terminal"
+        | "no-lid"
+        | "on-battery" => Ok(outcome.to_string()),
         other => Err(format!("unknown lid-external outcome {other}")),
     }
 }
@@ -159,7 +154,7 @@ pub fn lid_external_row(outcome: &str) -> Result<String, String> {
 pub fn power_key_row(outcome: &str) -> Result<String, String> {
     match outcome {
         "slept" | "restart-panel" | "nothing" | "skip" | "not-detected" | "not-run-on-runner"
-        | "needs-terminal" => Ok(outcome.to_string()),
+        | "needs-terminal" | "no-touch-id" => Ok(outcome.to_string()),
         other => Err(format!("unknown power-key outcome {other}")),
     }
 }
@@ -205,27 +200,39 @@ pub fn pmset_shows(excerpt: &str, needle: &str) -> bool {
     excerpt.contains(needle)
 }
 
-pub fn slowed_sentence(down: u64, up: u64, expected: u64) -> (Option<bool>, String) {
-    if down == 0 {
+/// Compare tick rates. The uncovered sample may be shorter than the covered one.
+pub fn slowed_sentence(
+    down: u64,
+    down_ms: u64,
+    up: u64,
+    up_ms: u64,
+    interval_ms: u64,
+) -> (Option<bool>, String) {
+    if down == 0 || down_ms == 0 || up_ms == 0 {
         return (
             None,
             "No overlay-down count was recorded, so slowing is not claimed.".to_string(),
         );
     }
+    let expected = expected_ticks(down_ms, interval_ms);
     if expected > 0 && down * 100 < expected * 80 {
         return (
             None,
             format!(
-                "not claimed: baseline below expected ({down} uncovered ticks, expected {expected})"
+                "not claimed: baseline below expected ({down} uncovered ticks in {down_ms} ms, expected {expected})"
             ),
         );
     }
-    let slowed = up * 100 < down * 80;
+    let down_rate = down.saturating_mul(1000) / down_ms;
+    let up_rate = up.saturating_mul(1000) / up_ms;
+    let slowed = up_rate.saturating_mul(100) < down_rate.saturating_mul(80);
     let sentence = if slowed {
-        format!("The covered process slowed ({up} ticks with the overlay up, {down} with it down).")
+        format!(
+            "The covered process slowed ({up_rate} ticks/s with the overlay up, {down_rate} ticks/s with it down)."
+        )
     } else {
         format!(
-            "The covered process did not slow in this sample ({up} ticks with the overlay up, {down} with it down)."
+            "The covered process did not slow in this sample ({up_rate} ticks/s with the overlay up, {down_rate} ticks/s with it down)."
         )
     };
     (Some(slowed), sentence)
@@ -243,7 +250,16 @@ pub fn hardware_row_filled(row: &HardwareRow) -> bool {
     row.status == "recorded"
         && matches!(
             row.outcome.as_deref(),
-            Some("slept" | "awake" | "no-external-display" | "restart-panel" | "nothing")
+            Some(
+                "slept"
+                    | "awake"
+                    | "no-external-display"
+                    | "restart-panel"
+                    | "nothing"
+                    | "no-lid"
+                    | "on-battery"
+                    | "no-touch-id"
+            )
         )
 }
 
@@ -280,8 +296,8 @@ pub fn hardware_only_list() -> Vec<String> {
 pub fn instructions(kit: bool) -> &'static str {
     if kit {
         "This run holds idle-sleep assertions, measures a covered timer (the screen goes black for about 60s), then asks for lid and Touch ID only.\n\
-         App Nap and throttling are scored from timer-tick drift in that sample. Press Enter after a physical step. Type skip to skip it.\n\
-         Control-C ends it and exits non-zero. The session is not locked and settings are not changed. Send result.json and result.txt."
+         App Nap and throttling are scored from timer-tick drift in that sample. The lid steps sleep and lock the Mac. Unlock, then press Enter. Type skip to skip it.\n\
+         Control-C ends it and exits non-zero. Settings are not changed. Send result.json and result.txt."
     } else {
         "Runner slice: create idle assertions, filtered pmset, optional caffeinate, short overlay-down and overlay-up timers.\n\
          App Nap, lid, and power-key rows stay not-run-on-runner. Drift is recorded but not claimed as App Nap.\n\
@@ -387,11 +403,6 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
     {
         reasons
             .push("idle assertions were not held through the lid and power-key rows".to_string());
-    }
-    if report.lid_on_power.status == "no-lid"
-        || report.lid_on_power.outcome.as_deref() == Some("no-lid")
-    {
-        reasons.push("this Mac is a laptop, so \"no lid\" is not the row".to_string());
     }
     reasons
 }
@@ -713,8 +724,10 @@ fn passing_runner_fixture() -> KitReport {
     let up = 158;
     let (slowed, sentence) = slowed_sentence(
         down,
+        RUNNER_SAMPLE_MS,
         up,
-        expected_ticks(RUNNER_SAMPLE_MS, DEFAULT_INTERVAL_MS),
+        RUNNER_SAMPLE_MS,
+        DEFAULT_INTERVAL_MS,
     );
     let assertions = AssertionReport {
         names_compiled: AssertionNames {
@@ -804,10 +817,11 @@ mod tests {
 
     #[test]
     fn a_laptop_lid_row_refuses_no_lid() {
-        assert!(laptop_lid_row("no lid").unwrap_err().contains("laptop"));
+        assert!(laptop_lid_row("no lid").is_err());
+        assert_eq!(laptop_lid_row("no-lid").unwrap(), "no-lid");
         assert_eq!(laptop_lid_row("slept").unwrap(), "slept");
         assert_eq!(laptop_lid_row("awake").unwrap(), "awake");
-        assert!(lid_external_row("no-lid").is_err());
+        assert_eq!(lid_external_row("no-lid").unwrap(), "no-lid");
         assert_eq!(
             lid_external_row("no-external-display").unwrap(),
             "no-external-display"
@@ -856,17 +870,20 @@ mod tests {
 
     #[test]
     fn covered_process_slowing_uses_an_eighty_percent_bar() {
-        let (slowed, sentence) = slowed_sentence(100, 90, 100);
+        let (slowed, sentence) = slowed_sentence(120, 8_000, 110, 8_000, 50);
         assert_eq!(slowed, Some(false));
         assert!(sentence.contains("did not slow"));
-        let (slowed, sentence) = slowed_sentence(100, 50, 100);
+        let (slowed, sentence) = slowed_sentence(120, 8_000, 50, 8_000, 50);
         assert_eq!(slowed, Some(true));
         assert!(sentence.contains("slowed"));
-        let (slowed, sentence) = slowed_sentence(50, 50, 133);
+        let (slowed, sentence) = slowed_sentence(127, 8_000, 900, 60_000, 50);
+        assert_eq!(slowed, Some(false));
+        assert!(sentence.contains("ticks/s"));
+        let (slowed, sentence) = slowed_sentence(50, 8_000, 50, 8_000, 50);
         assert_eq!(slowed, None);
         assert_eq!(fmt_slowed(slowed), "not-claimed");
         assert!(sentence.contains("not claimed: baseline below expected"));
-        assert!(sentence.contains("50 uncovered ticks, expected 133"));
+        assert!(sentence.contains("50 uncovered ticks in 8000 ms, expected 133"));
     }
 
     #[test]
@@ -1120,7 +1137,7 @@ mod tests {
     #[test]
     fn a_low_baseline_prints_timer_slowed_not_claimed() {
         let mut report = passing_runner_fixture();
-        let (slowed, sentence) = slowed_sentence(73, 72, 133);
+        let (slowed, sentence) = slowed_sentence(73, 8_000, 72, 8_000, 50);
         report.timer.overlay_down_count = Some(73);
         report.timer.overlay_up_count = Some(72);
         report.timer.slowed = slowed;

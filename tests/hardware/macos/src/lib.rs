@@ -196,7 +196,9 @@ fn hardware_row(id: &str, name: &str, key: &str, text: &str, mode: &str) -> Row 
         "slept" | "awake" | "restart-panel" | "nothing" if method != "none" => {
             row(id, name, "pass", None, physical, detail)
         }
-        "no-external-display" => row(id, name, "skip", Some("not-applicable"), physical, detail),
+        "no-external-display" | "no-lid" | "on-battery" | "no-touch-id" => {
+            row(id, name, "skip", Some("not-applicable"), physical, detail)
+        }
         "skip" => row(id, name, "skip", Some("operator"), physical, detail),
         "no-input" => row(id, name, "skip", Some("no-input"), physical, detail),
         "interrupted" => row(id, name, "skip", Some("interrupted"), physical, detail),
@@ -263,12 +265,18 @@ pub fn lock_exercise_row(id: &str, text: &str, ran: bool) -> Row {
     let locked = field(text, "state").as_deref() == Some("os-locked")
         && field(text, "lock-screen-appeared").as_deref() == Some("yes")
         && field(text, "input-reached-desktop-without-login").as_deref() == Some("no");
-    let status = if result == "os-locked" && locked {
+    let documented_row = id.contains("documented");
+    let documented_started = field(text, "documented-path").as_deref() == Some("started");
+    let private_fallback = field(text, "fail-closed").as_deref() == Some("lock-private");
+    let status = if result == "os-locked"
+        && locked
+        && (!documented_row || (documented_started && !private_fallback))
+    {
         "pass"
     } else {
         "fail"
     };
-    row(
+    let mut built = row(
         id,
         name,
         status,
@@ -279,6 +287,49 @@ pub fn lock_exercise_row(id: &str, text: &str, ran: bool) -> Row {
             field(text, "lock-screen-appeared").unwrap_or_else(|| "missing".into()),
             field(text, "input-reached-desktop-without-login").unwrap_or_else(|| "missing".into())
         ),
+    );
+    if let Some(changed) = field(text, "settings-changed") {
+        built
+            .measurements
+            .insert("settings-changed".into(), json!(changed));
+    }
+    built
+}
+
+pub fn keep_process_row(text: &str, exit_code: i32) -> Row {
+    let created = field(text, "assertion-created").as_deref() == Some("true");
+    let released = field(text, "assertion-released").as_deref() == Some("true");
+    let crashed = text.trim().is_empty() || exit_code == 127 || exit_code > 128;
+    if created && released && !crashed {
+        return row(
+            "m07-process",
+            "Keep-awake process",
+            "pass",
+            None,
+            false,
+            format!(
+                "assertions created and released; kit exit {exit_code} belongs to the hardware rows"
+            ),
+        );
+    }
+    let detail = if text.trim().is_empty() {
+        format!("keep-awake produced no result, exit {exit_code}")
+    } else if crashed {
+        format!("keep-awake crashed, exit {exit_code}")
+    } else {
+        format!(
+            "assertion-created={} assertion-released={} exit {exit_code}",
+            field(text, "assertion-created").unwrap_or_else(|| "missing".into()),
+            field(text, "assertion-released").unwrap_or_else(|| "missing".into())
+        )
+    };
+    row(
+        "m07-process",
+        "Keep-awake process",
+        "fail",
+        None,
+        false,
+        detail,
     )
 }
 
@@ -385,17 +436,89 @@ pub fn fail_closed(
     }
 }
 
-/// Assertions the kit released, and no fail-closed lock left the session held.
-pub fn restored_from(rows: &[Row], fail_closed_lock: bool) -> bool {
-    if fail_closed_lock {
-        return false;
-    }
+/// Assertions released and no preference write. A fail-closed OS lock is not an unrestored setting.
+pub fn restored_from(rows: &[Row]) -> bool {
     rows.iter().all(|row| {
         row.measurements
             .get("assertion-released")
             .and_then(Value::as_str)
             != Some("false")
+            && row
+                .measurements
+                .get("settings-changed")
+                .and_then(Value::as_str)
+                != Some("true")
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Machine {
+    pub laptop: bool,
+    pub displays: u32,
+    pub on_ac: Option<bool>,
+    pub touch_id: Option<bool>,
+    pub arch_x86_64: bool,
+    pub filevault: bool,
+    pub ci: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowPlan {
+    Run,
+    Skip(&'static str, &'static str),
+}
+
+pub fn plan_lid_on_power(machine: Machine) -> RowPlan {
+    if machine.ci {
+        return RowPlan::Skip("ci", "ci does not close the lid");
+    }
+    if !machine.laptop {
+        return RowPlan::Skip("not-applicable", "this Mac has no lid");
+    }
+    if machine.on_ac == Some(false) {
+        return RowPlan::Skip("not-applicable", "on battery; lid close on power needs AC");
+    }
+    RowPlan::Run
+}
+
+pub fn plan_lid_external(machine: Machine) -> RowPlan {
+    if machine.ci {
+        return RowPlan::Skip("ci", "ci does not close the lid");
+    }
+    if !machine.laptop {
+        return RowPlan::Skip("not-applicable", "this Mac has no lid");
+    }
+    if machine.displays < 2 {
+        return RowPlan::Skip("not-applicable", "fewer than two displays");
+    }
+    RowPlan::Run
+}
+
+pub fn plan_power_key(machine: Machine) -> RowPlan {
+    if machine.ci {
+        return RowPlan::Skip("ci", "ci does not tap Touch ID");
+    }
+    if machine.touch_id == Some(false) {
+        return RowPlan::Skip("not-applicable", "this Mac has no Touch ID");
+    }
+    RowPlan::Run
+}
+
+pub fn plan_smoke(machine: Machine) -> RowPlan {
+    if machine.arch_x86_64 {
+        RowPlan::Run
+    } else {
+        RowPlan::Skip("not-applicable", "x86_64 slice of the universal binary")
+    }
+}
+
+pub fn plan_lock_exercise(machine: Machine) -> RowPlan {
+    // FileVault on or off still runs the lock exercise.
+    if machine.ci {
+        RowPlan::Skip("ci", "ci does not lock the session")
+    } else {
+        RowPlan::Run
+    }
 }
 
 pub fn suite_exit(summary: &Summary, interrupted: bool) -> i32 {
@@ -643,13 +766,24 @@ power-key=not-run-on-runner
             "mode=kit\nassertion-created=true\nassertion-released=true\nresult=pass\napp-nap-verdict=\nlid-on-power=no-input\nlid-external=no-external-display\npower-key=no-input\n",
         );
         assert_eq!(empty[1].status, "fail");
-        assert!(restored_from(&empty, false));
-        assert!(!restored_from(
-            &keep_awake_rows(
-                "mode=kit\nassertion-created=true\nassertion-released=false\nresult=fail\napp-nap-verdict=not-claimed\nlid-on-power=no-input\nlid-external=no-input\npower-key=no-input\n"
-            ),
-            false
-        ));
+        assert!(restored_from(&empty));
+        assert!(!restored_from(&keep_awake_rows(
+            "mode=kit\nassertion-created=true\nassertion-released=false\nresult=fail\napp-nap-verdict=not-claimed\nlid-on-power=no-input\nlid-external=no-input\npower-key=no-input\n"
+        )));
+        let fallback = lock_exercise_row(
+            "m08-documented",
+            "result=os-locked\nstate=os-locked\nlock-screen-appeared=yes\ninput-reached-desktop-without-login=no\ndocumented-path=failed\nfail-closed=lock-private\nsettings-changed=false\n",
+            true,
+        );
+        assert_eq!(fallback.status, "fail");
+        assert!(restored_from(&[fallback]));
+        let healthy = keep_process_row(
+            "assertion-created=true\nassertion-released=true\nresult=incomplete\n",
+            1,
+        );
+        assert_eq!(healthy.status, "pass");
+        assert!(healthy.detail.contains("hardware rows"));
+        assert_eq!(keep_process_row("", 1).status, "fail");
         assert_eq!(scrub_model("MacBookPro16,2"), "MacBookPro16,2");
         assert_eq!(scrub_model("serial number"), "");
     }
@@ -739,5 +873,59 @@ power-key=not-run-on-runner
         assert!(txt.contains(SCHEMA));
         assert!(txt.contains("config:"));
         assert!(!txt.to_ascii_lowercase().contains("serial number"));
+    }
+
+    #[test]
+    fn every_setup_skips_or_runs_without_failing_the_machine() {
+        let henry = Machine {
+            laptop: true,
+            displays: 1,
+            on_ac: Some(true),
+            touch_id: Some(true),
+            arch_x86_64: true,
+            filevault: false,
+            ci: false,
+        };
+        assert_eq!(plan_lid_on_power(henry), RowPlan::Run);
+        assert_eq!(
+            plan_lid_external(henry),
+            RowPlan::Skip("not-applicable", "fewer than two displays")
+        );
+        assert_eq!(plan_power_key(henry), RowPlan::Run);
+        assert_eq!(plan_smoke(henry), RowPlan::Run);
+        assert_eq!(plan_lock_exercise(henry), RowPlan::Run);
+        let desktop = Machine {
+            laptop: false,
+            displays: 1,
+            on_ac: Some(true),
+            touch_id: Some(false),
+            arch_x86_64: false,
+            filevault: true,
+            ci: false,
+        };
+        assert!(matches!(plan_lid_on_power(desktop), RowPlan::Skip(_, _)));
+        assert!(matches!(plan_lid_external(desktop), RowPlan::Skip(_, _)));
+        assert_eq!(
+            plan_power_key(desktop),
+            RowPlan::Skip("not-applicable", "this Mac has no Touch ID")
+        );
+        assert!(matches!(plan_smoke(desktop), RowPlan::Skip(_, _)));
+        assert_eq!(plan_lock_exercise(desktop), RowPlan::Run);
+        let battery = Machine {
+            on_ac: Some(false),
+            ..henry
+        };
+        assert_eq!(
+            plan_lid_on_power(battery),
+            RowPlan::Skip("not-applicable", "on battery; lid close on power needs AC")
+        );
+        let clamshell = Machine {
+            displays: 2,
+            ..henry
+        };
+        assert_eq!(plan_lid_external(clamshell), RowPlan::Run);
+        let ci = Machine { ci: true, ..henry };
+        assert!(matches!(plan_lid_on_power(ci), RowPlan::Skip("ci", _)));
+        assert!(matches!(plan_lock_exercise(ci), RowPlan::Skip("ci", _)));
     }
 }

@@ -44,20 +44,27 @@ pub fn classify_pmset_since(text: &str, since: &str) -> SleepEvent {
 
 /// Scan `pmset -g log` text captured after a physical step started.
 pub fn classify_pmset_log(text: &str) -> SleepEvent {
-    let mut event = SleepEvent::None;
+    let mut system = false;
+    let mut display = false;
+    let mut wake = false;
     for line in text.lines() {
         match classify_pmset_log_line(line) {
             SleepEvent::None => {}
-            SleepEvent::Wake => event = SleepEvent::Wake,
-            SleepEvent::DisplaySleep => {
-                if event != SleepEvent::SystemSleep {
-                    event = SleepEvent::DisplaySleep;
-                }
-            }
-            SleepEvent::SystemSleep => event = SleepEvent::SystemSleep,
+            SleepEvent::Wake => wake = true,
+            SleepEvent::DisplaySleep => display = true,
+            SleepEvent::SystemSleep => system = true,
         }
     }
-    event
+    // A later wake is the unlock after the lid closed. It does not erase the sleep.
+    if system {
+        SleepEvent::SystemSleep
+    } else if display {
+        SleepEvent::DisplaySleep
+    } else if wake {
+        SleepEvent::Wake
+    } else {
+        SleepEvent::None
+    }
 }
 
 pub fn classify_pmset_log_line(line: &str) -> SleepEvent {
@@ -195,7 +202,11 @@ mod tests {
 2026-11-17 18:00:00 +0000 Display is turned off\n\
 2026-11-17 18:00:01 +0000 Entering Sleep state due to 'Clamshell Sleep'\n\
 2026-11-17 18:00:20 +0000 Wake from Sleep\n";
-        assert_eq!(classify_pmset_log(text), SleepEvent::Wake);
+        assert_eq!(classify_pmset_log(text), SleepEvent::SystemSleep);
+        assert_eq!(
+            classify_pmset_log("2026-11-17 18:00:20 +0000 Wake from Sleep\n"),
+            SleepEvent::Wake
+        );
         let only_display = "2026-11-17 18:00:00 +0000 Display is turned off\n";
         assert_eq!(classify_pmset_log(only_display), SleepEvent::DisplaySleep);
         assert_eq!(

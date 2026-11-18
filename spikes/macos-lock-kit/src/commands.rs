@@ -53,6 +53,12 @@ pub fn observation_argv_allowed(program: &str, args: &[&str]) -> bool {
     program == "/usr/bin/pgrep" && args == ["-x", "ScreenSaverEngine"]
 }
 
+/// Display sleep is the documented lock when the Lock Screen delay is immediate.
+/// The screen-saver engine does not lock on macOS 26 when `askForPassword` is unset.
+pub fn documented_display_sleep_allowed(program: &str, args: &[&str]) -> bool {
+    program == "/usr/bin/pmset" && args == ["displaysleepnow"]
+}
+
 fn otool_dash_l(program: &str, args: &[&str]) -> bool {
     program == "/usr/bin/otool"
         && args.len() == 2
@@ -125,6 +131,18 @@ mod tests {
         assert!(observation_argv_allowed(
             "/usr/bin/pgrep",
             &["-x", "ScreenSaverEngine"]
+        ));
+        assert!(documented_display_sleep_allowed(
+            "/usr/bin/pmset",
+            &["displaysleepnow"]
+        ));
+        assert!(!documented_display_sleep_allowed(
+            "/usr/bin/pmset",
+            &["sleepnow"]
+        ));
+        assert!(!read_only_argv_allowed(
+            "/usr/bin/pmset",
+            &["displaysleepnow"]
         ));
         assert!(!read_only_argv_allowed(
             SCREEN_SAVER_ENGINE_CANDIDATES[0],

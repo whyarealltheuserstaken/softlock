@@ -886,6 +886,9 @@ int macos_prove_screen_capture_kit(CaptureOut *out) {
                 SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
                 config.width = (size_t)display.frame.size.width;
                 config.height = (size_t)display.frame.size.height;
+                if (@available(macOS 13.0, *)) {
+                    config.capturesAudio = NO;
+                }
                 [SCScreenshotManager captureImageWithFilter:filter
                                               configuration:config
                                           completionHandler:^(CGImageRef image, NSError *shot_error) {
@@ -1040,6 +1043,9 @@ int macos_prove_sc_stream(CaptureOut *out) {
             config.width = (size_t)display.frame.size.width;
             config.height = (size_t)display.frame.size.height;
             config.pixelFormat = kCVPixelFormatType_32BGRA;
+            if (@available(macOS 13.0, *)) {
+                config.capturesAudio = NO;
+            }
             config.minimumFrameInterval = CMTimeMake(1, 2);
             config.queueDepth = 1;
             g_stream_sink = [[StreamSink alloc] init];

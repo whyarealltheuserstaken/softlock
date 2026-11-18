@@ -4,6 +4,7 @@
 
 mod args;
 mod drift;
+mod plan;
 mod report;
 mod scrub;
 mod sleep_detect;

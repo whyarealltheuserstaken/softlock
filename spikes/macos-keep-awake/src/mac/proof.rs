@@ -14,6 +14,7 @@ use serde::Serialize;
 use crate::args::{APP_NAP_SAMPLE_MS, Args, Mode};
 use crate::drift::{APP_NAP_GAP_THRESHOLD_MS, DriftStats, nap_verdict, stats_from_gaps};
 use crate::mac::ffi::{self, HeldAssertions};
+use crate::plan::{self, SetupSkip};
 use crate::report::{
     AssertionReport, CaffeinateReport, DISPLAY_ASSERTION, HardwareRow, KIT_ID, KitReport,
     SYSTEM_ASSERTION, TimerReport, exit_nonzero, expected_ticks, hardware_only_list, hardware_row,
@@ -259,7 +260,9 @@ fn sample_timers(args: &Args, down_child: Option<Child>) -> Result<TimerReport, 
     }
     let expected = expected_ticks(args.sample_ms, args.interval_ms);
     let (slowed, sentence) = match (down.ticks, up.ticks) {
-        (Some(down_n), Some(up_n)) => slowed_sentence(down_n, up_n, expected),
+        (Some(down_n), Some(up_n)) => {
+            slowed_sentence(down_n, down_ms, up_n, args.sample_ms, args.interval_ms)
+        }
         _ => (
             None,
             "Timer counts are incomplete, so slowing is not claimed.".to_string(),
@@ -617,7 +620,7 @@ fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareR
         PhysicalSpec {
             stamp: "lid-on-power",
             preset: args.lid_on_power.as_deref(),
-            instruction: "Close the lid on power (unplug any external display). Press Enter when that is done. Type skip to skip.",
+            instruction: "The Mac will sleep and lock. Close the lid on power, unlock, then press Enter. Type skip to skip.",
             parse: laptop_lid_row,
             held,
             timeout: Duration::from_secs(25),
@@ -638,7 +641,7 @@ fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareR
         PhysicalSpec {
             stamp: "lid-external",
             preset: args.lid_external.as_deref(),
-            instruction: "Plug in an external display, then close the lid. Press Enter when that is done. Type skip to skip.",
+            instruction: "Plug in a display, close the lid (the Mac sleeps and locks), unlock, then press Enter. Type skip to skip.",
             parse: lid_external_row,
             held: lid.assertion_held,
             timeout: Duration::from_secs(25),
@@ -707,13 +710,15 @@ fn record_physical(args: &Args, spec: PhysicalSpec<'_>) -> HardwareRow {
             "no-input",
         );
     }
-    if preset.is_none() && matches!(kind, LidKind::External) && ffi::display_count() < 2 {
+    if preset.is_none()
+        && let Some(skip) = setup_skip(kind)
+    {
         return hardware_row(
             "recorded".to_string(),
-            Some("no-external-display".to_string()),
+            Some(skip.outcome.to_string()),
             None,
             held,
-            "skipped before the prompt: fewer than two displays",
+            skip.note,
             "pre-prompt",
         );
     }
@@ -730,6 +735,7 @@ fn record_physical(args: &Args, spec: PhysicalSpec<'_>) -> HardwareRow {
             );
         }
     };
+    drain_stdin();
     crate::report::write_stdout(instruction);
     if stop_requested() {
         return hardware_row(
@@ -830,32 +836,100 @@ fn wait_for_sleep_or_skip(timeout: Duration, kind: LidKind, since: &str) -> Choi
             method: "interrupted".to_string(),
         };
     }
+    drain_stdin();
     crate::report::write_stdout(">");
-    match read_line_blocking() {
-        LineRead::Eof => Choice {
-            outcome: "no-input".to_string(),
-            method: "no-input".to_string(),
-        },
-        LineRead::Interrupted => Choice {
-            outcome: "interrupted".to_string(),
-            method: "interrupted".to_string(),
-        },
-        LineRead::Line(line) => {
-            let word = line.trim().to_ascii_lowercase();
-            if word.is_empty() || word == "enter" || word == "y" || word == "yes" {
-                watch_after_prompt(timeout, kind, since)
-            } else {
-                Choice {
-                    outcome: "skip".to_string(),
-                    method: "operator-skip".to_string(),
+    loop {
+        match read_line_blocking() {
+            LineRead::Eof => {
+                return Choice {
+                    outcome: "no-input".to_string(),
+                    method: "no-input".to_string(),
+                };
+            }
+            LineRead::Interrupted => {
+                return Choice {
+                    outcome: "interrupted".to_string(),
+                    method: "interrupted".to_string(),
+                };
+            }
+            LineRead::Line(line) => {
+                let word = line.trim().to_ascii_lowercase();
+                if word == "skip" {
+                    return Choice {
+                        outcome: "skip".to_string(),
+                        method: "operator-skip".to_string(),
+                    };
+                }
+                if word.is_empty() || word == "enter" || word == "y" || word == "yes" {
+                    return watch_after_prompt(timeout, kind, since);
                 }
             }
         }
     }
 }
 
+fn setup_skip(kind: LidKind) -> Option<SetupSkip> {
+    let model = command_text("sysctl", &["-n", "hw.model"]);
+    let laptop = plan::laptop_model(&model);
+    match kind {
+        LidKind::OnPower => {
+            let batt = command_text("pmset", &["-g", "batt"]);
+            plan::lid_on_power(laptop, plan::ac_power(&batt))
+        }
+        LidKind::External => plan::lid_external(laptop, ffi::display_count()),
+        LidKind::PowerKey => {
+            let (text, ok) = command_result("ioreg", &["-n", "AppleBiometricSensor", "-r"]);
+            plan::power_key(plan::touch_id_sensor(&text, ok))
+        }
+    }
+}
+
+fn command_text(program: &str, args: &[&str]) -> String {
+    command_result(program, args).0
+}
+
+fn command_result(program: &str, args: &[&str]) -> (String, bool) {
+    match Command::new(program).args(args).output() {
+        Ok(output) => (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            output.status.success(),
+        ),
+        Err(_) => (String::new(), false),
+    }
+}
+
+fn drain_stdin() {
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
+fn sleep_since(since: &str) -> Option<Choice> {
+    let raw = pmset_log();
+    let pmset = classify_pmset_since(&raw, since);
+    let event = detected_sleep(
+        ffi::PowerWatch::system_slept(),
+        ffi::PowerWatch::display_slept(),
+        pmset,
+    )?;
+    let method = detection_method(
+        ffi::PowerWatch::system_slept(),
+        ffi::PowerWatch::display_slept(),
+        pmset,
+    );
+    Some(Choice {
+        outcome: outcome_token(event).to_string(),
+        method: method.to_string(),
+    })
+}
+
 fn watch_after_prompt(timeout: Duration, kind: LidKind, since: &str) -> Choice {
     let (watch, watch_ok) = ffi::PowerWatch::start();
+    ffi::PowerWatch::pump(200);
+    if let Some(choice) = sleep_since(since) {
+        drop(watch);
+        return choice;
+    }
     ffi::PowerWatch::reset();
     let started = Instant::now();
     let mut log_ok = false;

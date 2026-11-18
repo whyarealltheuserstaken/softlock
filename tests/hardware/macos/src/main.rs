@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use macos_hardware_suite::{
     Config, SCHEMA, SuiteResult, budget_skip, decided_skip, exit_row, fail_closed, keep_awake_rows,
-    lock_exercise_row, lock_read_only_row, over_budget, restored_from, scrub_model, smoke_row,
-    suite_exit, summary_of,
+    keep_process_row, lock_exercise_row, lock_read_only_row, over_budget, restored_from,
+    scrub_model, smoke_row, suite_exit, summary_of,
 };
 
 const BUDGET_MS: u64 = 300_000;
@@ -42,14 +42,15 @@ fn run() -> i32 {
     }
     println!("macOS hardware suite. result.txt reports build time and test time.");
     println!(
+        "Needs Accessibility (posted input), Input Monitoring (event tap), and Screen Recording (sharing). Microphone is not used."
+    );
+    println!(
         "Automated checks run first. The screen goes black for about 60 seconds during App Nap."
     );
     if ci {
         println!("--ci skips lid, Touch ID, and lock exercises.");
     } else {
-        println!(
-            "Then: lid on power, external display plus lid, Touch ID tap, unlock with your password. Enter after each step. Type skip to skip."
-        );
+        println!("Lid steps sleep and lock the Mac. Unlock, then press Enter. Type skip to skip.");
     }
 
     let arch = command_out(&["uname", "-m"]);
@@ -83,17 +84,11 @@ fn run() -> i32 {
         );
     }
 
-    if !access_ready(ci) {
+    let grants = ensure_permissions(ci);
+    if !grants.input {
         rows.push(decided_skip(
             "m03-posted-input",
             "Posted input",
-            "not-applicable",
-            "grant Accessibility and Input Monitoring, then restart Terminal",
-            false,
-        ));
-        rows.push(decided_skip(
-            "m04-sharing",
-            "Sharing probe",
             "not-applicable",
             "grant Accessibility and Input Monitoring, then restart Terminal",
             false,
@@ -112,6 +107,16 @@ fn run() -> i32 {
             false,
             &format!("exit {m03}"),
         ));
+    }
+    if !grants.screen {
+        rows.push(decided_skip(
+            "m04-sharing",
+            "Sharing probe",
+            "not-applicable",
+            "grant Screen Recording, then restart Terminal",
+            false,
+        ));
+    } else {
         let sharing = spawn(
             &desktop_bin(),
             &[
@@ -179,17 +184,10 @@ fn run() -> i32 {
                 true,
             )
         };
-        rows.extend(keep_awake_rows(&read_text(
-            &out.join("m07").join("result.txt"),
-        )));
-        if keep != 0 && rows.iter().all(|row| row.status != "fail") && !interrupted() {
-            rows.push(exit_row(
-                "m07-process",
-                "Keep-awake process",
-                false,
-                false,
-                &format!("exit {keep}"),
-            ));
+        let keep_text = read_text(&out.join("m07").join("result.txt"));
+        rows.extend(keep_awake_rows(&keep_text));
+        if keep != 0 {
+            rows.push(keep_process_row(&keep_text, keep));
         }
     }
 
@@ -280,6 +278,7 @@ fn run() -> i32 {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish(
     rows: Vec<macos_hardware_suite::Row>,
     ci: bool,
@@ -299,7 +298,7 @@ fn finish(
         .any(|row| row.id.starts_with("m08-") && row.physical && row.status == "pass");
     let summary = summary_of(&rows);
     let plan = fail_closed(summary.fail > 0, ci, interrupted_run, session_locked);
-    let restored = restored_from(&rows, plan.lock);
+    let restored = restored_from(&rows);
     if plan.lock {
         let _ = spawn(
             &release_bin("macos-lock-kit"),
@@ -379,30 +378,53 @@ fn run_smoke(dir: &Path, log: &Path, arch: &str) -> i32 {
     )
 }
 
-fn access_ready(ci: bool) -> bool {
-    if access_granted() {
-        return true;
+struct Grants {
+    input: bool,
+    screen: bool,
+}
+
+fn ensure_permissions(ci: bool) -> Grants {
+    let mut grants = read_grants();
+    if grants.input && grants.screen {
+        return grants;
     }
     if ci || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return false;
+        return grants;
     }
-    println!(
-        "Grant Accessibility and Input Monitoring for this terminal in System Settings, then press Enter."
-    );
-    match read_line_interruptible() {
-        LineRead::Line(_) => !interrupted() && access_granted(),
-        LineRead::Interrupted => false,
-        LineRead::Eof => false,
+    println!("Grant the missing permission in System Settings, then press Enter.");
+    if matches!(read_line_interruptible(), LineRead::Line) {
+        grants = read_grants();
+    }
+    grants
+}
+
+fn read_grants() -> Grants {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            Grants {
+                input: AXIsProcessTrusted() != 0 && CGPreflightListenEventAccess() != 0,
+                screen: CGPreflightScreenCaptureAccess() != 0,
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Grants {
+            input: true,
+            screen: true,
+        }
     }
 }
 
 enum LineRead {
-    Line(String),
+    Line,
     Eof,
     Interrupted,
 }
 
 fn read_line_interruptible() -> LineRead {
+    drain_stdin();
     let mut line = String::new();
     loop {
         if interrupted() {
@@ -410,7 +432,7 @@ fn read_line_interruptible() -> LineRead {
         }
         match io::stdin().lock().read_line(&mut line) {
             Ok(0) => return LineRead::Eof,
-            Ok(_) => return LineRead::Line(line.trim().to_string()),
+            Ok(_) => return LineRead::Line,
             Err(error) if error.kind() == ErrorKind::Interrupted => {
                 if interrupted() {
                     return LineRead::Interrupted;
@@ -422,14 +444,10 @@ fn read_line_interruptible() -> LineRead {
     }
 }
 
-fn access_granted() -> bool {
+fn drain_stdin() {
     #[cfg(target_os = "macos")]
-    {
-        unsafe { AXIsProcessTrusted() != 0 && CGPreflightListenEventAccess() != 0 }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        true
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
     }
 }
 
@@ -561,6 +579,7 @@ unsafe extern "C" {
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightListenEventAccess() -> u8;
+    fn CGPreflightScreenCaptureAccess() -> u8;
 }
 
 fn interrupted() -> bool {
