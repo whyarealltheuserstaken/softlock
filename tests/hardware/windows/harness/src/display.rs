@@ -7,6 +7,8 @@
 pub enum DisplayStep {
     Connect,
     Disconnect,
+    /// The arrangement is unknown, so either direction counts.
+    Either,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -21,23 +23,27 @@ pub struct DisplayWatch {
 }
 
 pub fn display_step_seen(step: DisplayStep, before: DisplayWatch, after: DisplayWatch) -> bool {
-    let added = after.adds > before.adds;
-    let removed = after.removes > before.removes;
-    let changed = after.changes > before.changes;
+    let connect = connect_seen(before, after);
+    let disconnect = disconnect_seen(before, after);
     match step {
-        DisplayStep::Disconnect => {
-            removed
-                || count_fell(before.active, after.active)
-                || count_fell(before.monitors, after.monitors)
-                || changed
-        }
-        DisplayStep::Connect => {
-            added
-                || count_rose(before.active, after.active)
-                || count_rose(before.monitors, after.monitors)
-                || changed
-        }
+        DisplayStep::Connect => connect,
+        DisplayStep::Disconnect => disconnect,
+        DisplayStep::Either => connect || disconnect,
     }
+}
+
+fn connect_seen(before: DisplayWatch, after: DisplayWatch) -> bool {
+    after.adds > before.adds
+        || count_rose(before.active, after.active)
+        || count_rose(before.monitors, after.monitors)
+        || after.changes > before.changes
+}
+
+fn disconnect_seen(before: DisplayWatch, after: DisplayWatch) -> bool {
+    after.removes > before.removes
+        || count_fell(before.active, after.active)
+        || count_fell(before.monitors, after.monitors)
+        || after.changes > before.changes
 }
 
 fn count_rose(before: i32, after: i32) -> bool {
@@ -84,6 +90,15 @@ mod tests {
         assert!(display_step_seen(DisplayStep::Connect, before, added));
         let removed = watch(1, 1, 0, 1, 1);
         assert!(display_step_seen(DisplayStep::Disconnect, before, removed));
+    }
+
+    #[test]
+    fn an_unknown_arrangement_accepts_either_direction() {
+        let attached = watch(1, 1, 0, 0, 0);
+        let detached = watch(0, 1, 0, 0, 0);
+        assert!(display_step_seen(DisplayStep::Either, attached, detached));
+        assert!(display_step_seen(DisplayStep::Either, detached, attached));
+        assert!(!display_step_seen(DisplayStep::Either, attached, attached));
     }
 
     #[test]

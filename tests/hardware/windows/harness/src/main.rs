@@ -119,7 +119,8 @@ fn hotplug_main(args: &[String]) -> Result<ExitCode, String> {
     let step = match value.get("step").and_then(Value::as_str) {
         Some("connect") => DisplayStep::Connect,
         Some("disconnect") => DisplayStep::Disconnect,
-        _ => return Err("step must be connect or disconnect".to_string()),
+        Some("either") => DisplayStep::Either,
+        _ => return Err("step must be connect, disconnect, or either".to_string()),
     };
     let seen = display_step_seen(
         step,

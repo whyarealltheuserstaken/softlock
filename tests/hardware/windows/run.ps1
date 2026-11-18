@@ -414,7 +414,7 @@ function Read-Answer([string]$prompt, [int]$seconds) {
 }
 
 function Test-DisplayStep([string]$prompt, $before, $after) {
-    $step = if ($prompt.StartsWith('Unplug')) { 'disconnect' } else { 'connect' }
+    $step = if ($prompt.StartsWith('Unplug')) { 'disconnect' } elseif ($prompt.StartsWith('Either')) { 'either' } else { 'connect' }
     $path = Join-Path $env:TEMP ("softlock-hw-hotplug-{0}.json" -f $PID)
     $json = '{"step":"' + $step + '","before":' + (ConvertTo-HotplugJson $before) + ',"after":' + (ConvertTo-HotplugJson $after) + '}'
     Write-Utf8 $path $json
