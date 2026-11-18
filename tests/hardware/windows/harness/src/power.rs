@@ -99,6 +99,139 @@ fn hibernate_word(lower: &str) -> bool {
         || lower.contains("hibernacao")
 }
 
+/// AC and DC indexes for one power setting. The values come from the setting's
+/// own block, so a subgroup dump cannot report a different button's index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettingIndex {
+    pub ac: u32,
+    pub dc: u32,
+}
+
+/// Per-user `ACSettingIndex` and `DCSettingIndex` are independent. A missing
+/// side falls back to that side's scheme default. Either side still missing
+/// means the index is unknown.
+pub fn resolve_power_index(
+    user_ac: Option<u32>,
+    user_dc: Option<u32>,
+    default_ac: Option<u32>,
+    default_dc: Option<u32>,
+) -> Option<SettingIndex> {
+    Some(SettingIndex {
+        ac: user_ac.or(default_ac)?,
+        dc: user_dc.or(default_dc)?,
+    })
+}
+
+/// Restore writes AC and DC on `saved_scheme`. `/SETACTIVE` that scheme only
+/// when it is the plan in effect now, so those values apply. A different
+/// current scheme means the operator switched plans: write the values and
+/// leave the active plan alone.
+pub fn should_set_active(saved_scheme: &str, current_scheme: &str) -> bool {
+    match (scheme_id(saved_scheme), scheme_id(current_scheme)) {
+        (Some(saved), Some(current)) => saved == current,
+        _ => false,
+    }
+}
+
+fn scheme_id(text: &str) -> Option<String> {
+    let trimmed = text
+        .trim()
+        .trim_matches(|ch| ch == '{' || ch == '}')
+        .to_ascii_lowercase();
+    if is_guid(&trimmed) {
+        Some(trimmed)
+    } else {
+        parse_scheme_guid(text)
+    }
+}
+
+/// `powercfg /q` prints the current indexes as `0x........` after any minimum
+/// or maximum. Labels are localized, so the GUID and those hex values are the
+/// whole parse. Hidden settings omitted from the dump are not found.
+pub fn parse_setting_index(text: &str, setting: &str) -> Option<SettingIndex> {
+    let lower = text.to_ascii_lowercase();
+    let needle = setting
+        .trim()
+        .trim_matches(|ch| ch == '{' || ch == '}')
+        .to_ascii_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    let start = lower.find(&needle)?;
+    let rest = &text[start + needle.len()..];
+    let end = next_guid_at(&rest.to_ascii_lowercase()).unwrap_or(rest.len());
+    let values = hex_values(&rest[..end]);
+    if values.len() < 2 {
+        return None;
+    }
+    Some(SettingIndex {
+        ac: values[values.len() - 2],
+        dc: values[values.len() - 1],
+    })
+}
+
+/// The first GUID in `powercfg /GETACTIVESCHEME`. The label around it changes
+/// with the Windows language.
+pub fn parse_scheme_guid(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let at = next_guid_at(&lower)?;
+    Some(lower[at..at + 36].to_string())
+}
+
+fn next_guid_at(lower: &str) -> Option<usize> {
+    let bytes = lower.as_bytes();
+    let mut index = 0;
+    while index + 36 <= bytes.len() {
+        if is_guid(&lower[index..index + 36]) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_guid(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        let dash = index == 8 || index == 13 || index == 18 || index == 23;
+        if dash {
+            if *byte != b'-' {
+                return false;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn hex_values(text: &str) -> Vec<u32> {
+    let bytes = text.as_bytes();
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if bytes[index] == b'0' && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X') {
+            let start = index + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            if end > start
+                && let Ok(value) = u32::from_str_radix(&text[start..end], 16)
+            {
+                values.push(value);
+            }
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    values
+}
+
 /// True when `needle` sits in the named `powercfg /requests` section.
 pub fn section_contains(text: &str, section: &str, needle: &str) -> bool {
     if needle.is_empty() {
@@ -219,5 +352,137 @@ None.
         assert!(section_contains(text, "SYSTEM", "hardware suite"));
         assert!(!section_contains(text, "AWAYMODE", "hardware suite"));
         assert!(!section_contains(text, "SYSTEM", ""));
+    }
+
+    /// Published `powercfg /query SCHEME_CURRENT SUB_BUTTONS` text. The lid
+    /// block is the query output recorded for this subgroup; the power-button
+    /// block is the same format with that setting's documented GUID.
+    const SUB_BUTTONS: &str = "\
+Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)
+  GUID Alias: SCHEME_BALANCED
+  Subgroup GUID: 4f971e89-eebd-4455-a8de-9e59040e7347  (Power buttons and lid)
+    GUID Alias: SUB_BUTTONS
+    Power Setting GUID: 5ca83367-6e45-459f-a27b-476b1d01c936  (Lid close action)
+      GUID Alias: LIDACTION
+      Possible Setting Index: 000
+      Possible Setting Friendly Name: Do nothing
+      Possible Setting Index: 001
+      Possible Setting Friendly Name: Sleep
+      Possible Setting Index: 002
+      Possible Setting Friendly Name: Hibernate
+      Possible Setting Index: 003
+      Possible Setting Friendly Name: Shut down
+    Current AC Power Setting Index: 0x00000001
+    Current DC Power Setting Index: 0x00000001
+
+    Power Setting GUID: 7648efa3-dd9c-4e3e-b566-50f929386280  (Power button action)
+      GUID Alias: PBUTTONACTION
+      Possible Setting Index: 000
+      Possible Setting Friendly Name: Do nothing
+      Possible Setting Index: 001
+      Possible Setting Friendly Name: Sleep
+      Possible Setting Index: 002
+      Possible Setting Friendly Name: Hibernate
+      Possible Setting Index: 003
+      Possible Setting Friendly Name: Shut down
+    Current AC Power Setting Index: 0x00000003
+    Current DC Power Setting Index: 0x00000001
+";
+
+    #[test]
+    fn a_subgroup_query_keeps_each_setting_s_own_ac_and_dc_index() {
+        let lid = parse_setting_index(SUB_BUTTONS, "5ca83367-6e45-459f-a27b-476b1d01c936").unwrap();
+        assert_eq!(lid, SettingIndex { ac: 1, dc: 1 });
+        let button =
+            parse_setting_index(SUB_BUTTONS, "7648efa3-dd9c-4e3e-b566-50f929386280").unwrap();
+        assert_eq!(button, SettingIndex { ac: 3, dc: 1 });
+        assert_eq!(
+            parse_scheme_guid(SUB_BUTTONS).as_deref(),
+            Some("381b4222-f694-41f0-9685-ff5bb260df2e")
+        );
+        assert_eq!(
+            parse_scheme_guid(
+                "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+            )
+            .as_deref(),
+            Some("8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c")
+        );
+    }
+
+    #[test]
+    fn a_hidden_setting_omitted_from_the_query_is_not_another_buttons_index() {
+        let visible = "\
+Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)
+  Subgroup GUID: 4f971e89-eebd-4455-a8de-9e59040e7347  (Power buttons and lid)
+    Power Setting GUID: 7648efa3-dd9c-4e3e-b566-50f929386280  (Power button action)
+    Current AC Power Setting Index: 0x00000001
+    Current DC Power Setting Index: 0x00000001
+";
+        assert!(parse_setting_index(visible, "5ca83367-6e45-459f-a27b-476b1d01c936").is_none());
+        let button =
+            parse_setting_index(visible, "{7648efa3-dd9c-4e3e-b566-50f929386280}").unwrap();
+        assert_eq!(button.ac, 1);
+    }
+
+    #[test]
+    fn localized_labels_and_minimum_values_do_not_move_the_current_index() {
+        let german = "\
+Energieschema-GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Ausbalanciert)
+    Energieeinstellungs-GUID: 5ca83367-6e45-459f-a27b-476b1d01c936
+      Minimum Possible Setting: 0x00000000
+      Maximum Possible Setting: 0x00000003
+    Aktueller Wechselstrom-Energieeinstellungsindex: 0x00000002
+    Aktueller Gleichstrom-Energieeinstellungsindex: 0x00000000
+";
+        let lid = parse_setting_index(german, "5CA83367-6E45-459F-A27B-476B1D01C936").unwrap();
+        assert_eq!(lid, SettingIndex { ac: 2, dc: 0 });
+        assert!(parse_scheme_guid("").is_none());
+        assert!(parse_setting_index(german, "7648efa3-dd9c-4e3e-b566-50f929386280").is_none());
+    }
+
+    #[test]
+    fn each_power_index_falls_back_on_its_own() {
+        assert_eq!(
+            resolve_power_index(Some(3), None, Some(1), Some(2)),
+            Some(SettingIndex { ac: 3, dc: 2 })
+        );
+        assert_eq!(
+            resolve_power_index(None, Some(0), Some(1), Some(2)),
+            Some(SettingIndex { ac: 1, dc: 0 })
+        );
+        assert_eq!(
+            resolve_power_index(Some(3), Some(0), Some(1), Some(2)),
+            Some(SettingIndex { ac: 3, dc: 0 })
+        );
+        assert_eq!(
+            resolve_power_index(None, None, Some(1), Some(2)),
+            Some(SettingIndex { ac: 1, dc: 2 })
+        );
+        assert_eq!(
+            resolve_power_index(Some(3), None, None, Some(2)),
+            Some(SettingIndex { ac: 3, dc: 2 })
+        );
+        assert_eq!(
+            resolve_power_index(None, Some(0), Some(1), None),
+            Some(SettingIndex { ac: 1, dc: 0 })
+        );
+        assert_eq!(resolve_power_index(Some(3), None, None, None), None);
+        assert_eq!(resolve_power_index(None, None, None, Some(2)), None);
+        assert_eq!(resolve_power_index(None, None, Some(1), None), None);
+    }
+
+    #[test]
+    fn setactive_follows_the_scheme_that_is_active_now() {
+        let balanced = "381b4222-f694-41f0-9685-ff5bb260df2e";
+        let high = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+        assert!(should_set_active(balanced, balanced));
+        assert!(should_set_active(
+            "{381B4222-F694-41F0-9685-FF5BB260DF2E}",
+            "381b4222-f694-41f0-9685-ff5bb260df2e"
+        ));
+        assert!(!should_set_active(balanced, high));
+        assert!(!should_set_active(balanced, ""));
+        assert!(!should_set_active("", balanced));
+        assert!(!should_set_active("SCHEME_CURRENT", balanced));
     }
 }

@@ -191,13 +191,7 @@ pub fn conform(value: &Value) -> Result<(), String> {
 }
 
 fn profile(flags: &Flags) -> String {
-    if flags.ci {
-        "ci".to_string()
-    } else if flags.admin {
-        "admin".to_string()
-    } else {
-        "school".to_string()
-    }
+    crate::plan::profile_name(flags).to_string()
 }
 
 fn parse_supplied(values: &[Value]) -> BTreeMap<String, Supplied> {
@@ -314,11 +308,32 @@ fn recorded(item: &Planned, machine: &Machine) -> Row {
             measurements.insert("build".to_string(), json!(machine.build));
             measurements.insert("sleep".to_string(), json!(machine.power.sleep_label()));
             measurements.insert("displays".to_string(), json!(machine.displays));
+            measurements.insert(
+                "internal".to_string(),
+                json!(count_text(machine.internal_displays)),
+            );
+            measurements.insert(
+                "external".to_string(),
+                json!(count_text(machine.external_displays)),
+            );
+            measurements.insert(
+                "configured".to_string(),
+                json!(count_text(machine.configured_displays)),
+            );
             measurements.insert("hello".to_string(), json!(machine.hello.as_str()));
             measurements.insert("session".to_string(), json!(machine.session.as_str()));
             measurements.insert("lid".to_string(), json!(machine.lid));
             measurements.insert("ac".to_string(), json!(machine.ac));
-            ("pass", String::new())
+            (
+                "pass",
+                format!(
+                    "displays={} internal={} external={} configured={}",
+                    machine.displays,
+                    count_text(machine.internal_displays),
+                    count_text(machine.external_displays),
+                    count_text(machine.configured_displays),
+                ),
+            )
         }
     } else {
         ("fail", "unknown recorded row".to_string())
@@ -333,6 +348,17 @@ fn recorded(item: &Planned, machine: &Machine) -> Row {
         duration_ms: 0,
         detail,
         measurements,
+    }
+}
+
+fn full_detail(id: &str) -> bool {
+    matches!(id, "restore" | "display-hotplug" | "detect-config")
+}
+
+fn count_text(count: Option<u32>) -> String {
+    match count {
+        Some(value) => value.to_string(),
+        None => "?".to_string(),
     }
 }
 
@@ -433,11 +459,13 @@ impl Report {
             ),
             format!("mode: {}", self.mode),
             format!(
-                "Windows {} build {} | {} | displays {} | hello {} | {} | lid {}",
+                "Windows {} build {} | {} | displays {} internal {} external {} | hello {} | {} | lid {}",
                 machine.windows,
                 machine.build,
                 machine.power.sleep_label(),
                 machine.displays,
+                count_text(machine.internal_displays),
+                count_text(machine.external_displays),
                 machine.hello.as_str(),
                 machine.session.as_str(),
                 machine.lid,
@@ -453,12 +481,12 @@ impl Report {
             } else {
                 row.detail.clone()
             };
-            lines.push(format!(
-                "{:<24} {:<6} {}",
-                row.id,
-                row.status,
+            let shown = if full_detail(&row.id) {
+                detail
+            } else {
                 truncate(&detail, 60)
-            ));
+            };
+            lines.push(format!("{:<24} {:<6} {}", row.id, row.status, shown));
         }
         if !self.outcome.hklm_command.is_empty() {
             lines.push(String::new());
@@ -531,6 +559,7 @@ mod tests {
             admin: false,
             elevated: true,
             github_actions: true,
+            school: false,
         };
         (machine, flags)
     }
@@ -652,5 +681,28 @@ mod tests {
         assert_eq!(report.to_json()["fail_closed"], true);
         assert_eq!(report.to_json()["serial_collected"], false);
         conform(&report.to_json()).unwrap();
+    }
+
+    #[test]
+    fn a_personal_laptop_is_bench_and_the_restore_line_is_complete() {
+        let (machine, mut flags) = sample();
+        flags.ci = false;
+        flags.elevated = false;
+        flags.github_actions = false;
+        let command = "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v DisableLockWorkstation /t REG_DWORD /d 0 /f";
+        let detail = format!(
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System value DisableLockWorkstation was changed and was not put back. Run: {command}"
+        );
+        let supplied = vec![serde_json::json!({
+            "id": "restore",
+            "status": "fail",
+            "reason": detail,
+        })];
+        let report = render(&machine, &flags, 1_000, &supplied, &outcome());
+        assert_eq!(report.mode, "bench");
+        assert!(report.to_text().contains(command));
+        flags.school = true;
+        let school = render(&machine, &flags, 1_000, &[], &outcome());
+        assert_eq!(school.mode, "school");
     }
 }

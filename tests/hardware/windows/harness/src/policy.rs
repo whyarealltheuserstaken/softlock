@@ -8,9 +8,16 @@ pub enum Restore {
 
 /// `None` means the value was absent, so restore deletes it.
 pub fn restore_dword(previous: Option<u32>) -> Restore {
-    match previous {
-        Some(value) => Restore::Write(value),
-        None => Restore::Delete,
+    restore_saved(previous.is_some(), previous.unwrap_or(0))
+}
+
+/// `present` is false when this suite created the value. The stored number is
+/// then a placeholder, including 0, and must not be written back.
+pub fn restore_saved(present: bool, data: u32) -> Restore {
+    if present {
+        Restore::Write(data)
+    } else {
+        Restore::Delete
     }
 }
 
@@ -40,6 +47,12 @@ mod tests {
         assert_eq!(restore_dword(Some(1)), Restore::Write(1));
         assert_eq!(restore_dword(Some(0)), Restore::Write(0));
         assert_eq!(restore_dword(None), Restore::Delete);
+    }
+
+    #[test]
+    fn an_absent_disable_task_mgr_is_deleted_not_written_as_zero() {
+        assert_eq!(restore_saved(false, 0), Restore::Delete);
+        assert_eq!(restore_saved(true, 0), Restore::Write(0));
     }
 
     #[test]

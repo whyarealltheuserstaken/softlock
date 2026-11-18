@@ -54,6 +54,10 @@ pub struct Machine {
     pub elevated: bool,
     pub lid: String,
     pub ac: String,
+    pub internal_display: Option<bool>,
+    pub internal_displays: Option<u32>,
+    pub external_displays: Option<u32>,
+    pub configured_displays: Option<u32>,
 }
 
 impl Machine {
@@ -72,6 +76,10 @@ impl Machine {
             "elevated": self.elevated,
             "lid": self.lid,
             "ac": self.ac,
+            "internal_display": self.internal_display,
+            "internal_displays": self.internal_displays,
+            "external_displays": self.external_displays,
+            "configured_displays": self.configured_displays,
         })
     }
 }
@@ -97,6 +105,14 @@ struct Facts {
     chassis_laptop: Option<bool>,
     #[serde(default)]
     ac_line: Option<u8>,
+    #[serde(default)]
+    internal_display: Option<bool>,
+    #[serde(default)]
+    internal_count: Option<i32>,
+    #[serde(default)]
+    external_count: Option<i32>,
+    #[serde(default)]
+    configured: Option<i32>,
 }
 
 pub fn decode_facts(value: &Value) -> Result<Machine, String> {
@@ -113,7 +129,18 @@ pub fn decode_facts(value: &Value) -> Result<Machine, String> {
         elevated: facts.elevated,
         lid: lid_label(facts.chassis_laptop),
         ac: ac_label(facts.ac_line),
+        internal_display: facts.internal_display,
+        internal_displays: count_field(facts.internal_count),
+        external_displays: count_field(facts.external_count),
+        configured_displays: count_field(facts.configured),
     })
+}
+
+fn count_field(value: Option<i32>) -> Option<u32> {
+    match value {
+        Some(count) if count >= 0 => u32::try_from(count).ok(),
+        _ => None,
+    }
 }
 
 pub fn windows_family(build: u32) -> String {

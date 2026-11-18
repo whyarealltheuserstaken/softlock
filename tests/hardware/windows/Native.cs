@@ -22,9 +22,19 @@ namespace SoftLock.Hardware
         const uint WsExNoActivate = 0x08000000;
         const uint WsPopup = 0x80000000;
         const uint Marker = 0x00A00ADC;
+        const int MarkerSize = 32;
+        const uint LwaColorKey = 0x00000001;
+        const uint LwaAlpha = 0x00000002;
+        const uint WmPaint = 0x000F;
+        const uint WmEraseBkgnd = 0x0014;
         const uint WmNcHitTest = 0x0084;
         const uint WmPowerBroadcast = 0x0218;
+        const uint WmDeviceChange = 0x0219;
+        const uint WmDisplayChange = 0x007E;
         const uint WmWtsSessionChange = 0x02B1;
+        const int DbtDeviceArrival = 0x8000;
+        const int DbtDeviceRemoveComplete = 0x8004;
+        const int DbtDevtypDeviceInterface = 5;
         const int WtsSessionLock = 0x7;
         const int WtsSessionUnlock = 0x8;
         const int PbtApmSuspend = 0x0004;
@@ -39,6 +49,7 @@ namespace SoftLock.Hardware
         static IntPtr hook = IntPtr.Zero;
         static int injectedSeen;
         static WndProc overlayProc;
+        static bool paintMarker;
         static WndProc listenerProc;
         static IntPtr listenerHwnd = IntPtr.Zero;
         static Thread listenerThread;
@@ -50,6 +61,11 @@ namespace SoftLock.Hardware
         static int lidOpens;
         static int displayOff;
         static int displayOn;
+        static int displayAdds;
+        static int displayRemoves;
+        static int displayChanges;
+        static int lastActive = -1;
+        static IntPtr monitorNotify = IntPtr.Zero;
         static int sessionLocks;
         static int sessionUnlocks;
         static IntPtr powerRequest = IntPtr.Zero;
@@ -62,8 +78,7 @@ namespace SoftLock.Hardware
         {
             try
             {
-                EnsureDpi();
-                int monitors = MonitorRects().Count;
+                Census census = ReadCensus();
                 int protocol = ClientProtocol();
                 byte ac = 255;
                 SystemPowerStatus power;
@@ -72,15 +87,177 @@ namespace SoftLock.Hardware
                     ac = power.ACLineStatus;
                 }
                 bool admin = IsUserAnAdmin();
-                return "{\"ok\":true,\"monitors\":" + monitors
+                string internalJson = census.internalCount < 0 ? "null" : (census.internalCount > 0 ? "true" : "false");
+                return "{\"ok\":true,\"monitors\":" + DisplayCount(census)
+                    + ",\"enumerated\":" + census.enumerated
+                    + ",\"active\":" + census.active
+                    + ",\"configured\":" + census.configured
+                    + ",\"internal_count\":" + census.internalCount
+                    + ",\"external_count\":" + census.externalCount
                     + ",\"protocol\":" + protocol
                     + ",\"ac\":" + ac
+                    + ",\"internal\":" + internalJson
                     + ",\"elevated\":" + (admin ? "true" : "false") + "}";
             }
             catch (Exception error)
             {
-                return "{\"ok\":false,\"monitors\":0,\"protocol\":-1,\"ac\":255,\"elevated\":false,\"error\":\"" + Esc(error.Message) + "\"}";
+                return "{\"ok\":false,\"monitors\":0,\"enumerated\":-1,\"active\":-1,\"configured\":-1,\"internal_count\":-1,\"external_count\":-1,\"protocol\":-1,\"ac\":255,\"internal\":null,\"elevated\":false,\"error\":\"" + Esc(error.Message) + "\"}";
             }
+        }
+
+        // DISPLAYCONFIG_PATH_INFO is 72 bytes. The source is 20 bytes, so the
+        // target LUID is at 20, outputTechnology at 36, and targetAvailable at 60.
+        // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-displayconfig_path_info
+        class DisplayTarget
+        {
+            public int luidLow;
+            public int luidHigh;
+            public int id;
+            public int tech;
+            public bool available;
+            public string Key { get { return luidLow + ":" + luidHigh + ":" + id; } }
+        }
+
+        class Census
+        {
+            public int attached = -1;
+            public int active = -1;
+            public int configured = -1;
+            public int internalCount = -1;
+            public int externalCount = -1;
+            public int enumerated = -1;
+        }
+
+        static bool IsInternal(int tech)
+        {
+            if ((tech & unchecked((int)0x80000000)) != 0) return true;
+            return tech == 6 || tech == 11 || tech == 13;
+        }
+
+        static Census ReadCensus()
+        {
+            Census census = new Census();
+            try
+            {
+                EnsureDpi();
+                census.enumerated = MonitorRects().Count;
+            }
+            catch (Exception)
+            {
+                census.enumerated = -1;
+            }
+            List<DisplayTarget> active = QueryTargets(2, true);
+            List<DisplayTarget> all = QueryTargets(1, false);
+            if (active != null)
+            {
+                census.active = Distinct(active).Count;
+            }
+            List<DisplayTarget> present = null;
+            if (all != null)
+            {
+                List<DisplayTarget> unique = Distinct(all);
+                census.configured = unique.Count;
+                present = new List<DisplayTarget>();
+                foreach (DisplayTarget target in unique)
+                {
+                    if (target.available) present.Add(target);
+                }
+            }
+            if (active != null)
+            {
+                if (present == null) present = new List<DisplayTarget>();
+                foreach (DisplayTarget target in Distinct(active))
+                {
+                    bool known = false;
+                    foreach (DisplayTarget have in present)
+                    {
+                        if (have.Key == target.Key) { known = true; break; }
+                    }
+                    if (!known) present.Add(target);
+                }
+            }
+            if (present != null)
+            {
+                census.attached = present.Count;
+                int internals = 0;
+                foreach (DisplayTarget target in present)
+                {
+                    if (IsInternal(target.tech)) internals++;
+                }
+                census.internalCount = internals;
+                census.externalCount = present.Count - internals;
+            }
+            return census;
+        }
+
+        static int DisplayCount(Census census)
+        {
+            if (census.attached >= 0) return census.attached;
+            if (census.active >= 0) return census.active;
+            return census.enumerated;
+        }
+
+        static List<DisplayTarget> Distinct(List<DisplayTarget> targets)
+        {
+            List<DisplayTarget> unique = new List<DisplayTarget>();
+            foreach (DisplayTarget target in targets)
+            {
+                bool known = false;
+                foreach (DisplayTarget have in unique)
+                {
+                    if (have.Key == target.Key) { known = true; break; }
+                }
+                if (!known) unique.Add(target);
+            }
+            return unique;
+        }
+
+        static List<DisplayTarget> QueryTargets(uint flags, bool forceAvailable)
+        {
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                uint pathCount;
+                uint modeCount;
+                if (GetDisplayConfigBufferSizes(flags, out pathCount, out modeCount) != 0)
+                {
+                    return null;
+                }
+                if (pathCount == 0)
+                {
+                    return new List<DisplayTarget>();
+                }
+                int modeBytes = (int)modeCount * 128;
+                if (modeBytes < 128) modeBytes = 128;
+                IntPtr paths = Marshal.AllocHGlobal((int)pathCount * 128);
+                IntPtr modes = Marshal.AllocHGlobal(modeBytes);
+                try
+                {
+                    uint pathsOut = pathCount;
+                    uint modesOut = modeCount;
+                    int rc = QueryDisplayConfig(flags, ref pathsOut, paths, ref modesOut, modes, IntPtr.Zero);
+                    if (rc == 122) continue;
+                    if (rc != 0) return null;
+                    List<DisplayTarget> found = new List<DisplayTarget>();
+                    for (int i = 0; i < (int)pathsOut; i++)
+                    {
+                        int at = i * 72;
+                        DisplayTarget target = new DisplayTarget();
+                        target.luidLow = Marshal.ReadInt32(paths, at + 20);
+                        target.luidHigh = Marshal.ReadInt32(paths, at + 24);
+                        target.id = Marshal.ReadInt32(paths, at + 28);
+                        target.tech = Marshal.ReadInt32(paths, at + 36);
+                        target.available = forceAvailable || Marshal.ReadInt32(paths, at + 60) != 0;
+                        found.Add(target);
+                    }
+                    return found;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(paths);
+                    Marshal.FreeHGlobal(modes);
+                }
+            }
+            return null;
         }
 
         public static string OverlayJson()
@@ -92,11 +269,12 @@ namespace SoftLock.Hardware
                 List<Rect> monitors = MonitorRects();
                 if (monitors.Count == 0)
                 {
-                    return "{\"ok\":true,\"monitors\":0,\"windows\":0,\"topmost\":false,\"click_through\":false,\"covered\":false,\"affinity\":false,\"marker_visible\":false}";
+                    return "{\"ok\":true,\"monitors\":0,\"windows\":0,\"topmost\":false,\"click_through\":false,\"covered\":false,\"affinity\":false,\"marker_visible\":false,\"captured\":false}";
                 }
+                paintMarker = false;
                 overlayProc = OverlayWnd;
                 IntPtr proc = Marshal.GetFunctionPointerForDelegate(overlayProc);
-                IntPtr brush = CreateSolidBrush(Marker);
+                IntPtr brush = GetStockObject(4);
                 WndClass wc = new WndClass();
                 wc.lpfnWndProc = proc;
                 wc.hInstance = GetModuleHandle(null);
@@ -107,7 +285,9 @@ namespace SoftLock.Hardware
                 bool click = true;
                 bool covered = true;
                 bool affinity = true;
-                bool markerVisible = false;
+                bool markerVisible = true;
+                bool captured = false;
+                int painted = 0;
                 foreach (Rect monitor in monitors)
                 {
                     int width = monitor.right - monitor.left;
@@ -129,11 +309,27 @@ namespace SoftLock.Hardware
                     {
                         topmost = false;
                         covered = false;
+                        markerVisible = false;
                         continue;
                     }
                     windows.Add(hwnd);
-                    SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+                    // Stay hidden through the first paint. Black is the color key, so
+                    // only the 32x32 marker is visible once the window is shown.
+                    paintMarker = false;
+                    SetLayeredWindowAttributes(hwnd, 0, 255, LwaColorKey | LwaAlpha);
+                    UpdateWindow(hwnd);
+                    paintMarker = true;
+                    InvalidateRect(hwnd, IntPtr.Zero, false);
+                    UpdateWindow(hwnd);
                     ShowWindow(hwnd, 8);
+                    FlushFrame();
+                    painted++;
+                    int cx = monitor.left + (width / 2);
+                    int cy = monitor.top + (height / 2);
+                    if (ScreenPixel(cx, cy) != Marker)
+                    {
+                        markerVisible = false;
+                    }
                     uint style = (uint)GetExStyle(hwnd).ToInt64();
                     if ((style & WsExTopmost) == 0)
                     {
@@ -171,16 +367,15 @@ namespace SoftLock.Hardware
                             affinity = false;
                         }
                     }
-                    IntPtr dc = GetDC(IntPtr.Zero);
-                    if (dc != IntPtr.Zero)
+                    FlushFrame();
+                    if (ScreenPixel(cx, cy) == Marker)
                     {
-                        uint pixel = GetPixel(dc, monitor.left + (width / 2), monitor.top + (height / 2));
-                        ReleaseDC(IntPtr.Zero, dc);
-                        if (pixel == Marker)
-                        {
-                            markerVisible = true;
-                        }
+                        captured = true;
                     }
+                }
+                if (painted == 0)
+                {
+                    markerVisible = false;
                 }
                 return "{\"ok\":true,\"monitors\":" + monitors.Count
                     + ",\"windows\":" + windows.Count
@@ -188,14 +383,16 @@ namespace SoftLock.Hardware
                     + ",\"click_through\":" + Bool(click)
                     + ",\"covered\":" + Bool(covered)
                     + ",\"affinity\":" + Bool(affinity)
-                    + ",\"marker_visible\":" + Bool(markerVisible) + "}";
+                    + ",\"marker_visible\":" + Bool(markerVisible)
+                    + ",\"captured\":" + Bool(captured) + "}";
             }
             catch (Exception error)
             {
-                return "{\"ok\":false,\"monitors\":0,\"windows\":0,\"topmost\":false,\"click_through\":false,\"covered\":false,\"affinity\":false,\"marker_visible\":false,\"error\":\"" + Esc(error.Message) + "\"}";
+                return "{\"ok\":false,\"monitors\":0,\"windows\":0,\"topmost\":false,\"click_through\":false,\"covered\":false,\"affinity\":false,\"marker_visible\":false,\"captured\":false,\"error\":\"" + Esc(error.Message) + "\"}";
             }
             finally
             {
+                paintMarker = false;
                 foreach (IntPtr hwnd in windows)
                 {
                     DestroyWindow(hwnd);
@@ -287,6 +484,21 @@ namespace SoftLock.Hardware
             listenerThread.IsBackground = true;
             listenerThread.Start();
             ListenerReady.WaitOne(3000);
+        }
+
+        public static string HotplugJson()
+        {
+            Census census = ReadCensus();
+            lock (Gate)
+            {
+                return "{\"active\":" + DisplayCount(census)
+                    + ",\"monitors\":" + census.enumerated
+                    + ",\"internal\":" + census.internalCount
+                    + ",\"external\":" + census.externalCount
+                    + ",\"adds\":" + displayAdds
+                    + ",\"removes\":" + displayRemoves
+                    + ",\"changes\":" + displayChanges + "}";
+            }
         }
 
         public static string SnapshotJson()
@@ -462,6 +674,7 @@ namespace SoftLock.Hardware
                 Guid display = DisplayGuid;
                 RegisterPowerSettingNotification(listenerHwnd, ref lid, 0);
                 RegisterPowerSettingNotification(listenerHwnd, ref display, 0);
+                monitorNotify = RegisterMonitorNotify(listenerHwnd);
             }
             ListenerReady.Set();
             Msg msg;
@@ -469,6 +682,11 @@ namespace SoftLock.Hardware
             {
                 TranslateMessage(ref msg);
                 DispatchMessage(ref msg);
+            }
+            if (monitorNotify != IntPtr.Zero)
+            {
+                UnregisterDeviceNotification(monitorNotify);
+                monitorNotify = IntPtr.Zero;
             }
             if (listenerHwnd != IntPtr.Zero)
             {
@@ -495,6 +713,22 @@ namespace SoftLock.Hardware
                     NoteSetting(lParam);
                 }
             }
+            else if (message == WmDisplayChange)
+            {
+                NoteDisplayChange();
+            }
+            else if (message == WmDeviceChange)
+            {
+                int kind = wParam.ToInt32();
+                if (kind == DbtDeviceArrival)
+                {
+                    NoteDevice(true);
+                }
+                else if (kind == DbtDeviceRemoveComplete)
+                {
+                    NoteDevice(false);
+                }
+            }
             else if (message == WmWtsSessionChange)
             {
                 int kind = wParam.ToInt32();
@@ -508,6 +742,53 @@ namespace SoftLock.Hardware
                 }
             }
             return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+
+        static void NoteDisplayChange()
+        {
+            int active = DisplayCount(ReadCensus());
+            lock (Gate)
+            {
+                displayChanges++;
+                if (lastActive >= 0 && active >= 0)
+                {
+                    if (active > lastActive) { displayAdds++; }
+                    else if (active < lastActive) { displayRemoves++; }
+                }
+                if (active >= 0) { lastActive = active; }
+            }
+        }
+
+        static void NoteDevice(bool arrived)
+        {
+            int active = DisplayCount(ReadCensus());
+            lock (Gate)
+            {
+                displayChanges++;
+                if (lastActive >= 0 && active >= 0 && active != lastActive)
+                {
+                    if (arrived) { displayAdds++; } else { displayRemoves++; }
+                }
+                if (active >= 0) { lastActive = active; }
+            }
+        }
+
+        static IntPtr RegisterMonitorNotify(IntPtr hwnd)
+        {
+            DevBroadcastDeviceInterface filter = new DevBroadcastDeviceInterface();
+            filter.size = Marshal.SizeOf(typeof(DevBroadcastDeviceInterface));
+            filter.deviceType = DbtDevtypDeviceInterface;
+            filter.classGuid = new Guid("E6F07B5F-EE97-4a90-B076-33F57BF4EAA7");
+            IntPtr memory = Marshal.AllocHGlobal(filter.size);
+            try
+            {
+                Marshal.StructureToPtr(filter, memory, false);
+                return RegisterDeviceNotificationW(hwnd, memory, 0);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(memory);
+            }
         }
 
         static void NoteSetting(IntPtr lParam)
@@ -533,11 +814,78 @@ namespace SoftLock.Hardware
 
         static IntPtr OverlayWnd(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam)
         {
+            if (message == WmPaint)
+            {
+                PaintStruct paint;
+                IntPtr hdc = BeginPaint(hwnd, out paint);
+                if (hdc != IntPtr.Zero)
+                {
+                    Rect client;
+                    if (!GetClientRect(hwnd, out client))
+                    {
+                        client = paint.area;
+                    }
+                    IntPtr black = CreateSolidBrush(0);
+                    FillRect(hdc, ref client, black);
+                    DeleteObject(black);
+                    if (paintMarker)
+                    {
+                        Rect patch = MarkerPatch(client);
+                        IntPtr brush = CreateSolidBrush(Marker);
+                        FillRect(hdc, ref patch, brush);
+                        DeleteObject(brush);
+                    }
+                }
+                EndPaint(hwnd, ref paint);
+                return IntPtr.Zero;
+            }
             if (message == WmNcHitTest)
             {
                 return new IntPtr(-1);
             }
+            if (message == WmEraseBkgnd)
+            {
+                return new IntPtr(1);
+            }
             return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+
+        static Rect MarkerPatch(Rect client)
+        {
+            int width = client.right - client.left;
+            int height = client.bottom - client.top;
+            int size = MarkerSize;
+            if (size > width) { size = width; }
+            if (size > height) { size = height; }
+            Rect patch = new Rect();
+            patch.left = client.left + ((width - size) / 2);
+            patch.top = client.top + ((height - size) / 2);
+            patch.right = patch.left + size;
+            patch.bottom = patch.top + size;
+            return patch;
+        }
+
+        static uint ScreenPixel(int x, int y)
+        {
+            IntPtr dc = GetDC(IntPtr.Zero);
+            if (dc == IntPtr.Zero)
+            {
+                return 0xFFFFFFFF;
+            }
+            uint pixel = GetPixel(dc, x, y);
+            ReleaseDC(IntPtr.Zero, dc);
+            return pixel;
+        }
+
+        static void FlushFrame()
+        {
+            try
+            {
+                DwmFlush();
+            }
+            catch (Exception)
+            {
+            }
         }
 
         static IntPtr HookCallback(int code, IntPtr wParam, IntPtr lParam)
@@ -646,6 +994,16 @@ namespace SoftLock.Hardware
             public string lpszClassName;
         }
 
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct DevBroadcastDeviceInterface
+        {
+            public int size;
+            public int deviceType;
+            public int reserved;
+            public Guid classGuid;
+            public short name;
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         struct Rect
         {
@@ -653,6 +1011,25 @@ namespace SoftLock.Hardware
             public int top;
             public int right;
             public int bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct PaintStruct
+        {
+            public IntPtr hdc;
+            public int erase;
+            public Rect area;
+            public int restore;
+            public int incUpdate;
+            public int reserved1;
+            public int reserved2;
+            public int reserved3;
+            public int reserved4;
+            public int reserved5;
+            public int reserved6;
+            public int reserved7;
+            public int reserved8;
+            public int pad;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -688,6 +1065,10 @@ namespace SoftLock.Hardware
             public long Pad1;
         }
 
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr RegisterDeviceNotificationW(IntPtr hwnd, IntPtr filter, uint flags);
+        [DllImport("user32.dll")] static extern bool UnregisterDeviceNotification(IntPtr handle);
+        [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint pathCount, out uint modeCount);
+        [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint pathCount, IntPtr paths, ref uint modeCount, IntPtr modes, IntPtr topology);
         [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnum proc, IntPtr data);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern ushort RegisterClassW(ref WndClass wc);
@@ -695,6 +1076,15 @@ namespace SoftLock.Hardware
         static extern IntPtr CreateWindowExW(uint ex, string klass, string name, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
         [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr hwnd);
         [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int cmd);
+        [DllImport("user32.dll")] static extern bool UpdateWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool InvalidateRect(IntPtr hwnd, IntPtr rect, bool erase);
+        [DllImport("user32.dll")] static extern IntPtr BeginPaint(IntPtr hwnd, out PaintStruct paint);
+        [DllImport("user32.dll")] static extern bool EndPaint(IntPtr hwnd, ref PaintStruct paint);
+        [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out Rect rect);
+        [DllImport("user32.dll")] static extern int FillRect(IntPtr hdc, ref Rect rect, IntPtr brush);
+        [DllImport("gdi32.dll")] static extern IntPtr CreateSolidBrush(uint color);
+        [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+        [DllImport("dwmapi.dll")] static extern int DwmFlush();
         [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint key, byte alpha, uint flags);
         [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
         [DllImport("user32.dll")] static extern IntPtr SendMessageW(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
@@ -705,7 +1095,7 @@ namespace SoftLock.Hardware
         [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
         [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
         [DllImport("gdi32.dll")] static extern uint GetPixel(IntPtr dc, int x, int y);
-        [DllImport("gdi32.dll")] static extern IntPtr CreateSolidBrush(uint color);
+        [DllImport("gdi32.dll")] static extern IntPtr GetStockObject(int obj);
         [DllImport("user32.dll")] static extern IntPtr DefWindowProcW(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr module, uint thread);
         [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
