@@ -1,7 +1,7 @@
 //! Orchestrator, timer child, overlay child, and heartbeat child.
 
 use std::fs;
-use std::io::{self, BufRead, ErrorKind, Write};
+use std::io::{ErrorKind, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -14,6 +14,7 @@ use serde::Serialize;
 use crate::args::{APP_NAP_SAMPLE_MS, Args, Mode};
 use crate::drift::{APP_NAP_GAP_THRESHOLD_MS, DriftStats, nap_verdict, stats_from_gaps};
 use crate::mac::ffi::{self, HeldAssertions};
+use crate::plan::{self, SetupSkip};
 use crate::report::{
     AssertionReport, CaffeinateReport, DISPLAY_ASSERTION, HardwareRow, KIT_ID, KitReport,
     SYSTEM_ASSERTION, TimerReport, exit_nonzero, expected_ticks, hardware_only_list, hardware_row,
@@ -21,7 +22,10 @@ use crate::report::{
     runner_hardware_row, slowed_sentence,
 };
 use crate::scrub::{contains_serial, filter_pmset};
-use crate::sleep_detect::{classify_pmset_since, detected_sleep, detection_method, outcome_token};
+use crate::sleep_detect::{
+    classify_pmset_since, detected_sleep, detection_method, lid_close_seen, log_since,
+    outcome_token,
+};
 use crate::version::parse_sw_vers;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -200,6 +204,7 @@ fn empty_timer(args: &Args, error: &str) -> TimerReport {
         occlusion_visible_down: None,
         occlusion_visible_up: None,
         expected_ticks: expected,
+        uncovered_expected_ticks: expected,
         app_nap_ms: if args.mode == Mode::Kit {
             APP_NAP_SAMPLE_MS
         } else {
@@ -258,8 +263,11 @@ fn sample_timers(args: &Args, down_child: Option<Child>) -> Result<TimerReport, 
         return Err("interrupted".to_string());
     }
     let expected = expected_ticks(args.sample_ms, args.interval_ms);
+    let uncovered_expected = expected_ticks(down_ms, args.interval_ms);
     let (slowed, sentence) = match (down.ticks, up.ticks) {
-        (Some(down_n), Some(up_n)) => slowed_sentence(down_n, up_n, expected),
+        (Some(down_n), Some(up_n)) => {
+            slowed_sentence(down_n, down_ms, up_n, args.sample_ms, args.interval_ms)
+        }
         _ => (
             None,
             "Timer counts are incomplete, so slowing is not claimed.".to_string(),
@@ -283,6 +291,7 @@ fn sample_timers(args: &Args, down_child: Option<Child>) -> Result<TimerReport, 
         occlusion_visible_down: down.occlusion_visible,
         occlusion_visible_up: up.occlusion_visible,
         expected_ticks: expected,
+        uncovered_expected_ticks: uncovered_expected,
         app_nap_ms: if args.mode == Mode::Kit {
             APP_NAP_SAMPLE_MS
         } else {
@@ -617,7 +626,7 @@ fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareR
         PhysicalSpec {
             stamp: "lid-on-power",
             preset: args.lid_on_power.as_deref(),
-            instruction: "Close the lid on power (unplug any external display). Press Enter when that is done. Type skip to skip.",
+            instruction: "The Mac will sleep and lock. Close the lid on power, unlock, then press Enter. Type skip to skip.",
             parse: laptop_lid_row,
             held,
             timeout: Duration::from_secs(25),
@@ -638,7 +647,7 @@ fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareR
         PhysicalSpec {
             stamp: "lid-external",
             preset: args.lid_external.as_deref(),
-            instruction: "Plug in an external display, then close the lid. Press Enter when that is done. Type skip to skip.",
+            instruction: "Plug in a display, close the lid (the Mac sleeps and locks), unlock, then press Enter. Type skip to skip.",
             parse: lid_external_row,
             held: lid.assertion_held,
             timeout: Duration::from_secs(25),
@@ -670,7 +679,7 @@ fn hardware_rows(args: &Args, pid: u32, reason: &str) -> (HardwareRow, HardwareR
     (lid, external, power)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum LidKind {
     OnPower,
     External,
@@ -707,13 +716,15 @@ fn record_physical(args: &Args, spec: PhysicalSpec<'_>) -> HardwareRow {
             "no-input",
         );
     }
-    if preset.is_none() && matches!(kind, LidKind::External) && ffi::display_count() < 2 {
+    if preset.is_none()
+        && let Some(skip) = setup_skip(kind)
+    {
         return hardware_row(
             "recorded".to_string(),
-            Some("no-external-display".to_string()),
+            Some(skip.outcome.to_string()),
             None,
             held,
-            "skipped before the prompt: fewer than two displays",
+            skip.note,
             "pre-prompt",
         );
     }
@@ -730,6 +741,13 @@ fn record_physical(args: &Args, spec: PhysicalSpec<'_>) -> HardwareRow {
             );
         }
     };
+    let watch = if preset.is_none() {
+        Some(ffi::PowerWatch::start())
+    } else {
+        None
+    };
+    let watch_ok = watch.as_ref().is_some_and(|(_, ok)| *ok);
+    drain_stdin();
     crate::report::write_stdout(instruction);
     if stop_requested() {
         return hardware_row(
@@ -747,8 +765,15 @@ fn record_physical(args: &Args, spec: PhysicalSpec<'_>) -> HardwareRow {
             outcome: value.to_string(),
             method: "preset".to_string(),
         },
-        None => wait_for_sleep_or_skip(timeout, kind, &since),
+        None => wait_for_sleep_or_skip(Wait {
+            timeout,
+            kind,
+            since: &since,
+            instruction,
+            watch_ok,
+        }),
     };
+    drop(watch);
     let gap = stop_heartbeat(beat);
     if choice.outcome == "interrupted" || stop_requested() {
         return hardware_row(
@@ -823,77 +848,213 @@ fn stop_heartbeat(beat: Option<HeartbeatChild>) -> Option<u64> {
     heartbeat_gap(&beat.path)
 }
 
-fn wait_for_sleep_or_skip(timeout: Duration, kind: LidKind, since: &str) -> Choice {
+struct Wait<'a> {
+    timeout: Duration,
+    kind: LidKind,
+    since: &'a str,
+    instruction: &'a str,
+    watch_ok: bool,
+}
+
+fn wait_for_sleep_or_skip(wait: Wait<'_>) -> Choice {
     if stop_requested() {
         return Choice {
             outcome: "interrupted".to_string(),
             method: "interrupted".to_string(),
         };
     }
+    drain_stdin();
     crate::report::write_stdout(">");
-    match read_line_blocking() {
-        LineRead::Eof => Choice {
-            outcome: "no-input".to_string(),
-            method: "no-input".to_string(),
-        },
-        LineRead::Interrupted => Choice {
-            outcome: "interrupted".to_string(),
-            method: "interrupted".to_string(),
-        },
-        LineRead::Line(line) => {
-            let word = line.trim().to_ascii_lowercase();
-            if word.is_empty() || word == "enter" || word == "y" || word == "yes" {
-                watch_after_prompt(timeout, kind, since)
-            } else {
-                Choice {
-                    outcome: "skip".to_string(),
-                    method: "operator-skip".to_string(),
-                }
-            }
-        }
-    }
-}
-
-fn watch_after_prompt(timeout: Duration, kind: LidKind, since: &str) -> Choice {
-    let (watch, watch_ok) = ffi::PowerWatch::start();
-    ffi::PowerWatch::reset();
-    let started = Instant::now();
-    let mut log_ok = false;
+    let mut pending = String::new();
+    let mut saw_closed = false;
     loop {
         if stop_requested() {
-            drop(watch);
             return Choice {
                 outcome: "interrupted".to_string(),
                 method: "interrupted".to_string(),
             };
         }
+        if ffi::clamshell_closed() == 1 {
+            saw_closed = true;
+        }
+        ffi::PowerWatch::pump(50);
+        match poll_line(&mut pending, 150) {
+            LineRead::Pending => {}
+            LineRead::Eof => {
+                return Choice {
+                    outcome: "no-input".to_string(),
+                    method: "no-input".to_string(),
+                };
+            }
+            LineRead::Line(line) => {
+                let word = line.trim().to_ascii_lowercase();
+                if word == "skip" {
+                    return Choice {
+                        outcome: "skip".to_string(),
+                        method: "operator-skip".to_string(),
+                    };
+                }
+                if word.is_empty() || word == "enter" || word == "y" || word == "yes" {
+                    return watch_after_prompt(
+                        wait.timeout,
+                        wait.kind,
+                        wait.since,
+                        saw_closed,
+                        wait.watch_ok,
+                    );
+                }
+                crate::report::write_stdout(wait.instruction);
+                crate::report::write_stdout(">");
+            }
+        }
+    }
+}
+
+fn setup_skip(kind: LidKind) -> Option<SetupSkip> {
+    let model = command_text("sysctl", &["-n", "hw.model"]);
+    let registry = match ffi::has_lid() {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    };
+    let laptop = plan::has_lid(&model, registry);
+    match kind {
+        LidKind::OnPower => {
+            let batt = command_text("pmset", &["-g", "batt"]);
+            plan::lid_on_power(laptop, plan::ac_power(&batt))
+        }
+        LidKind::External => plan::lid_external(laptop, ffi::display_count()),
+        LidKind::PowerKey => plan::power_key(plan::touch_id_sensor(ffi::touch_id())),
+    }
+}
+
+fn command_text(program: &str, args: &[&str]) -> String {
+    command_result(program, args).0
+}
+
+fn command_result(program: &str, args: &[&str]) -> (String, bool) {
+    match Command::new(program).args(args).output() {
+        Ok(output) => (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            output.status.success(),
+        ),
+        Err(_) => (String::new(), false),
+    }
+}
+
+fn drain_stdin() {
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
+fn sleep_since(since: &str) -> Option<Choice> {
+    let raw = pmset_log();
+    let pmset = classify_pmset_since(&raw, since);
+    let event = detected_sleep(
+        ffi::PowerWatch::system_slept(),
+        ffi::PowerWatch::display_slept(),
+        pmset,
+    )?;
+    let method = detection_method(
+        ffi::PowerWatch::system_slept(),
+        ffi::PowerWatch::display_slept(),
+        pmset,
+    );
+    Some(Choice {
+        outcome: outcome_token(event).to_string(),
+        method: method.to_string(),
+    })
+}
+
+fn lid_method(since: &str, saw_closed: bool) -> Option<&'static str> {
+    let window = log_since(&pmset_log(), since);
+    if !lid_close_seen(ffi::PowerWatch::system_slept(), saw_closed, &window) {
+        return None;
+    }
+    if ffi::PowerWatch::system_slept() {
+        Some("iokit-power-notification")
+    } else if crate::sleep_detect::clamshell_sleep(&window) {
+        Some("pmset-log")
+    } else {
+        Some("clamshell-state")
+    }
+}
+
+fn lid_choice(kind: LidKind, since: &str, saw_closed: bool) -> Option<Choice> {
+    let method = lid_method(since, saw_closed)?;
+    let outcome = if kind == LidKind::External && !ffi::PowerWatch::system_slept() {
+        "closed"
+    } else {
+        "slept"
+    };
+    Some(Choice {
+        outcome: outcome.to_string(),
+        method: method.to_string(),
+    })
+}
+
+fn watch_after_prompt(
+    timeout: Duration,
+    kind: LidKind,
+    since: &str,
+    mut saw_closed: bool,
+    watch_ok: bool,
+) -> Choice {
+    ffi::PowerWatch::pump(200);
+    if ffi::clamshell_closed() == 1 {
+        saw_closed = true;
+    }
+    if matches!(kind, LidKind::OnPower | LidKind::External) {
+        if let Some(choice) = lid_choice(kind, since, saw_closed) {
+            return choice;
+        }
+    } else if let Some(choice) = sleep_since(since) {
+        return choice;
+    }
+    let started = Instant::now();
+    let mut log_ok = false;
+    loop {
+        if stop_requested() {
+            return Choice {
+                outcome: "interrupted".to_string(),
+                method: "interrupted".to_string(),
+            };
+        }
+        if ffi::clamshell_closed() == 1 {
+            saw_closed = true;
+        }
         let raw = pmset_log();
         if !raw.is_empty() {
             log_ok = true;
         }
-        let pmset = classify_pmset_since(&raw, since);
-        if let Some(event) = detected_sleep(
-            ffi::PowerWatch::system_slept(),
-            ffi::PowerWatch::display_slept(),
-            pmset,
-        ) {
-            let method = detection_method(
+        if matches!(kind, LidKind::OnPower | LidKind::External) {
+            if let Some(choice) = lid_choice(kind, since, saw_closed) {
+                return choice;
+            }
+        } else {
+            let pmset = classify_pmset_since(&raw, since);
+            if let Some(event) = detected_sleep(
                 ffi::PowerWatch::system_slept(),
                 ffi::PowerWatch::display_slept(),
                 pmset,
-            );
-            drop(watch);
-            return Choice {
-                outcome: outcome_token(event).to_string(),
-                method: method.to_string(),
-            };
+            ) {
+                let method = detection_method(
+                    ffi::PowerWatch::system_slept(),
+                    ffi::PowerWatch::display_slept(),
+                    pmset,
+                );
+                return Choice {
+                    outcome: outcome_token(event).to_string(),
+                    method: method.to_string(),
+                };
+            }
         }
         if started.elapsed() >= timeout {
             break;
         }
         ffi::PowerWatch::pump(200);
     }
-    drop(watch);
     let method = if watch_ok {
         "iokit-power-notification"
     } else if log_ok {
@@ -936,28 +1097,49 @@ fn local_stamp() -> Option<String> {
 
 enum LineRead {
     Line(String),
+    Pending,
     Eof,
-    Interrupted,
 }
 
-fn read_line_blocking() -> LineRead {
-    let mut line = String::new();
-    loop {
-        if stop_requested() {
-            return LineRead::Interrupted;
-        }
-        match io::stdin().lock().read_line(&mut line) {
-            Ok(0) => return LineRead::Eof,
-            Ok(_) => return LineRead::Line(line.trim().to_string()),
-            Err(error) if error.kind() == ErrorKind::Interrupted => {
-                if stop_requested() {
-                    return LineRead::Interrupted;
-                }
-                line.clear();
-            }
-            Err(_) => return LineRead::Eof,
-        }
+fn poll_line(pending: &mut String, wait_ms: i32) -> LineRead {
+    if let Some(line) = next_line(pending) {
+        return LineRead::Line(line);
     }
+    let mut fd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut fd, 1, wait_ms) };
+    if rc < 0 {
+        return LineRead::Pending;
+    }
+    if rc == 0 {
+        return LineRead::Pending;
+    }
+    if (fd.revents & libc::POLLIN) == 0 {
+        return LineRead::Eof;
+    }
+    let mut buf = [0u8; 256];
+    let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        return LineRead::Pending;
+    }
+    if n == 0 {
+        return LineRead::Eof;
+    }
+    pending.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+    if let Some(line) = next_line(pending) {
+        LineRead::Line(line)
+    } else {
+        LineRead::Pending
+    }
+}
+
+fn next_line(pending: &mut String) -> Option<String> {
+    let end = pending.find('\n')?;
+    let line = pending.drain(..=end).collect::<String>();
+    Some(line.trim().to_string())
 }
 
 fn stdin_is_terminal() -> bool {

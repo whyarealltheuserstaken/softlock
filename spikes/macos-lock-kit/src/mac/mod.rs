@@ -4,7 +4,7 @@
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -384,6 +384,10 @@ fn note_documented(record: &mut ExerciseRecord, attempt: Attempt, keys: KeyNote)
             record.state = "os-locked".to_string();
             record.result = "os-locked".to_string();
             record.lock_check = "available".to_string();
+            push_detail(
+                record,
+                "the documented path locked the session without the private symbol",
+            );
         }
         Attempt::StillRunning => {
             record.documented_path = "failed".to_string();
@@ -563,16 +567,13 @@ fn attempt_private() -> Tried {
 
 fn attempt_documented(facts: &Facts) -> Tried {
     let started = Instant::now();
+    let mut notes = Vec::new();
     match start_engine(facts) {
-        Err(error) => tried(
-            Attempt::Failed {
-                detail: error,
-                returned_ms: None,
-            },
-            Poll::none(),
-        ),
-        Ok(returned_ms) => {
+        Err(error) => notes.push(format!("ScreenSaverEngine: {error}")),
+        Ok((returned_ms, mut child)) => {
             if signals::tripped() {
+                let _ = child.kill();
+                let _ = child.wait();
                 return tried(
                     Attempt::Failed {
                         detail: "interrupted".to_string(),
@@ -582,6 +583,36 @@ fn attempt_documented(facts: &Facts) -> Tried {
                 );
             }
             let poll = poll_locked(started);
+            if matches!(poll.seen, LockSeen::Yes(_)) {
+                return tried(locked_attempt(returned_ms, &poll), poll);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            notes.push(
+                "ScreenSaverEngine started and the session was not locked (askForPassword is often unset on macOS 26)"
+                    .to_string(),
+            );
+        }
+    }
+    if signals::tripped() {
+        return tried(
+            Attempt::Failed {
+                detail: "interrupted".to_string(),
+                returned_ms: None,
+            },
+            Poll::none(),
+        );
+    }
+    match display_sleep_now() {
+        Err(error) => tried(
+            Attempt::Failed {
+                detail: format!("{}; {error}", notes.join("; ")),
+                returned_ms: None,
+            },
+            Poll::none(),
+        ),
+        Ok(returned_ms) => {
+            let poll = poll_locked_for(started, Duration::from_secs(8));
             let attempt = match poll.seen {
                 LockSeen::Yes(until_locked_ms) => Attempt::Locked {
                     returned_ms: Some(returned_ms),
@@ -591,13 +622,49 @@ fn attempt_documented(facts: &Facts) -> Tried {
                     returned_ms: Some(returned_ms),
                 },
                 LockSeen::No => Attempt::Failed {
-                    detail: "the screen saver started and the session was not locked".to_string(),
+                    detail: format!(
+                        "{}; pmset displaysleepnow returned and the session was not locked",
+                        notes.join("; ")
+                    ),
                     returned_ms: Some(returned_ms),
                 },
             };
             tried(attempt, poll)
         }
     }
+}
+
+fn locked_attempt(returned_ms: u64, poll: &Poll) -> Attempt {
+    match poll.seen {
+        LockSeen::Yes(until_locked_ms) => Attempt::Locked {
+            returned_ms: Some(returned_ms),
+            until_locked_ms,
+        },
+        _ => Attempt::Failed {
+            detail: "the session was not locked".to_string(),
+            returned_ms: Some(returned_ms),
+        },
+    }
+}
+
+fn display_sleep_now() -> Result<u64, String> {
+    let program = "/usr/bin/pmset";
+    let args = ["displaysleepnow"];
+    if !crate::commands::documented_display_sleep_allowed(program, &args) {
+        return Err("pmset displaysleepnow is not an allowed documented lock".to_string());
+    }
+    let started = Instant::now();
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| error.to_string())?;
+    if !status.success() {
+        return Err(format!("pmset displaysleepnow exited {status}"));
+    }
+    Ok(elapsed_ms(started.elapsed()))
 }
 
 fn wait_private() -> CallWait {
@@ -649,6 +716,10 @@ impl Poll {
 }
 
 fn poll_locked(started: Instant) -> Poll {
+    poll_locked_for(started, LOCK_POLL)
+}
+
+fn poll_locked_for(started: Instant, budget: Duration) -> Poll {
     if !session_check_available() {
         return Poll {
             seen: LockSeen::Unavailable,
@@ -656,7 +727,7 @@ fn poll_locked(started: Instant) -> Poll {
             key_false: Some(false),
         };
     }
-    let deadline = Instant::now() + LOCK_POLL;
+    let deadline = Instant::now() + budget;
     loop {
         if signals::tripped() {
             return Poll::none();
@@ -1017,7 +1088,7 @@ fn invoke_private() -> Result<u64, String> {
     Ok(elapsed_ms(started.elapsed()))
 }
 
-fn start_engine(facts: &Facts) -> Result<u64, String> {
+fn start_engine(facts: &Facts) -> Result<(u64, Child), String> {
     let Some(path) = facts.engine_path.as_deref() else {
         return Err("screen saver engine is missing".to_string());
     };
@@ -1033,16 +1104,20 @@ fn start_engine(facts: &Facts) -> Result<u64, String> {
         .map_err(|error| error.to_string())?;
     for _ in 0..40 {
         if signals::tripped() {
+            let _ = child.kill();
+            let _ = child.wait();
             return Err("interrupted".to_string());
         }
         if engine_running() {
-            return Ok(elapsed_ms(started.elapsed()));
+            return Ok((elapsed_ms(started.elapsed()), child));
         }
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!("screen saver engine exited {status}"));
         }
         thread::sleep(Duration::from_millis(50));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     Err("screen saver engine did not start".to_string())
 }
 

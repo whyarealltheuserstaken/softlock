@@ -3,6 +3,8 @@
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
+#import <LocalAuthentication/LocalAuthentication.h>
+#import <IOKit/IOKitLib.h>
 #import <IOKit/IOMessage.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
 
@@ -159,6 +161,76 @@ int m07_assertions_release(uint32_t system_id, uint32_t display_id) {
         display_rc = IOPMAssertionRelease(display_id);
     }
     return (system_rc == kIOReturnSuccess && display_rc == kIOReturnSuccess) ? 0 : 1;
+}
+
+#ifndef kIOMainPortDefault
+#define kIOMainPortDefault kIOMasterPortDefault
+#endif
+
+static int service_present(const char *name) {
+    io_iterator_t iter = IO_OBJECT_NULL;
+    kern_return_t kr =
+        IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(name), &iter);
+    if (kr != KERN_SUCCESS) {
+        return -1;
+    }
+    io_object_t found = IOIteratorNext(iter);
+    int present = found == IO_OBJECT_NULL ? 0 : 1;
+    if (found != IO_OBJECT_NULL) {
+        IOObjectRelease(found);
+    }
+    IOObjectRelease(iter);
+    return present;
+}
+
+int m07_touch_id(void) {
+    @autoreleasepool {
+        LAContext *context = [[LAContext alloc] init];
+        if (context != nil) {
+            NSError *error = nil;
+            (void)[context canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
+                                       error:&error];
+            if (context.biometryType == LABiometryTypeTouchID) {
+                return 1;
+            }
+            if (context.biometryType == LABiometryTypeNone) {
+                return 0;
+            }
+            return 0;
+        }
+    }
+    return service_present("AppleBiometricSensor");
+}
+
+// 1 closed, 0 open, -1 the clamshell property is absent.
+int m07_clamshell_closed(void) {
+    char path[128];
+    snprintf(path, sizeof path, "%s:/IOPowerConnection/IOPMrootDomain", kIOPowerPlane);
+    io_registry_entry_t root = IORegistryEntryFromPath(kIOMainPortDefault, path);
+    if (root == IO_OBJECT_NULL) {
+        return -1;
+    }
+    CFTypeRef value = IORegistryEntryCreateCFProperty(root, CFSTR("AppleClamshellState"),
+                                                      kCFAllocatorDefault, 0);
+    IOObjectRelease(root);
+    if (value == NULL) {
+        return -1;
+    }
+    int closed = -1;
+    if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
+        closed = CFBooleanGetValue((CFBooleanRef)value) ? 1 : 0;
+    }
+    CFRelease(value);
+    return closed;
+}
+
+// 1 when a clamshell property or an internal battery exists, 0 when the registry says neither.
+int m07_has_lid(void) {
+    int clamshell = m07_clamshell_closed();
+    if (clamshell == 0 || clamshell == 1) {
+        return 1;
+    }
+    return service_present("AppleSmartBattery");
 }
 
 int m07_display_count(void) {

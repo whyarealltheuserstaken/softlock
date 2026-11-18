@@ -193,10 +193,14 @@ fn hardware_row(id: &str, name: &str, key: &str, text: &str, mode: &str) -> Row 
     }
     let physical = true;
     match value.as_str() {
-        "slept" | "awake" | "restart-panel" | "nothing" if method != "none" => {
+        // A lid row needs a positive lid signal. Awake means Enter arrived and no lid close was seen.
+        "awake" if id.starts_with("m07-lid") => row(id, name, "fail", None, physical, detail),
+        "slept" | "closed" | "restart-panel" | "nothing" if method != "none" => {
             row(id, name, "pass", None, physical, detail)
         }
-        "no-external-display" => row(id, name, "skip", Some("not-applicable"), physical, detail),
+        "no-external-display" | "no-lid" | "on-battery" | "no-touch-id" => {
+            row(id, name, "skip", Some("not-applicable"), physical, detail)
+        }
         "skip" => row(id, name, "skip", Some("operator"), physical, detail),
         "no-input" => row(id, name, "skip", Some("no-input"), physical, detail),
         "interrupted" => row(id, name, "skip", Some("interrupted"), physical, detail),
@@ -263,12 +267,18 @@ pub fn lock_exercise_row(id: &str, text: &str, ran: bool) -> Row {
     let locked = field(text, "state").as_deref() == Some("os-locked")
         && field(text, "lock-screen-appeared").as_deref() == Some("yes")
         && field(text, "input-reached-desktop-without-login").as_deref() == Some("no");
-    let status = if result == "os-locked" && locked {
+    let documented_row = id.contains("documented");
+    let documented_started = field(text, "documented-path").as_deref() == Some("started");
+    let private_fallback = field(text, "fail-closed").as_deref() == Some("lock-private");
+    let status = if result == "os-locked"
+        && locked
+        && (!documented_row || (documented_started && !private_fallback))
+    {
         "pass"
     } else {
         "fail"
     };
-    row(
+    let mut built = row(
         id,
         name,
         status,
@@ -279,6 +289,54 @@ pub fn lock_exercise_row(id: &str, text: &str, ran: bool) -> Row {
             field(text, "lock-screen-appeared").unwrap_or_else(|| "missing".into()),
             field(text, "input-reached-desktop-without-login").unwrap_or_else(|| "missing".into())
         ),
+    );
+    if let Some(changed) = field(text, "settings-changed") {
+        built
+            .measurements
+            .insert("settings-changed".into(), json!(changed));
+    }
+    if documented_row && let Some(delay) = field(text, "screen-lock-status") {
+        built
+            .measurements
+            .insert("screen-lock-status".into(), json!(delay));
+    }
+    built
+}
+
+pub fn keep_process_row(text: &str, exit_code: i32) -> Row {
+    let created = field(text, "assertion-created").as_deref() == Some("true");
+    let released = field(text, "assertion-released").as_deref() == Some("true");
+    let crashed = text.trim().is_empty() || exit_code == 127 || exit_code > 128;
+    if created && released && !crashed {
+        return row(
+            "m07-process",
+            "Keep-awake process",
+            "pass",
+            None,
+            false,
+            format!(
+                "assertions created and released; kit exit {exit_code} belongs to the hardware rows"
+            ),
+        );
+    }
+    let detail = if text.trim().is_empty() {
+        format!("keep-awake produced no result, exit {exit_code}")
+    } else if crashed {
+        format!("keep-awake crashed, exit {exit_code}")
+    } else {
+        format!(
+            "assertion-created={} assertion-released={} exit {exit_code}",
+            field(text, "assertion-created").unwrap_or_else(|| "missing".into()),
+            field(text, "assertion-released").unwrap_or_else(|| "missing".into())
+        )
+    };
+    row(
+        "m07-process",
+        "Keep-awake process",
+        "fail",
+        None,
+        false,
+        detail,
     )
 }
 
@@ -385,16 +443,18 @@ pub fn fail_closed(
     }
 }
 
-/// Assertions the kit released, and no fail-closed lock left the session held.
-pub fn restored_from(rows: &[Row], fail_closed_lock: bool) -> bool {
-    if fail_closed_lock {
-        return false;
-    }
+/// Assertions released and no preference write. A fail-closed OS lock is not an unrestored setting.
+pub fn restored_from(rows: &[Row]) -> bool {
     rows.iter().all(|row| {
         row.measurements
             .get("assertion-released")
             .and_then(Value::as_str)
             != Some("false")
+            && row
+                .measurements
+                .get("settings-changed")
+                .and_then(Value::as_str)
+                != Some("true")
     })
 }
 
@@ -562,6 +622,23 @@ power-key-detection=iokit-power-notification
         assert_eq!(rows[3].status, "skip");
         assert_eq!(rows[3].skip_reason.as_deref(), Some("operator"));
         assert_eq!(rows[4].status, "pass");
+        let awake = "\
+mode=kit
+assertion-created=true
+assertion-released=true
+result=pass
+app-nap-verdict=napped
+lid-on-power=awake
+lid-on-power-detection=iokit-power-notification
+lid-external=closed
+lid-external-detection=clamshell-state
+power-key=nothing
+power-key-detection=iokit-power-notification
+";
+        let rows = keep_awake_rows(awake);
+        assert_eq!(rows[2].id, "m07-lid-on-power");
+        assert_eq!(rows[2].status, "fail");
+        assert_eq!(rows[3].status, "pass");
     }
 
     #[test]
@@ -643,13 +720,37 @@ power-key=not-run-on-runner
             "mode=kit\nassertion-created=true\nassertion-released=true\nresult=pass\napp-nap-verdict=\nlid-on-power=no-input\nlid-external=no-external-display\npower-key=no-input\n",
         );
         assert_eq!(empty[1].status, "fail");
-        assert!(restored_from(&empty, false));
-        assert!(!restored_from(
-            &keep_awake_rows(
-                "mode=kit\nassertion-created=true\nassertion-released=false\nresult=fail\napp-nap-verdict=not-claimed\nlid-on-power=no-input\nlid-external=no-input\npower-key=no-input\n"
-            ),
-            false
-        ));
+        assert!(restored_from(&empty));
+        assert!(!restored_from(&keep_awake_rows(
+            "mode=kit\nassertion-created=true\nassertion-released=false\nresult=fail\napp-nap-verdict=not-claimed\nlid-on-power=no-input\nlid-external=no-input\npower-key=no-input\n"
+        )));
+        let fallback = lock_exercise_row(
+            "m08-documented",
+            "result=os-locked\nstate=os-locked\nlock-screen-appeared=yes\ninput-reached-desktop-without-login=no\ndocumented-path=failed\nfail-closed=lock-private\nsettings-changed=false\n",
+            true,
+        );
+        assert_eq!(fallback.status, "fail");
+        assert!(restored_from(&[fallback]));
+        let started_private = lock_exercise_row(
+            "m08-documented",
+            "result=os-locked\nstate=os-locked\nlock-screen-appeared=yes\ninput-reached-desktop-without-login=no\ndocumented-path=started\nfail-closed=lock-private\nscreen-lock-status=immediate\nsettings-changed=false\n",
+            true,
+        );
+        assert_eq!(started_private.status, "fail");
+        assert_eq!(
+            started_private
+                .measurements
+                .get("screen-lock-status")
+                .and_then(|value| value.as_str()),
+            Some("immediate")
+        );
+        let healthy = keep_process_row(
+            "assertion-created=true\nassertion-released=true\nresult=incomplete\n",
+            1,
+        );
+        assert_eq!(healthy.status, "pass");
+        assert!(healthy.detail.contains("hardware rows"));
+        assert_eq!(keep_process_row("", 1).status, "fail");
         assert_eq!(scrub_model("MacBookPro16,2"), "MacBookPro16,2");
         assert_eq!(scrub_model("serial number"), "");
     }
