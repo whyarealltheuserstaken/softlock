@@ -877,10 +877,7 @@ fn setup_skip(kind: LidKind) -> Option<SetupSkip> {
             plan::lid_on_power(laptop, plan::ac_power(&batt))
         }
         LidKind::External => plan::lid_external(laptop, ffi::display_count()),
-        LidKind::PowerKey => {
-            let (text, ok) = command_result("ioreg", &["-n", "AppleBiometricSensor", "-r"]);
-            plan::power_key(plan::touch_id_sensor(&text, ok))
-        }
+        LidKind::PowerKey => plan::power_key(plan::touch_id_sensor(ffi::touch_id())),
     }
 }
 

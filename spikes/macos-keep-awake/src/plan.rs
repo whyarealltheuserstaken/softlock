@@ -65,12 +65,13 @@ pub fn ac_power(pmset_batt: &str) -> Option<bool> {
     }
 }
 
-/// `Some` only when `ioreg` actually answered. Empty output means no sensor.
-pub fn touch_id_sensor(ioreg: &str, command_ok: bool) -> Option<bool> {
-    if !command_ok {
-        return None;
+/// `1` is a sensor, `0` is a registry answer with no sensor, anything else is unread.
+pub fn touch_id_sensor(code: i32) -> Option<bool> {
+    match code {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
     }
-    Some(ioreg.contains("AppleBiometricSensor"))
 }
 
 #[cfg(test)]
@@ -109,11 +110,8 @@ mod tests {
         assert_eq!(ac_power("Now drawing from 'AC Power'"), Some(true));
         assert_eq!(ac_power("Now drawing from 'Battery Power'"), Some(false));
         assert_eq!(ac_power(""), None);
-        assert_eq!(
-            touch_id_sensor("+-o AppleBiometricSensor  <class>\n", true),
-            Some(true)
-        );
-        assert_eq!(touch_id_sensor("", true), Some(false));
-        assert_eq!(touch_id_sensor("", false), None);
+        assert_eq!(touch_id_sensor(1), Some(true));
+        assert_eq!(touch_id_sensor(0), Some(false));
+        assert_eq!(touch_id_sensor(-1), None);
     }
 }

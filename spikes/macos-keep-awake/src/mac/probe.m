@@ -3,6 +3,7 @@
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
+#import <IOKit/IOKitLib.h>
 #import <IOKit/IOMessage.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
 
@@ -159,6 +160,26 @@ int m07_assertions_release(uint32_t system_id, uint32_t display_id) {
         display_rc = IOPMAssertionRelease(display_id);
     }
     return (system_rc == kIOReturnSuccess && display_rc == kIOReturnSuccess) ? 0 : 1;
+}
+
+#ifndef kIOMainPortDefault
+#define kIOMainPortDefault kIOMasterPortDefault
+#endif
+
+int m07_touch_id(void) {
+    io_iterator_t iter = IO_OBJECT_NULL;
+    kern_return_t kr = IOServiceGetMatchingServices(
+        kIOMainPortDefault, IOServiceMatching("AppleBiometricSensor"), &iter);
+    if (kr != KERN_SUCCESS) {
+        return -1;
+    }
+    io_object_t found = IOIteratorNext(iter);
+    int present = found == IO_OBJECT_NULL ? 0 : 1;
+    if (found != IO_OBJECT_NULL) {
+        IOObjectRelease(found);
+    }
+    IOObjectRelease(iter);
+    return present;
 }
 
 int m07_display_count(void) {
