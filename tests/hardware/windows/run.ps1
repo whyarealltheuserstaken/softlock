@@ -1509,23 +1509,28 @@ try {
             $already = Test-SessionLocked $state
             if (-not $already) {
                 $step = 'causes'
-                # Not List[string].Add: on Windows PowerShell 5.1 that call is
-                # rejected with "Argument types do not match".
-                $causes = @()
-                $failedIds = @()
+                # Windows PowerShell 5.1 reports "Argument types do not match"
+                # for List[string].Add and for -join on that collection. Build
+                # the sentence with string concatenation only.
+                $because = ''
                 foreach ($row in @($results)) {
-                    if ($row.status -eq 'fail') { $failedIds += [string]$row.id }
+                    if ($row.status -ne 'fail') { continue }
+                    $id = '' + $row.id
+                    if ($because.Length -eq 0) { $because = 'rows ' + $id }
+                    else { $because = $because + ', ' + $id }
                 }
-                if ($failedIds.Count -gt 0) {
-                    $joined = [string]($failedIds -join ', ')
-                    $causes += ('rows ' + $joined)
+                if ($script:SuiteError) {
+                    if ($because.Length -eq 0) { $because = '' + $script:SuiteError }
+                    else { $because = $because + '; ' + $script:SuiteError }
                 }
-                if ($script:SuiteError) { $causes += [string]$script:SuiteError }
                 foreach ($item in @($restoreErrors)) {
-                    if ($item -and [string]$item -ne [string]$script:SuiteError) { $causes += [string]$item }
+                    if (-not $item) { continue }
+                    $line = '' + $item
+                    if ($script:SuiteError -and $line -eq $script:SuiteError) { continue }
+                    if ($because.Length -eq 0) { $because = $line }
+                    else { $because = $because + '; ' + $line }
                 }
-                if (@($causes).Count -eq 0) { $causes += 'a row failed' }
-                $because = [string](@($causes) -join '; ')
+                if ($because.Length -eq 0) { $because = 'a row failed' }
                 if ($script:LocksEnabled) {
                     Write-Host ("Locking Windows because " + $because + '.')
                 }
