@@ -1,0 +1,80 @@
+name: Windows hardware suite
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hardware-windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: path changes
+    runs-on: ubuntu-latest
+    outputs:
+      shared: ${{ steps.paths.outputs.shared }}
+      windows: ${{ steps.paths.outputs.windows }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Path filter self-check
+        run: bash .github/ci-path-outputs.sh --self-check
+      - name: Classify changed paths (fail closed)
+        id: paths
+        shell: bash
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_EVENT_PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash .github/ci-path-outputs.sh
+
+  suite:
+    name: hardware suite (${{ matrix.image }})
+    needs: changes
+    if: |
+      always() &&
+      needs.changes.result == 'success' &&
+      (github.ref == 'refs/heads/main' ||
+       needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs.windows == 'true')
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Format and clippy the harness
+        shell: powershell
+        run: |
+          cargo fmt --manifest-path tests\hardware\windows\harness\Cargo.toml -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --manifest-path tests\hardware\windows\harness\Cargo.toml --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Non-physical suite
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass -File tests\hardware\windows\run.ps1 --ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = "tests\hardware\windows\harness\target\release\softlock-win-hwsuite.exe"
+          $files = @(Get-ChildItem -Path suite-output -Recurse -Filter result.json)
+          if ($files.Count -lt 1) { Write-Error "result.json was not written"; exit 1 }
+          foreach ($file in $files) {
+            & $exe conform --file $file.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $py = "python"
+          if (-not (Get-Command python -ErrorAction SilentlyContinue)) { $py = "python3" }
+          & $py tests\hardware\check-schema.py $files[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

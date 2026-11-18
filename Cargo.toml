@@ -21,6 +21,7 @@ exclude = [
     "spikes/macos-lock-kit",
     "tests/hardware/macos",
     "tests/hardware/linux",
+    "tests/hardware/windows/harness",
 ]
 
 [workspace.package]
