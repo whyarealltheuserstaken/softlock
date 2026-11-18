@@ -1508,31 +1508,38 @@ try {
             $step = 'Test-SessionLocked'
             $already = Test-SessionLocked $state
             if (-not $already) {
-                $step = 'causes'
-                # Windows PowerShell 5.1 reports "Argument types do not match"
-                # for List[string].Add and for -join on that collection. Build
-                # the sentence with string concatenation only.
+                $step = 'causes-rows'
+                # A string literal plus a value is what Windows PowerShell 5.1
+                # rejects with "Argument types do not match" (op_Addition).
+                # Interpolation does not call that operator.
                 $because = ''
-                foreach ($row in @($results)) {
-                    if ($row.status -ne 'fail') { continue }
-                    $id = '' + $row.id
-                    if ($because.Length -eq 0) { $because = 'rows ' + $id }
-                    else { $because = $because + ', ' + $id }
+                foreach ($row in $results) {
+                    $status = "$($row.status)"
+                    if ($status -ne 'fail') { continue }
+                    $id = "$($row.id)"
+                    if ($because) { $because = "$because, $id" } else { $because = "rows $id" }
                 }
+                $step = 'causes-errors'
                 if ($script:SuiteError) {
-                    if ($because.Length -eq 0) { $because = '' + $script:SuiteError }
-                    else { $because = $because + '; ' + $script:SuiteError }
+                    $extra = "$($script:SuiteError)"
+                    if ($because) { $because = "$because; $extra" } else { $because = $extra }
                 }
-                foreach ($item in @($restoreErrors)) {
-                    if (-not $item) { continue }
-                    $line = '' + $item
-                    if ($script:SuiteError -and $line -eq $script:SuiteError) { continue }
-                    if ($because.Length -eq 0) { $because = $line }
-                    else { $because = $because + '; ' + $line }
+                $saved = $restoreErrors
+                if ($saved -is [string]) {
+                    if ($saved -and $saved -ne "$($script:SuiteError)") {
+                        if ($because) { $because = "$because; $saved" } else { $because = "$saved" }
+                    }
+                } elseif ($null -ne $saved) {
+                    foreach ($item in $saved) {
+                        if ($item -isnot [string] -or -not $item) { continue }
+                        if ($item -eq "$($script:SuiteError)") { continue }
+                        if ($because) { $because = "$because; $item" } else { $because = "$item" }
+                    }
                 }
-                if ($because.Length -eq 0) { $because = 'a row failed' }
+                $step = 'causes-finish'
+                if (-not $because) { $because = 'a row failed' }
                 if ($script:LocksEnabled) {
-                    Write-Host ("Locking Windows because " + $because + '.')
+                    Write-Host "Locking Windows because $because."
                 }
                 $step = 'LockNow'
                 Invoke-FailClosedLock
