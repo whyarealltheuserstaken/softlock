@@ -22,6 +22,7 @@ namespace SoftLock.Hardware
         const uint WsExNoActivate = 0x08000000;
         const uint WsPopup = 0x80000000;
         const uint Marker = 0x00A00ADC;
+        const uint WmPaint = 0x000F;
         const uint WmEraseBkgnd = 0x0014;
         const uint WmNcHitTest = 0x0084;
         const uint WmPowerBroadcast = 0x0218;
@@ -45,6 +46,7 @@ namespace SoftLock.Hardware
         static IntPtr hook = IntPtr.Zero;
         static int injectedSeen;
         static WndProc overlayProc;
+        static bool paintMarker;
         static WndProc listenerProc;
         static IntPtr listenerHwnd = IntPtr.Zero;
         static Thread listenerThread;
@@ -264,8 +266,9 @@ namespace SoftLock.Hardware
                 List<Rect> monitors = MonitorRects();
                 if (monitors.Count == 0)
                 {
-                    return "{\"ok\":true,\"monitors\":0,\"windows\":0,\"topmost\":false,\"click_through\":false,\"covered\":false,\"affinity\":false,\"marker_visible\":false}";
+                    return "{\"ok\":true,\"monitors\":0,\"windows\":0,\"topmost\":false,\"click_through\":false,\"covered\":false,\"affinity\":false,\"marker_visible\":false,\"captured\":false}";
                 }
+                paintMarker = false;
                 overlayProc = OverlayWnd;
                 IntPtr proc = Marshal.GetFunctionPointerForDelegate(overlayProc);
                 IntPtr brush = GetStockObject(4);
@@ -279,7 +282,9 @@ namespace SoftLock.Hardware
                 bool click = true;
                 bool covered = true;
                 bool affinity = true;
-                bool markerVisible = false;
+                bool markerVisible = true;
+                bool captured = false;
+                int painted = 0;
                 foreach (Rect monitor in monitors)
                 {
                     int width = monitor.right - monitor.left;
@@ -301,14 +306,28 @@ namespace SoftLock.Hardware
                     {
                         topmost = false;
                         covered = false;
+                        markerVisible = false;
                         continue;
                     }
                     windows.Add(hwnd);
-                    // Paint the black frame while the window is hidden, then show it
-                    // at alpha 0. The old marker brush flashed purple for one frame.
-                    SetLayeredWindowAttributes(hwnd, 0, 0, 2);
+                    // Stay hidden through the first paint, which is black. The marker
+                    // is painted only after the window is shown, so the capture check
+                    // can see it on screen and then confirm capture excluded it.
+                    paintMarker = false;
+                    SetLayeredWindowAttributes(hwnd, 0, 255, 2);
                     UpdateWindow(hwnd);
                     ShowWindow(hwnd, 8);
+                    paintMarker = true;
+                    InvalidateRect(hwnd, IntPtr.Zero, false);
+                    UpdateWindow(hwnd);
+                    FlushFrame();
+                    painted++;
+                    int cx = monitor.left + (width / 2);
+                    int cy = monitor.top + (height / 2);
+                    if (ScreenPixel(cx, cy) != Marker)
+                    {
+                        markerVisible = false;
+                    }
                     uint style = (uint)GetExStyle(hwnd).ToInt64();
                     if ((style & WsExTopmost) == 0)
                     {
@@ -346,16 +365,15 @@ namespace SoftLock.Hardware
                             affinity = false;
                         }
                     }
-                    IntPtr dc = GetDC(IntPtr.Zero);
-                    if (dc != IntPtr.Zero)
+                    FlushFrame();
+                    if (ScreenPixel(cx, cy) == Marker)
                     {
-                        uint pixel = GetPixel(dc, monitor.left + (width / 2), monitor.top + (height / 2));
-                        ReleaseDC(IntPtr.Zero, dc);
-                        if (pixel == Marker)
-                        {
-                            markerVisible = true;
-                        }
+                        captured = true;
                     }
+                }
+                if (painted == 0)
+                {
+                    markerVisible = false;
                 }
                 return "{\"ok\":true,\"monitors\":" + monitors.Count
                     + ",\"windows\":" + windows.Count
@@ -363,14 +381,16 @@ namespace SoftLock.Hardware
                     + ",\"click_through\":" + Bool(click)
                     + ",\"covered\":" + Bool(covered)
                     + ",\"affinity\":" + Bool(affinity)
-                    + ",\"marker_visible\":" + Bool(markerVisible) + "}";
+                    + ",\"marker_visible\":" + Bool(markerVisible)
+                    + ",\"captured\":" + Bool(captured) + "}";
             }
             catch (Exception error)
             {
-                return "{\"ok\":false,\"monitors\":0,\"windows\":0,\"topmost\":false,\"click_through\":false,\"covered\":false,\"affinity\":false,\"marker_visible\":false,\"error\":\"" + Esc(error.Message) + "\"}";
+                return "{\"ok\":false,\"monitors\":0,\"windows\":0,\"topmost\":false,\"click_through\":false,\"covered\":false,\"affinity\":false,\"marker_visible\":false,\"captured\":false,\"error\":\"" + Esc(error.Message) + "\"}";
             }
             finally
             {
+                paintMarker = false;
                 foreach (IntPtr hwnd in windows)
                 {
                     DestroyWindow(hwnd);
@@ -792,6 +812,24 @@ namespace SoftLock.Hardware
 
         static IntPtr OverlayWnd(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam)
         {
+            if (message == WmPaint)
+            {
+                PaintStruct paint;
+                IntPtr hdc = BeginPaint(hwnd, out paint);
+                if (hdc != IntPtr.Zero)
+                {
+                    Rect client;
+                    if (!GetClientRect(hwnd, out client))
+                    {
+                        client = paint.area;
+                    }
+                    IntPtr brush = CreateSolidBrush(paintMarker ? Marker : 0);
+                    FillRect(hdc, ref client, brush);
+                    DeleteObject(brush);
+                }
+                EndPaint(hwnd, ref paint);
+                return IntPtr.Zero;
+            }
             if (message == WmNcHitTest)
             {
                 return new IntPtr(-1);
@@ -801,6 +839,29 @@ namespace SoftLock.Hardware
                 return new IntPtr(1);
             }
             return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+
+        static uint ScreenPixel(int x, int y)
+        {
+            IntPtr dc = GetDC(IntPtr.Zero);
+            if (dc == IntPtr.Zero)
+            {
+                return 0xFFFFFFFF;
+            }
+            uint pixel = GetPixel(dc, x, y);
+            ReleaseDC(IntPtr.Zero, dc);
+            return pixel;
+        }
+
+        static void FlushFrame()
+        {
+            try
+            {
+                DwmFlush();
+            }
+            catch (Exception)
+            {
+            }
         }
 
         static IntPtr HookCallback(int code, IntPtr wParam, IntPtr lParam)
@@ -929,6 +990,25 @@ namespace SoftLock.Hardware
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        struct PaintStruct
+        {
+            public IntPtr hdc;
+            public int erase;
+            public Rect area;
+            public int restore;
+            public int incUpdate;
+            public int reserved1;
+            public int reserved2;
+            public int reserved3;
+            public int reserved4;
+            public int reserved5;
+            public int reserved6;
+            public int reserved7;
+            public int reserved8;
+            public int pad;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
         struct Msg
         {
             public IntPtr hwnd;
@@ -973,6 +1053,14 @@ namespace SoftLock.Hardware
         [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr hwnd);
         [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int cmd);
         [DllImport("user32.dll")] static extern bool UpdateWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool InvalidateRect(IntPtr hwnd, IntPtr rect, bool erase);
+        [DllImport("user32.dll")] static extern IntPtr BeginPaint(IntPtr hwnd, out PaintStruct paint);
+        [DllImport("user32.dll")] static extern bool EndPaint(IntPtr hwnd, ref PaintStruct paint);
+        [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out Rect rect);
+        [DllImport("user32.dll")] static extern int FillRect(IntPtr hdc, ref Rect rect, IntPtr brush);
+        [DllImport("gdi32.dll")] static extern IntPtr CreateSolidBrush(uint color);
+        [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+        [DllImport("dwmapi.dll")] static extern int DwmFlush();
         [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint key, byte alpha, uint flags);
         [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
         [DllImport("user32.dll")] static extern IntPtr SendMessageW(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);

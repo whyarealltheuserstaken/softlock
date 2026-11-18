@@ -107,6 +107,21 @@ pub struct SettingIndex {
     pub dc: u32,
 }
 
+/// Per-user `ACSettingIndex` and `DCSettingIndex` are independent. A missing
+/// side falls back to that side's scheme default. Either side still missing
+/// means the index is unknown.
+pub fn resolve_power_index(
+    user_ac: Option<u32>,
+    user_dc: Option<u32>,
+    default_ac: Option<u32>,
+    default_dc: Option<u32>,
+) -> Option<SettingIndex> {
+    Some(SettingIndex {
+        ac: user_ac.or(default_ac)?,
+        dc: user_dc.or(default_dc)?,
+    })
+}
+
 /// `powercfg /q` prints the current indexes as `0x........` after any minimum
 /// or maximum. Labels are localized, so the GUID and those hex values are the
 /// whole parse. Hidden settings omitted from the dump are not found.
@@ -400,5 +415,36 @@ Energieschema-GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Ausbalanciert)
         assert_eq!(lid, SettingIndex { ac: 2, dc: 0 });
         assert!(parse_scheme_guid("").is_none());
         assert!(parse_setting_index(german, "7648efa3-dd9c-4e3e-b566-50f929386280").is_none());
+    }
+
+    #[test]
+    fn each_power_index_falls_back_on_its_own() {
+        assert_eq!(
+            resolve_power_index(Some(3), None, Some(1), Some(2)),
+            Some(SettingIndex { ac: 3, dc: 2 })
+        );
+        assert_eq!(
+            resolve_power_index(None, Some(0), Some(1), Some(2)),
+            Some(SettingIndex { ac: 1, dc: 0 })
+        );
+        assert_eq!(
+            resolve_power_index(Some(3), Some(0), Some(1), Some(2)),
+            Some(SettingIndex { ac: 3, dc: 0 })
+        );
+        assert_eq!(
+            resolve_power_index(None, None, Some(1), Some(2)),
+            Some(SettingIndex { ac: 1, dc: 2 })
+        );
+        assert_eq!(
+            resolve_power_index(Some(3), None, None, Some(2)),
+            Some(SettingIndex { ac: 3, dc: 2 })
+        );
+        assert_eq!(
+            resolve_power_index(None, Some(0), Some(1), None),
+            Some(SettingIndex { ac: 1, dc: 0 })
+        );
+        assert_eq!(resolve_power_index(Some(3), None, None, None), None);
+        assert_eq!(resolve_power_index(None, None, None, Some(2)), None);
+        assert_eq!(resolve_power_index(None, None, Some(1), None), None);
     }
 }

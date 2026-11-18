@@ -1,5 +1,7 @@
 //! Whether a hotplug step was seen. A device or mode-change event is not a
-//! change: the attached, enumerated, internal, or external count has to move.
+//! change: a display count has to move. When both the internal and external
+//! counts are known, only the external count counts, so opening the lid is
+//! not a connect.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayStep {
@@ -34,7 +36,14 @@ pub fn display_step_seen(step: DisplayStep, before: DisplayWatch, after: Display
     }
 }
 
+fn arrangement_known(watch: DisplayWatch) -> bool {
+    watch.internal >= 0 && watch.external >= 0
+}
+
 fn connect_seen(before: DisplayWatch, after: DisplayWatch) -> bool {
+    if arrangement_known(before) && arrangement_known(after) {
+        return count_rose(before.external, after.external);
+    }
     count_rose(before.active, after.active)
         || count_rose(before.monitors, after.monitors)
         || count_rose(before.internal, after.internal)
@@ -42,6 +51,9 @@ fn connect_seen(before: DisplayWatch, after: DisplayWatch) -> bool {
 }
 
 fn disconnect_seen(before: DisplayWatch, after: DisplayWatch) -> bool {
+    if arrangement_known(before) && arrangement_known(after) {
+        return count_fell(before.external, after.external);
+    }
     count_fell(before.active, after.active)
         || count_fell(before.monitors, after.monitors)
         || count_fell(before.internal, after.internal)
@@ -115,5 +127,37 @@ mod tests {
         let sample = watch(1, 1, 0, 0, 0);
         assert!(!display_step_seen(DisplayStep::Connect, sample, sample));
         assert!(!display_step_seen(DisplayStep::Disconnect, sample, sample));
+    }
+
+    fn arranged(active: i32, internal: i32, external: i32) -> DisplayWatch {
+        DisplayWatch {
+            active,
+            monitors: active.max(0),
+            internal,
+            external,
+            adds: 0,
+            removes: 0,
+            changes: 0,
+        }
+    }
+
+    #[test]
+    fn opening_or_closing_the_lid_is_not_a_hotplug_when_the_external_count_is_known() {
+        let closed = arranged(1, 0, 1);
+        let open = arranged(2, 1, 1);
+        assert!(!display_step_seen(DisplayStep::Connect, closed, open));
+        assert!(!display_step_seen(DisplayStep::Disconnect, open, closed));
+        assert!(!display_step_seen(DisplayStep::Either, closed, open));
+        assert!(!display_step_seen(DisplayStep::Either, open, closed));
+    }
+
+    #[test]
+    fn an_external_display_is_the_plug_and_unplug_when_internal_and_external_are_known() {
+        let panel = arranged(1, 1, 0);
+        let both = arranged(2, 1, 1);
+        assert!(display_step_seen(DisplayStep::Connect, panel, both));
+        assert!(!display_step_seen(DisplayStep::Disconnect, panel, both));
+        assert!(display_step_seen(DisplayStep::Disconnect, both, panel));
+        assert!(!display_step_seen(DisplayStep::Connect, both, panel));
     }
 }

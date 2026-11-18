@@ -106,28 +106,31 @@ function Get-ActiveScheme {
     return ''
 }
 
+function Read-DwordAt([string]$path, [string]$name) {
+    try { $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($path) } catch { return $null }
+    if ($null -eq $key) { return $null }
+    $value = $key.GetValue($name, $null)
+    $key.Close()
+    if ($null -eq $value) { return $null }
+    return [int]$value
+}
+
 function Read-PowerIndex([string]$setting, [string]$scheme) {
     if (-not $scheme) { $scheme = Get-ActiveScheme }
     if (-not $scheme) { return $null }
+    # Each index uses its own per-user override, then that index's scheme default.
     $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
-    $paths = @(
-        "SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$scheme\$sub\$setting",
-        "SYSTEM\CurrentControlSet\Control\Power\PowerSettings\$sub\$setting\DefaultPowerSchemeValues\$scheme"
-    )
-    foreach ($path in $paths) {
-        try { $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($path) } catch { $key = $null }
-        if ($null -eq $key) { continue }
-        $ac = $key.GetValue('ACSettingIndex', $null)
-        $dc = $key.GetValue('DCSettingIndex', $null)
-        $key.Close()
-        if ($null -ne $ac -and $null -ne $dc) {
-            return [pscustomobject]@{ scheme = $scheme; ac = [int]$ac; dc = [int]$dc }
-        }
-    }
-    return $null
+    $user = "SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$scheme\$sub\$setting"
+    $fallback = "SYSTEM\CurrentControlSet\Control\Power\PowerSettings\$sub\$setting\DefaultPowerSchemeValues\$scheme"
+    $ac = Read-DwordAt $user 'ACSettingIndex'
+    if ($null -eq $ac) { $ac = Read-DwordAt $fallback 'ACSettingIndex' }
+    $dc = Read-DwordAt $user 'DCSettingIndex'
+    if ($null -eq $dc) { $dc = Read-DwordAt $fallback 'DCSettingIndex' }
+    if ($null -eq $ac -or $null -eq $dc) { return $null }
+    return [pscustomobject]@{ scheme = $scheme; ac = [int]$ac; dc = [int]$dc }
 }
 
-function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme) {
+function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme, [bool]$reactivate) {
     $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
     if (-not $scheme) { $scheme = Get-ActiveScheme }
     if (-not $scheme) { return 'active power scheme was not found' }
@@ -135,14 +138,39 @@ function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme) {
     if ($LASTEXITCODE -ne 0) { return "powercfg AC failed: $acText" }
     $dcText = Read-Native { powercfg /SETDCVALUEINDEX $scheme $sub $setting $dc }
     if ($LASTEXITCODE -ne 0) { return "powercfg DC failed: $dcText" }
-    $active = Read-Native { powercfg /SETACTIVE $scheme }
-    if ($LASTEXITCODE -ne 0) { return "powercfg SETACTIVE failed: $active" }
+    if ($reactivate) {
+        $active = Read-Native { powercfg /SETACTIVE $scheme }
+        if ($LASTEXITCODE -ne 0) { return "powercfg SETACTIVE failed: $active" }
+    }
     $after = Read-PowerIndex $setting $scheme
     if ($null -eq $after -or $after.ac -ne $ac -or $after.dc -ne $dc) {
         $got = if ($null -eq $after) { 'missing' } else { "ac=$($after.ac) dc=$($after.dc)" }
         return "read-back $got wanted ac=$ac dc=$dc scheme=$scheme"
     }
     return ''
+}
+
+function Test-CreatedKey($entry) {
+    return ($entry.PSObject.Properties.Name -contains 'created_key') -and ($entry.created_key -eq $true)
+}
+
+function Remove-CreatedKey($entry) {
+    if (-not (Test-CreatedKey $entry)) { return }
+    $root = Open-Root ([string]$entry.hive)
+    $path = [string]$entry.subkey
+    $key = $root.OpenSubKey($path, $true)
+    if ($null -eq $key) { return }
+    $empty = ($key.ValueCount -eq 0 -and $key.SubKeyCount -eq 0)
+    $key.Close()
+    if (-not $empty) { return }
+    $slash = $path.LastIndexOf('\')
+    if ($slash -lt 0) {
+        $root.DeleteSubKey($path, $false)
+        return
+    }
+    $parent = $root.OpenSubKey($path.Substring(0, $slash), $true)
+    if ($null -eq $parent) { return }
+    try { $parent.DeleteSubKey($path.Substring($slash + 1), $false) } finally { $parent.Close() }
 }
 
 $snapshot = Get-Content -LiteralPath $pending -Raw | ConvertFrom-Json
@@ -160,9 +188,16 @@ $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adminis
 $held = @()
 $failed = $false
 foreach ($entry in $values) {
-    if (Value-Matches $entry) { continue }
     if ($entry.hive -eq 'HKLM' -and -not $elevated) {
         $held += $entry
+        continue
+    }
+    if (Value-Matches $entry) {
+        try { Remove-CreatedKey $entry } catch {
+            $failed = $true
+            Write-Output "$($entry.hive)\$($entry.subkey) was created by the suite and was not deleted. $($_.Exception.Message)"
+            $held += $entry
+        }
         continue
     }
     $root = Open-Root ([string]$entry.hive)
@@ -187,6 +222,7 @@ foreach ($entry in $values) {
             if ($created) { throw 'the suite created this value and it is still present' }
             throw 'the saved value was not put back'
         }
+        Remove-CreatedKey $entry
     } catch {
         $failed = $true
         $verb = if ($entry.present -eq $true) { 'was changed and was not put back' } else { 'was created by the suite and was not deleted' }
@@ -205,11 +241,16 @@ foreach ($entry in $power) {
     if ($null -ne $current -and $current.ac -eq [int]$entry.ac -and $current.dc -eq [int]$entry.dc) {
         continue
     }
-    $err = Set-PowerIndex $setting ([int]$entry.ac) ([int]$entry.dc) $savedScheme
+    $scheme = if ($savedScheme) { $savedScheme } else { Get-ActiveScheme }
+    $wasActive = $true
+    if ($entry.PSObject.Properties.Name -contains 'active') { $wasActive = [bool]$entry.active }
+    $reactivate = $wasActive -and $scheme -and ((Get-ActiveScheme) -ne $scheme)
+    $err = Set-PowerIndex $setting ([int]$entry.ac) ([int]$entry.dc) $scheme $reactivate
     if ($err) {
         $failed = $true
-        $scheme = if ($savedScheme) { $savedScheme } else { Get-ActiveScheme }
-        Write-Output "power $setting was changed and was not put back. $err. Run: powercfg /SETACVALUEINDEX $scheme $sub $setting $($entry.ac) & powercfg /SETDCVALUEINDEX $scheme $sub $setting $($entry.dc) & powercfg /SETACTIVE $scheme"
+        $cmd = "powercfg /SETACVALUEINDEX $scheme $sub $setting $($entry.ac) & powercfg /SETDCVALUEINDEX $scheme $sub $setting $($entry.dc)"
+        if ($reactivate) { $cmd += " & powercfg /SETACTIVE $scheme" }
+        Write-Output "power $setting was changed and was not put back. $err. Run: $cmd"
         $powerLeft += $entry
     }
 }
@@ -220,13 +261,17 @@ if ($held.Count -gt 0 -or $powerLeft.Count -gt 0) {
         $present = if ($entry.present) { 'true' } else { 'false' }
         $kind = if ($entry.PSObject.Properties.Name -contains 'kind') { [string]$entry.kind } else { 'DWord' }
         $data = if ($entry.PSObject.Properties.Name -contains 'data') { [string]$entry.data } else { '0' }
-        $items += '{"hive":"' + $entry.hive + '","subkey":"' + ([string]$entry.subkey).Replace('\', '\\').Replace('"', '\"') + '","name":"' + $entry.name + '","present":' + $present + ',"kind":"' + $kind + '","data":"' + ($data.Replace('\', '\\').Replace('"', '\"')) + '"}'
+        $created = 'false'
+        if ($entry.PSObject.Properties.Name -contains 'created_key' -and ($entry.created_key -eq $true)) { $created = 'true' }
+        $items += '{"hive":"' + $entry.hive + '","subkey":"' + ([string]$entry.subkey).Replace('\', '\\').Replace('"', '\"') + '","name":"' + $entry.name + '","present":' + $present + ',"kind":"' + $kind + '","data":"' + ($data.Replace('\', '\\').Replace('"', '\"')) + '","created_key":' + $created + '}'
     }
     $powerJson = @()
     foreach ($entry in $powerLeft) {
         $scheme = ''
         if ($entry.PSObject.Properties.Name -contains 'scheme' -and $entry.scheme) { $scheme = [string]$entry.scheme }
-        $powerJson += '{"setting":"' + $entry.setting + '","ac":' + [int]$entry.ac + ',"dc":' + [int]$entry.dc + ',"scheme":"' + $scheme.Replace('\', '\\').Replace('"', '\"') + '"}'
+        $active = 'true'
+        if ($entry.PSObject.Properties.Name -contains 'active' -and -not $entry.active) { $active = 'false' }
+        $powerJson += '{"setting":"' + $entry.setting + '","ac":' + [int]$entry.ac + ',"dc":' + [int]$entry.dc + ',"scheme":"' + $scheme.Replace('\', '\\').Replace('"', '\"') + '","active":' + $active + '}'
     }
     $body = '{"values":[' + ($items -join ',') + '],"power":[' + ($powerJson -join ',') + ']}'
     [System.IO.File]::WriteAllText($pending, $body, (New-Object System.Text.UTF8Encoding $false))

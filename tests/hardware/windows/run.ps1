@@ -80,13 +80,17 @@ function Save-Pending {
     foreach ($entry in $script:Changes) {
         $present = if ($entry.present) { 'true' } else { 'false' }
         $kind = if ($entry.PSObject.Properties.Name -contains 'kind') { [string]$entry.kind } else { 'DWord' }
-        $parts += '{"hive":"' + $entry.hive + '","subkey":"' + (Escape-JsonString ([string]$entry.subkey)) + '","name":"' + (Escape-JsonString ([string]$entry.name)) + '","present":' + $present + ',"kind":"' + (Escape-JsonString $kind) + '","data":"' + (Escape-JsonString ([string]$entry.data)) + '"}'
+        $created = 'false'
+        if ($entry.PSObject.Properties.Name -contains 'created_key' -and $entry.created_key) { $created = 'true' }
+        $parts += '{"hive":"' + $entry.hive + '","subkey":"' + (Escape-JsonString ([string]$entry.subkey)) + '","name":"' + (Escape-JsonString ([string]$entry.name)) + '","present":' + $present + ',"kind":"' + (Escape-JsonString $kind) + '","data":"' + (Escape-JsonString ([string]$entry.data)) + '","created_key":' + $created + '}'
     }
     $power = @()
     foreach ($entry in $script:Power) {
         $scheme = ''
         if ($entry.PSObject.Properties.Name -contains 'scheme') { $scheme = [string]$entry.scheme }
-        $power += '{"setting":"' + (Escape-JsonString ([string]$entry.setting)) + '","ac":' + [int]$entry.ac + ',"dc":' + [int]$entry.dc + ',"scheme":"' + (Escape-JsonString $scheme) + '"}'
+        $active = 'true'
+        if ($entry.PSObject.Properties.Name -contains 'active' -and -not $entry.active) { $active = 'false' }
+        $power += '{"setting":"' + (Escape-JsonString ([string]$entry.setting)) + '","ac":' + [int]$entry.ac + ',"dc":' + [int]$entry.dc + ',"scheme":"' + (Escape-JsonString $scheme) + '","active":' + $active + '}'
     }
     $json = '{"values":[' + ($parts -join ',') + '],"power":[' + ($power -join ',') + ']}'
     Write-Utf8 $pendingPath $json
@@ -119,8 +123,10 @@ function Remember-Dword([string]$hive, [string]$subkey, [string]$name) {
     $present = $false
     $kind = 'DWord'
     $data = ''
+    $createdKey = $true
     $key = Open-Hive $hive $subkey $false
     if ($null -ne $key) {
+        $createdKey = $false
         foreach ($existing in @($key.GetValueNames())) {
             if ($existing -eq $name) {
                 $present = $true
@@ -137,6 +143,13 @@ function Remember-Dword([string]$hive, [string]$subkey, [string]$name) {
         }
         $key.Close()
     }
+    if (-not $createdKey) {
+        foreach ($prior in @($script:Changes.ToArray()) + @($script:Staged.ToArray())) {
+            if ($prior.hive -eq $hive -and $prior.subkey -eq $subkey -and $prior.PSObject.Properties.Name -contains 'created_key' -and $prior.created_key) {
+                $createdKey = $true
+            }
+        }
+    }
     $script:Staged.Add([pscustomobject]@{
         hive = $hive
         subkey = $subkey
@@ -144,6 +157,7 @@ function Remember-Dword([string]$hive, [string]$subkey, [string]$name) {
         present = $present
         kind = $kind
         data = $data
+        created_key = $createdKey
     })
 }
 
@@ -161,27 +175,21 @@ function Discard-Staged {
 }
 
 function Write-SuiteDword([string]$hive, [string]$subkey, [string]$name, [int]$value) {
+    # Flush the original before SetValue. A throw on the write, the read-back,
+    # or Close leaves the snapshot on disk. Restore skips a value that never changed.
     Remember-Dword $hive $subkey $name
-    try {
-        $read = Set-SuiteDword $hive $subkey $name $value
-        Commit-Staged
-        return $read
-    } catch {
-        Discard-Staged
-        throw
-    }
+    Commit-Staged
+    return Set-SuiteDword $hive $subkey $name $value
 }
 
 function Test-AccessDenied($record) {
-    $text = ''
-    if ($null -ne $record -and $null -ne $record.Exception) { $text = [string]$record.Exception.Message }
-    if ($text -match 'administrator' -or $text -match 'Access is denied' -or $text -match 'not allowed' -or $text -match 'privilege') {
-        return $true
-    }
     $ex = $null
     if ($null -ne $record) { $ex = $record.Exception }
     while ($null -ne $ex) {
         if ($ex -is [System.UnauthorizedAccessException] -or $ex -is [System.Security.SecurityException]) { return $true }
+        if ($ex -is [System.ComponentModel.Win32Exception] -and $ex.NativeErrorCode -eq 5) { return $true }
+        # E_ACCESSDENIED is 0x80070005. Win32 ERROR_ACCESS_DENIED is 5, checked above.
+        if ($ex.HResult -eq -2147024891) { return $true }
         $ex = $ex.InnerException
     }
     return $false
@@ -241,27 +249,27 @@ function Get-ActiveScheme {
     return ''
 }
 
+function Read-DwordAt([string]$path, [string]$name) {
+    try { $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($path) } catch { return $null }
+    if ($null -eq $key) { return $null }
+    $value = $key.GetValue($name, $null)
+    $key.Close()
+    if ($null -eq $value) { return $null }
+    return [int]$value
+}
+
 function Read-RegistryIndex([string]$scheme, [string]$setting) {
+    # Same rule as resolve_power_index: each index uses its own per-user
+    # override, and only that index falls back to the scheme default.
     $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
-    $paths = @(
-        "SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$scheme\$sub\$setting",
-        "SYSTEM\CurrentControlSet\Control\Power\PowerSettings\$sub\$setting\DefaultPowerSchemeValues\$scheme"
-    )
-    foreach ($path in $paths) {
-        try {
-            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($path)
-        } catch {
-            $key = $null
-        }
-        if ($null -eq $key) { continue }
-        $ac = $key.GetValue('ACSettingIndex', $null)
-        $dc = $key.GetValue('DCSettingIndex', $null)
-        $key.Close()
-        if ($null -ne $ac -and $null -ne $dc) {
-            return [pscustomobject]@{ setting = $setting; scheme = $scheme; ac = [int]$ac; dc = [int]$dc }
-        }
-    }
-    return $null
+    $user = "SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$scheme\$sub\$setting"
+    $fallback = "SYSTEM\CurrentControlSet\Control\Power\PowerSettings\$sub\$setting\DefaultPowerSchemeValues\$scheme"
+    $ac = Read-DwordAt $user 'ACSettingIndex'
+    if ($null -eq $ac) { $ac = Read-DwordAt $fallback 'ACSettingIndex' }
+    $dc = Read-DwordAt $user 'DCSettingIndex'
+    if ($null -eq $dc) { $dc = Read-DwordAt $fallback 'DCSettingIndex' }
+    if ($null -eq $ac -or $null -eq $dc) { return $null }
+    return [pscustomobject]@{ setting = $setting; scheme = $scheme; ac = [int]$ac; dc = [int]$dc; active = $true }
 }
 
 function Parse-IndexText([string]$text, [string]$setting) {
@@ -296,7 +304,12 @@ function Read-PowerIndex([string]$setting, [string]$scheme) {
     if ($null -ne $reg) { return $reg }
     $parsed = Parse-IndexText (Query-PowerText $scheme $setting) $setting
     if ($null -eq $parsed) { return $null }
-    return [pscustomobject]@{ setting = $setting; scheme = $scheme; ac = $parsed.ac; dc = $parsed.dc }
+    return [pscustomobject]@{ setting = $setting; scheme = $scheme; ac = $parsed.ac; dc = $parsed.dc; active = $true }
+}
+
+function Power-WasActive($entry) {
+    if ($entry.PSObject.Properties.Name -contains 'active') { return [bool]$entry.active }
+    return $true
 }
 
 function Power-RestoreCommand($entry) {
@@ -304,10 +317,14 @@ function Power-RestoreCommand($entry) {
     $scheme = ''
     if ($entry.PSObject.Properties.Name -contains 'scheme') { $scheme = Normalize-Guid ([string]$entry.scheme) }
     if (-not $scheme) { $scheme = Get-ActiveScheme }
-    return "powercfg /SETACVALUEINDEX $scheme $sub $($entry.setting) $($entry.ac) & powercfg /SETDCVALUEINDEX $scheme $sub $($entry.setting) $($entry.dc) & powercfg /SETACTIVE $scheme"
+    $cmd = "powercfg /SETACVALUEINDEX $scheme $sub $($entry.setting) $($entry.ac) & powercfg /SETDCVALUEINDEX $scheme $sub $($entry.setting) $($entry.dc)"
+    if ((Power-WasActive $entry) -and $scheme -and ((Get-ActiveScheme) -ne $scheme)) {
+        $cmd += " & powercfg /SETACTIVE $scheme"
+    }
+    return $cmd
 }
 
-function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme) {
+function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme, [bool]$reactivate) {
     $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
     if (-not $scheme) { $scheme = Get-ActiveScheme }
     if (-not $scheme) { return 'active power scheme was not found' }
@@ -317,8 +334,10 @@ function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme) {
     if ($LASTEXITCODE -ne 0) { return "powercfg AC $setting failed: $acText" }
     $dcText = Read-Native { powercfg /SETDCVALUEINDEX $scheme $sub $setting $dc }
     if ($LASTEXITCODE -ne 0) { return "powercfg DC $setting failed: $dcText" }
-    $active = Read-Native { powercfg /SETACTIVE $scheme }
-    if ($LASTEXITCODE -ne 0) { return "powercfg SETACTIVE $scheme failed: $active" }
+    if ($reactivate) {
+        $active = Read-Native { powercfg /SETACTIVE $scheme }
+        if ($LASTEXITCODE -ne 0) { return "powercfg SETACTIVE $scheme failed: $active" }
+    }
     $after = Read-PowerIndex $setting $scheme
     if ($null -eq $after) { return "powercfg read-back failed for $setting scheme $scheme" }
     if ($after.ac -ne $ac -or $after.dc -ne $dc) {
@@ -329,25 +348,23 @@ function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme) {
 
 function Ensure-DoNothing([string]$setting) {
     # Read the active scheme's AC and DC indexes from the registry, then from
-    # powercfg text. Write them back with that scheme GUID and /SETACTIVE.
+    # powercfg text. The original of each index is on disk before either write.
     $before = Read-PowerIndex $setting ''
     if ($null -eq $before) {
         if (-not (Test-SuiteElevated)) { return 'needs-admin' }
         return 'could not read the AC and DC indexes'
     }
     if ($before.ac -eq 0 -and $before.dc -eq 0) { return '' }
-    $err = Set-PowerIndex $setting 0 0 $before.scheme
-    if (-not $err) {
-        $known = $false
-        foreach ($entry in $script:Power.ToArray()) {
-            if ([string]$entry.setting -eq $setting) { $known = $true }
-        }
-        if (-not $known) {
-            $script:Power.Add($before)
-            Save-Pending
-        }
-        return ''
+    $known = $false
+    foreach ($entry in $script:Power.ToArray()) {
+        if ([string]$entry.setting -eq $setting) { $known = $true }
     }
+    if (-not $known) {
+        $script:Power.Add($before)
+        Save-Pending
+    }
+    $err = Set-PowerIndex $setting 0 0 $before.scheme $true
+    if (-not $err) { return '' }
     if (-not (Test-SuiteElevated) -or $err -match 'administrator' -or $err -match 'privilege') {
         return 'needs-admin'
     }
@@ -644,6 +661,29 @@ function Restore-Command($entry) {
     return "reg add `"$path`" /v $name /t $type /d $($entry.data) /f"
 }
 
+function Test-CreatedKey($entry) {
+    return ($entry.PSObject.Properties.Name -contains 'created_key') -and [bool]$entry.created_key
+}
+
+function Remove-CreatedKey($entry) {
+    if (-not (Test-CreatedKey $entry)) { return }
+    $root = if ($entry.hive -eq 'HKLM') { [Microsoft.Win32.Registry]::LocalMachine } else { [Microsoft.Win32.Registry]::CurrentUser }
+    $path = [string]$entry.subkey
+    $key = $root.OpenSubKey($path, $true)
+    if ($null -eq $key) { return }
+    $empty = ($key.ValueCount -eq 0 -and $key.SubKeyCount -eq 0)
+    $key.Close()
+    if (-not $empty) { return }
+    $slash = $path.LastIndexOf('\')
+    if ($slash -lt 0) {
+        $root.DeleteSubKey($path, $false)
+        return
+    }
+    $parent = $root.OpenSubKey($path.Substring(0, $slash), $true)
+    if ($null -eq $parent) { return }
+    try { $parent.DeleteSubKey($path.Substring($slash + 1), $false) } finally { $parent.Close() }
+}
+
 function Restore-Changes {
     $errors = New-Object System.Collections.Generic.List[string]
     $elevated = Test-SuiteElevated
@@ -653,7 +693,13 @@ function Restore-Changes {
             $remaining.Add($entry)
             continue
         }
-        if (Value-Matches $entry) { continue }
+        if (Value-Matches $entry) {
+            try { Remove-CreatedKey $entry } catch {
+                $remaining.Add($entry)
+                $errors.Add("$($entry.hive)\$($entry.subkey) was created by the suite and was not deleted. $($_.Exception.Message)")
+            }
+            continue
+        }
         try {
             $key = Open-Hive $entry.hive $entry.subkey $true
             if ($null -eq $key) { throw "cannot open $($entry.hive)\$($entry.subkey)" }
@@ -672,6 +718,7 @@ function Restore-Changes {
                 if ($created) { throw 'the suite created this value and it is still present' }
                 throw 'the saved value was not put back'
             }
+            Remove-CreatedKey $entry
         } catch {
             $remaining.Add($entry)
             $verb = if ($entry.present -eq $true) { 'was changed and was not put back' } else { 'was created by the suite and was not deleted' }
@@ -689,7 +736,10 @@ function Restore-Changes {
             if ($null -ne $current -and $current.ac -eq [int]$entry.ac -and $current.dc -eq [int]$entry.dc) {
                 continue
             }
-            $err = Set-PowerIndex $entry.setting ([int]$entry.ac) ([int]$entry.dc) $savedScheme
+            $scheme = Normalize-Guid $savedScheme
+            if (-not $scheme) { $scheme = Get-ActiveScheme }
+            $reactivate = (Power-WasActive $entry) -and $scheme -and ((Get-ActiveScheme) -ne $scheme)
+            $err = Set-PowerIndex $entry.setting ([int]$entry.ac) ([int]$entry.dc) $scheme $reactivate
             if ($err) {
                 $powerLeft.Add($entry)
                 $line = "power $($entry.setting) was changed and was not put back. $err. Run: $(Power-RestoreCommand $entry)"
@@ -944,10 +994,20 @@ try {
             }
             'overlay-capture' {
                 $probe = Get-Overlay
-                $ok = $probe.ok -and $probe.affinity -and -not $probe.marker_visible
-                Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{
-                    affinity = [bool]$probe.affinity
-                    marker_visible = [bool]$probe.marker_visible
+                $captured = $true
+                if ($probe.PSObject.Properties.Name -contains 'captured') { $captured = [bool]$probe.captured }
+                $visible = [bool]$probe.marker_visible
+                if (-not $probe.ok) {
+                    Add-Result $row.id 'fail' 'overlay was not created' @{ affinity = [bool]$probe.affinity; marker_visible = $visible; captured = $captured; stderr = (Probe-Error $probe) }
+                } elseif (-not $visible) {
+                    Add-Result $row.id 'skip' 'not-applicable' @{ affinity = [bool]$probe.affinity; marker_visible = $false; captured = $captured; stderr = 'marker was not visible on screen' }
+                } else {
+                    $ok = [bool]$probe.affinity -and -not $captured
+                    Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{
+                        affinity = [bool]$probe.affinity
+                        marker_visible = $true
+                        captured = $captured
+                    }
                 }
             }
             'toast-hkcu-restore' {
@@ -1252,7 +1312,18 @@ try {
             if ($null -eq $native) { throw 'fail-closed lock has no listener' }
             $state = $native::SessionStateJson() | ConvertFrom-Json
             if (-not ($state.ok -and $state.locked)) {
-                Write-Host 'Locking Windows because a row failed.'
+                $causes = New-Object System.Collections.Generic.List[string]
+                $failedIds = @()
+                foreach ($row in @($results)) {
+                    if ($row.status -eq 'fail') { $failedIds += [string]$row.id }
+                }
+                if ($failedIds.Count -gt 0) { $causes.Add('rows ' + ($failedIds -join ', ')) }
+                if ($script:SuiteError) { $causes.Add([string]$script:SuiteError) }
+                foreach ($item in @($restoreErrors)) {
+                    if ($item -and $item -ne $script:SuiteError) { $causes.Add([string]$item) }
+                }
+                if ($causes.Count -eq 0) { $causes.Add('a row failed') }
+                Write-Host ("Locking Windows because " + ($causes -join '; ') + '.')
                 $native::LockNow()
                 $deadline = [DateTime]::UtcNow.AddSeconds(2)
                 do {
