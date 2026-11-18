@@ -75,11 +75,55 @@ namespace SoftLock.Hardware
                 return "{\"ok\":true,\"monitors\":" + monitors
                     + ",\"protocol\":" + protocol
                     + ",\"ac\":" + ac
+                    + ",\"internal\":" + InternalJson()
                     + ",\"elevated\":" + (admin ? "true" : "false") + "}";
             }
             catch (Exception error)
             {
-                return "{\"ok\":false,\"monitors\":0,\"protocol\":-1,\"ac\":255,\"elevated\":false,\"error\":\"" + Esc(error.Message) + "\"}";
+                return "{\"ok\":false,\"monitors\":0,\"protocol\":-1,\"ac\":255,\"internal\":null,\"elevated\":false,\"error\":\"" + Esc(error.Message) + "\"}";
+            }
+        }
+
+        // DISPLAYCONFIG_PATH_INFO is 72 bytes. LUID alignment is 4, so the
+        // source is 20 bytes and outputTechnology is the UINT32 at offset 36.
+        // DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL is 0x80000000.
+        // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-displayconfig_path_info
+        static string InternalJson()
+        {
+            int found = ActiveInternalTargets();
+            if (found < 0) return "null";
+            return found > 0 ? "true" : "false";
+        }
+
+        static int ActiveInternalTargets()
+        {
+            uint pathCount;
+            uint modeCount;
+            if (GetDisplayConfigBufferSizes(2, out pathCount, out modeCount) != 0 || pathCount == 0)
+            {
+                return -1;
+            }
+            int pathBytes = (int)pathCount * 128;
+            int modeBytes = (int)modeCount * 128;
+            if (modeBytes < 8) modeBytes = 8;
+            IntPtr paths = Marshal.AllocHGlobal(pathBytes);
+            IntPtr modes = Marshal.AllocHGlobal(modeBytes);
+            try
+            {
+                int rc = QueryDisplayConfig(2, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
+                if (rc != 0) return -1;
+                int found = 0;
+                for (int i = 0; i < (int)pathCount; i++)
+                {
+                    int tech = Marshal.ReadInt32(paths, i * 72 + 36);
+                    if ((tech & unchecked((int)0x80000000)) != 0) found++;
+                }
+                return found;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(paths);
+                Marshal.FreeHGlobal(modes);
             }
         }
 
@@ -688,6 +732,8 @@ namespace SoftLock.Hardware
             public long Pad1;
         }
 
+        [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint pathCount, out uint modeCount);
+        [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint pathCount, IntPtr paths, ref uint modeCount, IntPtr modes, IntPtr topology);
         [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnum proc, IntPtr data);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern ushort RegisterClassW(ref WndClass wc);

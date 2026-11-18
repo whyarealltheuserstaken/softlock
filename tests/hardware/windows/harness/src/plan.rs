@@ -9,6 +9,10 @@ pub const BUDGET_MS: u64 = 300_000;
 pub const PROMPT_PLUG: &str = "Plug in a monitor, then press Enter. Type skip to skip.";
 pub const PROMPT_UNPLUG: &str = "Unplug that monitor, then press Enter. Type skip to skip.";
 pub const PROMPT_REPLUG: &str = "Plug that monitor back in, then press Enter. Type skip to skip.";
+pub const PROMPT_UNPLUG_EXTERNAL: &str =
+    "Unplug the external monitor, then press Enter. Type skip to skip.";
+pub const PROMPT_REPLUG_EXTERNAL: &str =
+    "Plug the external monitor back in, then press Enter. Type skip to skip.";
 pub const PROMPT_LID: &str = "Close the lid, then open it. The lid action is Do nothing. Then press Enter. Type skip to skip.";
 pub const PROMPT_LOCK: &str =
     "Press Enter to lock Windows, then sign in with PIN or password. Type skip to skip.";
@@ -19,6 +23,45 @@ pub struct Flags {
     pub admin: bool,
     pub elevated: bool,
     pub github_actions: bool,
+    pub school: bool,
+}
+
+/// `school` is only the explicit school profile. It does not change which rows run.
+pub fn profile_name(flags: &Flags) -> &'static str {
+    if flags.ci {
+        "ci"
+    } else if flags.admin {
+        "admin"
+    } else if flags.school {
+        "school"
+    } else {
+        "bench"
+    }
+}
+
+/// How a prompt reads a key.
+///
+/// `powershell -File` started from cmd.exe makes `[Console]::IsInputRedirected`
+/// true and `[Console]::KeyAvailable` throw, while `$Host.UI.RawUI` still
+/// reads the keyboard. A pipe with no host UI is real EOF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptSource {
+    Host,
+    Eof,
+}
+
+pub fn prompt_source(
+    console_redirected: bool,
+    console_key_throws: bool,
+    host_raw_ui: bool,
+) -> PromptSource {
+    if host_raw_ui {
+        PromptSource::Host
+    } else if console_redirected || console_key_throws {
+        PromptSource::Eof
+    } else {
+        PromptSource::Host
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,7 +270,10 @@ fn hotplug(machine: &Machine, flags: &Flags) -> Planned {
             false,
         );
     }
-    let prompts = if machine.displays >= 2 {
+    let external_only = machine.internal_display == Some(false);
+    let prompts = if external_only && machine.displays < 2 {
+        vec![PROMPT_UNPLUG_EXTERNAL, PROMPT_REPLUG_EXTERNAL]
+    } else if machine.displays >= 2 {
         vec![PROMPT_UNPLUG, PROMPT_REPLUG]
     } else {
         vec![PROMPT_PLUG, PROMPT_UNPLUG]
@@ -293,6 +339,7 @@ mod tests {
             admin,
             elevated,
             github_actions: ci,
+            school: false,
         }
     }
 
@@ -331,6 +378,7 @@ mod tests {
             admin: false,
             elevated: true,
             github_actions: false,
+            school: false,
         };
         let rows = plan(&machine(), &local);
         assert_eq!(row(&rows, "cad-hklm-readback").action, Action::Skip);
@@ -407,5 +455,49 @@ mod tests {
         assert_eq!(row(&rows, "session-lock").reason, "not-applicable");
         assert_eq!(row(&rows, "display-hotplug").action, Action::Skip);
         assert_eq!(row(&rows, "keep-awake-request").action, Action::Run);
+    }
+
+    #[test]
+    fn one_external_display_unplugs_instead_of_asking_for_a_new_monitor() {
+        let mut external = machine();
+        external.displays = 1;
+        external.internal_display = Some(false);
+        let rows = plan(&external, &flags(false, false, false));
+        assert_eq!(
+            row(&rows, "display-hotplug").prompts,
+            vec![PROMPT_UNPLUG_EXTERNAL, PROMPT_REPLUG_EXTERNAL]
+        );
+        let mut panel = machine();
+        panel.displays = 1;
+        panel.internal_display = Some(true);
+        let rows = plan(&panel, &flags(false, false, false));
+        assert_eq!(
+            row(&rows, "display-hotplug").prompts,
+            vec![PROMPT_PLUG, PROMPT_UNPLUG]
+        );
+    }
+
+    #[test]
+    fn school_does_not_change_which_rows_run() {
+        let bench = flags(false, false, false);
+        let mut school = bench.clone();
+        school.school = true;
+        let bench_rows = plan(&machine(), &bench);
+        let school_rows = plan(&machine(), &school);
+        assert_eq!(profile_name(&bench), "bench");
+        assert_eq!(profile_name(&school), "school");
+        assert_eq!(bench_rows.len(), school_rows.len());
+        for (left, right) in bench_rows.iter().zip(school_rows.iter()) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.action, right.action);
+            assert_eq!(left.reason, right.reason);
+        }
+    }
+
+    #[test]
+    fn a_cmd_file_launch_still_waits_for_enter() {
+        assert_eq!(prompt_source(true, true, true), PromptSource::Host);
+        assert_eq!(prompt_source(false, true, true), PromptSource::Host);
+        assert_eq!(prompt_source(true, true, false), PromptSource::Eof);
     }
 }

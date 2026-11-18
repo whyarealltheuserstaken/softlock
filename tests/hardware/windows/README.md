@@ -1,6 +1,6 @@
 # Windows hardware suite
 
-One command, from a normal PowerShell window. It does not ask for administrator and it does not show a User Account Control prompt.
+One command, from PowerShell or from cmd.exe. It does not ask for administrator and it does not show a User Account Control prompt. A normal run is labeled `bench`. `--school` labels the school profile and does not change which rows run.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\hardware\windows\run.ps1
@@ -8,8 +8,8 @@ powershell -ExecutionPolicy Bypass -File tests\hardware\windows\run.ps1
 
 The command builds this folder's parser with `cargo test --locked --release`, then runs the rows. A full run finishes within 5 minutes. Results are `suite-output\<timestamp>\result.json` and `result.txt`. `result.json` uses schema `softlock-hardware-suite/1`. `result.txt` includes the summary line `pass=N fail=N skip=N`.
 
-`--admin` adds the HKLM policy read-back and the fail-closed lock check. Without it, those rows are skipped. Pass `--admin` from a prompt that is already elevated. `--ci` skips every physical step and is what the `windows-2022` and `windows-2025` runners use. This command never installs the desktop-proof or input-hook service.
+From a prompt that is not elevated, the first line says admin rows will skip. To run them, open an elevated prompt and pass `--admin`. `--admin` adds the HKLM policy read-back and the fail-closed lock check. `--ci` skips every physical step and is what the `windows-2022` and `windows-2025` runners use. `--ci` is ignored unless `GITHUB_ACTIONS=true`. This command never installs the desktop-proof or input-hook service.
 
-Physical steps are one line each, and only when this machine can do them. The suite decides those skips from the detected config before it asks. Press Enter after the step, or type `skip`. If the step was done and the suite does not see it, that row fails. While a physical step is planned, the lid and power-button actions are set to Do nothing (AC and DC) and put back when the run ends. The power button is not a prompted check: Windows does not deliver a language-independent press signal while that action is Do nothing. Ctrl+C stops the run, writes the result, and exits non-zero. A closed prompt with no answer is a skip.
+Physical steps are one line each, and only when this machine can do them. The suite decides those skips from the detected config before it asks. Press Enter after the step, or type `skip`. The prompt waits on the PowerShell host, including when cmd.exe starts `powershell -File`. If the only active display is an external monitor, the step is unplug, then plug it back in. If the step was done and the suite does not see it, that row fails. The lid is prompted only after the lid action is confirmed as Do nothing (AC and DC). The power button is not a prompted check: Windows does not deliver a language-independent press signal while that action is Do nothing. Ctrl+C stops the run, writes the result, and exits non-zero. A closed prompt with no answer is a skip.
 
-It puts back every value it changed, the power actions, and the keep-awake request, including after Ctrl+C. A failed row locks Windows once at the end. The suite does not unlock Windows. `--ci` is ignored unless `GITHUB_ACTIONS=true`.
+It puts back every value it changed. A value is recorded only after the write succeeds. A failed row locks Windows once at the end. The suite does not unlock Windows.

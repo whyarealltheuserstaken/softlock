@@ -16,7 +16,9 @@ pub use failclosed::{finish_state, lock_blocked, within_one_second};
 pub use hello::{Action, DeviceEvent, InputOrigin, Modifiers, PassthroughWindow, decide};
 pub use hookdec::{EXTRA_LOAD, EXTRA_MARKER, EXTRA_VIS, HookAction, HookEvent, classify};
 pub use machine::{HelloKind, Machine, SessionKind, decode_facts};
-pub use plan::{Action as RowAction, BUDGET_MS, Flags, Planned, plan, plan_value};
+pub use plan::{
+    Action as RowAction, BUDGET_MS, Flags, Planned, plan, plan_value, profile_name, prompt_source,
+};
 pub use policy::{Restore, hkcu_value_allowed, hklm_value_allowed, restore_dword};
 pub use power::{PowerAvailability, parse_powercfg_a, section_contains};
 pub use redact::redact;

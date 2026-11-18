@@ -191,13 +191,7 @@ pub fn conform(value: &Value) -> Result<(), String> {
 }
 
 fn profile(flags: &Flags) -> String {
-    if flags.ci {
-        "ci".to_string()
-    } else if flags.admin {
-        "admin".to_string()
-    } else {
-        "school".to_string()
-    }
+    crate::plan::profile_name(flags).to_string()
 }
 
 fn parse_supplied(values: &[Value]) -> BTreeMap<String, Supplied> {
@@ -453,12 +447,12 @@ impl Report {
             } else {
                 row.detail.clone()
             };
-            lines.push(format!(
-                "{:<24} {:<6} {}",
-                row.id,
-                row.status,
+            let shown = if row.id == "restore" {
+                detail
+            } else {
                 truncate(&detail, 60)
-            ));
+            };
+            lines.push(format!("{:<24} {:<6} {}", row.id, row.status, shown));
         }
         if !self.outcome.hklm_command.is_empty() {
             lines.push(String::new());
@@ -531,6 +525,7 @@ mod tests {
             admin: false,
             elevated: true,
             github_actions: true,
+            school: false,
         };
         (machine, flags)
     }
@@ -652,5 +647,28 @@ mod tests {
         assert_eq!(report.to_json()["fail_closed"], true);
         assert_eq!(report.to_json()["serial_collected"], false);
         conform(&report.to_json()).unwrap();
+    }
+
+    #[test]
+    fn a_personal_laptop_is_bench_and_the_restore_line_is_complete() {
+        let (machine, mut flags) = sample();
+        flags.ci = false;
+        flags.elevated = false;
+        flags.github_actions = false;
+        let command = "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v DisableLockWorkstation /t REG_DWORD /d 0 /f";
+        let detail = format!(
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System value DisableLockWorkstation was changed and was not put back. Run: {command}"
+        );
+        let supplied = vec![serde_json::json!({
+            "id": "restore",
+            "status": "fail",
+            "reason": detail,
+        })];
+        let report = render(&machine, &flags, 1_000, &supplied, &outcome());
+        assert_eq!(report.mode, "bench");
+        assert!(report.to_text().contains(command));
+        flags.school = true;
+        let school = render(&machine, &flags, 1_000, &[], &outcome());
+        assert_eq!(school.mode, "school");
     }
 }

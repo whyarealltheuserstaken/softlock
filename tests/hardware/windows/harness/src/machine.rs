@@ -54,6 +54,7 @@ pub struct Machine {
     pub elevated: bool,
     pub lid: String,
     pub ac: String,
+    pub internal_display: Option<bool>,
 }
 
 impl Machine {
@@ -72,6 +73,7 @@ impl Machine {
             "elevated": self.elevated,
             "lid": self.lid,
             "ac": self.ac,
+            "internal_display": self.internal_display,
         })
     }
 }
@@ -97,6 +99,8 @@ struct Facts {
     chassis_laptop: Option<bool>,
     #[serde(default)]
     ac_line: Option<u8>,
+    #[serde(default)]
+    internal_display: Option<bool>,
 }
 
 pub fn decode_facts(value: &Value) -> Result<Machine, String> {
@@ -113,6 +117,7 @@ pub fn decode_facts(value: &Value) -> Result<Machine, String> {
         elevated: facts.elevated,
         lid: lid_label(facts.chassis_laptop),
         ac: ac_label(facts.ac_line),
+        internal_display: facts.internal_display,
     })
 }
 

@@ -1,4 +1,4 @@
-# SoftLock Windows hardware suite. School-safe unless --admin is passed.
+# Windows hardware suite. A normal run is bench. --school is the school profile.
 # Does not show a UAC prompt and does not install a SYSTEM service.
 
 $ErrorActionPreference = 'Stop'
@@ -6,12 +6,15 @@ Set-StrictMode -Version Latest
 
 $ci = $false
 $admin = $false
+$school = $false
 foreach ($arg in $args) {
     switch ($arg) {
         '--ci' { $ci = $true }
         '-Ci' { $ci = $true }
         '--admin' { $admin = $true }
         '-Admin' { $admin = $true }
+        '--school' { $school = $true }
+        '-School' { $school = $true }
         default {
             Write-Error "Unknown argument $arg"
             exit 2
@@ -36,6 +39,7 @@ $script:Locking = $false
 $script:LockError = ''
 $script:Interrupted = $false
 $script:Changes = New-Object System.Collections.Generic.List[object]
+$script:Staged = New-Object System.Collections.Generic.List[object]
 $script:Power = New-Object System.Collections.Generic.List[object]
 $script:Restored = $false
 $script:HklmCommand = ''
@@ -105,6 +109,11 @@ function Remember-Dword([string]$hive, [string]$subkey, [string]$name) {
             return
         }
     }
+    foreach ($entry in $script:Staged) {
+        if ($entry.hive -eq $hive -and $entry.subkey -eq $subkey -and $entry.name -eq $name) {
+            return
+        }
+    }
     $present = $false
     $kind = 'DWord'
     $data = '0'
@@ -126,7 +135,7 @@ function Remember-Dword([string]$hive, [string]$subkey, [string]$name) {
         }
         $key.Close()
     }
-    $script:Changes.Add([pscustomobject]@{
+    $script:Staged.Add([pscustomobject]@{
         hive = $hive
         subkey = $subkey
         name = $name
@@ -134,7 +143,46 @@ function Remember-Dword([string]$hive, [string]$subkey, [string]$name) {
         kind = $kind
         data = $data
     })
+}
+
+function Commit-Staged {
+    if ($script:Staged.Count -eq 0) { return }
+    foreach ($entry in $script:Staged.ToArray()) {
+        $script:Changes.Add($entry)
+    }
+    $script:Staged.Clear()
     Save-Pending
+}
+
+function Discard-Staged {
+    $script:Staged.Clear()
+}
+
+function Write-SuiteDword([string]$hive, [string]$subkey, [string]$name, [int]$value) {
+    Remember-Dword $hive $subkey $name
+    try {
+        $read = Set-SuiteDword $hive $subkey $name $value
+        Commit-Staged
+        return $read
+    } catch {
+        Discard-Staged
+        throw
+    }
+}
+
+function Test-AccessDenied($record) {
+    $text = ''
+    if ($null -ne $record -and $null -ne $record.Exception) { $text = [string]$record.Exception.Message }
+    if ($text -match 'administrator' -or $text -match 'Access is denied' -or $text -match 'not allowed' -or $text -match 'privilege') {
+        return $true
+    }
+    $ex = $null
+    if ($null -ne $record) { $ex = $record.Exception }
+    while ($null -ne $ex) {
+        if ($ex -is [System.UnauthorizedAccessException] -or $ex -is [System.Security.SecurityException]) { return $true }
+        $ex = $ex.InnerException
+    }
+    return $false
 }
 
 function Set-SuiteDword([string]$hive, [string]$subkey, [string]$name, [int]$value) {
@@ -191,30 +239,33 @@ function Read-PowerIndex([string]$setting) {
     }
 }
 
-function Apply-DoNothing([string]$setting) {
-    $current = Read-PowerIndex $setting
-    if ($null -eq $current) { return 'powercfg /q did not return the current index' }
-    $script:Power.Add($current)
-    Save-Pending
-    return Set-PowerIndex $setting 0 0
-}
-
 function Ensure-DoNothing([string]$setting) {
-    $current = Read-PowerIndex $setting
-    if ($null -eq $current) { return 'powercfg /q did not return the current index' }
-    $known = $false
-    foreach ($entry in $script:Power.ToArray()) {
-        if ([string]$entry.setting -eq $setting) { $known = $true }
+    # powercfg /SETACVALUEINDEX writes the active scheme. Re-read the index:
+    # an unelevated process often gets a privilege error, or exit 0 with the index unchanged.
+    $before = Read-PowerIndex $setting
+    if ($null -eq $before) {
+        if (-not (Test-SuiteElevated)) { return 'needs-admin' }
+        return 'powercfg /q did not return the current index'
     }
-    if ($current.ac -eq 0 -and $current.dc -eq 0) {
+    if ($before.ac -eq 0 -and $before.dc -eq 0) { return '' }
+    $err = Set-PowerIndex $setting 0 0
+    $after = Read-PowerIndex $setting
+    if ($null -ne $after -and $after.ac -eq 0 -and $after.dc -eq 0) {
+        $known = $false
+        foreach ($entry in $script:Power.ToArray()) {
+            if ([string]$entry.setting -eq $setting) { $known = $true }
+        }
         if (-not $known) {
-            $script:Power.Add($current)
+            $script:Power.Add($before)
             Save-Pending
         }
         return ''
     }
-    if ($known) { return Set-PowerIndex $setting 0 0 }
-    return Apply-DoNothing $setting
+    if (-not (Test-SuiteElevated) -or $err -match 'administrator' -or $err -match 'privilege') {
+        return 'needs-admin'
+    }
+    if ($err) { return $err }
+    return 'powercfg index was not 0 after set'
 }
 
 function Complete-Interrupted {
@@ -262,7 +313,7 @@ function Write-FallbackReport([string]$outDir, [bool]$restored) {
     $locked = if ($script:ActuallyLocked) { 'true' } else { 'false' }
     $interrupted = if ($script:Interrupted) { 'true' } else { 'false' }
     $restoredBit = if ($restored) { 'true' } else { 'false' }
-    $mode = if ($ci) { 'ci' } else { 'school' }
+    $mode = if ($ci) { 'ci' } elseif ($admin) { 'admin' } elseif ($school) { 'school' } else { 'bench' }
     $startedUtc = $started.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
     $finishedUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
     $json = '{"schema":"softlock-hardware-suite/1","suite":"windows","started_utc":"' + $startedUtc + '","finished_utc":"' + $finishedUtc + '","duration_ms":' + (Elapsed-Ms) + ',"mode":"' + $mode + '","config":{},"tests":[' + ($tests -join ',') + '],"summary":{"pass":' + $pass + ',"fail":' + $fail + ',"skip":' + $skip + '},"fail_closed":' + $locked + ',"serial_collected":false,"restored":' + $restoredBit + ',"interrupted":' + $interrupted + ',"state":"' + $state + '"}'
@@ -307,14 +358,19 @@ function Write-SuiteReport([bool]$restored) {
 
 function Read-Answer([string]$prompt, [int]$seconds) {
     Write-Host $prompt
-    $redirected = $false
-    try { $redirected = [Console]::IsInputRedirected } catch { $redirected = $true }
-    if ($redirected) { return 'eof' }
-    $previous = $false
+    # prompt_source: a host RawUI waits even when [Console]::IsInputRedirected is true.
+    # powershell -File from cmd.exe hits that case and KeyAvailable throws.
+    $hostUi = $false
     try {
-        $previous = [Console]::TreatControlCAsInput
-        [Console]::TreatControlCAsInput = $true
+        $null = $Host.UI.RawUI.WindowSize
+        $hostUi = $true
     } catch {
+        $hostUi = $false
+    }
+    if (-not $hostUi) {
+        $redirected = $true
+        try { $redirected = [Console]::IsInputRedirected } catch { $redirected = $true }
+        if ($redirected) { return 'eof' }
     }
     $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
     $buf = New-Object System.Text.StringBuilder
@@ -323,23 +379,45 @@ function Read-Answer([string]$prompt, [int]$seconds) {
         Sync-Interrupt
         if ($script:Interrupted) { $kind = 'interrupt'; break }
         if ((Elapsed-Ms) -gt $budgetMs) { $kind = 'budget'; break }
-        try {
-            if (-not [Console]::KeyAvailable) {
-                Start-Sleep -Milliseconds 50
-                continue
+        $vk = 0
+        $ch = [char]0
+        $ctrl = $false
+        if ($hostUi) {
+            try {
+                if (-not $Host.UI.RawUI.KeyAvailable) {
+                    Start-Sleep -Milliseconds 50
+                    continue
+                }
+                $key = $Host.UI.RawUI.ReadKey('IncludeKeyDown,NoEcho')
+                $vk = [int]$key.VirtualKeyCode
+                $ch = $key.Character
+                $ctrl = (([int]$key.ControlKeyState) -band 12) -ne 0
+            } catch {
+                $kind = 'eof'
+                break
             }
-            $key = [Console]::ReadKey($true)
-        } catch {
-            $kind = 'eof'
-            break
+        } else {
+            try {
+                if (-not [Console]::KeyAvailable) {
+                    Start-Sleep -Milliseconds 50
+                    continue
+                }
+                $key = [Console]::ReadKey($true)
+            } catch {
+                $kind = 'eof'
+                break
+            }
+            if ($key.Key -eq 'Enter') { $vk = 13 }
+            elseif ($key.Key -eq 'Backspace') { $vk = 8 }
+            $ch = $key.KeyChar
+            $ctrl = ($ch -eq 3) -or ($key.Key -eq 'C' -and ($key.Modifiers -band [ConsoleModifiers]::Control))
         }
-        $controlC = ($key.KeyChar -eq 3) -or ($key.Key -eq 'C' -and ($key.Modifiers -band [ConsoleModifiers]::Control))
-        if ($controlC) {
+        if (($ch -eq 3) -or ($vk -eq 67 -and $ctrl)) {
             $script:Interrupted = $true
             $kind = 'interrupt'
             break
         }
-        if ($key.Key -eq 'Enter') {
+        if ($vk -eq 13) {
             $text = $buf.ToString().Trim().ToLowerInvariant()
             if ($text -eq '' -or $text -eq 'y' -or $text -eq 'yes' -or $text -eq 'ok' -or $text -eq 'go') {
                 $kind = 'go'
@@ -352,13 +430,12 @@ function Read-Answer([string]$prompt, [int]$seconds) {
             }
             break
         }
-        if ($key.Key -eq 'Backspace') {
+        if ($vk -eq 8) {
             if ($buf.Length -gt 0) { $buf.Length = $buf.Length - 1 }
             continue
         }
-        if ($key.KeyChar -ne 0) { [void]$buf.Append($key.KeyChar) }
+        if ([int]$ch -ge 32) { [void]$buf.Append($ch) }
     }
-    try { [Console]::TreatControlCAsInput = $previous } catch { }
     return $kind
 }
 
@@ -424,6 +501,54 @@ function Probe-Error($probe) {
     return ''
 }
 
+function Snapshot-Data($key, [string]$name) {
+    $kind = $key.GetValueKind($name).ToString()
+    $raw = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $data = ''
+    if ($kind -eq 'Binary') {
+        $data = [Convert]::ToBase64String([byte[]]$raw)
+    } elseif ($kind -eq 'MultiString') {
+        $data = ([string[]]$raw) -join "`n"
+    } else {
+        $data = [string]$raw
+    }
+    return [pscustomobject]@{ kind = $kind; data = $data }
+}
+
+function Value-Matches($entry) {
+    $key = Open-Hive $entry.hive $entry.subkey $false
+    if ($null -eq $key) { return -not $entry.present }
+    $found = $null
+    foreach ($existing in @($key.GetValueNames())) {
+        if ($existing -eq [string]$entry.name) { $found = Snapshot-Data $key $existing }
+    }
+    $key.Close()
+    if (-not $entry.present) { return $null -eq $found }
+    if ($null -eq $found) { return $false }
+    $kindName = 'DWord'
+    if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { $kindName = [string]$entry.kind }
+    return ($found.kind -eq $kindName) -and ($found.data -eq [string]$entry.data)
+}
+
+function Restore-Command($entry) {
+    $path = "$($entry.hive)\$($entry.subkey)"
+    $name = [string]$entry.name
+    if (-not $entry.present) {
+        return "reg delete `"$path`" /v $name /f"
+    }
+    $kindName = 'DWord'
+    if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { $kindName = [string]$entry.kind }
+    $type = switch ($kindName) {
+        'QWord' { 'REG_QWORD' }
+        'String' { 'REG_SZ' }
+        'ExpandString' { 'REG_EXPAND_SZ' }
+        'MultiString' { 'REG_MULTI_SZ' }
+        'Binary' { 'REG_BINARY' }
+        default { 'REG_DWORD' }
+    }
+    return "reg add `"$path`" /v $name /t $type /d $($entry.data) /f"
+}
+
 function Restore-Changes {
     $errors = New-Object System.Collections.Generic.List[string]
     $elevated = Test-SuiteElevated
@@ -433,6 +558,7 @@ function Restore-Changes {
             $remaining.Add($entry)
             continue
         }
+        if (Value-Matches $entry) { continue }
         try {
             $key = Open-Hive $entry.hive $entry.subkey $true
             if ($null -eq $key) { throw "cannot open $($entry.hive)\$($entry.subkey)" }
@@ -448,16 +574,25 @@ function Restore-Changes {
             $key.Close()
         } catch {
             $remaining.Add($entry)
-            $errors.Add("$($entry.hive)\$($entry.subkey) $($entry.name): $($_.Exception.Message)")
+            $line = "$($entry.hive)\$($entry.subkey) value $($entry.name) was changed and was not put back. $($_.Exception.Message). Run: $(Restore-Command $entry)"
+            $errors.Add($line)
+            Write-Host $line
         }
     }
     $powerLeft = New-Object System.Collections.Generic.List[object]
+    $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
     foreach ($entry in $script:Power.ToArray()) {
         try {
+            $current = Read-PowerIndex ([string]$entry.setting)
+            if ($null -ne $current -and $current.ac -eq [int]$entry.ac -and $current.dc -eq [int]$entry.dc) {
+                continue
+            }
             $err = Set-PowerIndex $entry.setting ([int]$entry.ac) ([int]$entry.dc)
             if ($err) {
                 $powerLeft.Add($entry)
-                $errors.Add($err)
+                $line = "power $($entry.setting) was changed and was not put back. $err. Run: powercfg /SETACVALUEINDEX SCHEME_CURRENT $sub $($entry.setting) $($entry.ac) & powercfg /SETDCVALUEINDEX SCHEME_CURRENT $sub $($entry.setting) $($entry.dc) & powercfg /SETACTIVE SCHEME_CURRENT"
+                $errors.Add($line)
+                Write-Host $line
             }
         } catch {
             $powerLeft.Add($entry)
@@ -475,6 +610,12 @@ function Restore-Changes {
     }
     if ($hklmLeft -and -not $elevated) {
         $script:HklmCommand = "powershell -ExecutionPolicy Bypass -File `"$restoreScript`""
+        foreach ($entry in $remaining.ToArray()) {
+            if ($entry.hive -ne 'HKLM') { continue }
+            $line = "$($entry.hive)\$($entry.subkey) value $($entry.name) was changed and was not put back. Run: $(Restore-Command $entry)"
+            $errors.Add($line)
+            Write-Host $line
+        }
         $errors.Add("HKLM was not restored. From an elevated prompt run: $($script:HklmCommand)")
     }
     return @($errors)
@@ -549,6 +690,10 @@ function ConvertTo-ResultJson {
     return '[' + ($rows -join ',') + ']'
 }
 
+if (-not (Test-SuiteElevated)) {
+    Write-Host 'Admin rows will skip. To run them, open an elevated prompt and pass --admin.'
+}
+
 try {
     $detect = $null
     Add-Type -Path (Join-Path $PSScriptRoot 'Native.cs') -ErrorAction Stop
@@ -588,10 +733,15 @@ try {
     $pinJson = if ($pin) { 'true' } else { 'false' }
     $laptopJson = if ($null -eq $laptop) { 'null' } else { if ($laptop) { 'true' } else { 'false' } }
     $powerEscaped = Escape-JsonString $powerText
+    $internalJson = 'null'
+    if ($detect.PSObject.Properties.Name -contains 'internal' -and $null -ne $detect.internal) {
+        $internalJson = if ($detect.internal) { 'true' } else { 'false' }
+    }
     $factsPath = Join-Path $env:TEMP ("softlock-hw-facts-{0}.json" -f $PID)
     $facts = '{' +
         '"ci":' + $(if ($ci) { 'true' } else { 'false' }) +
         ',"admin":' + $(if ($admin) { 'true' } else { 'false' }) +
+        ',"school":' + $(if ($school) { 'true' } else { 'false' }) +
         ',"elevated":' + $(if ($detect.elevated) { 'true' } else { 'false' }) +
         ',"github_actions":' + $(if ($env:GITHUB_ACTIONS -eq 'true') { 'true' } else { 'false' }) +
         ',"current_build":"' + (Escape-JsonString ([string]$version.CurrentBuild)) + '"' +
@@ -603,6 +753,7 @@ try {
         ',"client_protocol":' + [int]$detect.protocol +
         ',"chassis_laptop":' + $laptopJson +
         ',"ac_line":' + [int]$detect.ac +
+        ',"internal_display":' + $internalJson +
         '}'
     Write-Utf8 $factsPath $facts
 
@@ -643,8 +794,18 @@ try {
     if ($needsButtons) {
         $lidHeld = Ensure-DoNothing '5ca83367-6e45-459f-a27b-476b1d01c936'
         $buttonHeld = Ensure-DoNothing '7648efa3-dd9c-4e3e-b566-50f929386280'
-        if ($lidHeld) { Add-Result 'lid-cycle' 'fail' 'lid policy was not changed' @{ stderr = $lidHeld } }
-        if ($buttonHeld) { Add-Result 'power-key' 'fail' 'power button policy was not changed' @{ stderr = $buttonHeld } }
+        $lidPrompt = $false
+        foreach ($planned in @($plan.rows)) {
+            if ($planned.id -eq 'lid-cycle' -and $planned.action -eq 'prompt') { $lidPrompt = $true }
+        }
+        if ($lidPrompt -and $lidHeld -eq 'needs-admin') {
+            Add-Result 'lid-cycle' 'skip' 'needs-admin' @{ stderr = 'powercfg LIDACTION needs administrator' }
+        } elseif ($lidPrompt -and $lidHeld) {
+            Add-Result 'lid-cycle' 'fail' 'lid policy was not changed' @{ stderr = $lidHeld }
+        }
+        if ($buttonHeld -and $buttonHeld -ne 'needs-admin') {
+            Add-Result 'power-key' 'fail' 'power button policy was not changed' @{ stderr = $buttonHeld }
+        }
     }
 
     foreach ($row in @($plan.rows)) {
@@ -693,8 +854,7 @@ try {
                     Add-Result $row.id 'skip' 'not-applicable' @{}
                 } else {
                     $sub = 'Software\Microsoft\Windows\CurrentVersion\PushNotifications'
-                    Remember-Dword 'HKCU' $sub 'ToastEnabled'
-                    $read = Set-SuiteDword 'HKCU' $sub 'ToastEnabled' 0
+                    $read = Write-SuiteDword 'HKCU' $sub 'ToastEnabled' 0
                     $restoredNow = @(Restore-Changes)
                     if ($restoredNow.Count -gt 0) {
                         Add-Result $row.id 'fail' ($restoredNow -join '; ') @{ value = $read; stderr = ($restoredNow -join '; ') }
@@ -735,7 +895,11 @@ try {
                     display = [bool]$seen.display
                     system_error = [int]$probe.system_error
                 }
-                if (-not $seenOk) {
+                $adminMeasure = (-not (Test-SuiteElevated)) -or ($requests -match 'administrator') -or ($requests -match 'privileges')
+                if (-not $seenOk -and $adminMeasure) {
+                    $status = 'skip'
+                    $reason = 'needs-admin'
+                } elseif (-not $seenOk) {
                     if ($env:GITHUB_ACTIONS -eq 'true' -and $apiOk) {
                         $status = 'skip'
                         $reason = 'ci'
@@ -764,8 +928,7 @@ try {
                 )
                 $ok = $true
                 foreach ($pair in $pairs) {
-                    Remember-Dword 'HKCU' $pair.sub $pair.name
-                    if ((Set-SuiteDword 'HKCU' $pair.sub $pair.name 1) -ne 1) { $ok = $false }
+                    if ((Write-SuiteDword 'HKCU' $pair.sub $pair.name 1) -ne 1) { $ok = $false }
                 }
                 $restoredNow = @(Restore-Changes)
                 if ($restoredNow.Count -gt 0) {
@@ -778,8 +941,7 @@ try {
                 if ($row.action -eq 'skip') { continue }
                 try {
                     $sub = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'
-                    Remember-Dword 'HKLM' $sub 'HideFastUserSwitching'
-                    $read = Set-SuiteDword 'HKLM' $sub 'HideFastUserSwitching' 1
+                    $read = Write-SuiteDword 'HKLM' $sub 'HideFastUserSwitching' 1
                     $restoredNow = @(Restore-Changes)
                     if ($restoredNow.Count -gt 0) {
                         Add-Result $row.id 'fail' ($restoredNow -join '; ') @{ value = $read; stderr = ($restoredNow -join '; ') }
@@ -794,8 +956,7 @@ try {
                 if ($row.action -eq 'skip') { continue }
                 $script:Armed = $true
                 $sub = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'
-                Remember-Dword 'HKCU' $sub 'DisableLockWorkstation'
-                Set-SuiteDword 'HKCU' $sub 'DisableLockWorkstation' 1 | Out-Null
+                Write-SuiteDword 'HKCU' $sub 'DisableLockWorkstation' 1 | Out-Null
                 $probe = $native::MeasureLockJson() | ConvertFrom-Json
                 $restoredNow = @(Restore-Changes)
                 if ($probe.locked) {
@@ -852,7 +1013,9 @@ try {
             'lid-cycle' {
                 if ($row.action -eq 'skip') { continue }
                 $held = Ensure-DoNothing '5ca83367-6e45-459f-a27b-476b1d01c936'
-                if ($held) {
+                if ($held -eq 'needs-admin') {
+                    Add-Result $row.id 'skip' 'needs-admin' @{ stderr = 'powercfg LIDACTION needs administrator' }
+                } elseif ($held) {
                     Add-Result $row.id 'fail' 'lid policy was not changed' @{ stderr = $held }
                 } else {
                     $before = $native::SnapshotJson() | ConvertFrom-Json
@@ -921,10 +1084,15 @@ try {
             default { }
         }
         } catch {
+            Discard-Staged
             if ($results.Count -eq $beforeCount) {
                 $message = ''
                 if ($null -ne $_.Exception) { $message = $_.Exception.Message }
-                Add-Result $row.id 'fail' 'setting failed' @{ stderr = $message }
+                if ((Test-AccessDenied $_) -and -not (Test-SuiteElevated)) {
+                    Add-Result $row.id 'skip' 'needs-admin' @{ stderr = $message }
+                } else {
+                    Add-Result $row.id 'fail' 'setting failed' @{ stderr = $message }
+                }
             }
         }
         if ($script:Interrupted) { break }
@@ -985,6 +1153,7 @@ try {
         $real = @($restoreErrors | Where-Object { $_ })
         $restored = ($real.Count -eq 0)
         if (-not $restored) {
+            Write-Host ($real -join "`n")
             Add-Result 'restore' 'fail' ($real -join '; ') @{ stderr = ($real -join '; ') }
         } else {
             Add-Result 'restore' 'pass' '' @{}

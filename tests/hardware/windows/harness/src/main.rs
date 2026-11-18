@@ -6,7 +6,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use serde_json::Value;
-use softlock_win_hwsuite::{Flags, Outcome, Report, conform, plan_value, render, section_contains};
+use softlock_win_hwsuite::{
+    Flags, Outcome, Report, conform, plan_value, profile_name, render, section_contains,
+};
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -40,7 +42,7 @@ fn plan_main(args: &[String]) -> Result<ExitCode, String> {
     let flags = flags_from(&facts)?;
     let (machine, rows) = plan_value(&facts, &flags)?;
     let body = serde_json::json!({
-        "profile": if flags.ci { "ci" } else if flags.admin { "admin" } else { "school" },
+        "profile": profile_name(&flags),
         "config": machine.to_json(),
         "rows": rows.iter().map(|row| serde_json::json!({
             "id": row.id,
@@ -145,6 +147,7 @@ fn flags_from(facts: &Value) -> Result<Flags, String> {
         admin: bool_field(facts, "admin")?,
         elevated: bool_field(facts, "elevated")?,
         github_actions: bool_field(facts, "github_actions")?,
+        school: bool_field(facts, "school")?,
     })
 }
 
