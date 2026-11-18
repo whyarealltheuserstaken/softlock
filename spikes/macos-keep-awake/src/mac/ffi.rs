@@ -48,6 +48,8 @@ unsafe extern "C" {
     fn m07_assertions_release(system_id: u32, display_id: u32) -> i32;
     fn m07_display_count() -> i32;
     fn m07_touch_id() -> i32;
+    fn m07_clamshell_closed() -> i32;
+    fn m07_has_lid() -> i32;
     fn m07_overlay_open(out: *mut WindowOut, x: f64, y: f64, w: f64, h: f64, use_rect: i32) -> i32;
     fn m07_overlay_close() -> i32;
     fn m07_overlay_pump(millis: u32);
@@ -254,6 +256,14 @@ pub fn display_count() -> i32 {
 
 pub fn touch_id() -> i32 {
     unsafe { m07_touch_id() }
+}
+
+pub fn clamshell_closed() -> i32 {
+    unsafe { m07_clamshell_closed() }
+}
+
+pub fn has_lid() -> i32 {
+    unsafe { m07_has_lid() }
 }
 
 pub struct PowerWatch;

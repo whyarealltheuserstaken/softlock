@@ -49,6 +49,8 @@ jobs:
         run: cargo fmt --manifest-path spikes/macos-keep-awake/Cargo.toml -- --check
       - name: Clippy
         run: cargo clippy --locked --manifest-path spikes/macos-keep-awake/Cargo.toml --all-targets -- -D warnings
+      - name: Hardware suite clippy
+        run: cargo clippy --locked --manifest-path tests/hardware/macos/Cargo.toml --all-targets -- -D warnings
       - name: Unit tests
         run: cargo test --locked --manifest-path spikes/macos-keep-awake/Cargo.toml
       - name: Hardware suite unit tests

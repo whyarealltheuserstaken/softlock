@@ -85,12 +85,12 @@ fn run() -> i32 {
     }
 
     let grants = ensure_permissions(ci);
-    if !grants.input {
+    if !grants.input() {
         rows.push(decided_skip(
             "m03-posted-input",
             "Posted input",
             "not-applicable",
-            "grant Accessibility and Input Monitoring, then restart Terminal",
+            &grants.input_note(),
             false,
         ));
     } else {
@@ -113,7 +113,7 @@ fn run() -> i32 {
             "m04-sharing",
             "Sharing probe",
             "not-applicable",
-            "grant Screen Recording, then restart Terminal",
+            "missing Screen Recording; grant Screen Recording, then restart Terminal",
             false,
         ));
     } else {
@@ -379,19 +379,62 @@ fn run_smoke(dir: &Path, log: &Path, arch: &str) -> i32 {
 }
 
 struct Grants {
-    input: bool,
+    accessibility: bool,
+    listen: bool,
     screen: bool,
+}
+
+impl Grants {
+    fn input(&self) -> bool {
+        self.accessibility && self.listen
+    }
+
+    fn missing_names(&self) -> String {
+        let mut missing = Vec::new();
+        if !self.accessibility {
+            missing.push("Accessibility");
+        }
+        if !self.listen {
+            missing.push("Input Monitoring");
+        }
+        if !self.screen {
+            missing.push("Screen Recording");
+        }
+        if missing.is_empty() {
+            missing.push("Accessibility");
+        }
+        missing.join(" and ")
+    }
+
+    fn input_note(&self) -> String {
+        let mut missing = Vec::new();
+        if !self.accessibility {
+            missing.push("Accessibility");
+        }
+        if !self.listen {
+            missing.push("Input Monitoring");
+        }
+        let names = if missing.is_empty() {
+            "Accessibility and Input Monitoring".to_string()
+        } else {
+            missing.join(" and ")
+        };
+        format!("missing {names}; grant {names}, then restart Terminal")
+    }
 }
 
 fn ensure_permissions(ci: bool) -> Grants {
     let mut grants = read_grants();
-    if grants.input && grants.screen {
+    if grants.input() && grants.screen {
         return grants;
     }
     if ci || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return grants;
     }
-    println!("Grant the missing permission in System Settings, then press Enter.");
+    println!(
+        "Missing {}. Grant it in System Settings, then press Enter.",
+        grants.missing_names()
+    );
     if matches!(read_line_interruptible(), LineRead::Line) {
         grants = read_grants();
     }
@@ -403,7 +446,8 @@ fn read_grants() -> Grants {
     {
         unsafe {
             Grants {
-                input: AXIsProcessTrusted() != 0 && CGPreflightListenEventAccess() != 0,
+                accessibility: AXIsProcessTrusted() != 0,
+                listen: CGPreflightListenEventAccess() != 0,
                 screen: CGPreflightScreenCaptureAccess() != 0,
             }
         }
@@ -411,7 +455,8 @@ fn read_grants() -> Grants {
     #[cfg(not(target_os = "macos"))]
     {
         Grants {
-            input: true,
+            accessibility: true,
+            listen: true,
             screen: true,
         }
     }

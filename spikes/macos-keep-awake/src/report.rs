@@ -79,6 +79,7 @@ pub struct TimerReport {
     pub occlusion_visible_down: Option<bool>,
     pub occlusion_visible_up: Option<bool>,
     pub expected_ticks: u64,
+    pub uncovered_expected_ticks: u64,
     pub app_nap_ms: u64,
     pub app_nap_count: Option<u64>,
     pub app_nap_occlusion_visible: Option<bool>,
@@ -146,7 +147,8 @@ pub fn lid_external_row(outcome: &str) -> Result<String, String> {
         | "not-run-on-runner"
         | "needs-terminal"
         | "no-lid"
-        | "on-battery" => Ok(outcome.to_string()),
+        | "on-battery"
+        | "closed" => Ok(outcome.to_string()),
         other => Err(format!("unknown lid-external outcome {other}")),
     }
 }
@@ -259,6 +261,7 @@ pub fn hardware_row_filled(row: &HardwareRow) -> bool {
                     | "no-lid"
                     | "on-battery"
                     | "no-touch-id"
+                    | "closed"
             )
         )
 }
@@ -571,6 +574,10 @@ pub fn render(report: &KitReport) -> String {
         report.timer.expected_ticks
     ));
     out.push_str(&format!(
+        "timer-uncovered-expected-ticks={}\n",
+        report.timer.uncovered_expected_ticks
+    ));
+    out.push_str(&format!(
         "timer-occlusion-visible-down={}\n",
         fmt_flag(report.timer.occlusion_visible_down)
     ));
@@ -780,6 +787,7 @@ fn passing_runner_fixture() -> KitReport {
             occlusion_visible_down: Some(true),
             occlusion_visible_up: Some(false),
             expected_ticks: expected_ticks(RUNNER_SAMPLE_MS, DEFAULT_INTERVAL_MS),
+            uncovered_expected_ticks: expected_ticks(RUNNER_SAMPLE_MS, DEFAULT_INTERVAL_MS),
             app_nap_ms: APP_NAP_SAMPLE_MS,
             app_nap_count: None,
             app_nap_occlusion_visible: None,
@@ -931,6 +939,10 @@ mod tests {
             expected_ticks(RUNNER_SAMPLE_MS, DEFAULT_INTERVAL_MS)
         );
         assert_eq!(report.timer.expected_ticks, 133);
+        assert_eq!(report.timer.uncovered_expected_ticks, 133);
+        assert!(text.contains("timer-uncovered-expected-ticks=133"));
+        assert_eq!(expected_ticks(8_000, 50), 133);
+        assert_eq!(expected_ticks(60_000, 50), 1_000);
         assert!(text.contains("lid-on-power-assertion-held=true"));
         assert!(!text.contains("WindowServer"));
         let json = serde_json::to_string(&report).expect("json");

@@ -53,6 +53,15 @@ pub fn laptop_model(model: &str) -> bool {
     lower.contains("macbook")
 }
 
+/// `registry` is `Some` when the clamshell property or an internal battery was checked.
+/// Mac14 and Mac15 laptops do not contain "MacBook" in `hw.model`.
+pub fn has_lid(model: &str, registry: Option<bool>) -> bool {
+    match registry {
+        Some(present) => present,
+        None => laptop_model(model),
+    }
+}
+
 /// `Some(true)` is AC, `Some(false)` is battery, `None` is unread.
 pub fn ac_power(pmset_batt: &str) -> Option<bool> {
     let lower = pmset_batt.to_ascii_lowercase();
@@ -107,6 +116,12 @@ mod tests {
         assert!(power_key(None).is_none());
         assert!(laptop_model("MacBookPro16,2"));
         assert!(!laptop_model("Macmini6,2"));
+        assert!(!laptop_model("Mac14,2"));
+        assert!(has_lid("Mac14,2", Some(true)));
+        assert!(has_lid("Mac15,12", Some(true)));
+        assert!(!has_lid("Macmini8,1", Some(false)));
+        assert!(!has_lid("Mac14,2", None));
+        assert!(has_lid("MacBookPro16,2", None));
         assert_eq!(ac_power("Now drawing from 'AC Power'"), Some(true));
         assert_eq!(ac_power("Now drawing from 'Battery Power'"), Some(false));
         assert_eq!(ac_power(""), None);

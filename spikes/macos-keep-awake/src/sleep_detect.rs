@@ -69,11 +69,14 @@ pub fn classify_pmset_log(text: &str) -> SleepEvent {
 
 pub fn classify_pmset_log_line(line: &str) -> SleepEvent {
     let lower = line.to_ascii_lowercase();
+    // Darkwake is a maintenance wake, not a lid close.
+    if lower.contains("darkwake") {
+        return SleepEvent::None;
+    }
     if lower.contains("entering sleep")
         || lower.contains("clamshell sleep")
         || lower.contains("due to idle sleep")
         || column_is(&lower, "sleep")
-        || column_is(&lower, "darkwake")
     {
         return SleepEvent::SystemSleep;
     }
@@ -147,6 +150,16 @@ pub fn detection_method(
     }
 }
 
+/// A lid close is a clamshell sleep in the log, not darkwake and not display sleep.
+pub fn clamshell_sleep(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("clamshell sleep")
+}
+
+/// Positive lid signal: the system-sleep watcher, a closed clamshell, or a clamshell-sleep line.
+pub fn lid_close_seen(iokit_system: bool, clamshell_closed: bool, pmset_window: &str) -> bool {
+    iokit_system || clamshell_closed || clamshell_sleep(pmset_window)
+}
+
 pub fn outcome_token(event: SleepEvent) -> &'static str {
     match event {
         SleepEvent::SystemSleep | SleepEvent::DisplaySleep => "slept",
@@ -168,7 +181,7 @@ mod tests {
         );
         assert_eq!(
             classify_pmset_log_line("2026-11-17 18:01:02 +0000 Sleep                 DarkWake"),
-            SleepEvent::SystemSleep
+            SleepEvent::None
         );
         assert_eq!(
             classify_pmset_log_line("2026-11-17 18:01:03 +0000 Display is turned off"),
@@ -211,7 +224,7 @@ mod tests {
         assert_eq!(classify_pmset_log(only_display), SleepEvent::DisplaySleep);
         assert_eq!(
             classify_pmset_log("2026-11-17 18:00:00 +0000 DarkWake from Sleep"),
-            SleepEvent::SystemSleep
+            SleepEvent::None
         );
     }
 
@@ -244,6 +257,21 @@ mod tests {
         );
         assert_eq!(outcome_token(SleepEvent::SystemSleep), "slept");
         assert_eq!(outcome_token(SleepEvent::None), "awake");
+    }
+
+    #[test]
+    fn darkwake_alone_is_not_a_lid_close() {
+        let dark = "\
+2026-11-17 18:00:00 +0000 DarkWake from Sleep\n\
+2026-11-17 18:00:01 +0000 Display is turned off\n";
+        assert!(!clamshell_sleep(dark));
+        assert!(!lid_close_seen(false, false, dark));
+        assert_eq!(classify_pmset_log(dark), SleepEvent::DisplaySleep);
+        let clamshell = "2026-11-17 18:00:02 +0000 Entering Sleep state due to 'Clamshell Sleep'\n";
+        assert!(clamshell_sleep(clamshell));
+        assert!(lid_close_seen(false, false, clamshell));
+        assert!(lid_close_seen(true, false, ""));
+        assert!(lid_close_seen(false, true, dark));
     }
 
     #[test]

@@ -193,7 +193,9 @@ fn hardware_row(id: &str, name: &str, key: &str, text: &str, mode: &str) -> Row 
     }
     let physical = true;
     match value.as_str() {
-        "slept" | "awake" | "restart-panel" | "nothing" if method != "none" => {
+        // A lid row needs a positive lid signal. Awake means Enter arrived and no lid close was seen.
+        "awake" if id.starts_with("m07-lid") => row(id, name, "fail", None, physical, detail),
+        "slept" | "closed" | "restart-panel" | "nothing" if method != "none" => {
             row(id, name, "pass", None, physical, detail)
         }
         "no-external-display" | "no-lid" | "on-battery" | "no-touch-id" => {
@@ -292,6 +294,11 @@ pub fn lock_exercise_row(id: &str, text: &str, ran: bool) -> Row {
         built
             .measurements
             .insert("settings-changed".into(), json!(changed));
+    }
+    if documented_row && let Some(delay) = field(text, "screen-lock-status") {
+        built
+            .measurements
+            .insert("screen-lock-status".into(), json!(delay));
     }
     built
 }
@@ -449,76 +456,6 @@ pub fn restored_from(rows: &[Row]) -> bool {
                 .and_then(Value::as_str)
                 != Some("true")
     })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Machine {
-    pub laptop: bool,
-    pub displays: u32,
-    pub on_ac: Option<bool>,
-    pub touch_id: Option<bool>,
-    pub arch_x86_64: bool,
-    pub filevault: bool,
-    pub ci: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RowPlan {
-    Run,
-    Skip(&'static str, &'static str),
-}
-
-pub fn plan_lid_on_power(machine: Machine) -> RowPlan {
-    if machine.ci {
-        return RowPlan::Skip("ci", "ci does not close the lid");
-    }
-    if !machine.laptop {
-        return RowPlan::Skip("not-applicable", "this Mac has no lid");
-    }
-    if machine.on_ac == Some(false) {
-        return RowPlan::Skip("not-applicable", "on battery; lid close on power needs AC");
-    }
-    RowPlan::Run
-}
-
-pub fn plan_lid_external(machine: Machine) -> RowPlan {
-    if machine.ci {
-        return RowPlan::Skip("ci", "ci does not close the lid");
-    }
-    if !machine.laptop {
-        return RowPlan::Skip("not-applicable", "this Mac has no lid");
-    }
-    if machine.displays < 2 {
-        return RowPlan::Skip("not-applicable", "fewer than two displays");
-    }
-    RowPlan::Run
-}
-
-pub fn plan_power_key(machine: Machine) -> RowPlan {
-    if machine.ci {
-        return RowPlan::Skip("ci", "ci does not tap Touch ID");
-    }
-    if machine.touch_id == Some(false) {
-        return RowPlan::Skip("not-applicable", "this Mac has no Touch ID");
-    }
-    RowPlan::Run
-}
-
-pub fn plan_smoke(machine: Machine) -> RowPlan {
-    if machine.arch_x86_64 {
-        RowPlan::Run
-    } else {
-        RowPlan::Skip("not-applicable", "x86_64 slice of the universal binary")
-    }
-}
-
-pub fn plan_lock_exercise(machine: Machine) -> RowPlan {
-    // FileVault on or off still runs the lock exercise.
-    if machine.ci {
-        RowPlan::Skip("ci", "ci does not lock the session")
-    } else {
-        RowPlan::Run
-    }
 }
 
 pub fn suite_exit(summary: &Summary, interrupted: bool) -> i32 {
@@ -685,6 +622,23 @@ power-key-detection=iokit-power-notification
         assert_eq!(rows[3].status, "skip");
         assert_eq!(rows[3].skip_reason.as_deref(), Some("operator"));
         assert_eq!(rows[4].status, "pass");
+        let awake = "\
+mode=kit
+assertion-created=true
+assertion-released=true
+result=pass
+app-nap-verdict=napped
+lid-on-power=awake
+lid-on-power-detection=iokit-power-notification
+lid-external=closed
+lid-external-detection=clamshell-state
+power-key=nothing
+power-key-detection=iokit-power-notification
+";
+        let rows = keep_awake_rows(awake);
+        assert_eq!(rows[2].id, "m07-lid-on-power");
+        assert_eq!(rows[2].status, "fail");
+        assert_eq!(rows[3].status, "pass");
     }
 
     #[test]
@@ -777,6 +731,19 @@ power-key=not-run-on-runner
         );
         assert_eq!(fallback.status, "fail");
         assert!(restored_from(&[fallback]));
+        let started_private = lock_exercise_row(
+            "m08-documented",
+            "result=os-locked\nstate=os-locked\nlock-screen-appeared=yes\ninput-reached-desktop-without-login=no\ndocumented-path=started\nfail-closed=lock-private\nscreen-lock-status=immediate\nsettings-changed=false\n",
+            true,
+        );
+        assert_eq!(started_private.status, "fail");
+        assert_eq!(
+            started_private
+                .measurements
+                .get("screen-lock-status")
+                .and_then(|value| value.as_str()),
+            Some("immediate")
+        );
         let healthy = keep_process_row(
             "assertion-created=true\nassertion-released=true\nresult=incomplete\n",
             1,
@@ -873,59 +840,5 @@ power-key=not-run-on-runner
         assert!(txt.contains(SCHEMA));
         assert!(txt.contains("config:"));
         assert!(!txt.to_ascii_lowercase().contains("serial number"));
-    }
-
-    #[test]
-    fn every_setup_skips_or_runs_without_failing_the_machine() {
-        let henry = Machine {
-            laptop: true,
-            displays: 1,
-            on_ac: Some(true),
-            touch_id: Some(true),
-            arch_x86_64: true,
-            filevault: false,
-            ci: false,
-        };
-        assert_eq!(plan_lid_on_power(henry), RowPlan::Run);
-        assert_eq!(
-            plan_lid_external(henry),
-            RowPlan::Skip("not-applicable", "fewer than two displays")
-        );
-        assert_eq!(plan_power_key(henry), RowPlan::Run);
-        assert_eq!(plan_smoke(henry), RowPlan::Run);
-        assert_eq!(plan_lock_exercise(henry), RowPlan::Run);
-        let desktop = Machine {
-            laptop: false,
-            displays: 1,
-            on_ac: Some(true),
-            touch_id: Some(false),
-            arch_x86_64: false,
-            filevault: true,
-            ci: false,
-        };
-        assert!(matches!(plan_lid_on_power(desktop), RowPlan::Skip(_, _)));
-        assert!(matches!(plan_lid_external(desktop), RowPlan::Skip(_, _)));
-        assert_eq!(
-            plan_power_key(desktop),
-            RowPlan::Skip("not-applicable", "this Mac has no Touch ID")
-        );
-        assert!(matches!(plan_smoke(desktop), RowPlan::Skip(_, _)));
-        assert_eq!(plan_lock_exercise(desktop), RowPlan::Run);
-        let battery = Machine {
-            on_ac: Some(false),
-            ..henry
-        };
-        assert_eq!(
-            plan_lid_on_power(battery),
-            RowPlan::Skip("not-applicable", "on battery; lid close on power needs AC")
-        );
-        let clamshell = Machine {
-            displays: 2,
-            ..henry
-        };
-        assert_eq!(plan_lid_external(clamshell), RowPlan::Run);
-        let ci = Machine { ci: true, ..henry };
-        assert!(matches!(plan_lid_on_power(ci), RowPlan::Skip("ci", _)));
-        assert!(matches!(plan_lock_exercise(ci), RowPlan::Skip("ci", _)));
     }
 }

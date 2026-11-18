@@ -11,7 +11,13 @@ fn main() {
         .flag("-fobjc-arc")
         .flag("-Wno-deprecated-declarations")
         .compile("macoskeepawake");
-    for framework in ["AppKit", "CoreFoundation", "Foundation", "IOKit"] {
+    for framework in [
+        "AppKit",
+        "CoreFoundation",
+        "Foundation",
+        "IOKit",
+        "LocalAuthentication",
+    ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
 }
