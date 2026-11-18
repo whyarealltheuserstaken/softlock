@@ -22,6 +22,7 @@ namespace SoftLock.Hardware
         const uint WsExNoActivate = 0x08000000;
         const uint WsPopup = 0x80000000;
         const uint Marker = 0x00A00ADC;
+        const uint WmEraseBkgnd = 0x0014;
         const uint WmNcHitTest = 0x0084;
         const uint WmPowerBroadcast = 0x0218;
         const uint WmDeviceChange = 0x0219;
@@ -72,8 +73,7 @@ namespace SoftLock.Hardware
         {
             try
             {
-                EnsureDpi();
-                int monitors = MonitorRects().Count;
+                Census census = ReadCensus();
                 int protocol = ClientProtocol();
                 byte ac = 255;
                 SystemPowerStatus power;
@@ -82,59 +82,177 @@ namespace SoftLock.Hardware
                     ac = power.ACLineStatus;
                 }
                 bool admin = IsUserAnAdmin();
-                return "{\"ok\":true,\"monitors\":" + monitors
+                string internalJson = census.internalCount < 0 ? "null" : (census.internalCount > 0 ? "true" : "false");
+                return "{\"ok\":true,\"monitors\":" + DisplayCount(census)
+                    + ",\"enumerated\":" + census.enumerated
+                    + ",\"active\":" + census.active
+                    + ",\"configured\":" + census.configured
+                    + ",\"internal_count\":" + census.internalCount
+                    + ",\"external_count\":" + census.externalCount
                     + ",\"protocol\":" + protocol
                     + ",\"ac\":" + ac
-                    + ",\"internal\":" + InternalJson()
+                    + ",\"internal\":" + internalJson
                     + ",\"elevated\":" + (admin ? "true" : "false") + "}";
             }
             catch (Exception error)
             {
-                return "{\"ok\":false,\"monitors\":0,\"protocol\":-1,\"ac\":255,\"internal\":null,\"elevated\":false,\"error\":\"" + Esc(error.Message) + "\"}";
+                return "{\"ok\":false,\"monitors\":0,\"enumerated\":-1,\"active\":-1,\"configured\":-1,\"internal_count\":-1,\"external_count\":-1,\"protocol\":-1,\"ac\":255,\"internal\":null,\"elevated\":false,\"error\":\"" + Esc(error.Message) + "\"}";
             }
         }
 
-        // DISPLAYCONFIG_PATH_INFO is 72 bytes. LUID alignment is 4, so the
-        // source is 20 bytes and outputTechnology is the UINT32 at offset 36.
-        // DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL is 0x80000000.
+        // DISPLAYCONFIG_PATH_INFO is 72 bytes. The source is 20 bytes, so the
+        // target LUID is at 20, outputTechnology at 36, and targetAvailable at 60.
         // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-displayconfig_path_info
-        static string InternalJson()
+        class DisplayTarget
         {
-            int found = ActiveInternalTargets();
-            if (found < 0) return "null";
-            return found > 0 ? "true" : "false";
+            public int luidLow;
+            public int luidHigh;
+            public int id;
+            public int tech;
+            public bool available;
+            public string Key { get { return luidLow + ":" + luidHigh + ":" + id; } }
         }
 
-        static int ActiveInternalTargets()
+        class Census
         {
-            uint pathCount;
-            uint modeCount;
-            if (GetDisplayConfigBufferSizes(2, out pathCount, out modeCount) != 0 || pathCount == 0)
-            {
-                return -1;
-            }
-            int pathBytes = (int)pathCount * 128;
-            int modeBytes = (int)modeCount * 128;
-            if (modeBytes < 8) modeBytes = 8;
-            IntPtr paths = Marshal.AllocHGlobal(pathBytes);
-            IntPtr modes = Marshal.AllocHGlobal(modeBytes);
+            public int attached = -1;
+            public int active = -1;
+            public int configured = -1;
+            public int internalCount = -1;
+            public int externalCount = -1;
+            public int enumerated = -1;
+        }
+
+        static bool IsInternal(int tech)
+        {
+            if ((tech & unchecked((int)0x80000000)) != 0) return true;
+            return tech == 6 || tech == 11 || tech == 13;
+        }
+
+        static Census ReadCensus()
+        {
+            Census census = new Census();
             try
             {
-                int rc = QueryDisplayConfig(2, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
-                if (rc != 0) return -1;
-                int found = 0;
-                for (int i = 0; i < (int)pathCount; i++)
-                {
-                    int tech = Marshal.ReadInt32(paths, i * 72 + 36);
-                    if ((tech & unchecked((int)0x80000000)) != 0) found++;
-                }
-                return found;
+                EnsureDpi();
+                census.enumerated = MonitorRects().Count;
             }
-            finally
+            catch (Exception)
             {
-                Marshal.FreeHGlobal(paths);
-                Marshal.FreeHGlobal(modes);
+                census.enumerated = -1;
             }
+            List<DisplayTarget> active = QueryTargets(2, true);
+            List<DisplayTarget> all = QueryTargets(1, false);
+            if (active != null)
+            {
+                census.active = Distinct(active).Count;
+            }
+            List<DisplayTarget> present = null;
+            if (all != null)
+            {
+                List<DisplayTarget> unique = Distinct(all);
+                census.configured = unique.Count;
+                present = new List<DisplayTarget>();
+                foreach (DisplayTarget target in unique)
+                {
+                    if (target.available) present.Add(target);
+                }
+            }
+            if (active != null)
+            {
+                if (present == null) present = new List<DisplayTarget>();
+                foreach (DisplayTarget target in Distinct(active))
+                {
+                    bool known = false;
+                    foreach (DisplayTarget have in present)
+                    {
+                        if (have.Key == target.Key) { known = true; break; }
+                    }
+                    if (!known) present.Add(target);
+                }
+            }
+            if (present != null)
+            {
+                census.attached = present.Count;
+                int internals = 0;
+                foreach (DisplayTarget target in present)
+                {
+                    if (IsInternal(target.tech)) internals++;
+                }
+                census.internalCount = internals;
+                census.externalCount = present.Count - internals;
+            }
+            return census;
+        }
+
+        static int DisplayCount(Census census)
+        {
+            if (census.attached >= 0) return census.attached;
+            if (census.active >= 0) return census.active;
+            return census.enumerated;
+        }
+
+        static List<DisplayTarget> Distinct(List<DisplayTarget> targets)
+        {
+            List<DisplayTarget> unique = new List<DisplayTarget>();
+            foreach (DisplayTarget target in targets)
+            {
+                bool known = false;
+                foreach (DisplayTarget have in unique)
+                {
+                    if (have.Key == target.Key) { known = true; break; }
+                }
+                if (!known) unique.Add(target);
+            }
+            return unique;
+        }
+
+        static List<DisplayTarget> QueryTargets(uint flags, bool forceAvailable)
+        {
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                uint pathCount;
+                uint modeCount;
+                if (GetDisplayConfigBufferSizes(flags, out pathCount, out modeCount) != 0)
+                {
+                    return null;
+                }
+                if (pathCount == 0)
+                {
+                    return new List<DisplayTarget>();
+                }
+                int modeBytes = (int)modeCount * 128;
+                if (modeBytes < 128) modeBytes = 128;
+                IntPtr paths = Marshal.AllocHGlobal((int)pathCount * 128);
+                IntPtr modes = Marshal.AllocHGlobal(modeBytes);
+                try
+                {
+                    uint pathsOut = pathCount;
+                    uint modesOut = modeCount;
+                    int rc = QueryDisplayConfig(flags, ref pathsOut, paths, ref modesOut, modes, IntPtr.Zero);
+                    if (rc == 122) continue;
+                    if (rc != 0) return null;
+                    List<DisplayTarget> found = new List<DisplayTarget>();
+                    for (int i = 0; i < (int)pathsOut; i++)
+                    {
+                        int at = i * 72;
+                        DisplayTarget target = new DisplayTarget();
+                        target.luidLow = Marshal.ReadInt32(paths, at + 20);
+                        target.luidHigh = Marshal.ReadInt32(paths, at + 24);
+                        target.id = Marshal.ReadInt32(paths, at + 28);
+                        target.tech = Marshal.ReadInt32(paths, at + 36);
+                        target.available = forceAvailable || Marshal.ReadInt32(paths, at + 60) != 0;
+                        found.Add(target);
+                    }
+                    return found;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(paths);
+                    Marshal.FreeHGlobal(modes);
+                }
+            }
+            return null;
         }
 
         public static string OverlayJson()
@@ -150,7 +268,7 @@ namespace SoftLock.Hardware
                 }
                 overlayProc = OverlayWnd;
                 IntPtr proc = Marshal.GetFunctionPointerForDelegate(overlayProc);
-                IntPtr brush = CreateSolidBrush(Marker);
+                IntPtr brush = GetStockObject(4);
                 WndClass wc = new WndClass();
                 wc.lpfnWndProc = proc;
                 wc.hInstance = GetModuleHandle(null);
@@ -186,7 +304,10 @@ namespace SoftLock.Hardware
                         continue;
                     }
                     windows.Add(hwnd);
-                    SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+                    // Paint the black frame while the window is hidden, then show it
+                    // at alpha 0. The old marker brush flashed purple for one frame.
+                    SetLayeredWindowAttributes(hwnd, 0, 0, 2);
+                    UpdateWindow(hwnd);
                     ShowWindow(hwnd, 8);
                     uint style = (uint)GetExStyle(hwnd).ToInt64();
                     if ((style & WsExTopmost) == 0)
@@ -345,21 +466,13 @@ namespace SoftLock.Hardware
 
         public static string HotplugJson()
         {
-            int active = ActivePathCount();
-            int monitors = -1;
-            try
-            {
-                EnsureDpi();
-                monitors = MonitorRects().Count;
-            }
-            catch (Exception)
-            {
-                monitors = -1;
-            }
+            Census census = ReadCensus();
             lock (Gate)
             {
-                return "{\"active\":" + active
-                    + ",\"monitors\":" + monitors
+                return "{\"active\":" + DisplayCount(census)
+                    + ",\"monitors\":" + census.enumerated
+                    + ",\"internal\":" + census.internalCount
+                    + ",\"external\":" + census.externalCount
                     + ",\"adds\":" + displayAdds
                     + ",\"removes\":" + displayRemoves
                     + ",\"changes\":" + displayChanges + "}";
@@ -611,7 +724,7 @@ namespace SoftLock.Hardware
 
         static void NoteDisplayChange()
         {
-            int active = ActivePathCount();
+            int active = DisplayCount(ReadCensus());
             lock (Gate)
             {
                 displayChanges++;
@@ -626,42 +739,15 @@ namespace SoftLock.Hardware
 
         static void NoteDevice(bool arrived)
         {
-            int active = ActivePathCount();
+            int active = DisplayCount(ReadCensus());
             lock (Gate)
             {
                 displayChanges++;
-                if (arrived) { displayAdds++; } else { displayRemoves++; }
+                if (lastActive >= 0 && active >= 0 && active != lastActive)
+                {
+                    if (arrived) { displayAdds++; } else { displayRemoves++; }
+                }
                 if (active >= 0) { lastActive = active; }
-            }
-        }
-
-        // QDC_ONLY_ACTIVE_PATHS. Zero paths means no display is attached.
-        static int ActivePathCount()
-        {
-            uint pathCount;
-            uint modeCount;
-            if (GetDisplayConfigBufferSizes(2, out pathCount, out modeCount) != 0)
-            {
-                return -1;
-            }
-            if (pathCount == 0)
-            {
-                return 0;
-            }
-            int modeBytes = (int)modeCount * 128;
-            if (modeBytes < 8) { modeBytes = 8; }
-            IntPtr paths = Marshal.AllocHGlobal((int)pathCount * 128);
-            IntPtr modes = Marshal.AllocHGlobal(modeBytes);
-            try
-            {
-                int rc = QueryDisplayConfig(2, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
-                if (rc != 0) { return -1; }
-                return (int)pathCount;
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(paths);
-                Marshal.FreeHGlobal(modes);
             }
         }
 
@@ -709,6 +795,10 @@ namespace SoftLock.Hardware
             if (message == WmNcHitTest)
             {
                 return new IntPtr(-1);
+            }
+            if (message == WmEraseBkgnd)
+            {
+                return new IntPtr(1);
             }
             return DefWindowProcW(hwnd, message, wParam, lParam);
         }
@@ -882,6 +972,7 @@ namespace SoftLock.Hardware
         static extern IntPtr CreateWindowExW(uint ex, string klass, string name, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
         [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr hwnd);
         [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int cmd);
+        [DllImport("user32.dll")] static extern bool UpdateWindow(IntPtr hwnd);
         [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint key, byte alpha, uint flags);
         [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
         [DllImport("user32.dll")] static extern IntPtr SendMessageW(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
@@ -892,7 +983,7 @@ namespace SoftLock.Hardware
         [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
         [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
         [DllImport("gdi32.dll")] static extern uint GetPixel(IntPtr dc, int x, int y);
-        [DllImport("gdi32.dll")] static extern IntPtr CreateSolidBrush(uint color);
+        [DllImport("gdi32.dll")] static extern IntPtr GetStockObject(int obj);
         [DllImport("user32.dll")] static extern IntPtr DefWindowProcW(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr module, uint thread);
         [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);

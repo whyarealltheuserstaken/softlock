@@ -20,7 +20,10 @@ pub use hookdec::{EXTRA_LOAD, EXTRA_MARKER, EXTRA_VIS, HookAction, HookEvent, cl
 pub use machine::{HelloKind, Machine, SessionKind, decode_facts};
 pub use plan::{Action as RowAction, BUDGET_MS, Flags, Planned, plan, plan_value, profile_name};
 pub use policy::{Restore, hkcu_value_allowed, hklm_value_allowed, restore_dword, restore_saved};
-pub use power::{PowerAvailability, parse_powercfg_a, section_contains};
+pub use power::{
+    PowerAvailability, SettingIndex, parse_powercfg_a, parse_scheme_guid, parse_setting_index,
+    section_contains,
+};
 pub use redact::redact;
 pub use report::{Outcome, Report, SCHEMA, conform, render};
 

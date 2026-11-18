@@ -7,8 +7,8 @@ use std::process::ExitCode;
 
 use serde_json::Value;
 use softlock_win_hwsuite::{
-    DisplayStep, DisplayWatch, Flags, Outcome, Report, conform, display_step_seen, plan_value,
-    profile_name, render, section_contains,
+    DisplayStep, DisplayWatch, Flags, Outcome, Report, conform, display_step_seen,
+    parse_scheme_guid, parse_setting_index, plan_value, profile_name, render, section_contains,
 };
 
 fn main() -> ExitCode {
@@ -20,9 +20,12 @@ fn main() -> ExitCode {
         "report" => finish(report_main(&rest)),
         "requests" => finish(requests_main(&rest)),
         "hotplug" => finish(hotplug_main(&rest)),
+        "power-index" => finish(power_index_main(&rest)),
         "conform" => finish(conform_main(&rest)),
         _ => {
-            eprintln!("usage: softlock-win-hwsuite plan|report|requests|hotplug|conform");
+            eprintln!(
+                "usage: softlock-win-hwsuite plan|report|requests|hotplug|power-index|conform"
+            );
             ExitCode::from(2)
         }
     }
@@ -131,15 +134,54 @@ fn hotplug_main(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn power_index_main(args: &[String]) -> Result<ExitCode, String> {
+    let path = required(args, "--text")?;
+    let setting = required(args, "--setting")?;
+    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let scheme = parse_scheme_guid(&text);
+    match parse_setting_index(&text, setting) {
+        Some(index) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "found": true,
+                    "ac": index.ac,
+                    "dc": index.dc,
+                    "scheme": scheme,
+                })
+            );
+        }
+        None => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "found": false,
+                    "scheme": scheme,
+                })
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn watch_field(value: &Value, name: &str) -> Result<DisplayWatch, String> {
     let watch = value.get(name).ok_or_else(|| format!("missing {name}"))?;
     Ok(DisplayWatch {
         active: i32_field(watch, "active")?,
         monitors: i32_field(watch, "monitors")?,
+        internal: i32_field_or(watch, "internal", -1)?,
+        external: i32_field_or(watch, "external", -1)?,
         adds: u32_field(watch, "adds")?,
         removes: u32_field(watch, "removes")?,
         changes: u32_field(watch, "changes")?,
     })
+}
+
+fn i32_field_or(value: &Value, name: &str, missing: i32) -> Result<i32, String> {
+    match value.get(name) {
+        None | Some(Value::Null) => Ok(missing),
+        Some(_) => i32_field(value, name),
+    }
 }
 
 fn i32_field(value: &Value, name: &str) -> Result<i32, String> {

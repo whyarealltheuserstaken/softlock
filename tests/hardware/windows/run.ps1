@@ -84,7 +84,9 @@ function Save-Pending {
     }
     $power = @()
     foreach ($entry in $script:Power) {
-        $power += '{"setting":"' + (Escape-JsonString ([string]$entry.setting)) + '","ac":' + [int]$entry.ac + ',"dc":' + [int]$entry.dc + '}'
+        $scheme = ''
+        if ($entry.PSObject.Properties.Name -contains 'scheme') { $scheme = [string]$entry.scheme }
+        $power += '{"setting":"' + (Escape-JsonString ([string]$entry.setting)) + '","ac":' + [int]$entry.ac + ',"dc":' + [int]$entry.dc + ',"scheme":"' + (Escape-JsonString $scheme) + '"}'
     }
     $json = '{"values":[' + ($parts -join ',') + '],"power":[' + ($power -join ',') + ']}'
     Write-Utf8 $pendingPath $json
@@ -215,42 +217,127 @@ function Convert-RegistryData([string]$kind, [string]$data) {
     }
 }
 
-function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc) {
-    $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
-    $acText = Read-Native { powercfg /SETACVALUEINDEX SCHEME_CURRENT $sub $setting $ac }
-    if ($LASTEXITCODE -ne 0) { return "powercfg AC $setting failed: $acText" }
-    $dcText = Read-Native { powercfg /SETDCVALUEINDEX SCHEME_CURRENT $sub $setting $dc }
-    if ($LASTEXITCODE -ne 0) { return "powercfg DC $setting failed: $dcText" }
-    $active = Read-Native { powercfg /SETACTIVE SCHEME_CURRENT }
-    if ($LASTEXITCODE -ne 0) { return "powercfg SETACTIVE failed: $active" }
+function Normalize-Guid([string]$guid) {
+    if (-not $guid) { return '' }
+    $trimmed = $guid.Trim().Trim('{}')
+    if ($trimmed -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        return $trimmed.ToLower()
+    }
     return ''
 }
 
-function Read-PowerIndex([string]$setting) {
+function Get-ActiveScheme {
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes')
+        if ($null -ne $key) {
+            $guid = Normalize-Guid ([string]$key.GetValue('ActivePowerScheme'))
+            $key.Close()
+            if ($guid) { return $guid }
+        }
+    } catch { }
+    $text = Read-Native { powercfg /GETACTIVESCHEME }
+    $match = [regex]::Match($text, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+    if ($match.Success) { return $match.Value.ToLower() }
+    return ''
+}
+
+function Read-RegistryIndex([string]$scheme, [string]$setting) {
     $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
-    $text = Read-Native { powercfg /q SCHEME_CURRENT $sub $setting }
-    $ac = [regex]::Match($text, 'Current AC Power Setting Index:\s+0x([0-9A-Fa-f]+)')
-    $dc = [regex]::Match($text, 'Current DC Power Setting Index:\s+0x([0-9A-Fa-f]+)')
-    if (-not $ac.Success -or -not $dc.Success) { return $null }
-    return [pscustomobject]@{
-        setting = $setting
-        ac = [Convert]::ToInt32($ac.Groups[1].Value, 16)
-        dc = [Convert]::ToInt32($dc.Groups[1].Value, 16)
+    $paths = @(
+        "SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$scheme\$sub\$setting",
+        "SYSTEM\CurrentControlSet\Control\Power\PowerSettings\$sub\$setting\DefaultPowerSchemeValues\$scheme"
+    )
+    foreach ($path in $paths) {
+        try {
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($path)
+        } catch {
+            $key = $null
+        }
+        if ($null -eq $key) { continue }
+        $ac = $key.GetValue('ACSettingIndex', $null)
+        $dc = $key.GetValue('DCSettingIndex', $null)
+        $key.Close()
+        if ($null -ne $ac -and $null -ne $dc) {
+            return [pscustomobject]@{ setting = $setting; scheme = $scheme; ac = [int]$ac; dc = [int]$dc }
+        }
     }
+    return $null
+}
+
+function Parse-IndexText([string]$text, [string]$setting) {
+    if (-not $text -or -not $exe) { return $null }
+    $path = Join-Path $env:TEMP ("softlock-hw-power-{0}.txt" -f $PID)
+    Write-Utf8 $path $text
+    $raw = & $exe power-index --text $path --setting $setting
+    $code = $LASTEXITCODE
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    if ($code -ne 0 -or -not $raw) { return $null }
+    $parsed = $raw | ConvertFrom-Json
+    if (-not $parsed.found) { return $null }
+    return [pscustomobject]@{ ac = [int]$parsed.ac; dc = [int]$parsed.dc }
+}
+
+function Query-PowerText([string]$scheme, [string]$setting) {
+    $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
+    # /q documents scheme and subgroup only. A named setting is still tried
+    # because LIDACTION is hidden and a subgroup query can omit it. /qh, when
+    # this build has it, includes those hidden settings. Aliases are not used.
+    $hidden = Read-Native { powercfg /qh $scheme $sub }
+    if ($LASTEXITCODE -eq 0 -and $hidden -match [regex]::Escape($setting)) { return $hidden }
+    $named = Read-Native { powercfg /q $scheme $sub $setting }
+    if ($named -match [regex]::Escape($setting)) { return $named }
+    return Read-Native { powercfg /q $scheme $sub }
+}
+
+function Read-PowerIndex([string]$setting, [string]$scheme) {
+    if (-not $scheme) { $scheme = Get-ActiveScheme }
+    if (-not $scheme) { return $null }
+    $reg = Read-RegistryIndex $scheme $setting
+    if ($null -ne $reg) { return $reg }
+    $parsed = Parse-IndexText (Query-PowerText $scheme $setting) $setting
+    if ($null -eq $parsed) { return $null }
+    return [pscustomobject]@{ setting = $setting; scheme = $scheme; ac = $parsed.ac; dc = $parsed.dc }
+}
+
+function Power-RestoreCommand($entry) {
+    $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
+    $scheme = ''
+    if ($entry.PSObject.Properties.Name -contains 'scheme') { $scheme = Normalize-Guid ([string]$entry.scheme) }
+    if (-not $scheme) { $scheme = Get-ActiveScheme }
+    return "powercfg /SETACVALUEINDEX $scheme $sub $($entry.setting) $($entry.ac) & powercfg /SETDCVALUEINDEX $scheme $sub $($entry.setting) $($entry.dc) & powercfg /SETACTIVE $scheme"
+}
+
+function Set-PowerIndex([string]$setting, [int]$ac, [int]$dc, [string]$scheme) {
+    $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
+    if (-not $scheme) { $scheme = Get-ActiveScheme }
+    if (-not $scheme) { return 'active power scheme was not found' }
+    # The documented arguments are GUIDs. SCHEME_CURRENT is not used: on some
+    # builds the set is ignored until /SETACTIVE is given that scheme's GUID.
+    $acText = Read-Native { powercfg /SETACVALUEINDEX $scheme $sub $setting $ac }
+    if ($LASTEXITCODE -ne 0) { return "powercfg AC $setting failed: $acText" }
+    $dcText = Read-Native { powercfg /SETDCVALUEINDEX $scheme $sub $setting $dc }
+    if ($LASTEXITCODE -ne 0) { return "powercfg DC $setting failed: $dcText" }
+    $active = Read-Native { powercfg /SETACTIVE $scheme }
+    if ($LASTEXITCODE -ne 0) { return "powercfg SETACTIVE $scheme failed: $active" }
+    $after = Read-PowerIndex $setting $scheme
+    if ($null -eq $after) { return "powercfg read-back failed for $setting scheme $scheme" }
+    if ($after.ac -ne $ac -or $after.dc -ne $dc) {
+        return "read-back ac=$($after.ac) dc=$($after.dc) wanted ac=$ac dc=$dc scheme=$scheme"
+    }
+    return ''
 }
 
 function Ensure-DoNothing([string]$setting) {
-    # powercfg /SETACVALUEINDEX writes the active scheme. Re-read the index:
-    # an unelevated process often gets a privilege error, or exit 0 with the index unchanged.
-    $before = Read-PowerIndex $setting
+    # Read the active scheme's AC and DC indexes from the registry, then from
+    # powercfg text. Write them back with that scheme GUID and /SETACTIVE.
+    $before = Read-PowerIndex $setting ''
     if ($null -eq $before) {
         if (-not (Test-SuiteElevated)) { return 'needs-admin' }
-        return 'powercfg /q did not return the current index'
+        return 'could not read the AC and DC indexes'
     }
     if ($before.ac -eq 0 -and $before.dc -eq 0) { return '' }
-    $err = Set-PowerIndex $setting 0 0
-    $after = Read-PowerIndex $setting
-    if ($null -ne $after -and $after.ac -eq 0 -and $after.dc -eq 0) {
+    $err = Set-PowerIndex $setting 0 0 $before.scheme
+    if (-not $err) {
         $known = $false
         foreach ($entry in $script:Power.ToArray()) {
             if ([string]$entry.setting -eq $setting) { $known = $true }
@@ -264,8 +351,7 @@ function Ensure-DoNothing([string]$setting) {
     if (-not (Test-SuiteElevated) -or $err -match 'administrator' -or $err -match 'privilege') {
         return 'needs-admin'
     }
-    if ($err) { return $err }
-    return 'powercfg index was not 0 after set'
+    return $err
 }
 
 function Complete-Interrupted {
@@ -426,8 +512,26 @@ function Test-DisplayStep([string]$prompt, $before, $after) {
     return [bool]$parsed.seen
 }
 
+function Json-Count($object, [string]$name) {
+    if ($null -eq $object -or -not ($object.PSObject.Properties.Name -contains $name)) { return 'null' }
+    if ($null -eq $object.$name) { return 'null' }
+    $value = [int]$object.$name
+    if ($value -lt 0) { return 'null' }
+    return [string]$value
+}
+
+function Sample-Count($sample, [string]$name) {
+    if ($null -eq $sample -or -not ($sample.PSObject.Properties.Name -contains $name) -or $null -eq $sample.$name) { return -1 }
+    return [int]$sample.$name
+}
+
+function Format-DisplayCounts($sample) {
+    if ($null -eq $sample) { return 'missing' }
+    return ("a={0} m={1} i={2} e={3}" -f (Sample-Count $sample 'active'), (Sample-Count $sample 'monitors'), (Sample-Count $sample 'internal'), (Sample-Count $sample 'external'))
+}
+
 function ConvertTo-HotplugJson($sample) {
-    return '{"active":' + [int]$sample.active + ',"monitors":' + [int]$sample.monitors + ',"adds":' + [int]$sample.adds + ',"removes":' + [int]$sample.removes + ',"changes":' + [int]$sample.changes + '}'
+    return '{"active":' + (Sample-Count $sample 'active') + ',"monitors":' + (Sample-Count $sample 'monitors') + ',"internal":' + (Sample-Count $sample 'internal') + ',"external":' + (Sample-Count $sample 'external') + ',"adds":' + (Sample-Count $sample 'adds') + ',"removes":' + (Sample-Count $sample 'removes') + ',"changes":' + (Sample-Count $sample 'changes') + '}'
 }
 
 function Power-Since($afterRecord) {
@@ -577,17 +681,18 @@ function Restore-Changes {
         }
     }
     $powerLeft = New-Object System.Collections.Generic.List[object]
-    $sub = '4f971e89-eebd-4455-a8de-9e59040e7347'
     foreach ($entry in $script:Power.ToArray()) {
         try {
-            $current = Read-PowerIndex ([string]$entry.setting)
+            $savedScheme = ''
+            if ($entry.PSObject.Properties.Name -contains 'scheme') { $savedScheme = [string]$entry.scheme }
+            $current = Read-PowerIndex ([string]$entry.setting) $savedScheme
             if ($null -ne $current -and $current.ac -eq [int]$entry.ac -and $current.dc -eq [int]$entry.dc) {
                 continue
             }
-            $err = Set-PowerIndex $entry.setting ([int]$entry.ac) ([int]$entry.dc)
+            $err = Set-PowerIndex $entry.setting ([int]$entry.ac) ([int]$entry.dc) $savedScheme
             if ($err) {
                 $powerLeft.Add($entry)
-                $line = "power $($entry.setting) was changed and was not put back. $err. Run: powercfg /SETACVALUEINDEX SCHEME_CURRENT $sub $($entry.setting) $($entry.ac) & powercfg /SETDCVALUEINDEX SCHEME_CURRENT $sub $($entry.setting) $($entry.dc) & powercfg /SETACTIVE SCHEME_CURRENT"
+                $line = "power $($entry.setting) was changed and was not put back. $err. Run: $(Power-RestoreCommand $entry)"
                 $errors.Add($line)
                 Write-Host $line
             }
@@ -745,6 +850,9 @@ try {
         ',"installation_type":"' + (Escape-JsonString ([string]$version.InstallationType)) + '"' +
         ',"powercfg_a":"' + $powerEscaped + '"' +
         ',"monitor_count":' + [int]$detect.monitors +
+        ',"internal_count":' + (Json-Count $detect 'internal_count') +
+        ',"external_count":' + (Json-Count $detect 'external_count') +
+        ',"configured":' + (Json-Count $detect 'configured') +
         ',"biometric":' + $bioJson +
         ',"pin":' + $pinJson +
         ',"client_protocol":' + [int]$detect.protocol +
@@ -976,27 +1084,42 @@ try {
             'display-enum' {
                 $again = $native::DetectJson() | ConvertFrom-Json
                 $ok = [int]$again.monitors -ge 1
-                Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{ displays = [int]$again.monitors }
+                Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{
+                    displays = [int]$again.monitors
+                    internal = (Sample-Count $again 'internal_count')
+                    external = (Sample-Count $again 'external_count')
+                }
             }
             'display-hotplug' {
                 if ($row.action -eq 'skip') { continue }
-                $before = $native::HotplugJson() | ConvertFrom-Json
+                $start = $native::HotplugJson() | ConvertFrom-Json
+                $before = $start
+                $during = $null
+                $last = $null
                 $held = $null
                 $missed = $false
+                $stepIndex = 0
                 $prompts = @($row.prompts)
                 foreach ($prompt in $prompts) {
                     $answer = Read-Answer $prompt 25
                     if ($answer -eq 'interrupt') { break }
                     if ($answer -ne 'go') { $held = $answer; break }
-                    $after = $native::HotplugJson() | ConvertFrom-Json
-                    if (-not (Test-DisplayStep $prompt $before $after)) { $missed = $true }
-                    $before = $after
+                    $sample = $native::HotplugJson() | ConvertFrom-Json
+                    if (-not (Test-DisplayStep $prompt $before $sample)) { $missed = $true }
+                    if ($stepIndex -eq 0) { $during = $sample } else { $last = $sample }
+                    $before = $sample
+                    $stepIndex++
                 }
+                if ($null -eq $during) { $during = $start }
+                if ($null -eq $last) { $last = $during }
+                $counts = "before $(Format-DisplayCounts $start) during $(Format-DisplayCounts $during) after $(Format-DisplayCounts $last)"
                 if ($script:Interrupted) {
                 } elseif ($missed) {
-                    Add-Result $row.id 'fail' 'not detected' @{
-                        active = [int]$before.active
-                        monitors = [int]$before.monitors
+                    Add-Result $row.id 'fail' "not detected $counts" @{
+                        active = (Sample-Count $last 'active')
+                        monitors = (Sample-Count $last 'monitors')
+                        internal = (Sample-Count $last 'internal')
+                        external = (Sample-Count $last 'external')
                     }
                 } elseif ($held -eq 'budget') {
                     Add-Result $row.id 'skip' 'budget' @{}
@@ -1005,9 +1128,11 @@ try {
                 } elseif ($null -ne $held) {
                     Add-Result $row.id 'skip' 'no-input' @{}
                 } else {
-                    Add-Result $row.id 'pass' '' @{
-                        active = [int]$before.active
-                        monitors = [int]$before.monitors
+                    Add-Result $row.id 'pass' $counts @{
+                        active = (Sample-Count $last 'active')
+                        monitors = (Sample-Count $last 'monitors')
+                        internal = (Sample-Count $last 'internal')
+                        external = (Sample-Count $last 'external')
                     }
                 }
             }

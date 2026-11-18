@@ -308,11 +308,32 @@ fn recorded(item: &Planned, machine: &Machine) -> Row {
             measurements.insert("build".to_string(), json!(machine.build));
             measurements.insert("sleep".to_string(), json!(machine.power.sleep_label()));
             measurements.insert("displays".to_string(), json!(machine.displays));
+            measurements.insert(
+                "internal".to_string(),
+                json!(count_text(machine.internal_displays)),
+            );
+            measurements.insert(
+                "external".to_string(),
+                json!(count_text(machine.external_displays)),
+            );
+            measurements.insert(
+                "configured".to_string(),
+                json!(count_text(machine.configured_displays)),
+            );
             measurements.insert("hello".to_string(), json!(machine.hello.as_str()));
             measurements.insert("session".to_string(), json!(machine.session.as_str()));
             measurements.insert("lid".to_string(), json!(machine.lid));
             measurements.insert("ac".to_string(), json!(machine.ac));
-            ("pass", String::new())
+            (
+                "pass",
+                format!(
+                    "displays={} internal={} external={} configured={}",
+                    machine.displays,
+                    count_text(machine.internal_displays),
+                    count_text(machine.external_displays),
+                    count_text(machine.configured_displays),
+                ),
+            )
         }
     } else {
         ("fail", "unknown recorded row".to_string())
@@ -327,6 +348,13 @@ fn recorded(item: &Planned, machine: &Machine) -> Row {
         duration_ms: 0,
         detail,
         measurements,
+    }
+}
+
+fn count_text(count: Option<u32>) -> String {
+    match count {
+        Some(value) => value.to_string(),
+        None => "?".to_string(),
     }
 }
 
@@ -427,11 +455,13 @@ impl Report {
             ),
             format!("mode: {}", self.mode),
             format!(
-                "Windows {} build {} | {} | displays {} | hello {} | {} | lid {}",
+                "Windows {} build {} | {} | displays {} internal {} external {} | hello {} | {} | lid {}",
                 machine.windows,
                 machine.build,
                 machine.power.sleep_label(),
                 machine.displays,
+                count_text(machine.internal_displays),
+                count_text(machine.external_displays),
                 machine.hello.as_str(),
                 machine.session.as_str(),
                 machine.lid,
@@ -447,7 +477,7 @@ impl Report {
             } else {
                 row.detail.clone()
             };
-            let shown = if row.id == "restore" {
+            let shown = if row.id == "restore" || row.id == "display-hotplug" || row.id == "detect-config" {
                 detail
             } else {
                 truncate(&detail, 60)
