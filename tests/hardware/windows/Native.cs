@@ -48,6 +48,7 @@ namespace SoftLock.Hardware
         static HookProc hookProc;
         static IntPtr hook = IntPtr.Zero;
         static int injectedSeen;
+        static bool locksEnabled = true;
         static WndProc overlayProc;
         static bool paintMarker;
         static WndProc listenerProc;
@@ -544,9 +545,27 @@ namespace SoftLock.Hardware
                 + ",\"elapsed_ms\":" + watch.ElapsedMilliseconds + "}";
         }
 
-        public static void LockNow()
+        public static void SetLockEnabled(bool enabled)
         {
-            LockWorkStation();
+            locksEnabled = enabled;
+        }
+
+        // bool, not void: the suite invokes this through MethodInfo so a
+        // PowerShell binder mismatch cannot skip the lock.
+        public static bool LockNow()
+        {
+            if (!locksEnabled)
+            {
+                return false;
+            }
+            try
+            {
+                return LockWorkStation();
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         public static void InstallCtrlHandler()
@@ -566,27 +585,34 @@ namespace SoftLock.Hardware
         // WTS_SESSIONSTATE_LOCK is 0 and WTS_SESSIONSTATE_UNLOCK is 1 since Windows 7.
         public static string SessionStateJson()
         {
-            IntPtr buffer;
-            int bytes;
-            if (!WTSQuerySessionInformationW(IntPtr.Zero, -1, 25, out buffer, out bytes) || buffer == IntPtr.Zero)
-            {
-                return "{\"ok\":false,\"locked\":false,\"flags\":-1}";
-            }
             try
             {
-                if (bytes < 20)
+                IntPtr buffer;
+                uint bytes;
+                if (!WTSQuerySessionInformationW(IntPtr.Zero, -1, 25, out buffer, out bytes) || buffer == IntPtr.Zero)
                 {
                     return "{\"ok\":false,\"locked\":false,\"flags\":-1}";
                 }
-                int level = Marshal.ReadInt32(buffer);
-                int flags = Marshal.ReadInt32(buffer, 16);
-                bool known = level == 1 && (flags == 0 || flags == 1);
-                bool locked = known && flags == 0;
-                return "{\"ok\":" + Bool(known) + ",\"locked\":" + Bool(locked) + ",\"flags\":" + flags + "}";
+                try
+                {
+                    if (bytes < 20)
+                    {
+                        return "{\"ok\":false,\"locked\":false,\"flags\":-1}";
+                    }
+                    int level = Marshal.ReadInt32(buffer);
+                    int flags = Marshal.ReadInt32(buffer, 16);
+                    bool known = level == 1 && (flags == 0 || flags == 1);
+                    bool locked = known && flags == 0;
+                    return "{\"ok\":" + Bool(known) + ",\"locked\":" + Bool(locked) + ",\"flags\":" + flags + "}";
+                }
+                finally
+                {
+                    WTSFreeMemory(buffer);
+                }
             }
-            finally
+            catch (Exception)
             {
-                WTSFreeMemory(buffer);
+                return "{\"ok\":false,\"locked\":false,\"flags\":-1}";
             }
         }
 
@@ -932,7 +958,7 @@ namespace SoftLock.Hardware
         static int ClientProtocol()
         {
             IntPtr buffer;
-            int bytes;
+            uint bytes;
             if (!WTSQuerySessionInformationW(IntPtr.Zero, -1, 16, out buffer, out bytes) || buffer == IntPtr.Zero)
             {
                 return -1;
@@ -1101,7 +1127,8 @@ namespace SoftLock.Hardware
         [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
         [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] static extern uint SendInput(uint count, byte[] inputs, int size);
-        [DllImport("user32.dll")] static extern bool LockWorkStation();
+        [DllImport("user32.dll", EntryPoint = "LockWorkStation", SetLastError = true, ExactSpelling = true)]
+        static extern bool LockWorkStation();
         [DllImport("user32.dll")] static extern int GetMessage(out Msg msg, IntPtr hwnd, uint min, uint max);
         [DllImport("user32.dll")] static extern bool PeekMessage(out Msg msg, IntPtr hwnd, uint min, uint max, uint remove);
         [DllImport("user32.dll")] static extern bool TranslateMessage(ref Msg msg);
@@ -1118,7 +1145,8 @@ namespace SoftLock.Hardware
         [DllImport("kernel32.dll", SetLastError = true)] static extern int PowerSetRequest(IntPtr request, int type);
         [DllImport("kernel32.dll", SetLastError = true)] static extern int PowerClearRequest(IntPtr request, int type);
         [DllImport("shell32.dll")] static extern bool IsUserAnAdmin();
-        [DllImport("wtsapi32.dll", CharSet = CharSet.Unicode)] static extern bool WTSQuerySessionInformationW(IntPtr server, int session, int klass, out IntPtr buffer, out int bytes);
+        [DllImport("wtsapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "WTSQuerySessionInformationW", SetLastError = true)]
+        static extern bool WTSQuerySessionInformationW(IntPtr server, int session, int klass, out IntPtr buffer, out uint bytes);
         [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr memory);
         [DllImport("wtsapi32.dll")] static extern bool WTSRegisterSessionNotification(IntPtr hwnd, int flags);
         [DllImport("wtsapi32.dll")] static extern bool WTSUnRegisterSessionNotification(IntPtr hwnd);
