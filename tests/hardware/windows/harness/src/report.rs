@@ -351,6 +351,10 @@ fn recorded(item: &Planned, machine: &Machine) -> Row {
     }
 }
 
+fn full_detail(id: &str) -> bool {
+    matches!(id, "restore" | "display-hotplug" | "detect-config")
+}
+
 fn count_text(count: Option<u32>) -> String {
     match count {
         Some(value) => value.to_string(),
@@ -477,7 +481,7 @@ impl Report {
             } else {
                 row.detail.clone()
             };
-            let shown = if row.id == "restore" || row.id == "display-hotplug" || row.id == "detect-config" {
+            let shown = if full_detail(&row.id) {
                 detail
             } else {
                 truncate(&detail, 60)
