@@ -118,6 +118,7 @@ static void ensure_app(void) {
 }
 
 static NSRunningApplication *g_saved_front = nil;
+static BOOL wait_until(NSTimeInterval seconds, int (^pred)(void));
 
 static void activate_for_measure(void) {
     if (g_saved_front == nil) {
