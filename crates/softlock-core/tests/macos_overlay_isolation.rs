@@ -38,6 +38,7 @@ const ACCEPTANCE_TESTS: &[&str] = &[
     "fn measured_and_typed_click_and_focus_must_agree",
     "fn ctrl_c_during_a_prompt_does_not_wait_for_enter",
     "fn timeout_watchdog_sets_stop_without_an_enter_key",
+    "fn measured_blocked_with_no_typed_answer_fails",
 ];
 
 #[test]
@@ -231,8 +232,12 @@ fn each_acceptance_checkbox_has_a_named_test_and_the_overlay_is_always_torn_down
     let readme =
         fs::read_to_string(root.join("spikes/macos-overlay-kit/README.md")).expect("readme");
     assert!(readme.contains("cursor/m06-overlay-intel-kit-feda"));
+    assert!(readme.contains("git checkout -B"));
+    assert!(readme.contains("git rev-parse HEAD"));
     assert!(readme.contains("Accessibility"));
     assert!(readme.contains("timeout"));
+    assert!(proof.contains("_exit"));
+    assert!(probe.contains("screencapture timed out") || probe.contains("task.terminate"));
 }
 
 #[test]

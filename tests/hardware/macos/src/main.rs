@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use macos_hardware_suite::{
     Config, SCHEMA, SuiteResult, budget_skip, decided_skip, exit_row, fail_closed, keep_awake_rows,
-    keep_process_row, lock_exercise_row, lock_read_only_row, over_budget, overlay_rows, physical_input_rows,
-    restored_from, scrub_model, smoke_row, suite_exit, summary_of,
+    keep_process_row, lock_exercise_row, lock_read_only_row, over_budget, overlay_rows,
+    physical_input_rows, restored_from, scrub_model, smoke_row, suite_exit, summary_of,
 };
 
 const BUDGET_MS: u64 = 300_000;

@@ -277,10 +277,16 @@ impl TargetWindow {
             m06_posted_click_focus(&mut out);
         }
         let granted = out.accessibility != 0;
+        let error = optional_text(&out.error);
+        let untrusted = error
+            .as_deref()
+            .is_some_and(|value| value.contains("target never became key"));
         let click = if !granted {
             "not-applicable"
         } else if out.click_count > 0 {
             "fell-through"
+        } else if untrusted {
+            "measurement-unreliable"
         } else {
             "blocked"
         };
@@ -288,6 +294,8 @@ impl TargetWindow {
             "moved"
         } else if out.target_is_key != 0 {
             "held"
+        } else if untrusted {
+            "measurement-unreliable"
         } else {
             "moved"
         };
@@ -304,7 +312,7 @@ impl TargetWindow {
             typed_focus: String::new(),
             click_outcome: click.to_string(),
             focus_outcome: focus.to_string(),
-            note: optional_text(&out.error).unwrap_or_default(),
+            note: error.unwrap_or_default(),
         }
     }
 

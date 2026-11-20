@@ -239,6 +239,13 @@ pub fn score_hotplug(
             ),
         );
     }
+    if typed == "covered" && screens_after <= screens_before {
+        return operator_row(
+            "fail",
+            Some("no-hotplug-observed"),
+            &format!("typed covered but screens stayed {screens_before}→{screens_after}"),
+        );
+    }
     let outcome = if screens_after > screens_before {
         "covered"
     } else {
@@ -270,7 +277,15 @@ pub fn measured_and_typed_disagree(measured: &str, typed: &str) -> bool {
 pub fn row_is_failure(outcome: Option<&str>) -> bool {
     matches!(
         outcome,
-        Some("miss" | "covered-by-space" | "covered-by-fullscreen" | "blocked" | "moved")
+        Some(
+            "miss"
+                | "covered-by-space"
+                | "covered-by-fullscreen"
+                | "blocked"
+                | "moved"
+                | "measurement-unreliable"
+                | "no-hotplug-observed"
+        )
     )
 }
 
@@ -407,14 +422,10 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
     push_row_failure(&mut reasons, "spaces", &report.spaces);
     push_row_failure(&mut reasons, "fullscreen", &report.fullscreen);
     push_row_failure(&mut reasons, "hotplug", &report.hotplug);
-    if row_is_failure(Some(&report.click_focus.click_outcome))
-        && !report.click_focus.typed_click.is_empty()
-    {
+    if row_is_failure(Some(&report.click_focus.click_outcome)) {
         reasons.push(format!("click={}", report.click_focus.click_outcome));
     }
-    if row_is_failure(Some(&report.click_focus.focus_outcome))
-        && !report.click_focus.typed_focus.is_empty()
-    {
+    if row_is_failure(Some(&report.click_focus.focus_outcome)) {
         reasons.push(format!("focus={}", report.click_focus.focus_outcome));
     }
     reasons
@@ -1118,6 +1129,38 @@ mod tests {
             score_hotplug("covered", 1, 2, 2, 2).outcome.as_deref(),
             Some("covered")
         );
+        let no_plug = score_hotplug("covered", 1, 1, 1, 1);
+        assert_eq!(no_plug.status, "fail");
+        assert_eq!(no_plug.outcome.as_deref(), Some("no-hotplug-observed"));
+    }
+
+    #[test]
+    fn measured_blocked_with_no_typed_answer_fails() {
+        let mut report = passing_runner_fixture();
+        report.click_focus.typed_click.clear();
+        report.click_focus.typed_focus.clear();
+        report.click_focus.measured_click = "blocked".to_string();
+        report.click_focus.click_outcome = "blocked".to_string();
+        report.click_focus.measured_focus = "held".to_string();
+        report.click_focus.focus_outcome = "held".to_string();
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("click=blocked"))
+        );
+        assert!(render(&report).contains("result=fail"));
+        report.click_focus.measured_click = "fell-through".to_string();
+        report.click_focus.click_outcome = "fell-through".to_string();
+        report.click_focus.measured_focus = "moved".to_string();
+        report.click_focus.focus_outcome = "moved".to_string();
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("focus=moved"))
+        );
+        report.click_focus.focus_outcome = "measurement-unreliable".to_string();
+        assert!(row_is_failure(Some("measurement-unreliable")));
+        assert!(render(&report).contains("result=fail"));
     }
 
     #[test]

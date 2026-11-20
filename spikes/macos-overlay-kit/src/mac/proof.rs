@@ -21,13 +21,27 @@ use crate::report::{
 };
 use crate::scrub::{contains_serial, scrub};
 use crate::version::parse_sw_vers;
-use crate::wait::{POLL_MS, WaitOutcome, poll_stdin, spawn_watchdog, wait_slice};
+use crate::wait::{
+    HARD_EXIT_GRACE_MS, POLL_MS, WaitOutcome, hard_exit_due, poll_stdin, spawn_watchdog, wait_slice,
+};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+static TORN_DOWN: AtomicBool = AtomicBool::new(false);
+static SIGINT_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(600_000);
 
-extern "C" fn handle_stop(_signal: i32) {
+extern "C" fn handle_stop(signal: i32) {
+    if signal == libc::SIGINT {
+        let n = SIGINT_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n >= 1 {
+            unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::raise(libc::SIGINT);
+            }
+            return;
+        }
+    }
     STOP.store(true, Ordering::Relaxed);
 }
 
@@ -39,15 +53,11 @@ pub fn dispatch(args: Args) -> i32 {
     let output_dir = args.output_dir.clone();
     match catch_unwind(AssertUnwindSafe(|| dispatch_inner(&args))) {
         Ok(code) => {
-            ffi::OverlayGuard::close();
-            ffi::presentation_clear();
-            ffi::TargetWindow::close();
+            tear_overlay_down();
             code
         }
         Err(_) => {
-            ffi::OverlayGuard::close();
-            ffi::presentation_clear();
-            ffi::TargetWindow::close();
+            tear_overlay_down();
             let _ = write_crash_report(&output_dir, "probe panicked");
             1
         }
@@ -89,8 +99,15 @@ fn dispatch_inner(args: &Args) -> i32 {
     let mut click_focus = TargetWindow::posted_click_focus();
     click_focus.accessibility = click_focus.accessibility || target.accessibility;
     let accessibility = click_focus.accessibility;
-    let bits = ffi::presentation_apply();
-    let mut presentation = presentation_rows(&bits, kit);
+    let mut presentation = presentation_rows(
+        &ffi::PresentationBits {
+            app_active: false,
+            process_switching: false,
+            force_quit: false,
+            session_termination: false,
+        },
+        kit,
+    );
     let mut no_input = false;
     let mut interrupted = stop_requested() || OverlayGuard::escape_seen();
     let (spaces, fullscreen, hotplug) = if interrupted || timed_out_flag() {
@@ -120,10 +137,8 @@ fn dispatch_inner(args: &Args) -> i32 {
     if kit && !interrupted && !timed_out_flag() {
         fill_presentation_from_args(args, &mut presentation, false);
     }
-    OverlayGuard::close();
+    tear_overlay_down();
     let _ = OverlayGuard::wait_hidden(2000);
-    ffi::presentation_clear();
-    TargetWindow::close();
     if kit && !interrupted && !timed_out_flag() {
         fill_power_key_last(args, &mut presentation);
     }
@@ -302,10 +317,23 @@ fn fill_presentation_from_args(args: &Args, rows: &mut [PresentationRow], power_
             };
             continue;
         }
+        let apply_options = !is_power;
+        if apply_options {
+            let bits = ffi::presentation_apply();
+            row.applied_while_inactive = match row.name.as_str() {
+                "command-tab" => bits.process_switching && !bits.app_active,
+                "force-quit" => bits.force_quit && !bits.app_active,
+                _ => false,
+            };
+            row.app_was_active = bits.app_active;
+        }
         if let Some(value) = values[index] {
             row.outcome = value.to_string();
             if row.outcome == "desktop-reachable" {
                 row.note = PRESENTATION_RECORDED_NOTE.to_string();
+            }
+            if apply_options {
+                ffi::presentation_clear();
             }
             continue;
         }
@@ -321,6 +349,9 @@ fn fill_presentation_from_args(args: &Args, rows: &mut [PresentationRow], power_
         row.outcome = answer;
         if row.outcome == "desktop-reachable" {
             row.note = PRESENTATION_RECORDED_NOTE.to_string();
+        }
+        if apply_options {
+            ffi::presentation_clear();
         }
     }
 }
@@ -475,14 +506,35 @@ fn spawn_watchdog_onto_stop(timeout_ms: u64) {
             if timed.load(Ordering::Relaxed) {
                 TIMED_OUT.store(true, Ordering::Relaxed);
                 STOP.store(true, Ordering::Relaxed);
-                return;
+                break;
             }
             if STOP.load(Ordering::Relaxed) {
                 return;
             }
             std::thread::sleep(slice);
         }
+        let grace_deadline = Instant::now() + Duration::from_millis(HARD_EXIT_GRACE_MS);
+        while Instant::now() < grace_deadline {
+            if TORN_DOWN.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(slice);
+        }
+        if hard_exit_due(
+            TORN_DOWN.load(Ordering::Relaxed),
+            TIMED_OUT.load(Ordering::Relaxed),
+            true,
+        ) {
+            unsafe { libc::_exit(3) };
+        }
     });
+}
+
+fn tear_overlay_down() {
+    ffi::OverlayGuard::close();
+    ffi::presentation_clear();
+    ffi::TargetWindow::close();
+    TORN_DOWN.store(true, Ordering::Relaxed);
 }
 
 fn drain_stdin() {

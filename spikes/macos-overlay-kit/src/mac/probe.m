@@ -511,7 +511,13 @@ int m06_control_open(void) {
         window.backgroundColor = [NSColor colorWithSRGBRed:0.05 green:0.82 blue:0.08 alpha:1];
         g_control = window;
         [window orderFrontRegardless];
-        pump(0.2);
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:2];
+        while ([until timeIntervalSinceNow] > 0) {
+            if (window.isVisible && (window.occlusionState & NSWindowOcclusionStateVisible) != 0) {
+                break;
+            }
+            pump(0.02);
+        }
     }
     return 0;
 }
@@ -539,7 +545,10 @@ int m06_target_open(ClickOut *out) {
         window.contentView = view;
         [window makeKeyAndOrderFront:nil];
         g_target = window;
-        pump(0.2);
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:2];
+        while ([until timeIntervalSinceNow] > 0 && !window.isKeyWindow) {
+            pump(0.02);
+        }
         out->target_is_key = window.isKeyWindow ? 1 : 0;
         out->accessibility = AXIsProcessTrusted() ? 1 : 0;
         out->listen = CGPreflightListenEventAccess() ? 1 : 0;
@@ -585,8 +594,14 @@ int m06_posted_click_focus(ClickOut *out) {
             out->key_count = atomic_load(&g_keys);
             return 0;
         }
+        if (!g_target.isKeyWindow) {
+            snprintf(out->error, sizeof out->error, "target never became key");
+        }
+        int baseline_clicks = atomic_load(&g_clicks);
+        int baseline_keys = atomic_load(&g_keys);
         NSRect frame = g_target.frame;
-        CGPoint point = CGPointMake(NSMidX(frame), NSMidY(frame));
+        CGFloat display_h = CGDisplayBounds(CGMainDisplayID()).size.height;
+        CGPoint point = CGPointMake(NSMidX(frame), display_h - NSMidY(frame));
         CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, point, kCGMouseButtonLeft);
         CGEventRef up = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp, point, kCGMouseButtonLeft);
         if (down != NULL && up != NULL) {
@@ -608,7 +623,13 @@ int m06_posted_click_focus(ClickOut *out) {
             }
             CFRelease(source);
         }
-        pump(0.4);
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:2];
+        while ([until timeIntervalSinceNow] > 0) {
+            if (atomic_load(&g_clicks) > baseline_clicks || atomic_load(&g_keys) > baseline_keys) {
+                break;
+            }
+            pump(0.02);
+        }
         overlay_key = NO;
         for (NSWindow *window in g_overlay) {
             if (window.isKeyWindow) {
@@ -987,7 +1008,24 @@ static void capture_scstream(CaptureOut *out) {
 static void capture_screencapture(CaptureOut *out) {
     char path[] = "/tmp/m06-overlay-capture.png";
     unlink(path);
-    int rc = system("/usr/sbin/screencapture -x /tmp/m06-overlay-capture.png");
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/sbin/screencapture"];
+    task.arguments = @[ @"-x", @"/tmp/m06-overlay-capture.png" ];
+    NSError *launch_error = nil;
+    if (![task launchAndReturnError:&launch_error]) {
+        snprintf(out->detail, sizeof out->detail, "screencapture launch failed");
+        return;
+    }
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:8];
+    while (task.running && [until timeIntervalSinceNow] > 0) {
+        pump(0.05);
+    }
+    if (task.running) {
+        [task terminate];
+        snprintf(out->detail, sizeof out->detail, "screencapture timed out");
+        return;
+    }
+    int rc = task.terminationStatus;
     if (rc != 0) {
         snprintf(out->detail, sizeof out->detail, "screencapture exit %d", rc);
         return;

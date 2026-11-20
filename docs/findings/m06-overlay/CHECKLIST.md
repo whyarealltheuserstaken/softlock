@@ -5,7 +5,8 @@ Henry runs this only after review. Checkout at `/Users/admin/softlock`.
 ```bash
 cd /Users/admin/softlock
 git fetch origin
-git checkout cursor/m06-overlay-intel-kit-feda
+git checkout -B cursor/m06-overlay-intel-kit-feda origin/cursor/m06-overlay-intel-kit-feda
+git rev-parse HEAD
 ./tests/hardware/macos/run.sh --build-only
 ./tests/hardware/macos/run.sh
 ```

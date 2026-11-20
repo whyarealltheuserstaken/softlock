@@ -15,6 +15,7 @@ pub const SKIP_REASONS: &[&str] = &[
     "ci",
     "operator",
     "interrupted",
+    "screen-recording-not-granted",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,7 +391,7 @@ pub fn overlay_rows(text: &str) -> Vec<Row> {
             "m06-markers",
             "Capture marker counts",
             "skip",
-            Some("operator"),
+            Some("screen-recording-not-granted"),
             false,
             format!("screen-recording=false result={result} torn-down={torn}"),
         )
@@ -480,9 +481,21 @@ fn overlay_operator_row(
     mode: &str,
     physical: bool,
 ) -> Row {
+    overlay_operator_row_scored(id, name, key, text, mode, physical, false)
+}
+
+fn overlay_operator_row_scored(
+    id: &str,
+    name: &str,
+    key: &str,
+    text: &str,
+    mode: &str,
+    physical: bool,
+    score_on_runner: bool,
+) -> Row {
     let value = field(text, key).unwrap_or_else(|| "missing".into());
     let detail = value.clone();
-    if mode == "runner" || value == "not-run-on-runner" {
+    if value == "not-run-on-runner" || (mode == "runner" && !score_on_runner) {
         return row(id, name, "skip", Some("ci"), physical, detail);
     }
     match value.as_str() {
@@ -493,9 +506,13 @@ fn overlay_operator_row(
         | "swallowed"
         | "presentation-option-worked"
         | "desktop-reachable" => row(id, name, "pass", None, physical, detail),
-        "miss" | "covered-by-space" | "covered-by-fullscreen" | "blocked" | "moved" => {
-            row(id, name, "fail", None, physical, detail)
-        }
+        "miss"
+        | "covered-by-space"
+        | "covered-by-fullscreen"
+        | "blocked"
+        | "moved"
+        | "measurement-unreliable"
+        | "no-hotplug-observed" => row(id, name, "fail", None, physical, detail),
         value if value.starts_with("fail:") => row(id, name, "fail", None, physical, detail),
         "no-external-display" => row(id, name, "skip", Some("not-applicable"), physical, detail),
         "skip" => row(id, name, "skip", Some("operator"), physical, detail),
@@ -508,24 +525,26 @@ fn overlay_operator_row(
 }
 
 fn overlay_click_row(text: &str, mode: &str) -> Row {
-    overlay_operator_row(
+    overlay_operator_row_scored(
         "m06-click",
         "Click through overlay",
         "click",
         text,
         mode,
         false,
+        true,
     )
 }
 
 fn overlay_focus_row(text: &str, mode: &str) -> Row {
-    overlay_operator_row(
+    overlay_operator_row_scored(
         "m06-focus",
         "Keyboard focus held",
         "focus",
         text,
         mode,
         false,
+        true,
     )
 }
 
@@ -1130,6 +1149,7 @@ power-key=not-run-on-runner
         );
     }
 
+    #[test]
     fn overlay_runner_skips_operator_rows_and_passes_markers() {
         let text = "\
 mode=runner
@@ -1317,6 +1337,44 @@ power-key=swallowed
             .unwrap();
         assert_ne!(markers.status, "pass");
         assert_eq!(markers.status, "skip");
+        assert_eq!(
+            markers.skip_reason.as_deref(),
+            Some("screen-recording-not-granted")
+        );
+    }
+
+    #[test]
+    fn overlay_runner_measured_blocked_and_moved_fail() {
+        let text = "\
+mode=runner
+result=fail
+overlay-torn-down=true
+dismissible=true
+displays-covered=true
+click=blocked
+focus=moved
+spaces=not-run-on-runner
+fullscreen=not-run-on-runner
+hotplug=not-run-on-runner
+command-tab=not-run-on-runner
+force-quit=not-run-on-runner
+power-key=not-run-on-runner
+";
+        let rows = overlay_rows(text);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-click")
+                .unwrap()
+                .status,
+            "fail"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-focus")
+                .unwrap()
+                .status,
+            "fail"
+        );
     }
 
     fn plan_row(status: &str) -> Row {

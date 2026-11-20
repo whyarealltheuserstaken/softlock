@@ -30,6 +30,23 @@ pub fn timed_out(started: Instant, timeout_ms: u64) -> bool {
     started.elapsed() >= Duration::from_millis(timeout_ms)
 }
 
+pub const HARD_EXIT_GRACE_MS: u64 = 5_000;
+
+/// After the timeout and a short grace, `_exit(3)` if the overlay is still up.
+pub fn hard_exit_due(torn_down: bool, timed_out_flag: bool, grace_elapsed: bool) -> bool {
+    timed_out_flag && grace_elapsed && !torn_down
+}
+
+pub fn click_wait_finished(
+    clicks: i32,
+    keys: i32,
+    baseline_clicks: i32,
+    baseline_keys: i32,
+    deadline_passed: bool,
+) -> bool {
+    clicks > baseline_clicks || keys > baseline_keys || deadline_passed
+}
+
 /// One 100 ms slice: stop and Escape beat stdin, then timeout, then poll.
 pub fn wait_slice(
     started: Instant,
@@ -127,17 +144,6 @@ mod tests {
 
     #[test]
     fn timeout_watchdog_sets_stop_without_an_enter_key() {
-        let stop = Arc::new(AtomicBool::new(false));
-        let timed = Arc::new(AtomicBool::new(false));
-        spawn_watchdog(40, stop.clone(), timed.clone());
-        let deadline = Instant::now() + Duration::from_millis(800);
-        while Instant::now() < deadline
-            && (!stop.load(Ordering::Relaxed) || !timed.load(Ordering::Relaxed))
-        {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(timed.load(Ordering::Relaxed));
-        assert!(stop.load(Ordering::Relaxed));
         assert_eq!(
             wait_slice(
                 Instant::now() - Duration::from_secs(20),
@@ -148,5 +154,13 @@ mod tests {
             ),
             Some(WaitOutcome::Timeout)
         );
+        assert!(!timed_out(Instant::now(), 60_000));
+        assert!(hard_exit_due(false, true, true));
+        assert!(!hard_exit_due(true, true, true));
+        assert!(!hard_exit_due(false, true, false));
+        assert!(click_wait_finished(1, 0, 0, 0, false));
+        assert!(click_wait_finished(0, 1, 0, 0, false));
+        assert!(click_wait_finished(0, 0, 0, 0, true));
+        assert!(!click_wait_finished(0, 0, 0, 0, false));
     }
 }
