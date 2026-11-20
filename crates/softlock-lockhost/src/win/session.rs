@@ -1418,7 +1418,9 @@ mod quit_guard {
             }
         }
         let _release = Release;
-        let _order = super::QUIT_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _order = super::QUIT_TEST
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         super::QUIT_OS.store(super::QUIT_IDLE, std::sync::atomic::Ordering::Release);
         super::failclosed::block_os_lock_for_test(true);
         let mut tried = false;
@@ -1472,7 +1474,9 @@ mod quit_thread {
             }
         }
         let _release = Release;
-        let _order = super::QUIT_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _order = super::QUIT_TEST
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         QUIT_OS.store(QUIT_IDLE, Ordering::Release);
         super::failclosed::block_os_lock_for_test(true);
         let started = Instant::now();
