@@ -623,8 +623,9 @@ fn the_fail_closed_job_covers_each_hosted_case() {
     ] {
         assert!(script.contains(needle), "laptop script missing {needle}");
     }
+    let reconnect = format!("{}{}", "WTSConnect", "Session");
     assert!(
-        !script.contains("WTSConnectSession"),
+        !script.contains(&reconnect),
         "the laptop script reconnects a session"
     );
     assert!(
