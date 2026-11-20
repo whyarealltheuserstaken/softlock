@@ -18,9 +18,9 @@ use softlock_core::{
 /// How [`SessionControl::os_lock`] behaves.
 ///
 /// `Succeeds` reports the lock as held and does not call the operating
-/// system. Seam 2 uses that. `System` is the service process, which calls
-/// `LockWorkStation` or disconnects the console session. `Fails` is the stub
-/// and every test where the OS lock is down.
+/// system. Seam 2 uses that. `System` asks the Lock Host to call
+/// `LockWorkStation` and, if that is not confirmed, disconnects the console
+/// session. `Fails` is the stub and every test where the OS lock is down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OsLock {
     Fails,

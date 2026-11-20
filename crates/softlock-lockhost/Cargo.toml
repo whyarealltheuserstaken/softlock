@@ -24,6 +24,7 @@ softlock-service = { path = "../softlock-service" }
 
 [target.'cfg(windows)'.dependencies]
 softlock-core = { path = "../softlock-core" }
+softlock-windows = { path = "../softlock-windows" }
 zeroize = { version = "1.8.2", default-features = false, features = ["alloc"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",

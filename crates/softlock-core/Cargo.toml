@@ -53,6 +53,9 @@ name = "spike_isolation"
 name = "os_lock_isolation"
 
 [[test]]
+name = "os_lock"
+
+[[test]]
 name = "macos_spike_isolation"
 
 [[test]]

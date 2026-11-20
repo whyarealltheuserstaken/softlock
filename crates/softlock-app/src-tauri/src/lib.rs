@@ -117,6 +117,13 @@ fn lock_from_app() -> OwnerViewDto {
 }
 
 #[tauri::command]
+fn lock_for_real() -> OwnerViewDto {
+    #[cfg(windows)]
+    owner::lock_for_real();
+    view_dto(&shown_view())
+}
+
+#[tauri::command]
 fn set_pin(mut pin: String) -> PinOutcome {
     if let Some(code) = pin_field_error(&pin) {
         pin.zeroize();
@@ -192,6 +199,7 @@ pub fn run() {
             platform_status,
             owner_view,
             lock_from_app,
+            lock_for_real,
             set_pin,
             quit_app
         ])

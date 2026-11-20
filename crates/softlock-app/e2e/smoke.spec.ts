@@ -86,6 +86,25 @@ test("a pin that needs confirmation is not treated as a lock failure", async ({ 
   await expect(page.getByTestId("service-line")).toHaveText("Service running");
 });
 
+test("lock for real is a separate tray action", async ({ page }) => {
+  await page.goto("/");
+  await page.getByTestId("tray-hard-lock").click();
+  await expect(page.locator("main")).toHaveAttribute("data-hard-lock", "1");
+  await expect(page.locator("main")).toHaveAttribute("data-lock-source", "");
+  await expect(page.getByTestId("tray-hard-lock")).toHaveText("Lock for real");
+});
+
+test("a fall-back event shows the time and the reason after sign-in", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() =>
+    window.__SOFTLOCK_FALLBACK__?.(1500, "the lock host stopped answering"),
+  );
+  await expect(page.getByTestId("hotkey-notice")).toContainText(
+    "switched to the Windows lock at 1500 ms because the lock host stopped answering",
+  );
+  await expect(page.locator("main")).toHaveAttribute("data-locked", "off");
+});
+
 test("quitting the app does not stop the service", async ({ page }) => {
   await page.goto("/");
   await page.getByTestId("tray-quit").click();

@@ -35,6 +35,41 @@ pub fn lock_request(source: LockSource) -> RequestKind {
     RequestKind::Lock { source, note: None }
 }
 
+/// Tray "Lock for real". The service asks the Lock Host for the workstation
+/// lock and falls back to disconnecting the console session.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn hard_lock_request() -> RequestKind {
+    RequestKind::HardLock
+}
+
+/// Sentence shown after the owner signs back in. The product name comes from
+/// the name constant. `at_ms` is the service clock on the fall-back event.
+pub fn fallback_notice(fallback: &softlock_core::Fallback) -> String {
+    format!(
+        "{} switched to the Windows lock at {} ms because {}",
+        softlock_core::PRODUCT_DISPLAY_NAME,
+        fallback.at_ms,
+        fallback_reason(fallback.reason)
+    )
+}
+
+fn fallback_reason(reason: softlock_core::FailReason) -> &'static str {
+    use softlock_core::FailReason;
+    match reason {
+        FailReason::ArmStep { .. } => "an arming step failed",
+        FailReason::HeartbeatMissed => "the lock host stopped answering",
+        FailReason::HostExited => "the lock host exited",
+        FailReason::GuardUnhealthy => "the input guard failed",
+        FailReason::OverlayUnhealthy => "the lock screen failed",
+        FailReason::ArmTimeout => "arming took too long",
+        FailReason::RevertFailed => "settings could not be restored",
+        FailReason::ServiceStop => "the service was asked to stop",
+        FailReason::HardLock => "lock for real",
+        FailReason::SessionActive => "a lock was still in progress",
+        FailReason::Repair => "settings still need repair",
+    }
+}
+
 #[cfg(test)]
 pub fn quit_request() -> Option<RequestKind> {
     None
@@ -165,5 +200,23 @@ mod tests {
         assert!(!command.contains("stop"));
         assert_eq!(autostart_failure_notice(0), None);
         assert_eq!(autostart_failure_notice(5), Some("autostart failed"));
+        assert!(matches!(hard_lock_request(), RequestKind::HardLock));
+    }
+
+    #[test]
+    fn a_fake_fall_back_event_names_the_time_and_the_reason() {
+        use softlock_core::{FailReason, Fallback};
+        let notice = fallback_notice(&Fallback {
+            reason: FailReason::HeartbeatMissed,
+            at_ms: 1_500,
+        });
+        let name = softlock_core::PRODUCT_DISPLAY_NAME;
+        assert_eq!(
+            notice,
+            format!(
+                "{name} switched to the Windows lock at 1500 ms because the lock host stopped answering"
+            )
+        );
+        assert!(!notice.contains("Unlocked"));
     }
 }

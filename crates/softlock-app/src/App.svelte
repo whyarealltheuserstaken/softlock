@@ -34,6 +34,10 @@
     view = await bridge.lock("Tray");
   }
 
+  async function lockForReal() {
+    view = await bridge.hardLock();
+  }
+
   async function savePin() {
     view = await bridge.setPin(pin);
   }
@@ -53,6 +57,7 @@
   data-service-stop={view.serviceStop ? "true" : "false"}
   data-locked={view.locked ? "on" : "off"}
   data-notice={view.notice}
+  data-hard-lock={view.hardLockCount}
 >
   {#if platformMessage}
     <p class="platform-status" role="status">{platformMessage}</p>
@@ -69,6 +74,7 @@
       <p data-testid="tray-status">{statusLine(view)}</p>
       <p data-testid="tray-service">{serviceLine(view)}</p>
       <button type="button" data-testid="tray-lock" onclick={lockFromTray}>{ui.lockNow}</button>
+      <button type="button" data-testid="tray-hard-lock" onclick={lockForReal}>{ui.lockForReal}</button>
       <button type="button" data-testid="tray-quit" onclick={quit}>{ui.quit}</button>
     </section>
   {/if}

@@ -107,7 +107,7 @@ pub fn view_after(previous: &OwnerView, event: &Result<ResponseKind, IpcError>) 
     match event {
         Ok(response @ ResponseKind::StateChanged { .. })
         | Ok(response @ ResponseKind::Status { .. }) => view_from_status(response),
-        Ok(ResponseKind::Accepted) => previous.clone(),
+        Ok(ResponseKind::Accepted) | Ok(ResponseKind::FellBackToOsLock { .. }) => previous.clone(),
         _ => OwnerView::unknown(),
     }
 }
@@ -252,5 +252,15 @@ mod tests {
         let view = view_after(&view, &Ok(decoded));
         assert!(!view.locked());
         assert!(status_text(&view).contains("tray=off"));
+
+        let fallback = ResponseKind::FellBackToOsLock {
+            fallback: softlock_core::Fallback {
+                reason: softlock_core::FailReason::HostExited,
+                at_ms: 2_000,
+            },
+        };
+        let kept = view_after(&view, &Ok(fallback));
+        assert!(!kept.locked());
+        assert!(shows_unlocked(kept.service_running, kept.state));
     }
 }

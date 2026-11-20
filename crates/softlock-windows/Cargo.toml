@@ -6,3 +6,21 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+softlock-core = { path = "../softlock-core" }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Shutdown",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[bin]]
+name = "os-lock-confirm"
+path = "src/bin/confirm.rs"

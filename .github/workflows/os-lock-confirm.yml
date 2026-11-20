@@ -1,0 +1,86 @@
+name: OS lock confirm
+
+# Last and isolated. The confirm job locks the runner session.
+# Nothing in this workflow waits on that job. No push trigger: a push to
+# main must not lock a runner. The binary also refuses unless
+# GITHUB_ACTIONS=true and RUNNER_ENVIRONMENT=github-hosted, and it refuses
+# the school workstation before any lock call.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/softlock-core/src/oslock.rs'
+      - 'crates/softlock-core/tests/os_lock.rs'
+      - 'crates/softlock-windows/**'
+      - 'crates/softlock-service/src/windows.rs'
+      - 'crates/softlock-lockhost/src/win/failclosed.rs'
+      - '.github/workflows/os-lock-confirm.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: os-lock-confirm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    name: checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Format, clippy, and the lock-chain tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy -p softlock-core -p softlock-windows -p softlock-service -p softlock-lockhost --all-targets -- -D warnings
+          cargo test -p softlock-core --test os_lock --locked
+          cargo test -p softlock-windows --locked
+
+  confirm:
+    name: confirm (${{ matrix.image }})
+    needs: checks
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Refuse a runner that is not GitHub-hosted
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            throw 'refusing a runner that is not GitHub-hosted'
+          }
+      - name: Confirm the workstation lock
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked -p softlock-windows --bin os-lock-confirm
+          & .\target\release\os-lock-confirm.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload the confirm report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: os-lock-confirm-${{ matrix.image }}
+          path: suite-output/**/result.json
+          if-no-files-found: warn

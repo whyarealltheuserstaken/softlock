@@ -38,7 +38,7 @@ use windows::Win32::System::Pipes::{
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe,
 };
 use windows::Win32::System::RemoteDesktop::{
-    WTSDisconnectSession, WTSGetActiveConsoleSessionId, WTSSESSION_NOTIFICATION,
+    WTSGetActiveConsoleSessionId, WTSSESSION_NOTIFICATION,
 };
 use windows::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_SESSIONCHANGE, SERVICE_ACCEPT_STOP,
@@ -46,7 +46,6 @@ use windows::Win32::System::Services::{
     SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
     SERVICE_WIN32_OWN_PROCESS, SetServiceStatus, StartServiceCtrlDispatcherW,
 };
-use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, GetCurrentProcess, GetCurrentProcessId, GetProcessId,
     OpenProcess, OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -82,11 +81,65 @@ pub fn lock_session(session: u32) -> Result<(), OsLockError> {
     if stub_os_lock() {
         return Err(OsLockError::Failed);
     }
-    if current_session() != 0 && unsafe { LockWorkStation() }.is_ok() {
-        return Ok(());
+    let result = softlock_windows::run_service(session, request_host_primary);
+    for error in &result.errors {
+        crate::audit("os-lock", &[("error", error)]);
     }
-    unsafe { WTSDisconnectSession(None, session, false) }.map_err(|_| OsLockError::Failed)
+    match result.outcome {
+        softlock_core::Outcome::Confirmed { method } => {
+            crate::audit(
+                "os-lock",
+                &[
+                    ("result", "confirmed"),
+                    ("method", method.name()),
+                    ("policy", softlock_core::policy_seam()),
+                ],
+            );
+            Ok(())
+        }
+        softlock_core::Outcome::FailedClosed { attempts } => {
+            let detail = softlock_core::failed_closed_log(
+                softlock_core::Caller::ServiceCoordinated,
+                &attempts,
+            );
+            crate::audit(
+                "os-lock",
+                &[("result", "failed-closed"), ("detail", &detail)],
+            );
+            Err(OsLockError::Failed)
+        }
+    }
 }
+
+fn request_host_primary() -> bool {
+    let sender = HOST_TX
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let Some(sender) = sender else {
+        crate::audit("os-lock", &[("host", "absent")]);
+        return false;
+    };
+    let Ok(frame) = encode_service(0, &ServiceToHost::OsLock) else {
+        crate::audit("os-lock", &[("host", "encode-failed")]);
+        return false;
+    };
+    if sender.send(frame).is_err() {
+        crate::audit("os-lock", &[("host", "send-failed")]);
+        return false;
+    }
+    true
+}
+
+fn remember_host_writer(sender: Sender<Vec<u8>>) {
+    *HOST_TX.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(sender);
+}
+
+fn forget_host_writer() {
+    *HOST_TX.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+}
+
+static HOST_TX: Mutex<Option<Sender<Vec<u8>>>> = Mutex::new(None);
 
 pub fn run_foreground() -> i32 {
     serve(None)
@@ -416,6 +469,7 @@ impl HostChild {
     }
 
     fn stop(self) -> std::io::Result<()> {
+        forget_host_writer();
         unsafe {
             let _ = TerminateProcess(self.handle(), 1);
             let _ = CloseHandle(self.handle());
@@ -474,6 +528,7 @@ fn spawn_host(
             unsafe { std::fs::File::from_raw_handle(write_raw as *mut std::ffi::c_void) };
         host_writer(generation, &mut file, rx);
     });
+    remember_host_writer(tx.clone());
     Ok(HostChild {
         process: process.0 as isize,
         writer: tx,
@@ -1138,14 +1193,30 @@ fn stream_subscription(
         return true;
     }
     let mut previous = None;
+    let mut previous_fallback = None;
     while !STOP.load(Ordering::Acquire) {
         if !subscriber_connected(pipe) {
             break;
         }
-        let name = authority
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .state_name();
+        let (name, fallback) = {
+            let guard = authority
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            (guard.state_name(), guard.last_fallback())
+        };
+        if fallback != previous_fallback {
+            previous_fallback = fallback;
+            if let Some(fallback) = fallback
+                && write_response(
+                    pipe,
+                    *id,
+                    &softlock_core::ResponseKind::FellBackToOsLock { fallback },
+                )
+                .is_err()
+            {
+                break;
+            }
+        }
         if previous == Some(name) {
             thread::sleep(Duration::from_millis(50));
             continue;

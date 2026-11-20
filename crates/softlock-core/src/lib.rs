@@ -16,6 +16,7 @@ mod hostmsg;
 mod ipc;
 mod journal;
 mod name;
+mod oslock;
 mod pin;
 mod platform;
 mod state;
@@ -44,6 +45,11 @@ pub use journal::{Journal, JournalEntry};
 pub use name::{
     APP_BUNDLE_ID, APP_PACKAGE_NAME, PRODUCT_DISPLAY_NAME, SERVICE_DISPLAY_NAME, SERVICE_ID,
     SERVICE_NAME, pipe_name, registry_key,
+};
+pub use oslock::{
+    Attempt, CONFIRM_BUDGET, Caller, Expect, Method, NoticeKind, Observation, OsLockOps, Outcome,
+    StepFault, confirmed, console_notice, fail_closed, failed_closed_log, policy_seam,
+    stays_guarded, within_budget,
 };
 pub use pin::{
     MIN_PIN_LEN, PIN_MEMORY_KIB, PIN_PARALLELISM, PIN_SALT_LEN, PIN_TIME_COST, PinHashError,

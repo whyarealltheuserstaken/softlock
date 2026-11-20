@@ -14,10 +14,18 @@ use crate::state::{LaunchNonce, Secret};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum ServiceToHost {
-    Welcome { nonce: NonceBytes },
+    Welcome {
+        nonce: NonceBytes,
+    },
     Arm,
     Disarm,
-    PromptResult { accepted: bool, backoff_ms: u64 },
+    /// Lock the signed-in session. The Service confirms it and disconnects
+    /// the console itself when this does not. The host must not disconnect.
+    OsLock,
+    PromptResult {
+        accepted: bool,
+        backoff_ms: u64,
+    },
 }
 
 #[derive(Debug)]

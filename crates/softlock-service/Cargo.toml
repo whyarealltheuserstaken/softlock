@@ -20,6 +20,7 @@ tracing = "0.1.41"
 zeroize = { version = "1.8.2", default-features = false, features = ["alloc"] }
 
 [target.'cfg(windows)'.dependencies]
+softlock-windows = { path = "../softlock-windows" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",

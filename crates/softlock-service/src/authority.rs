@@ -92,6 +92,10 @@ impl Authority {
         self.controller.state().name()
     }
 
+    pub fn last_fallback(&self) -> Option<softlock_core::Fallback> {
+        self.controller.notifications().back().copied()
+    }
+
     pub fn recovery_due(&self) -> bool {
         self.controller.recovery_due()
     }
