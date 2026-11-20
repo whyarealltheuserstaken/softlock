@@ -19,13 +19,12 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: os-lock-fail-closed-${{ github.ref }}-${{ matrix.case }}
-  cancel-in-progress: false
-
 jobs:
   fail-closed:
     name: ${{ matrix.case }} (${{ matrix.image }})
+    concurrency:
+      group: os-lock-fail-closed-${{ github.ref }}-${{ matrix.case }}-${{ matrix.image }}
+      cancel-in-progress: false
     runs-on: ${{ matrix.image }}
     timeout-minutes: 20
     strategy:
