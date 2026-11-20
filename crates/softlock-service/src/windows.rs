@@ -32,6 +32,9 @@ use windows::Win32::Security::{
     TokenPrimary, TokenSessionId, TokenUser, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, CreatePipe, DisconnectNamedPipe,
     GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
@@ -48,8 +51,9 @@ use windows::Win32::System::Services::{
 };
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, GetCurrentProcess, GetCurrentProcessId, GetProcessId,
-    OpenProcess, OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    OpenProcess, OpenProcessToken, OpenThread, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, STARTUPINFOW,
+    THREAD_QUERY_LIMITED_INFORMATION, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{WTS_SESSION_LOCK, WTS_SESSION_UNLOCK};
 use windows::core::{PCWSTR, PWSTR};
@@ -514,11 +518,17 @@ fn supervise(
         if !arm.is_waiting() {
             arm_sent = false;
         }
-        let alive = host
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .as_ref()
-            .is_some_and(HostChild::alive);
+        let alive = {
+            let mut held = host.lock().unwrap_or_else(|poison| poison.into_inner());
+            // A suspended host still looks alive to WaitForSingleObject and can
+            // keep a session call blocked. End it before the disconnect.
+            if held.as_ref().is_some_and(HostChild::wedged)
+                && let Some(child) = held.take()
+            {
+                let _ = child.stop();
+            }
+            held.as_ref().is_some_and(HostChild::alive)
+        };
         let action = authority
             .try_lock()
             .map(|mut guard| guard.poll_host(Instant::now(), alive))
@@ -548,6 +558,34 @@ fn supervise(
     }
 }
 
+fn thread_is_suspended(thread: HANDLE) -> bool {
+    let mut count = 0u32;
+    let status = unsafe {
+        NtQueryInformationThread(
+            thread.0,
+            THREAD_SUSPEND_COUNT,
+            &mut count as *mut u32 as *mut core::ffi::c_void,
+            4,
+            std::ptr::null_mut(),
+        )
+    };
+    status == 0 && count > 0
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryInformationThread(
+        thread: *mut core::ffi::c_void,
+        class: u32,
+        info: *mut core::ffi::c_void,
+        length: u32,
+        returned: *mut u32,
+    ) -> i32;
+}
+
+/// `ThreadSuspendCount` in `THREADINFOCLASS`.
+const THREAD_SUSPEND_COUNT: u32 = 35;
+
 struct HostChild {
     process: isize,
     writer: std::sync::mpsc::Sender<Vec<u8>>,
@@ -560,6 +598,47 @@ impl HostChild {
 
     fn alive(&self) -> bool {
         (unsafe { WaitForSingleObject(self.handle(), 0) }) == WAIT_TIMEOUT
+    }
+
+    /// True when a thread in this process has been suspended. `NtSuspendProcess`
+    /// leaves the process handle unsignaled, so the silence timer would wait
+    /// out a host that can no longer run.
+    fn wedged(&self) -> bool {
+        let pid = unsafe { GetProcessId(self.handle()) };
+        if pid == 0 {
+            return false;
+        }
+        unsafe {
+            let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) else {
+                return false;
+            };
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..THREADENTRY32::default()
+            };
+            let mut wedged = false;
+            if Thread32First(snapshot, &mut entry).is_ok() {
+                loop {
+                    if entry.th32OwnerProcessID == pid
+                        && let Ok(thread) =
+                            OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, entry.th32ThreadID)
+                    {
+                        if thread_is_suspended(thread) {
+                            wedged = true;
+                        }
+                        let _ = CloseHandle(thread);
+                        if wedged {
+                            break;
+                        }
+                    }
+                    if Thread32Next(snapshot, &mut entry).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = CloseHandle(snapshot);
+            wedged
+        }
     }
 
     fn stop(self) -> std::io::Result<()> {
