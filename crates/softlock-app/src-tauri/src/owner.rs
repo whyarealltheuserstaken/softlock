@@ -192,7 +192,6 @@ fn perform_hard_lock() {
         Ok(ResponseKind::Accepted | ResponseKind::AlreadyLocked) => {
             if let Ok(status) = transact(RequestKind::GetStatus) {
                 publish(view_from_status(&status));
-                return;
             }
         }
         Ok(_) => {
