@@ -624,7 +624,6 @@ fn the_fail_closed_job_covers_each_hosted_case() {
         "NtResumeProcess",
         "PSObject.Properties",
         "finally",
-        "SoftLockAgent",
         "Connect(200)",
         "1000",
     ] {
@@ -642,6 +641,11 @@ fn the_fail_closed_job_covers_each_hosted_case() {
     assert!(
         !script.contains("softlock-service' -ErrorAction SilentlyContinue | Stop-Process"),
         "the laptop script stops every service process"
+    );
+    let agent = format!("{}{}", "Soft", "LockAgent");
+    assert!(
+        script.contains(&agent),
+        "laptop script missing the installed service name"
     );
     let owner = std::fs::read_to_string(root.join("crates/softlock-app/src-tauri/src/owner.rs"))
         .expect("owner");

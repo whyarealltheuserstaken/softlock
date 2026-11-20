@@ -809,6 +809,10 @@ const QUIT_DONE: u8 = 5;
 /// The quit path's OS lock. The window thread only reads the result.
 static QUIT_OS: AtomicU8 = AtomicU8::new(QUIT_IDLE);
 
+/// The quit tests share `QUIT_OS` and the held OS-lock flag.
+#[cfg(test)]
+static QUIT_TEST: Mutex<()> = Mutex::new(());
+
 /// Quit is the service pipe closing. The OS lock can take the whole
 /// confirmation budget, so it runs off the window thread. The hooks stay
 /// until the result says the session is locked, or another host has armed.
@@ -1414,6 +1418,7 @@ mod quit_guard {
             }
         }
         let _release = Release;
+        let _order = super::QUIT_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
         super::QUIT_OS.store(super::QUIT_IDLE, std::sync::atomic::Ordering::Release);
         super::failclosed::block_os_lock_for_test(true);
         let mut tried = false;
@@ -1467,6 +1472,7 @@ mod quit_thread {
             }
         }
         let _release = Release;
+        let _order = super::QUIT_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
         QUIT_OS.store(QUIT_IDLE, Ordering::Release);
         super::failclosed::block_os_lock_for_test(true);
         let started = Instant::now();
