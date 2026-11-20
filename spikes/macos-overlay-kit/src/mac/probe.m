@@ -726,10 +726,15 @@ int m06_posted_click_focus(ClickOut *out) {
         }
         CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
         if (source != NULL) {
-            CGEventRef key = CGEventCreateKeyboardEvent(source, (CGKeyCode)0, true);
-            if (key != NULL) {
-                CGEventPost(kCGSessionEventTap, key);
-                CFRelease(key);
+            CGEventRef key_down = CGEventCreateKeyboardEvent(source, (CGKeyCode)0, true);
+            CGEventRef key_up = CGEventCreateKeyboardEvent(source, (CGKeyCode)0, false);
+            if (key_down != NULL) {
+                CGEventPost(kCGSessionEventTap, key_down);
+                CFRelease(key_down);
+            }
+            if (key_up != NULL) {
+                CGEventPost(kCGSessionEventTap, key_up);
+                CFRelease(key_up);
             }
             CFRelease(source);
         }

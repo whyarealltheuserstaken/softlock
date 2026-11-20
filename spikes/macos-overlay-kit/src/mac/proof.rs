@@ -18,6 +18,7 @@ use crate::report::{
     CaptureSample, ClickFocus, KIT_ID, KitReport, OperatorRow, PRESENTATION_RECORDED_NOTE,
     PresentationRow, claims_from_samples, exit_nonzero, hold_presentation_across_prompt,
     operator_row, render, row_is_failure, runner_operator_row, score_hotplug,
+    skip_interactive_after_click,
 };
 use crate::scrub::{contains_serial, scrub};
 use crate::version::parse_sw_vers;
@@ -110,12 +111,13 @@ fn dispatch_inner(args: &Args) -> i32 {
     );
     let mut no_input = false;
     let mut interrupted = stop_requested() || OverlayGuard::escape_seen();
-    let (spaces, fullscreen, hotplug) = if interrupted || timed_out_flag() {
-        skipped_rows(if timed_out_flag() {
-            "timeout"
-        } else {
-            "interrupted"
-        })
+    let skip_prompts = skip_interactive_after_click(
+        click_focus.frontmost_restored,
+        interrupted,
+        timed_out_flag(),
+    );
+    let (spaces, fullscreen, hotplug) = if let Some(reason) = skip_prompts {
+        skipped_rows(reason)
     } else if kit {
         fill_click_from_args(args, &mut click_focus);
         let rows = kit_rows(args, &mut overlay, screens_before, &mut max_screens);
@@ -134,12 +136,12 @@ fn dispatch_inner(args: &Args) -> i32 {
         .max(overlay.window.display_count);
     let screens_after = ffi::display_count().max(overlay.window.display_count);
     let covered_after = overlay.window.covered_count;
-    if kit && !interrupted && !timed_out_flag() {
+    if kit && skip_prompts.is_none() {
         fill_presentation_from_args(args, &mut presentation, false);
     }
     tear_overlay_down();
     let _ = OverlayGuard::wait_hidden(2000);
-    if kit && !interrupted && !timed_out_flag() {
+    if kit && skip_prompts.is_none() {
         fill_power_key_last(args, &mut presentation);
     }
     interrupted = interrupted || stop_requested() || OverlayGuard::escape_seen();

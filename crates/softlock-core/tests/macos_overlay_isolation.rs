@@ -42,6 +42,7 @@ const ACCEPTANCE_TESTS: &[&str] = &[
     "fn click_wait_finished_when_counts_change_or_deadline",
     "fn frontmost_app_is_restored_before_a_prompt",
     "fn a_pid_posted_click_is_measurement_unreliable",
+    "fn no_prompt_runs_when_frontmost_is_not_restored",
 ];
 
 #[test]

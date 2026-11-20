@@ -330,6 +330,24 @@ pub fn hold_presentation_across_prompt(app_active: bool) -> bool {
     !app_active
 }
 
+/// After the posted click, skip every interactive row if the saved app is not frontmost.
+pub fn skip_interactive_after_click(
+    frontmost_restored: bool,
+    interrupted: bool,
+    timed_out: bool,
+) -> Option<&'static str> {
+    if timed_out {
+        return Some("timeout");
+    }
+    if interrupted {
+        return Some("interrupted");
+    }
+    if !frontmost_restored {
+        return Some("frontmost-not-restored");
+    }
+    None
+}
+
 #[cfg(test)]
 pub fn row_is_success(outcome: Option<&str>) -> bool {
     matches!(
@@ -1257,6 +1275,23 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("frontmost-not-restored"))
         );
+    }
+
+    #[test]
+    fn no_prompt_runs_when_frontmost_is_not_restored() {
+        assert_eq!(
+            skip_interactive_after_click(false, false, false),
+            Some("frontmost-not-restored")
+        );
+        assert_eq!(
+            skip_interactive_after_click(true, true, false),
+            Some("interrupted")
+        );
+        assert_eq!(
+            skip_interactive_after_click(true, false, true),
+            Some("timeout")
+        );
+        assert_eq!(skip_interactive_after_click(true, false, false), None);
     }
 
     #[test]
