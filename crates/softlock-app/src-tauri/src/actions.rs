@@ -95,11 +95,11 @@ fn local_offset_secs() -> i32 {
         unsafe {
             let mut info = windows::Win32::System::Time::TIME_ZONE_INFORMATION::default();
             let kind = windows::Win32::System::Time::GetTimeZoneInformation(&mut info);
-            let bias = match kind {
-                windows::Win32::System::Time::TIME_ZONE_ID_DAYLIGHT => {
-                    info.Bias + info.DaylightBias
-                }
-                _ => info.Bias + info.StandardBias,
+            // TIME_ZONE_ID_DAYLIGHT is 2. The windows crate does not name it.
+            let bias = if kind == 2 {
+                info.Bias + info.DaylightBias
+            } else {
+                info.Bias + info.StandardBias
             };
             -bias * 60
         }
