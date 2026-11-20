@@ -1748,6 +1748,7 @@ fn hard_lock_from_the_app_while_locked_is_rejected() {
     assert!(!controller.returned_to_unlocked());
 }
 
+#[test]
 fn hard_lock_from_the_lock_host_while_locked_fails_closed() {
     let mut controller = locked_started();
     controller.handle(Event::Public {
@@ -1763,6 +1764,7 @@ fn hard_lock_from_the_lock_host_while_locked_fails_closed() {
     assert!(!controller.returned_to_unlocked());
 }
 
+#[test]
 fn hard_lock_from_the_app_while_unlocked_calls_the_os_lock_and_stays_unlocked() {
     let mut controller = started(FakePlatform::new());
     controller.handle(Event::Public {
