@@ -1437,6 +1437,7 @@ mod quit_guard {
             source: LockSource::Tray,
             prompt: PromptState::Idle,
         };
+        let held = super::failclosed::os_lock_held_count();
         assert!(super::arm_quit_lock(&mut tried, &locked));
         assert!(tried);
         assert_eq!(
@@ -1444,6 +1445,13 @@ mod quit_guard {
             super::QUIT_RUNNING
         );
         assert!(!super::arm_quit_lock(&mut tried, &locked));
+        let entered = std::time::Instant::now();
+        while super::failclosed::os_lock_held_count() == held {
+            if entered.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("the quit lock reached Windows instead of the test hold");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         super::failclosed::block_os_lock_for_test(false);
         let done = std::time::Instant::now();
         loop {
@@ -1479,6 +1487,7 @@ mod quit_thread {
             .unwrap_or_else(|poison| poison.into_inner());
         QUIT_OS.store(QUIT_IDLE, Ordering::Release);
         super::failclosed::block_os_lock_for_test(true);
+        let held = super::failclosed::os_lock_held_count();
         let started = Instant::now();
         schedule_quit_os_lock();
         let queued = started.elapsed();
@@ -1488,6 +1497,12 @@ mod quit_thread {
             queued.as_millis()
         );
         assert_eq!(QUIT_OS.load(Ordering::Acquire), QUIT_RUNNING);
+        while super::failclosed::os_lock_held_count() == held {
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!("the quit lock reached Windows instead of the test hold");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         std::thread::sleep(Duration::from_millis(40));
         assert_eq!(
             QUIT_OS.load(Ordering::Acquire),

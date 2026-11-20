@@ -86,12 +86,21 @@ static OS_LOCK_STUB: AtomicU8 = AtomicU8::new(1);
 
 #[cfg(test)]
 static BLOCK_OS_LOCK: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static OS_LOCK_HELD: AtomicU64 = AtomicU64::new(0);
 
 /// Holds `lock_or_disconnect` on the worker so a test can see that the
 /// window thread already returned. The held call does not touch Windows.
 #[cfg(test)]
 pub(crate) fn block_os_lock_for_test(block: bool) {
     BLOCK_OS_LOCK.store(block, Ordering::Release);
+}
+
+/// How many workers have entered the hold. A test waits for this to move
+/// before it clears the block, so the worker cannot reach Windows.
+#[cfg(test)]
+pub(crate) fn os_lock_held_count() -> u64 {
+    OS_LOCK_HELD.load(Ordering::Acquire)
 }
 
 pub(crate) fn lock_or_disconnect(session: u32) -> RealLock {
@@ -111,6 +120,7 @@ fn held_for_test() -> bool {
     if !BLOCK_OS_LOCK.load(Ordering::Acquire) {
         return false;
     }
+    OS_LOCK_HELD.fetch_add(1, Ordering::Release);
     while BLOCK_OS_LOCK.load(Ordering::Acquire) {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
