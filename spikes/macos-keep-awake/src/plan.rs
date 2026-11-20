@@ -86,10 +86,6 @@ pub fn lid_presence(model: &str, registry: Option<bool>) -> LidPresence {
     }
 }
 
-pub fn has_lid(model: &str, registry: Option<bool>) -> bool {
-    lid_presence(model, registry) == LidPresence::Present
-}
-
 /// `Some(true)` is AC, `Some(false)` is battery, `None` is unread.
 pub fn ac_power(pmset_batt: &str) -> Option<bool> {
     let lower = pmset_batt.to_ascii_lowercase();
@@ -145,11 +141,11 @@ mod tests {
         assert!(laptop_model("MacBookPro16,2"));
         assert!(!laptop_model("Macmini6,2"));
         assert!(!laptop_model("Mac14,2"));
-        assert!(has_lid("Mac14,2", Some(true)));
-        assert!(has_lid("Mac15,12", Some(true)));
-        assert!(!has_lid("Macmini8,1", Some(false)));
-        assert!(!has_lid("Mac14,2", None));
-        assert!(has_lid("MacBookPro16,2", None));
+        assert_eq!(lid_presence("Mac14,2", Some(true)), LidPresence::Present);
+        assert_eq!(lid_presence("Mac15,12", Some(true)), LidPresence::Present);
+        assert_eq!(lid_presence("Macmini8,1", Some(false)), LidPresence::Absent);
+        assert_eq!(lid_presence("Mac14,2", None), LidPresence::Unknown);
+        assert_eq!(lid_presence("MacBookPro16,2", None), LidPresence::Present);
         assert_eq!(ac_power("Now drawing from 'AC Power'"), Some(true));
         assert_eq!(ac_power("Now drawing from 'Battery Power'"), Some(false));
         assert_eq!(ac_power(""), None);
