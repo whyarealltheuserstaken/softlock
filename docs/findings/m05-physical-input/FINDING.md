@@ -19,7 +19,7 @@ The GitHub job (`macos-latest`, `macos-15-intel`, `macos-26-intel`) is the slice
 
 ## What only a person at a Mac can prove
 
-Test machine header: [Henry's sheet](../../tickets/macos/henry-sheet.md). Target kit Mac: MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), `MacBookPro16,2`, Intel Core i5, macOS Tahoe 26.7.3, laptop. The kit still runs on Apple silicon, other macOS 11+ versions, desktops with no lid, and one or many displays: rows that do not apply skip with a precise reason (`no-keyboard`, `no-trackpad`, `no-second-keyboard`, `no-tap`, `ci`, `operator`, `no-input`). They are never labelled as a lid miss.
+Test machine header: [Henry's sheet](../../tickets/macos/henry-sheet.md). Target kit Mac: MacBook Pro (13-inch, 2020, Four Thunderbolt 3 ports), `MacBookPro16,2`, Intel Core i5, macOS Tahoe 26.7.3, laptop. The kit still runs on Apple silicon, other macOS 11+ versions, desktops with no lid, and one or many displays: rows that do not apply skip with a precise reason (`no-keyboard`, `no-trackpad`, `no-second-keyboard`, `no-tap`, `window-not-key`, `ci`, `operator`, `no-input`, `not-applicable`). They are never labelled as a lid miss. Run `--kit` for the person-at-the-Mac slice. Bare `run.sh` is the full suite.
 
 Rows CI cannot fill:
 

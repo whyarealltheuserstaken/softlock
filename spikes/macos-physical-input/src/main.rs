@@ -4,9 +4,12 @@
 
 mod args;
 mod classify;
+mod grants;
+mod guard;
 mod plan;
 mod report;
 mod scrub;
+mod target;
 mod text;
 mod version;
 

@@ -10,7 +10,6 @@
 #import <IOKit/hid/IOHIDUsageTables.h>
 
 #include <dlfcn.h>
-#include <spawn.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -25,9 +24,7 @@
 extern char **environ;
 
 static const int kProbeKey = 0;
-static const int kMarkerKey = 50;
-static const int kSlowKey = 8;
-static const int kSlowSleepMs = 2000;
+static const int kTargetCapSecs = 30 * 60;
 
 @class ProbeWindow;
 static ProbeWindow *g_window = nil;
@@ -35,16 +32,15 @@ static CFMachPortRef g_tap = NULL;
 static CFRunLoopSourceRef g_tap_source = NULL;
 static _Atomic int g_tap_released = 1;
 
-static _Atomic int g_count_post = 0;
-static _Atomic int64_t g_last_post_ms = 0;
+static _Atomic int g_count_key = 0;
+static _Atomic int g_count_click = 0;
+static _Atomic int g_count_scroll = 0;
+static _Atomic int g_count_probe = 0;
 static _Atomic int64_t g_wait_state = 0;
 static _Atomic int64_t g_wait_pid = 0;
 static _Atomic int64_t g_wait_type = 0;
 static _Atomic int g_wait_saw = 0;
 static _Atomic int64_t g_disable_type = 0;
-static _Atomic int g_marker_seen = 0;
-static _Atomic int64_t g_slow_entered_ms = 0;
-static _Atomic int64_t g_slow_returned_ms = 0;
 static _Atomic int64_t g_disable_ms = 0;
 
 typedef struct {
@@ -112,14 +108,6 @@ static void write_text(const char *path, const char *text) {
     fclose(file);
 }
 
-static int read_int_line(const char *text, const char *key, long long *out) {
-    const char *found = strstr(text, key);
-    if (found == NULL) {
-        return -1;
-    }
-    return sscanf(found + strlen(key), "%lld", out) == 1 ? 0 : -1;
-}
-
 int m05_hw_model(char *dest, size_t cap) {
     if (dest == NULL || cap == 0) {
         return 1;
@@ -149,17 +137,19 @@ static CGEventRef listen_callback(CGEventTapProxy proxy, CGEventType type, CGEve
     atomic_store(&g_wait_pid, CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID));
     atomic_store(&g_wait_type, (int64_t)type);
     atomic_store(&g_wait_saw, 1);
-    if (type == kCGEventKeyDown) {
-        int64_t key = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
-        if (key == kProbeKey) {
-            atomic_fetch_add(&g_count_post, 1);
-            atomic_store(&g_last_post_ms, now_ms());
-        }
-        if (key == kMarkerKey) {
-            atomic_store(&g_marker_seen, 1);
-        }
-    }
     return event;
+}
+
+static void write_state(const char *dir) {
+    char body[512];
+    int key = (g_window != nil && [g_window isKeyWindow]) ? 1 : 0;
+    snprintf(body, sizeof body,
+             "ready=1\ncount-key=%d\ncount-click=%d\ncount-scroll=%d\ncount-probe=%d\nwritten-ms=%lld\nkey=%d\n",
+             atomic_load(&g_count_key), atomic_load(&g_count_click), atomic_load(&g_count_scroll),
+             atomic_load(&g_count_probe), (long long)now_ms(), key);
+    char path[1024];
+    join_path(path, sizeof path, dir, "target-state.txt");
+    write_text(path, body);
 }
 
 static void tap_release(void) {
@@ -421,39 +411,38 @@ int m05_classify_target(const char *dir) {
         [window orderFrontRegardless];
         [window makeKeyAndOrderFront:nil];
         wait_until_key(window);
-        id monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskLeftMouseDown |
-                                                                       NSEventMaskScrollWheel
+        NSEventMask mask = NSEventMaskKeyDown | NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown |
+                           NSEventMaskOtherMouseDown | NSEventMaskScrollWheel;
+        id monitor = [NSEvent addLocalMonitorForEventsMatchingMask:mask
                                                            handler:^NSEvent *(NSEvent *event) {
-                                                             if (event.type == NSEventTypeKeyDown &&
-                                                                 event.keyCode == kProbeKey) {
-                                                                 atomic_fetch_add(&g_count_post, 1);
-                                                                 atomic_store(&g_last_post_ms, now_ms());
+                                                             if (event.type == NSEventTypeKeyDown) {
+                                                                 atomic_fetch_add(&g_count_key, 1);
+                                                                 if (event.keyCode == kProbeKey) {
+                                                                     atomic_fetch_add(&g_count_probe, 1);
+                                                                 }
+                                                             } else if (event.type == NSEventTypeLeftMouseDown ||
+                                                                        event.type == NSEventTypeRightMouseDown ||
+                                                                        event.type == NSEventTypeOtherMouseDown) {
+                                                                 atomic_fetch_add(&g_count_click, 1);
+                                                             } else if (event.type == NSEventTypeScrollWheel) {
+                                                                 atomic_fetch_add(&g_count_scroll, 1);
                                                              }
-                                                             if (event.type == NSEventTypeKeyDown ||
-                                                                 event.type == NSEventTypeLeftMouseDown ||
-                                                                 event.type == NSEventTypeScrollWheel) {
-                                                                 char body[256];
-                                                                 snprintf(body, sizeof body,
-                                                                          "ready=1\ncount0=%d\nlast0=%lld\nkind=%ld\n",
-                                                                          atomic_load(&g_count_post),
-                                                                          (long long)atomic_load(&g_last_post_ms),
-                                                                          (long)event.type);
-                                                                 char path[1024];
-                                                                 join_path(path, sizeof path, dir, "target-state.txt");
-                                                                 write_text(path, body);
-                                                             }
+                                                             write_state(dir);
                                                              return event;
                                                            }];
         char stop[1024];
         join_path(stop, sizeof stop, dir, "target.stop");
-        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:90];
+        char focus[1024];
+        join_path(focus, sizeof focus, dir, "target.focus");
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:(double)kTargetCapSecs];
         while ([until timeIntervalSinceNow] > 0) {
-            char body[256];
-            snprintf(body, sizeof body, "ready=1\ncount0=%d\nlast0=%lld\n", atomic_load(&g_count_post),
-                     (long long)atomic_load(&g_last_post_ms));
-            char path[1024];
-            join_path(path, sizeof path, dir, "target-state.txt");
-            write_text(path, body);
+            if (access(focus, F_OK) == 0) {
+                activate_app();
+                [window makeKeyAndOrderFront:nil];
+                wait_until_key(window);
+                unlink(focus);
+            }
+            write_state(dir);
             if (access(stop, F_OK) == 0) {
                 break;
             }
@@ -542,24 +531,14 @@ int m05_classify_post(const char *source, const char *dir) {
     return rc == 0 ? 0 : 1;
 }
 
-int m05_read_target_count(const char *dir) {
-    char path[1024];
-    join_path(path, sizeof path, dir, "target-state.txt");
-    FILE *file = fopen(path, "r");
-    if (file == NULL) {
-        return -1;
+int m05_input_grants(int *accessibility, int *listen) {
+    if (accessibility != NULL) {
+        *accessibility = AXIsProcessTrusted() ? 1 : 0;
     }
-    char text[512];
-    size_t n = fread(text, 1, sizeof text - 1, file);
-    fclose(file);
-    text[n] = 0;
-    long long ready = 0;
-    long long c0 = 0;
-    if (read_int_line(text, "ready=", &ready) != 0 || ready != 1) {
-        return -1;
+    if (listen != NULL) {
+        *listen = CGPreflightListenEventAccess() ? 1 : 0;
     }
-    read_int_line(text, "count0=", &c0);
-    return (int)c0;
+    return 0;
 }
 
 int m05_pump(int millis) {

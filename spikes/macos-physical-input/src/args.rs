@@ -6,6 +6,9 @@ use crate::classify::POST_SOURCES;
 
 pub const DEFAULT_OUTPUT_DIR: &str = "physical-input-output";
 
+pub const USAGE: &str = "usage: macos-physical-input --kit | --runner | --classify-target | --classify-post <source> [--output-dir DIR]\n\
+Bare invocation prints this usage and does not post keys. --kit is the person-at-the-Mac run. --runner is the GitHub slice.";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Runner,
@@ -69,6 +72,9 @@ where
     if selected > 1 {
         return Err("kit, runner, and classify children are different processes".to_string());
     }
+    if selected == 0 {
+        return Err(USAGE.to_string());
+    }
     let mode = if classify_target {
         Mode::ClassifyTarget
     } else if post_source.is_some() {
@@ -104,11 +110,15 @@ mod tests {
     }
 
     #[test]
-    fn the_default_mode_is_the_runner_and_it_holds_the_tap() {
-        let args = parse(tokens(&[])).unwrap();
-        assert_eq!(args.mode, Mode::Runner);
-        assert!(args.mode.holds_tap());
-        assert!(args.output_dir.ends_with(DEFAULT_OUTPUT_DIR));
+    fn no_args_prints_usage_and_does_not_post_keys() {
+        let error = parse(tokens(&[])).unwrap_err();
+        assert!(error.contains("--kit"));
+        assert!(error.contains("--runner"));
+        assert!(error.contains("does not post keys"));
+        let runner = parse(tokens(&["--runner"])).unwrap();
+        assert_eq!(runner.mode, Mode::Runner);
+        assert!(runner.mode.holds_tap());
+        assert!(runner.output_dir.ends_with(DEFAULT_OUTPUT_DIR));
         let kit = parse(tokens(&["--kit"])).unwrap();
         assert_eq!(kit.mode, Mode::Kit);
         assert!(kit.mode.holds_tap());

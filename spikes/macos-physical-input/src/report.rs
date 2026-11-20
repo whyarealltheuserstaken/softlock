@@ -163,8 +163,10 @@ pub fn runner_skip(kind: &str, subject: &str) -> EventRow {
 pub fn instructions(kit: bool) -> &'static str {
     if kit {
         "This run creates a listen-only session tap, the same probe m03 used.\n\
-         Type one key, click, and scroll the trackpad. The kit then posts from a second process.\n\
-         Focus a password field when asked. Plug in a spare USB keyboard only if you have one.\n\
+         Type one key, click, and scroll the trackpad.\n\
+         The kit then posts from a second process. The probe window must be key first. Leave any password field until asked.\n\
+         Then focus a password field when asked. Leave it when that row is done.\n\
+         Plug in a spare USB keyboard only if you have one.\n\
          Type skip to skip a row. Control-C releases the tap and exits non-zero. Input is never swallowed."
     } else {
         "Runner slice: listen-only session tap and CGEventPost from a second process under each source state.\n\
@@ -525,7 +527,38 @@ mod tests {
     }
 
     #[test]
+    fn kit_instructions_match_the_post_order() {
+        let text = instructions(true);
+        assert!(text.contains("posts from a second process"));
+        assert!(text.contains("probe window must be key"));
+        assert!(text.contains("Leave any password field until asked"));
+        assert!(text.contains("Leave it when that row is done"));
+        let posts_at = text.find("posts from a second process").unwrap();
+        let password_at = text.find("focus a password field").unwrap();
+        assert!(
+            posts_at < password_at,
+            "second-process posts must be described before the password prompt"
+        );
+    }
+
+    #[test]
     fn a_failure_releases_the_tap_and_does_not_leave_input_blocked() {
+        use crate::guard::TapGuard;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static RELEASED: AtomicBool = AtomicBool::new(false);
+        RELEASED.store(false, Ordering::SeqCst);
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = TapGuard::new(|| RELEASED.store(true, Ordering::SeqCst));
+            panic!("probe panicked");
+        }));
+        assert!(unwound.is_err());
+        assert!(
+            RELEASED.load(Ordering::SeqCst),
+            "TapGuard Drop must run dispatch's release path"
+        );
+
         let mut stuck = sample();
         stuck.tap_released = false;
         stuck.restored = false;

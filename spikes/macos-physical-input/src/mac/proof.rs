@@ -1,22 +1,23 @@
 //! Orchestrator. Children never hold the tap.
 
 use std::fs;
-use std::io::{ErrorKind, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::args::{Args, Mode};
 use crate::classify::{POST_SOURCES, classification_verdict, disable_event_name};
-use crate::mac::ffi::{self, TapGuard};
+use crate::guard::TapGuard;
+use crate::mac::ffi;
 use crate::plan;
 use crate::report::{
     EventRow, FallbackRow, KIT_ID, KitReport, SecureRow, event_row, exit_nonzero, recorded_event,
     render, runner_skip,
 };
 use crate::scrub::{contains_serial, scrub_model};
+use crate::target::{self, TargetState};
 use crate::version::parse_sw_vers;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -75,8 +76,8 @@ fn run_orchestrator(args: &Args) -> i32 {
     let tap = if interrupted {
         None
     } else {
-        match TapGuard::create() {
-            Ok(guard) => Some(guard),
+        match ffi::tap_create() {
+            Ok(()) => Some(TapGuard::new(ffi::tap_release)),
             Err(error) => {
                 probe_crash = Some(error);
                 None
@@ -84,6 +85,13 @@ fn run_orchestrator(args: &Args) -> i32 {
         }
     };
     let tap_created = tap.is_some();
+    let tap_skip_note = tap_skip_note();
+    if kit && !tap_created {
+        if !tap_skip_note.is_empty() {
+            crate::report::write_stdout(&tap_skip_note);
+        }
+        probe_crash = None;
+    }
 
     let exe = current_exe().ok();
     let mut target = if tap_created && !interrupted {
@@ -96,8 +104,6 @@ fn run_orchestrator(args: &Args) -> i32 {
     let physical_key;
     let physical_click;
     let physical_scroll;
-    let usb_keyboard;
-    let secure;
     if kit && tap_created && !interrupted {
         physical_key = wait_physical(
             args,
@@ -123,76 +129,32 @@ fn run_orchestrator(args: &Args) -> i32 {
         no_input = is_no_input(&physical_key)
             || is_no_input(&physical_click)
             || is_no_input(&physical_scroll);
-        interrupted = interrupted || stop_requested();
-        secure = if interrupted || no_input {
-            skipped_secure(if interrupted {
-                "interrupted"
-            } else {
-                "no-input"
-            })
-        } else {
-            wait_secure(args)
-        };
-        usb_keyboard = if interrupted || no_input {
-            event_row(
-                if interrupted {
-                    "interrupted"
-                } else {
-                    "no-input"
-                },
-                Some(if interrupted {
-                    "interrupted"
-                } else {
-                    "no-input"
-                }),
-                "usb",
-                "skipped",
-                if interrupted {
-                    "interrupted"
-                } else {
-                    "no-input"
-                },
-            )
-        } else {
-            wait_usb(args, inventory.keyboards)
-        };
-        no_input = no_input || is_no_input(&usb_keyboard) || secure.detection_method == "no-input";
     } else if kit && !tap_created {
         physical_key = event_row(
             "not-applicable",
             Some("no-tap"),
             "key",
-            "session tap was not created",
+            &tap_skip_note,
             "pre-prompt",
         );
         physical_click = event_row(
             "not-applicable",
             Some("no-tap"),
             "click",
-            "session tap was not created",
+            &tap_skip_note,
             "pre-prompt",
         );
         physical_scroll = event_row(
             "not-applicable",
             Some("no-tap"),
             "scroll",
-            "session tap was not created",
+            &tap_skip_note,
             "pre-prompt",
         );
-        usb_keyboard = event_row(
-            "not-applicable",
-            Some("no-tap"),
-            "usb",
-            "session tap was not created",
-            "pre-prompt",
-        );
-        secure = skipped_secure("no-tap");
     } else {
         physical_key = runner_skip("key", "A physical key");
         physical_click = runner_skip("click", "A physical click");
         physical_scroll = runner_skip("scroll", "A trackpad scroll");
-        usb_keyboard = runner_skip("usb", "A spare USB keyboard");
-        secure = skipped_secure("not-run-on-runner");
     }
 
     interrupted = interrupted || stop_requested();
@@ -204,6 +166,46 @@ fn run_orchestrator(args: &Args) -> i32 {
         }
     } else {
         Vec::new()
+    };
+
+    interrupted = interrupted || stop_requested();
+    let (secure, usb_keyboard) = if kit && tap_created && !interrupted && !no_input {
+        crate::report::write_stdout(
+            "Leave any password field until asked. Then focus a password field when asked.",
+        );
+        let secure = wait_secure(args);
+        crate::report::write_stdout("Leave the password field now. That row is done.");
+        let usb_keyboard = wait_usb(args, inventory.keyboards);
+        no_input = no_input || is_no_input(&usb_keyboard) || secure.detection_method == "no-input";
+        (secure, usb_keyboard)
+    } else if kit && !tap_created {
+        let mut secure = skipped_secure("no-tap");
+        secure.note.clone_from(&tap_skip_note);
+        (
+            secure,
+            event_row(
+                "not-applicable",
+                Some("no-tap"),
+                "usb",
+                &tap_skip_note,
+                "pre-prompt",
+            ),
+        )
+    } else if kit {
+        let reason = if interrupted {
+            "interrupted"
+        } else {
+            "no-input"
+        };
+        (
+            skipped_secure(reason),
+            event_row(reason, Some(reason), "usb", "skipped", reason),
+        )
+    } else {
+        (
+            skipped_secure("not-run-on-runner"),
+            runner_skip("usb", "A spare USB keyboard"),
+        )
     };
 
     let (slow, marker) = if tap_created {
@@ -384,16 +386,19 @@ fn wait_physical(
             }
             LineRead::Pending => {}
         }
+        if let Some(row) = stale_row(args, kind) {
+            return row;
+        }
         let wait = ffi::tap_wait(kind, 200);
         if wait.saw {
-            let before = ffi::read_target_count(&args.output_dir);
+            let before = count_for(args, kind);
             ffi::pump(150);
-            let after = ffi::read_target_count(&args.output_dir);
+            let after = count_for(args, kind);
             return recorded_event(
                 kind,
                 wait.state_id,
                 wait.source_pid,
-                after > before && before >= 0,
+                target::window_received(before, after),
                 true,
                 None,
                 None,
@@ -433,7 +438,7 @@ fn wait_secure(args: &Args) -> SecureRow {
     if !stdin_is_terminal() {
         return skipped_secure("no-input");
     }
-    let before = ffi::read_target_count(&args.output_dir);
+    let before = count_for(args, "any-key");
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut pending = String::new();
     let mut quiet = true;
@@ -451,38 +456,42 @@ fn wait_secure(args: &Args) -> SecureRow {
         let wait = ffi::tap_wait("any-key", 200);
         if wait.disable_type != 0 {
             let name = disable_event_name(wait.disable_type);
-            let after = ffi::read_target_count(&args.output_dir);
+            let after = count_for(args, "any-key");
             return SecureRow {
                 status: "recorded".into(),
                 outcome: Some("disabled-by-user-input".into()),
                 disable_event: name.into(),
                 secure_enabled: enabled.into(),
-                window_received: Some(after > before && before >= 0),
+                window_received: Some(target::window_received(before, after)),
                 note: name.into(),
                 detection_method: "disable-event".into(),
             };
         }
         if wait.saw {
             quiet = false;
-            let after = ffi::read_target_count(&args.output_dir);
+            let after = count_for(args, "any-key");
             return SecureRow {
                 status: "recorded".into(),
                 outcome: Some("still-seeing".into()),
                 disable_event: "none".into(),
                 secure_enabled: enabled.into(),
-                window_received: Some(after > before && before >= 0),
+                window_received: Some(target::window_received(before, after)),
                 note: "tap still saw a key while a password field was requested".into(),
                 detection_method: "listen-only-tap".into(),
             };
         }
         if Instant::now() >= deadline {
-            let after = ffi::read_target_count(&args.output_dir);
+            let after = count_for(args, "any-key");
             return SecureRow {
                 status: "recorded".into(),
-                outcome: Some(if quiet { "quiet" } else { "not-detected" }),
+                outcome: Some(if quiet {
+                    "quiet".to_string()
+                } else {
+                    "not-detected".to_string()
+                }),
                 disable_event: "none".into(),
                 secure_enabled: enabled.into(),
-                window_received: Some(after > before && before >= 0),
+                window_received: Some(target::window_received(before, after)),
                 note: "no key and no disable event during the wait".into(),
                 detection_method: "listen-only-tap".into(),
             };
@@ -564,17 +573,28 @@ fn wait_usb(args: &Args, keyboards_now: i32) -> EventRow {
 
 fn second_process_posts(exe: &Path, args: &Args) -> Vec<EventRow> {
     let mut rows = Vec::new();
+    let kit = args.mode == Mode::Kit;
     for source in POST_SOURCES {
-        let kind = match *source {
-            "kCGEventSourceStatePrivate" => "post-private",
-            "kCGEventSourceStateCombinedSessionState" => "post-combined",
-            _ => "post-hid",
-        };
+        let kind = target::post_kind(source);
+        if let Some(row) = stale_row(args, kind) {
+            rows.push(row);
+            continue;
+        }
+        if !wait_probe_is_key(args) && kit {
+            rows.push(event_row(
+                "skip",
+                Some("window-not-key"),
+                kind,
+                "probe window did not become key before the post",
+                "window-not-key",
+            ));
+            continue;
+        }
         let mut built = None;
         for _ in 0..5 {
             let last = args.output_dir.join("last-post.txt");
             let _ = fs::remove_file(&last);
-            let before = ffi::read_target_count(&args.output_dir);
+            let before = count_for(args, kind);
             ffi::clear_wait();
             match Command::new(exe)
                 .args([
@@ -628,7 +648,7 @@ fn second_process_posts(exe: &Path, args: &Args) -> Vec<EventRow> {
             }
             let wait = ffi::last_event();
             ffi::pump(150);
-            let after = ffi::read_target_count(&args.output_dir);
+            let after = count_for(args, kind);
             let (state_id, source_pid, poster_pid) = read_last_post(&last);
             let tap_saw = wait.saw;
             let state = if tap_saw {
@@ -645,7 +665,7 @@ fn second_process_posts(exe: &Path, args: &Args) -> Vec<EventRow> {
                 kind,
                 state,
                 pid,
-                after > before && before >= 0,
+                target::window_received(before, after),
                 tap_saw,
                 Some("second-process"),
                 poster_pid,
@@ -682,6 +702,7 @@ fn read_last_post(path: &Path) -> (Option<i64>, Option<i64>, Option<i64>) {
 
 fn start_target(exe: &Path, args: &Args) -> Result<Child, String> {
     let _ = fs::remove_file(args.output_dir.join("target.stop"));
+    let _ = fs::remove_file(args.output_dir.join("target.focus"));
     let _ = fs::remove_file(args.output_dir.join("target-state.txt"));
     Command::new(exe)
         .args([
@@ -698,10 +719,65 @@ fn start_target(exe: &Path, args: &Args) -> Result<Child, String> {
 fn wait_target_ready(dir: &Path) {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
-        if ffi::read_target_count(dir) >= 0 {
+        if load_target(dir).ready {
             return;
         }
         ffi::pump(50);
+    }
+}
+
+fn load_target(dir: &Path) -> TargetState {
+    let text = fs::read_to_string(dir.join("target-state.txt")).unwrap_or_default();
+    target::parse_target_state(&text)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn count_for(args: &Args, kind: &str) -> i32 {
+    target::count_for_kind(&load_target(&args.output_dir), kind)
+}
+
+fn stale_row(args: &Args, kind: &str) -> Option<EventRow> {
+    let state = load_target(&args.output_dir);
+    if !state.ready {
+        return None;
+    }
+    if target::is_stale(state.written_ms, now_ms()) {
+        return Some(event_row(
+            "fail",
+            Some("target-stale"),
+            kind,
+            "target-state.txt heartbeat is stale",
+            "target-stale",
+        ));
+    }
+    None
+}
+
+fn wait_probe_is_key(args: &Args) -> bool {
+    let _ = fs::write(args.output_dir.join("target.focus"), "focus\n");
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        if load_target(&args.output_dir).key {
+            return true;
+        }
+        ffi::pump(50);
+    }
+    load_target(&args.output_dir).key
+}
+
+fn tap_skip_note() -> String {
+    let (accessibility, listen) = ffi::input_grants();
+    let note = crate::grants::input_note(accessibility, listen);
+    if note.is_empty() {
+        "session tap was not created".into()
+    } else {
+        note
     }
 }
 
@@ -811,16 +887,4 @@ fn write_crash_report(dir: &Path, message: &str) -> Result<(), String> {
     );
     fs::write(dir.join("result.txt"), body).map_err(|error| error.to_string())?;
     Ok(())
-}
-
-#[allow(dead_code)]
-fn drain_stdin() {
-    unsafe {
-        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
-    }
-}
-
-#[allow(dead_code)]
-fn ignore_io(error: ErrorKind) -> bool {
-    error == ErrorKind::Interrupted
 }

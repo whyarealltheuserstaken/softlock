@@ -304,18 +304,10 @@ fn physical_row(id: &str, name: &str, key: &str, text: &str, physical: bool) -> 
                 row(id, name, "fail", None, physical, detail)
             }
         }
-        "recorded"
-            if key == "secure"
-                && matches!(
-                    field(text, "secure").as_deref(),
-                    Some("quiet" | "disabled-by-user-input" | "still-seeing")
-                ) =>
-        {
-            row(id, name, "pass", None, physical, detail)
-        }
         "quiet" | "disabled-by-user-input" | "still-seeing" => {
             row(id, name, "pass", None, physical, detail)
         }
+        "window-not-key" => row(id, name, "skip", Some("not-applicable"), physical, detail),
         "recorded" if key == "usb-keyboard" => {
             if field(text, "usb-keyboard-state-id").as_deref() != Some("none")
                 && field(text, "usb-keyboard-source-pid").as_deref() != Some("none")
@@ -331,7 +323,7 @@ fn physical_row(id: &str, name: &str, key: &str, text: &str, physical: bool) -> 
         "skip" => row(id, name, "skip", Some("operator"), physical, detail),
         "no-input" => row(id, name, "skip", Some("no-input"), physical, detail),
         "interrupted" => row(id, name, "skip", Some("interrupted"), physical, detail),
-        "not-detected" | "missing" | "error" | "tap-disabled" => {
+        "not-detected" | "missing" | "error" | "tap-disabled" | "target-stale" => {
             row(id, name, "fail", None, physical, detail)
         }
         _ => row(id, name, "fail", None, physical, detail),
@@ -344,11 +336,17 @@ fn classification_row(text: &str) -> Row {
     let named = field(text, "m14-named").as_deref() == Some("true") || rule.contains("m14");
     let detail = format!("{value} rule={rule} m14={named}");
     if value == "pending-physical" {
+        let mode = field(text, "mode").unwrap_or_default();
+        let reason = if mode == "kit" {
+            "not-applicable"
+        } else {
+            "ci"
+        };
         return row(
             "m05-classification",
             "Classification rule",
             "skip",
-            Some("ci"),
+            Some(reason),
             false,
             detail,
         );
@@ -1033,6 +1031,19 @@ power-key=not-run-on-runner
                 .status,
             "pass"
         );
+        let not_key = kit_m05().replace("post-private=recorded", "post-private=window-not-key");
+        let skipped = physical_input_rows(&not_key)
+            .into_iter()
+            .find(|row| row.id == "m05-post-private")
+            .unwrap();
+        assert_eq!(skipped.status, "skip");
+        assert_eq!(skipped.skip_reason.as_deref(), Some("not-applicable"));
+        let stale = kit_m05().replace("physical-click=recorded", "physical-click=target-stale");
+        let failed = physical_input_rows(&stale)
+            .into_iter()
+            .find(|row| row.id == "m05-physical-click")
+            .unwrap();
+        assert_eq!(failed.status, "fail");
     }
 
     #[test]
@@ -1099,6 +1110,22 @@ usb-keyboard-detection=listen-only-tap
             .find(|row| row.id == "m05-classification")
             .unwrap();
         assert_eq!(pending.skip_reason.as_deref(), Some("ci"));
+        let kit_pending = "\
+mode=kit
+tap-created=true
+tap-released=true
+tap-option=listen-only
+classification=pending-physical
+classification-rule=hid-and-pid-0-is-physical
+m14-named=true
+";
+        let kit_pending = physical_input_rows(kit_pending)
+            .into_iter()
+            .find(|row| row.id == "m05-classification")
+            .unwrap();
+        assert_eq!(kit_pending.status, "skip");
+        assert_eq!(kit_pending.skip_reason.as_deref(), Some("not-applicable"));
+        assert_ne!(kit_pending.skip_reason.as_deref(), Some("ci"));
         let confirmed = physical_input_rows(&kit_m05())
             .into_iter()
             .find(|row| row.id == "m05-classification")

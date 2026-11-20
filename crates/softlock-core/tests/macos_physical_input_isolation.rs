@@ -191,6 +191,12 @@ fn stop_handler_covers_hangup_and_the_tap_is_listen_only() {
     assert!(probe.contains("kCGEventTapOptionListenOnly"));
     assert!(probe.contains("tap_release"));
     assert!(probe.contains("CGEventTapEnable(g_tap, false)"));
+    assert!(!probe.contains("kMarkerKey"));
+    assert!(!probe.contains("kSlowKey"));
+    assert!(probe.contains("count-probe"));
+    assert!(probe.contains("count-click"));
+    assert!(probe.contains("target.stop"));
+    assert!(probe.contains("kTargetCapSecs"));
 }
 
 #[test]

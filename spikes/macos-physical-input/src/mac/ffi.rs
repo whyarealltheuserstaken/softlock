@@ -50,7 +50,7 @@ unsafe extern "C" {
     fn m05_secure_enabled() -> i32;
     fn m05_classify_target(dir: *const c_char) -> i32;
     fn m05_classify_post(source: *const c_char, dir: *const c_char) -> i32;
-    fn m05_read_target_count(dir: *const c_char) -> i32;
+    fn m05_input_grants(accessibility: *mut i32, listen: *mut i32) -> i32;
     fn m05_pump(millis: i32) -> i32;
 }
 
@@ -188,28 +188,17 @@ pub fn classify_post(source: &str, dir: &Path) -> i32 {
     unsafe { m05_classify_post(source.as_ptr(), dir.as_ptr()) }
 }
 
-pub fn read_target_count(dir: &Path) -> i32 {
-    let dir = cstr(&dir.to_string_lossy());
-    unsafe { m05_read_target_count(dir.as_ptr()) }
+pub fn input_grants() -> (bool, bool) {
+    let mut accessibility = 0;
+    let mut listen = 0;
+    unsafe {
+        m05_input_grants(&mut accessibility, &mut listen);
+    }
+    (accessibility != 0, listen != 0)
 }
 
 pub fn pump(millis: i32) {
     unsafe {
         m05_pump(millis);
-    }
-}
-
-pub struct TapGuard;
-
-impl TapGuard {
-    pub fn create() -> Result<Self, String> {
-        tap_create()?;
-        Ok(Self)
-    }
-}
-
-impl Drop for TapGuard {
-    fn drop(&mut self) {
-        tap_release();
     }
 }
