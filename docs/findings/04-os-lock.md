@@ -9,7 +9,7 @@ Dependent tickets:
 
 ## What each path is
 
-1. **Blocked.** `LockWorkStation` from the signed-in session while `DisableLockWorkstation` is 1. The proof passes only when the API fails, no lock notification arrives, and the session is not reported locked.
+1. **Blocked.** `LockWorkStation` from the signed-in session while `DisableLockWorkstation` is 1. The call can return success. The proof passes when no lock notification arrives and the session is not reported locked. The wait is the one-second budget, so this row's elapsed time is about one second.
 2. **Primary candidate.** Clear `DisableLockWorkstation`, then `LockWorkStation` from that same user-session process. Confirmation is the lock notification, in under one second. The other lockdown values stay set.
 3. **Service fall-back.** `WTSDisconnectSession` on the console session from `OsLockProbe`, a session-0 service. This is the call the service makes when the Lock Host is gone.
 4. **Lock Host fall-back.** `WTSDisconnectSession` on the user-session process's own session. This is the call the Lock Host makes when the service is gone. It does not need `DisableLockWorkstation` cleared.

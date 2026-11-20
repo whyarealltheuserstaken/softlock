@@ -17,11 +17,12 @@ pub fn under_one_second(elapsed_us: u128) -> bool {
     elapsed_us < ONE_SECOND_US
 }
 
-/// The policy blocks the call when the API fails, no lock notification
-/// arrived, and the session is not reported locked. An unreadable flag does
-/// not count as locked.
-pub fn blocked_proven(api_ok: bool, saw_lock: bool, session_locked: Option<bool>) -> bool {
-    !api_ok && !saw_lock && session_locked != Some(true)
+/// The policy blocks the lock when no lock notification arrived and the
+/// session is not reported locked. `LockWorkStation` can still return success
+/// in that case, so the API result is not part of the proof. An unreadable
+/// flag does not count as locked.
+pub fn blocked_proven(_api_ok: bool, saw_lock: bool, session_locked: Option<bool>) -> bool {
+    !saw_lock && session_locked != Some(true)
 }
 
 pub fn confirmed(api_ok: bool, notified: bool, elapsed_us: u128) -> bool {
@@ -80,12 +81,14 @@ mod tests {
     }
 
     #[test]
-    fn the_policy_blocks_the_lock_only_when_the_call_fails_and_the_session_stays_up() {
+    fn the_policy_blocks_the_lock_when_no_notification_arrives_and_the_session_stays_up() {
         assert!(blocked_proven(false, false, Some(false)));
         assert!(blocked_proven(false, false, None));
-        assert!(!blocked_proven(true, false, Some(false)));
+        assert!(blocked_proven(true, false, Some(false)));
+        assert!(!blocked_proven(true, false, Some(true)));
         assert!(!blocked_proven(false, true, Some(false)));
         assert!(!blocked_proven(false, false, Some(true)));
+        assert!(!blocked_proven(true, true, Some(false)));
     }
 
     #[test]
@@ -145,7 +148,8 @@ mod tests {
     #[test]
     fn judge_uses_the_blocked_and_confirm_rules() {
         assert!(judge("blocked", false, false, 1_000_000, Some(false)));
-        assert!(!judge("blocked", true, false, 10, Some(false)));
+        assert!(judge("blocked", true, false, 1_000_000, Some(false)));
+        assert!(!judge("blocked", true, true, 10, Some(false)));
         assert!(judge("confirm", true, true, 40, Some(true)));
         assert!(!judge("confirm", true, true, 1_000_000, Some(true)));
         assert!(!judge("other", true, true, 10, Some(true)));

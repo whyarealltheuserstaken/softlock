@@ -290,7 +290,7 @@ function Add-ProbeRow([string]$id, [string]$name, $result, [int]$duration) {
     $kind = ''
     if ($parsed.kind) { $kind = [string]$parsed.kind }
     $detail = "elapsed_us=$elapsed kind=$kind api=$($parsed.api_ok)"
-    Write-Host "timing $id api=$($parsed.api_ok) notified=$($parsed.notified) kind=$kind elapsed_us=$elapsed win32=$($parsed.win32)"
+    Write-Host "timing $id api=$($parsed.api_ok) notified=$($parsed.notified) kind=$kind elapsed_us=$elapsed win32=$($parsed.win32) session_locked=$($parsed.session_locked)"
     $status = if ($parsed.pass -eq $true) { 'pass' } else { 'fail' }
     if ($parsed.error) { $detail = "$detail $($parsed.error)" }
     Add-Row $id $name $status $null $true $duration $detail $measurements
