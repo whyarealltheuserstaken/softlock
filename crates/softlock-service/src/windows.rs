@@ -1560,8 +1560,7 @@ fn client_role(image: &str) -> softlock_core::Role {
 fn dev_app_role() -> bool {
     #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
     {
-        return std::env::var("SOFTLOCK_DEV_APP").ok().as_deref() == Some("1")
-            && dev_app_role_allowed();
+        std::env::var("SOFTLOCK_DEV_APP").ok().as_deref() == Some("1") && dev_app_role_allowed()
     }
     #[cfg(not(any(feature = "simulated-physical", feature = "live-fail-closed")))]
     {
