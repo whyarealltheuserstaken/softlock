@@ -16,10 +16,11 @@
   let view: OwnerView = bridge.current();
   let pin = "";
 
-  onMount(async () => {
-    const status = await loadPlatformStatus(bridge.kind);
-    supported = status.supported;
-    platformMessage = status.supported ? null : status.message;
+  onMount(() => {
+    void loadPlatformStatus(bridge.kind).then((status) => {
+      supported = status.supported;
+      platformMessage = status.supported ? null : status.message;
+    });
     return bridge.subscribe((next) => {
       view = next;
     });
@@ -51,6 +52,7 @@
   data-quit={view.quit ? "local" : "no"}
   data-service-stop={view.serviceStop ? "true" : "false"}
   data-locked={view.locked ? "on" : "off"}
+  data-notice={view.notice}
 >
   {#if platformMessage}
     <p class="platform-status" role="status">{platformMessage}</p>
@@ -58,6 +60,9 @@
 
   <p class="status-line" data-testid="status-line">{statusLine(view)}</p>
   <p class="service-line" data-testid="service-line">{serviceLine(view)}</p>
+  {#if view.notice}
+    <p data-testid="hotkey-notice">{view.notice}</p>
+  {/if}
 
   {#if bridge.kind === "fake"}
     <section data-testid="tray">
