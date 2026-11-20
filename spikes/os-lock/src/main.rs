@@ -1,5 +1,7 @@
 //! Throwaway probe. Not linked into product binaries.
 
+mod hosted;
+mod school;
 mod verdict;
 
 #[cfg(windows)]

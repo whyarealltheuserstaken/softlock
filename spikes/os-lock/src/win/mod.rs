@@ -6,8 +6,7 @@ mod util;
 
 pub fn dispatch(args: &[String]) -> u8 {
     let command = args.first().map(String::as_str).unwrap_or("");
-    if command != "service" && session::school_workstation() {
-        eprintln!("refusing: school workstation");
+    if command != "service" && refuse_identity() {
         return 2;
     }
     if needs_authorization(command) && !authorized(args) {
@@ -19,15 +18,14 @@ pub fn dispatch(args: &[String]) -> u8 {
         "status" => session::status(),
         "heartbeat" => heartbeat(args),
         "measure-blocked" => measure::lock("blocked"),
-        "measure-lock" => measure::lock("confirm"),
+        "measure-lock" => measure::lock("lock"),
         "measure-self" => measure::own(args),
-        "stay-disconnected" => measure::stay(),
+        "fail-closed" => measure::fail_closed(),
         "install-service" => service::install(args),
         "uninstall-service" => service::uninstall(),
         "service-disconnect" => service::request(args),
         "service" => {
-            if session::school_workstation() {
-                eprintln!("refusing: school workstation");
+            if refuse_identity() {
                 return 2;
             }
             service::run()
@@ -35,6 +33,28 @@ pub fn dispatch(args: &[String]) -> u8 {
         _ => {
             eprintln!("unknown command");
             2
+        }
+    }
+}
+
+fn refuse_identity() -> bool {
+    match session::school_check() {
+        crate::school::SchoolCheck::No => false,
+        crate::school::SchoolCheck::Yes => {
+            eprintln!("refusing: school workstation");
+            true
+        }
+        crate::school::SchoolCheck::Unreadable => {
+            let missing = session::missing_identity_fields();
+            if missing.is_empty() {
+                eprintln!("refusing: workstation identity could not be read");
+            } else {
+                eprintln!(
+                    "refusing: workstation identity could not be read: {}",
+                    missing.join(" ")
+                );
+            }
+            true
         }
     }
 }
@@ -51,7 +71,7 @@ fn needs_authorization(command: &str) -> bool {
             | "measure-blocked"
             | "measure-lock"
             | "measure-self"
-            | "stay-disconnected"
+            | "fail-closed"
             | "install-service"
             | "service-disconnect"
     )

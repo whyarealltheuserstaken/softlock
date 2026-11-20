@@ -81,7 +81,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          powershell -ExecutionPolicy Bypass -File spikes\os-lock\restore.ps1
+          powershell -ExecutionPolicy Bypass -File spikes\os-lock\restore.ps1 -Journal C:\ProgramData\os-lock-probe\pending.json
           sc.exe stop OsLockProbe
           sc.exe delete OsLockProbe
           schtasks.exe /Delete /TN os-lock-restore /F

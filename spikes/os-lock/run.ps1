@@ -18,26 +18,62 @@ if ($ci -and $env:GITHUB_ACTIONS -ne 'true') {
     $ci = $false
 }
 
-function Test-SchoolWorkstation {
+function Read-BiosString([string]$name) {
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('HARDWARE\DESCRIPTION\System\BIOS')
+    if ($null -eq $key) { return $null }
     try {
-        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('HARDWARE\DESCRIPTION\System\BIOS')
-        if ($null -eq $key) { return $false }
-        $name = [string]$key.GetValue('SystemProductName')
+        $value = $key.GetValue($name, $null)
+    } finally {
         $key.Close()
-        if ($name.ToLowerInvariant().Contains('thinkstation p7')) { return $true }
-    } catch { }
+    }
+    if ($null -eq $value) { return $null }
+    $text = [string]$value
+    if ($text.Length -eq 0) { return $null }
+    return $text
+}
+
+function Test-MtmPrefix([string]$value) {
+    $upper = $value.ToUpperInvariant()
+    foreach ($token in ($upper -split '[^A-Za-z0-9]')) {
+        if ($token.StartsWith('30F2') -or $token.StartsWith('30F3')) { return $true }
+    }
     return $false
 }
 
-if (Test-SchoolWorkstation) {
+function Test-SchoolWorkstation {
+    $family = Read-BiosString 'SystemFamily'
+    $version = Read-BiosString 'SystemVersion'
+    $product = Read-BiosString 'SystemProductName'
+    if ($null -eq $family -or $null -eq $version -or $null -eq $product) {
+        $missing = @()
+        if ($null -eq $family) { $missing += 'SystemFamily' }
+        if ($null -eq $version) { $missing += 'SystemVersion' }
+        if ($null -eq $product) { $missing += 'SystemProductName' }
+        return ('unreadable ' + ($missing -join ' '))
+    }
+    foreach ($value in @($family, $version, $product)) {
+        if ($value.ToLowerInvariant().Contains('thinkstation p7')) { return 'school' }
+        if (Test-MtmPrefix $value) { return 'school' }
+    }
+    return 'no'
+}
+
+$school = Test-SchoolWorkstation
+if ($school.StartsWith('unreadable')) {
+    $fields = $school.Substring(11).Trim()
+    Write-Host "refusing: workstation identity could not be read: $fields"
+    exit 2
+}
+if ($school -eq 'school') {
     Write-Host 'refusing: school workstation'
     exit 2
 }
 
 . (Join-Path $PSScriptRoot 'restore.ps1')
 
-$pendingDir = Join-Path $env:LOCALAPPDATA 'os-lock-probe'
-$pendingPath = Join-Path $pendingDir 'pending.json'
+$probeDir = 'C:\ProgramData\os-lock-probe'
+$pendingPath = Join-Path $probeDir 'pending.json'
+$script:Hosted = ($env:GITHUB_ACTIONS -eq 'true' -and $env:RUNNER_ENVIRONMENT -eq 'github-hosted')
 $restoreScript = Join-Path $PSScriptRoot 'restore.ps1'
 $taskName = 'os-lock-restore'
 $runOnceName = 'os-lock-restore'
@@ -53,18 +89,55 @@ function Current-Sid {
     return $identity.User.Value
 }
 
+function Test-ReparsePath([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    $item = Get-Item -LiteralPath $path -Force
+    return [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+}
+
+function Initialize-ProbeDir {
+    if (Test-ReparsePath 'C:\ProgramData') { throw 'ProgramData is a reparse point' }
+    if (Test-ReparsePath $probeDir) { throw 'probe directory is a reparse point' }
+    if (-not (Test-Path -LiteralPath $probeDir)) {
+        New-Item -ItemType Directory -Path $probeDir | Out-Null
+    }
+    if (Test-ReparsePath $probeDir) { throw 'probe directory is a reparse point' }
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $prop = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+        $id = New-Object System.Security.Principal.SecurityIdentifier $sid
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($id, $rights, $inherit, $prop, $allow)
+        $acl.AddAccessRule($rule)
+    }
+    $item = Get-Item -LiteralPath $probeDir -Force
+    $item.SetAccessControl($acl)
+    $read = $item.GetAccessControl()
+    foreach ($ace in @($read.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
+        $who = [string]$ace.IdentityReference.Value
+        if ($who -ne 'S-1-5-18' -and $who -ne 'S-1-5-32-544') {
+            throw 'probe directory grants access to someone other than SYSTEM and Administrators'
+        }
+    }
+    Copy-Item -LiteralPath $restoreScript -Destination (Join-Path $probeDir 'restore.ps1') -Force
+    if (Test-ReparsePath (Join-Path $probeDir 'restore.ps1')) { throw 'restore script is a reparse point' }
+}
+
 function Register-RunOnceEntry {
+    $installed = Join-Path $probeDir 'restore.ps1'
     $run = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\Microsoft\Windows\CurrentVersion\RunOnce')
-    $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$restoreScript`""
+    $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$installed`" -Journal `"$pendingPath`""
     $run.SetValue($runOnceName, $command)
     $run.Close()
 }
 
 function Register-RestoreTaskEntry {
-    $dir = 'C:\ProgramData\os-lock-probe'
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $cmd = Join-Path $dir 'restore.cmd'
-    $line = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$restoreScript`"`r`n"
+    $installed = Join-Path $probeDir 'restore.ps1'
+    $cmd = Join-Path $probeDir 'restore.cmd'
+    $line = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$installed`" -Journal `"$pendingPath`"`r`n"
     $utf8 = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllText($cmd, $line, $utf8)
     $previous = $ErrorActionPreference
@@ -82,16 +155,18 @@ function Register-RestoreTaskEntry {
 }
 
 function Save-PendingFile($entries) {
-    if (-not (Test-Path -LiteralPath $pendingDir)) {
-        New-Item -ItemType Directory -Path $pendingDir | Out-Null
-    }
     $items = @()
     foreach ($entry in (Get-Items $entries)) {
+        if (-not (Test-AllowedEntry $entry)) { throw 'refusing to journal a value outside the lockdown allow-list' }
+        if ($entry.kind -and [string]$entry.kind -ne 'DWord') { throw 'refusing to journal a non-DWORD value' }
         $present = if ($entry.present -eq $true) { 'true' } else { 'false' }
-        $kind = if ($entry.kind) { [string]$entry.kind } else { 'DWord' }
-        $created = if ($entry.created_key -eq $true) { 'true' } else { 'false' }
-        $data = [string]$entry.data
-        $items += '{"hive":"' + [string]$entry.hive + '","subkey":"' + ([string]$entry.subkey).Replace('\', '\\') + '","name":"' + [string]$entry.name + '","present":' + $present + ',"kind":"' + $kind + '","data":"' + $data + '","created_key":' + $created + '}'
+        $data = '0'
+        if ($entry.present -eq $true) {
+            $number = 0
+            if (-not [int]::TryParse([string]$entry.data, [ref]$number)) { throw 'refusing to journal a non-DWORD value' }
+            $data = "$number"
+        }
+        $items += '{"hive":"' + [string]$entry.hive + '","subkey":"' + ([string]$entry.subkey).Replace('\', '\\') + '","name":"' + [string]$entry.name + '","present":' + $present + ',"kind":"DWord","data":"' + $data + '","created_key":false}'
     }
     $body = '{"sid":"' + (Current-Sid) + '","values":[' + ($items -join ',') + ']}'
     $utf8 = New-Object System.Text.UTF8Encoding $false
@@ -111,8 +186,9 @@ function Read-Original([string]$hive, [string]$subkey, [string]$name) {
         if ($existing -ne $name) { continue }
         $found = $true
         $kind = $key.GetValueKind($existing).ToString()
-        $raw = $key.GetValue($existing)
-        $data = "$raw"
+        if ($kind -ne 'DWord') { throw "refusing to change non-DWORD value $name" }
+        $raw = $key.GetValue($existing, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $data = "$([int]$raw)"
     }
     $key.Close()
     if (-not $found) {
@@ -139,53 +215,139 @@ function Read-Dword([string]$hive, [string]$subkey, [string]$name) {
     return [int]$value
 }
 
+function Test-TaskPresent {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & schtasks.exe /Query /TN $taskName 2>&1 | Out-Null
+        return $LASTEXITCODE -eq 0
+    } finally { $ErrorActionPreference = $previous }
+}
+
+function Start-SystemRestore {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & schtasks.exe /Run /TN $taskName 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'schtasks /Run failed' }
+    } finally { $ErrorActionPreference = $previous }
+}
+
+function Set-ProbeAway($entry) {
+    $current = $null
+    if ($entry.present -eq $true) { $current = [int]$entry.data }
+    $away = 7
+    if ($current -eq 7) { $away = 6 }
+    Set-Dword ([string]$entry.hive) ([string]$entry.subkey) ([string]$entry.name) $away
+}
+
+function Wait-TaskStays([int]$seconds) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+    do {
+        if (-not (Test-TaskPresent)) { throw 'the SYSTEM task removed itself before HKLM was in the journal' }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+}
+
+function Wait-TaskGone([int]$seconds) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+    do {
+        if (-not (Test-TaskPresent)) { return }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'the SYSTEM task was left behind after HKLM was restored'
+}
+
+function Wait-PolicyValue($entry, [int]$seconds) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+    $wanted = $null
+    if ($entry.present -eq $true) { $wanted = [int]$entry.data }
+    do {
+        $got = Read-Dword ([string]$entry.hive) ([string]$entry.subkey) ([string]$entry.name)
+        if ($null -eq $wanted -and $null -eq $got) { return }
+        if ($null -ne $wanted -and $null -ne $got -and $got -eq $wanted) { return }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "timed out waiting for $([string]$entry.name)"
+}
+
 function Invoke-SelfCheck {
     if (-not (Test-Elevated)) { throw 'self-check needs an elevated prompt' }
     if (Test-Path -LiteralPath $pendingPath) { throw 'a restore is already pending; run restore.ps1 before --self-check' }
-    $probe = 'Software\os-lock-probe-citest'
-    $roots = @(
-        @{ hive = 'HKCU'; root = [Microsoft.Win32.Registry]::CurrentUser },
-        @{ hive = 'HKLM'; root = [Microsoft.Win32.Registry]::LocalMachine }
+    Initialize-ProbeDir
+    $rows = @(
+        @{ hive = 'HKCU'; subkey = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'DisableTaskMgr' },
+        @{ hive = 'HKCU'; subkey = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'DisableLockWorkstation' },
+        @{ hive = 'HKCU'; subkey = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'DisableChangePassword' },
+        @{ hive = 'HKCU'; subkey = 'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'; name = 'NoLogoff' },
+        @{ hive = 'HKCU'; subkey = 'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'; name = 'NoClose' },
+        @{ hive = 'HKLM'; subkey = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'HideFastUserSwitching' },
+        @{ hive = 'HKLM'; subkey = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'ConsentPromptBehaviorAdmin' },
+        @{ hive = 'HKLM'; subkey = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'ConsentPromptBehaviorUser' }
     )
+    $saved = @()
+    foreach ($row in $rows) { $saved += (Read-Original $row.hive $row.subkey $row.name) }
+    $hkcuOnly = @()
+    foreach ($entry in $saved) { if ([string]$entry.hive -eq 'HKCU') { $hkcuOnly += $entry } }
+    $evilKey = [Microsoft.Win32.Registry]::LocalMachine
     try {
-        foreach ($item in $roots) { $item.root.DeleteSubKeyTree($probe, $false) }
-        Set-Dword 'HKCU' $probe 'Keep' 4
-        Set-Dword 'HKLM' $probe 'Keep' 6
-        $entries = @()
-        $entries += (Read-Original 'HKCU' $probe 'Keep')
-        $entries += (Read-Original 'HKLM' $probe 'Keep')
-        $entries += (Read-Original 'HKCU' $probe 'Extra')
-        Save-PendingFile $entries
+        $decoyDir = Join-Path $env:LOCALAPPDATA 'os-lock-probe'
+        New-Item -ItemType Directory -Force -Path $decoyDir | Out-Null
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText((Join-Path $decoyDir 'pending.json'), '{"sid":"S-1-5-18","values":[{"hive":"HKCU","subkey":"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System","name":"DisableLockWorkstation","present":true,"kind":"DWord","data":"9","created_key":false}]}', $utf8)
+
+        Save-PendingFile $hkcuOnly
         Register-RunOnceEntry
         Register-RestoreTaskEntry
-        Set-Dword 'HKCU' $probe 'Keep' 9
-        Set-Dword 'HKLM' $probe 'Keep' 8
-        Set-Dword 'HKCU' $probe 'Extra' 1
-        $code = Invoke-PendingRestore
-        if ($code -ne 0) { throw "restore exited $code" }
-        $hkcu = Read-Dword 'HKCU' $probe 'Keep'
-        $hklm = Read-Dword 'HKLM' $probe 'Keep'
-        $extra = Read-Dword 'HKCU' $probe 'Extra'
-        if ($hkcu -ne 4) { throw 'HKCU Keep was not put back' }
-        if ($hklm -ne 6) { throw 'HKLM Keep was not put back' }
-        if ($null -ne $extra) { throw 'Extra was created by the probe and was not deleted' }
+        foreach ($entry in $hkcuOnly) { Set-ProbeAway $entry }
+        Start-SystemRestore
+        foreach ($entry in $hkcuOnly) { Wait-PolicyValue $entry 20 }
+        Wait-TaskStays 3
+        $locked = Read-Dword 'HKCU' 'Software\Microsoft\Windows\CurrentVersion\Policies\System' 'DisableLockWorkstation'
+        if ($locked -eq 9) { throw 'SYSTEM restore read the user-profile journal' }
+
+        Save-PendingFile $saved
+        $text = [System.IO.File]::ReadAllText($pendingPath)
+        $evil = ',{"hive":"HKLM","subkey":"Software\\os-lock-evil","name":"Evil","present":true,"kind":"DWord","data":"5","created_key":false}'
+        if (-not $text.EndsWith(']}')) { throw 'journal shape was not written by this probe' }
+        $text = $text.Substring(0, $text.Length - 2) + $evil + ']}'
+        [System.IO.File]::WriteAllText($pendingPath, $text, $utf8)
+        foreach ($entry in $saved) { Set-ProbeAway $entry }
+        $evilRoot = $evilKey.CreateSubKey('Software\os-lock-evil')
+        $evilRoot.SetValue('Evil', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+        $evilRoot.Close()
+        if (-not (Test-TaskPresent)) { Register-RestoreTaskEntry }
+        Start-SystemRestore
+        foreach ($entry in $saved) { Wait-PolicyValue $entry 20 }
+        $evilLeft = Read-Dword 'HKLM' 'Software\os-lock-evil' 'Evil'
+        if ($evilLeft -ne 1) { throw 'restore applied a value outside the allow-list' }
+        Wait-TaskGone 20
         if (Test-Path -LiteralPath $pendingPath) { throw 'pending.json was left behind' }
+
+        Save-PendingFile $saved
+        Register-RunOnceEntry
+        Set-Dword 'HKCU' 'Software\Microsoft\Windows\CurrentVersion\Policies\System' 'DisableLockWorkstation' 7
         $run = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\RunOnce', $false)
-        if ($null -ne $run) {
-            $left = $run.GetValue($runOnceName, $null)
-            $run.Close()
-            if ($null -ne $left) { throw 'RunOnce was left behind' }
-        }
+        if ($null -eq $run) { throw 'RunOnce was not registered' }
+        $command = [string]$run.GetValue($runOnceName, '')
+        $run.Close()
+        if ($command -notlike '*C:\ProgramData\os-lock-probe\restore.ps1*') { throw 'RunOnce does not call the protected script' }
+        if ($command -notlike '*-Journal *C:\ProgramData\os-lock-probe\pending.json*') { throw 'RunOnce does not pass the journal path' }
         $previous = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        try { & schtasks.exe /Query /TN $taskName 2>&1 | Out-Null; $taskCode = $LASTEXITCODE } finally { $ErrorActionPreference = $previous }
-        if ($taskCode -eq 0) { throw 'the restore task was left behind' }
+        try {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $probeDir 'restore.ps1') -Journal $pendingPath
+            if ($LASTEXITCODE -ne 0) { throw 'RunOnce command failed' }
+        } finally { $ErrorActionPreference = $previous }
+        $lockEntry = $null
+        foreach ($entry in $saved) { if ([string]$entry.name -eq 'DisableLockWorkstation') { $lockEntry = $entry } }
+        Wait-PolicyValue $lockEntry 20
         Write-Host 'self-check ok'
     } finally {
-        foreach ($item in $roots) {
-            try { $item.root.DeleteSubKeyTree($probe, $false) } catch { }
-        }
-        if (Test-Path -LiteralPath $pendingPath) { Invoke-PendingRestore | Out-Null }
+        try { $evilKey.DeleteSubKeyTree('Software\os-lock-evil', $false) } catch { }
+        try { Save-PendingFile $saved } catch { }
+        try { Invoke-PendingRestore | Out-Null } catch { }
+        try { $evilKey.DeleteSubKeyTree('Software\os-lock-evil', $false) } catch { }
     }
 }
 
@@ -317,7 +479,7 @@ function Stop-Heartbeat {
 }
 
 function Remove-Reconnect {
-    $path = Join-Path $outDir 'reconnect.on'
+    $path = Join-Path $probeDir 'reconnect.on'
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
 }
 
@@ -405,13 +567,21 @@ try {
     $ErrorActionPreference = $previous
     if ($build -ne 0) { throw 'cargo build failed' }
     if (-not (Test-Path -LiteralPath $exe)) { throw 'the probe executable was not built' }
+    Initialize-ProbeDir
+    $protected = Join-Path $probeDir 'os-lock-proof.exe'
+    Copy-Item -LiteralPath $exe -Destination $protected -Force
+    if (Test-ReparsePath $protected) { throw 'probe executable is a reparse point' }
+    $exe = $protected
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
     $pre = Invoke-Probe 'preflight'
     if ($pre.code -ne 0 -or $null -eq $pre.json) { throw "preflight failed: $($pre.text)" }
+    if ($pre.json.identity_unreadable -eq $true) { throw 'workstation identity could not be read' }
     if (-not $pre.json.elevated) { Write-SkipReport 'needs-admin' 'not admin' }
     if (-not $pre.json.console_present) { Write-SkipReport 'not-applicable' 'no console session' }
     if ($pre.json.remote -eq $true) { Write-SkipReport 'not-applicable' 'remote session' }
+    if (-not $pre.json.console_user_known) { throw 'could not read the console session user' }
+    if (-not $pre.json.console_user_match) { throw 'elevated user is not the console session user' }
     Add-Row 'preflight' 'Preflight' 'pass' $null $true 0 "session=$($pre.json.session) console=$($pre.json.console)" '{}'
 
     $saved = New-Object System.Collections.Generic.List[object]
@@ -444,36 +614,33 @@ try {
     Add-ProbeRow 'lock-workstation' 'LockWorkStation after the policy is cleared' $locked ([int]$watch.ElapsedMilliseconds)
     Set-Dword $lockPolicy.hive $lockPolicy.subkey $lockPolicy.name 1
 
-    $service = Invoke-Probe 'install-service' '--output-dir' $outDir '--allow-local'
-    $serviceUp = $service.code -eq 0
-    if ($serviceUp) {
-        [System.IO.File]::WriteAllText((Join-Path $outDir 'reconnect.on'), "on`n")
-        $watch.Restart()
-        $fromService = Invoke-Probe 'service-disconnect' '--output-dir' $outDir '--allow-local'
-        Add-ProbeRow 'service-disconnect' 'Disconnect the console session from session 0' $fromService ([int]$watch.ElapsedMilliseconds)
-        $back = Wait-Connected
-        $connected = $back.json -and $back.json.connected -eq $true
-        if ($connected -or -not $ci) {
+    if ($script:Hosted) {
+        $service = Invoke-Probe 'install-service' '--watch-pid' "$PID" '--allow-local'
+        $serviceUp = $service.code -eq 0
+        if ($serviceUp) {
+            [System.IO.File]::WriteAllText((Join-Path $probeDir 'reconnect.on'), "on`n")
             $watch.Restart()
-            $ownArgs = @('measure-self', '--allow-local')
-            if ($connected) { $ownArgs += @('--reconnect', '--output-dir', $outDir) }
-            $own = Invoke-Probe @ownArgs
-            Add-ProbeRow 'own-session' 'Disconnect this session' $own ([int]$watch.ElapsedMilliseconds)
-            if ($connected) { Wait-Connected | Out-Null }
+            $fromService = Invoke-Probe 'service-disconnect' '--allow-local'
+            Add-ProbeRow 'service-disconnect' 'Disconnect the console session from session 0' $fromService ([int]$watch.ElapsedMilliseconds)
+            $back = Wait-Connected
+            $connected = $back.json -and $back.json.connected -eq $true
+            if ($connected) {
+                $watch.Restart()
+                $own = Invoke-Probe 'measure-self' '--allow-local' '--reconnect'
+                Add-ProbeRow 'own-session' 'Disconnect this session' $own ([int]$watch.ElapsedMilliseconds)
+                Wait-Connected | Out-Null
+            } else {
+                Add-Row 'own-session' 'Disconnect this session' 'fail' $null $true 0 'session stayed disconnected' '{}'
+            }
         } else {
-            Add-Row 'own-session' 'Disconnect this session' 'fail' $null $true 0 'session stayed disconnected' '{}'
+            $why = $service.text
+            if (-not $why) { $why = 'the session 0 service did not start' }
+            Add-Row 'service-disconnect' 'Disconnect the console session from session 0' 'fail' $null $true 0 $why '{}'
+            Add-Row 'own-session' 'Disconnect this session' 'fail' $null $true 0 'the session 0 service was not running, so disconnect was not called' '{}'
         }
     } else {
-        $why = $service.text
-        if (-not $why) { $why = 'the session 0 service did not start' }
-        Add-Row 'service-disconnect' 'Disconnect the console session from session 0' 'fail' $null $true 0 $why '{}'
-        if ($ci) {
-            Add-Row 'own-session' 'Disconnect this session' 'fail' $null $true 0 'the session 0 service was not running, so disconnect was not called' '{}'
-        } else {
-            $watch.Restart()
-            $own = Invoke-Probe 'measure-self' '--allow-local'
-            Add-ProbeRow 'own-session' 'Disconnect this session' $own ([int]$watch.ElapsedMilliseconds)
-        }
+        Add-Row 'service-disconnect' 'Disconnect the console session from session 0' 'skip' 'not-applicable' $true 0 'reconnect is ci only' '{}'
+        Add-Row 'own-session' 'Disconnect this session' 'skip' 'not-applicable' $true 0 'reconnect is ci only' '{}'
     }
 
     Start-Sleep -Milliseconds 400
@@ -529,36 +696,26 @@ try {
                 $fallback = [string]$decision.json.fallback
             }
         }
-        $status = $null
-        try { $status = Invoke-Probe 'status' } catch { $status = $null }
-        $atSignIn = $false
-        if ($status -and $status.json -and ($status.json.locked -eq $true -or $status.json.connected -eq $false)) { $atSignIn = $true }
         $state = 'never-unlocked'
-        if ($atSignIn) { $state = 'os-locked' }
         try { Write-ProofReport $script:Restored $state $primary $fallback } catch { Write-Host $_.Exception.Message }
-        if ($script:MustEndLocked -and -not $atSignIn) {
+        if ($script:MustEndLocked) {
             $watchEnd = [Diagnostics.Stopwatch]::StartNew()
-            if ($ci) {
-                $end = Invoke-Probe 'measure-lock' '--allow-local'
-            } else {
-                $end = Invoke-Probe 'stay-disconnected' '--allow-local'
-            }
+            $end = Invoke-Probe 'fail-closed' '--allow-local'
             $endMs = [int]$watchEnd.ElapsedMilliseconds
-            if ($end.json -and ($end.json.pass -eq $true -or $end.json.api_ok -eq $true)) {
+            $confirmed = $end.json -and ($end.json.pass -eq $true) -and ([string]$end.json.error -ne 'fail-closed-failed')
+            if ($confirmed) {
                 Add-Row 'end-locked' 'End at the Windows sign-in screen' 'pass' $null $true $endMs '' (Json-Measure $end.json)
-                $atSignIn = $true
+                $state = 'os-locked'
             } else {
-                $detail = if ($end) { $end.text } else { 'the ending lock was not called' }
-                Add-Row 'end-locked' 'End at the Windows sign-in screen' 'fail' $null $true $endMs $detail '{}'
+                $detail = if ($end) { $end.text } else { 'fail-closed-failed' }
+                Add-Row 'fail-closed-failed' 'Fail closed' 'fail' $null $true $endMs $detail '{}'
+                $state = 'never-unlocked'
             }
-            $state = 'never-unlocked'
-            if ($atSignIn) { $state = 'os-locked' }
             try { Write-ProofReport $script:Restored $state $primary $fallback } catch { Write-Host $_.Exception.Message }
-        } elseif ($script:MustEndLocked) {
-            Add-Row 'end-locked' 'End at the Windows sign-in screen' 'pass' $null $true 0 'already at the sign-in screen' '{}'
-            try { Write-ProofReport $script:Restored 'os-locked' $primary $fallback } catch { Write-Host $_.Exception.Message }
         }
-        if ($script:Failed -or -not $script:Restored) { $script:ExitCode = 1 } else { $script:ExitCode = 0 }
+        $anyFail = $false
+        foreach ($row in (Get-Items $script:Rows)) { if ($row.status -eq 'fail') { $anyFail = $true } }
+        if ($script:Failed -or -not $script:Restored -or $anyFail) { $script:ExitCode = 1 } else { $script:ExitCode = 0 }
     }
 }
 

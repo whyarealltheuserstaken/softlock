@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,35 +21,46 @@ use windows::Win32::System::Services::{
     StartServiceW,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, SetEvent, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_SYNCHRONIZE, SetEvent,
+    WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
 use super::measure;
 use super::session::{self, console_session};
-use super::util::{self, SERVICE_NAME, explain, wide};
+use super::util::{self, PROBE_DIR, SERVICE_NAME, explain, wide};
+use crate::hosted;
 
 static STATUS_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
-static OUTPUT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static WATCH_PID: AtomicU32 = AtomicU32::new(0);
+static CI_RECONNECT: AtomicBool = AtomicBool::new(false);
 
 pub fn install(args: &[String]) -> u8 {
-    let dir = match util::flag_path(args, "--output-dir") {
+    let watch = match watch_pid(args) {
+        Ok(pid) => pid,
+        Err(error) => {
+            eprintln!("{error}");
+            return 2;
+        }
+    };
+    let dir = match probe_dir() {
         Ok(path) => path,
         Err(error) => {
             eprintln!("{error}");
             return 2;
         }
     };
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        eprintln!("create {}: {error}", dir.display());
-        return 1;
+    if let Err(error) = exe_is_in_probe_dir() {
+        eprintln!("{error}");
+        return 2;
     }
     let _ = std::fs::remove_file(dir.join("ready"));
     let _ = std::fs::remove_file(dir.join("service.json"));
     let _ = std::fs::remove_file(dir.join("request"));
     let _ = std::fs::remove_file(dir.join("stop"));
-    match exercise_install(&dir) {
+    let _ = std::fs::remove_file(dir.join("reconnect.on"));
+    match exercise_install(watch, hosted_now()) {
         Ok(()) => {
             if wait_for_file(&dir.join("ready"), Duration::from_secs(20)) {
                 0
@@ -76,7 +87,8 @@ pub fn uninstall() -> u8 {
 }
 
 pub fn request(args: &[String]) -> u8 {
-    let dir = match util::flag_path(args, "--output-dir") {
+    let _ = args;
+    let dir = match probe_dir() {
         Ok(path) => path,
         Err(error) => {
             eprintln!("{error}");
@@ -109,14 +121,19 @@ pub fn request(args: &[String]) -> u8 {
 
 pub fn run() -> u8 {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let dir = match util::flag_path(&args, "--output-dir") {
-        Ok(path) => path,
+    let watch = match watch_pid(&args) {
+        Ok(pid) => pid,
         Err(error) => {
             eprintln!("{error}");
             return 2;
         }
     };
-    let _ = OUTPUT.set(dir);
+    WATCH_PID.store(watch, Ordering::SeqCst);
+    CI_RECONNECT.store(util::has_flag(&args, "--ci-reconnect"), Ordering::SeqCst);
+    if probe_dir().is_err() {
+        eprintln!("refusing: probe directory is not a real directory");
+        return 2;
+    }
     let mut name = wide(SERVICE_NAME);
     let table = [
         SERVICE_TABLE_ENTRYW {
@@ -172,28 +189,28 @@ unsafe extern "system" fn control_handler(
 }
 
 fn service_body() {
-    let Some(dir) = OUTPUT.get() else {
+    let Ok(dir) = probe_dir() else {
         return;
     };
     let _ = enable_privilege(SE_TCB_NAME);
     if session::school_workstation() {
         return;
     }
-    if notify_ready(dir).is_err() {
+    if notify_ready(&dir).is_err() {
         return;
     }
     let _ = util::write_text(&dir.join("ready"), "ready\n");
-    let deadline = Instant::now() + Duration::from_secs(180);
-    while Instant::now() < deadline && !stop_requested(dir) {
+    while !stop_requested(&dir) {
+        if !watch_alive() {
+            delete_own_service();
+            return;
+        }
         if dir.join("request").is_file() && !dir.join("service.json").is_file() {
             let console = console_session();
-            let report = measure::measure_disconnect(console, reconnect_enabled(dir));
+            let report = measure::measure_disconnect(console, reconnect_enabled(&dir));
             let _ = measure::publish(&dir.join("service.json"), &report);
             let _ = std::fs::remove_file(dir.join("request"));
-        } else if reconnect_enabled(dir)
-            && !dir.join("hold").is_file()
-            && session::session_is_disconnected(console_session())
-        {
+        } else if reconnect_enabled(&dir) && session::session_is_disconnected(console_session()) {
             let _ = reconnect(console_session());
         }
         thread::sleep(Duration::from_millis(10));
@@ -206,7 +223,7 @@ fn notify_ready(dir: &Path) -> Result<(), String> {
 }
 
 fn reconnect_enabled(dir: &Path) -> bool {
-    dir.join("reconnect.on").is_file() && !dir.join("reconnect.off").is_file()
+    CI_RECONNECT.load(Ordering::SeqCst) && dir.join("reconnect.on").is_file()
 }
 
 fn stop_requested(dir: &Path) -> bool {
@@ -228,12 +245,12 @@ fn reconnect(session: u32) -> Result<(), String> {
     }
 }
 
-fn exercise_install(dir: &Path) -> Result<(), String> {
+fn exercise_install(watch: u32, ci_reconnect: bool) -> Result<(), String> {
     let scm = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ALL_ACCESS) }
         .map_err(|error| explain(error, "OpenSCManagerW"))?;
     let name = wide(SERVICE_NAME);
     remove_existing(scm, &name);
-    let binary = service_command(dir)?;
+    let binary = service_command(watch, ci_reconnect)?;
     let binary_wide = wide(&binary);
     let display = wide("OS lock probe");
     let service = create_service(scm, &name, &display, &binary_wide)?;
@@ -253,13 +270,91 @@ fn exercise_remove() -> Result<(), String> {
     Ok(())
 }
 
-fn service_command(dir: &Path) -> Result<String, String> {
+fn service_command(watch: u32, ci_reconnect: bool) -> Result<String, String> {
     let exe = util::exe_path()?;
-    Ok(format!(
-        "\"{}\" service --output-dir \"{}\"",
-        exe.display(),
-        dir.display()
-    ))
+    let mut command = format!("\"{}\" service --watch-pid {watch}", exe.display());
+    if ci_reconnect {
+        command.push_str(" --ci-reconnect");
+    }
+    Ok(command)
+}
+
+fn hosted_now() -> bool {
+    hosted::hosted_runner(
+        std::env::var("GITHUB_ACTIONS").ok().as_deref(),
+        std::env::var("RUNNER_ENVIRONMENT").ok().as_deref(),
+    )
+}
+
+fn watch_pid(args: &[String]) -> Result<u32, String> {
+    let text = util::flag_value(args, "--watch-pid")?;
+    let pid = text
+        .parse::<u32>()
+        .map_err(|_| "watch pid is not a number".to_string())?;
+    if pid == 0 {
+        return Err("watch pid is missing".to_string());
+    }
+    Ok(pid)
+}
+
+fn probe_dir() -> Result<PathBuf, String> {
+    let path = PathBuf::from(PROBE_DIR);
+    if util::path_is_reparse(Path::new(r"C:\ProgramData")) || util::path_is_reparse(&path) {
+        return Err("probe directory is a reparse point".to_string());
+    }
+    if !path.is_dir() {
+        return Err("probe directory is missing".to_string());
+    }
+    Ok(path)
+}
+
+fn exe_is_in_probe_dir() -> Result<(), String> {
+    let exe = util::exe_path()?;
+    if util::path_is_reparse(&exe) {
+        return Err("service binary is a reparse point".to_string());
+    }
+    let dir = probe_dir()?;
+    let Some(parent) = exe.parent() else {
+        return Err("service binary is not in the probe directory".to_string());
+    };
+    if !parent
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&dir.to_string_lossy())
+    {
+        return Err("service binary is not in the probe directory".to_string());
+    }
+    Ok(())
+}
+
+fn watch_alive() -> bool {
+    let pid = WATCH_PID.load(Ordering::SeqCst);
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else {
+            return false;
+        };
+        let state = WaitForSingleObject(handle, 0);
+        let _ = CloseHandle(handle);
+        state != WAIT_OBJECT_0
+    }
+}
+
+fn delete_own_service() {
+    let Ok(scm) =
+        (unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ALL_ACCESS) })
+    else {
+        return;
+    };
+    let name = wide(SERVICE_NAME);
+    let Ok(service) = (unsafe { OpenServiceW(scm, PCWSTR(name.as_ptr()), SERVICE_ALL_ACCESS) })
+    else {
+        close_scm(scm);
+        return;
+    };
+    let _ = delete_service(service);
+    close_scm(scm);
 }
 
 fn create_service(

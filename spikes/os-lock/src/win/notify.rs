@@ -1,6 +1,4 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -91,20 +89,6 @@ pub fn snapshot() -> Note {
             kind: "none",
         },
     }
-}
-
-pub fn wait_for_note(budget: Duration) -> Note {
-    let start = Instant::now();
-    while start.elapsed() < budget {
-        pump();
-        let note = snapshot();
-        if note.notified {
-            return note;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    pump();
-    snapshot()
 }
 
 pub fn pump() {

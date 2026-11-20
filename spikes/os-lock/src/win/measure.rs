@@ -30,7 +30,7 @@ pub fn lock(mode: &str) -> u8 {
 
 pub fn own(args: &[String]) -> u8 {
     let reconnect = util::has_flag(args, "--reconnect");
-    let mut report = measure("confirm", false, || call_disconnect(own_session()));
+    let mut report = measure("disconnect", false, || call_disconnect(own_session()));
     if reconnect {
         let session = own_session().unwrap_or_else(console_session);
         report.reconnected = session::wait_until_active(session, Duration::from_secs(8));
@@ -38,27 +38,40 @@ pub fn own(args: &[String]) -> u8 {
     emit_report(&report)
 }
 
-pub fn stay() -> u8 {
-    let (api_ok, win32) = call_disconnect(own_session());
-    let report = Report {
-        ok: api_ok,
-        pass: api_ok,
-        api_ok,
-        win32,
-        notified: false,
-        kind: "console-disconnect".to_string(),
-        elapsed_us: 0,
-        session_locked: None,
-        reconnected: false,
-        error: String::new(),
+/// Lock, confirmed by a notification or session state within one second.
+/// Otherwise disconnect, confirmed the same way. The API return is ignored.
+pub fn fail_closed() -> u8 {
+    if let Err(error) = notify::arm() {
+        return emit_report(&error_report(error));
+    }
+    let session = own_session().unwrap_or_else(console_session);
+    let lock_report = measure("lock", false, call_lock);
+    let mut disconnect_report = None;
+    let outcome = crate::verdict::run_close_chain(
+        || lock_report.pass,
+        || {
+            let report = measure("disconnect", false, || call_disconnect(Some(session)));
+            let pass = report.pass;
+            disconnect_report = Some(report);
+            pass
+        },
+    );
+    let mut chosen = if lock_report.pass {
+        lock_report
+    } else {
+        disconnect_report.unwrap_or_else(|| error_report("fail-closed-failed".to_string()))
     };
-    emit_report(&report)
+    if outcome == crate::verdict::CloseOutcome::Failed {
+        chosen.pass = false;
+        chosen.error = "fail-closed-failed".to_string();
+    }
+    emit_report(&chosen)
 }
 
 pub fn measure_disconnect(session: u32, reconnect: bool) -> Report {
     let target = session;
     measure_after(
-        "confirm",
+        "disconnect",
         reconnect,
         move || call_disconnect(Some(target)),
         move || {
@@ -88,7 +101,7 @@ fn measure_after(
     let (api_ok, win32) = call();
     let worker = thread::spawn(after);
     let budget = Duration::from_millis(1000).saturating_sub(start.elapsed());
-    let note = notify::wait_for_note(budget);
+    let note = wait_signal(mode, session, budget);
     let elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     let join_deadline = Instant::now() + Duration::from_secs(8);
     while !worker.is_finished() && Instant::now() < join_deadline {
@@ -119,13 +132,22 @@ fn report_from(
     reconnected: bool,
 ) -> Report {
     let session_locked = session::session_is_locked(session);
-    let pass = crate::verdict::judge(
-        mode,
-        api_ok,
-        note.notified,
-        u128::from(elapsed_us),
-        session_locked,
-    );
+    let elapsed = u128::from(elapsed_us);
+    let pass = match mode {
+        "blocked" => crate::verdict::blocked_proven(
+            api_ok,
+            note.notified && note.kind == "lock",
+            session_locked,
+        ),
+        "lock" => crate::verdict::confirmed_lock(note.kind, note.notified, session_locked, elapsed),
+        "disconnect" => crate::verdict::confirmed_disconnect(
+            note.kind,
+            note.notified,
+            session::session_is_disconnected(session),
+            elapsed,
+        ),
+        _ => false,
+    };
     Report {
         ok: true,
         pass,
@@ -137,6 +159,33 @@ fn report_from(
         session_locked,
         reconnected,
         error: String::new(),
+    }
+}
+
+fn wait_signal(mode: &str, session: u32, budget: Duration) -> Note {
+    let start = Instant::now();
+    loop {
+        notify::pump();
+        let note = notify::snapshot();
+        if note.notified {
+            return note;
+        }
+        if mode != "disconnect" && session::session_is_locked(session) == Some(true) {
+            return Note {
+                notified: true,
+                kind: "lock",
+            };
+        }
+        if mode == "disconnect" && session::session_is_disconnected(session) {
+            return Note {
+                notified: true,
+                kind: "console-disconnect",
+            };
+        }
+        if start.elapsed() >= budget {
+            return notify::snapshot();
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 }
 

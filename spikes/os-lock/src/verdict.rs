@@ -25,8 +25,52 @@ pub fn blocked_proven(_api_ok: bool, saw_lock: bool, session_locked: Option<bool
     !saw_lock && session_locked != Some(true)
 }
 
-pub fn confirmed(api_ok: bool, notified: bool, elapsed_us: u128) -> bool {
-    api_ok && notified && under_one_second(elapsed_us)
+/// A notification inside the deadline. The API's success flag is not evidence.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn confirmed(notified: bool, elapsed_us: u128) -> bool {
+    notified && under_one_second(elapsed_us)
+}
+
+/// The lock is real when a lock notification arrived, or the session state
+/// says locked, inside one second. A successful return by itself is not a lock.
+pub fn confirmed_lock(
+    kind: &str,
+    notified: bool,
+    session_locked: Option<bool>,
+    elapsed_us: u128,
+) -> bool {
+    under_one_second(elapsed_us) && ((notified && kind == "lock") || session_locked == Some(true))
+}
+
+pub fn confirmed_disconnect(
+    kind: &str,
+    notified: bool,
+    disconnected: bool,
+    elapsed_us: u128,
+) -> bool {
+    under_one_second(elapsed_us) && ((notified && kind == "console-disconnect") || disconnected)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseOutcome {
+    Locked,
+    Failed,
+}
+
+/// Try the lock. Only if that is not confirmed, try the disconnect. If neither
+/// is confirmed the outcome is [`CloseOutcome::Failed`] and the caller must
+/// not report the machine as locked.
+pub fn run_close_chain(
+    try_lock: impl FnOnce() -> bool,
+    try_disconnect: impl FnOnce() -> bool,
+) -> CloseOutcome {
+    if try_lock() {
+        return CloseOutcome::Locked;
+    }
+    if try_disconnect() {
+        return CloseOutcome::Locked;
+    }
+    CloseOutcome::Failed
 }
 
 /// `LockWorkStation` is primary when it confirms. `WTSDisconnectSession` is
@@ -56,6 +100,7 @@ pub fn pick(lock: bool, service: bool, own: bool) -> Pick {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn judge(
     mode: &str,
     api_ok: bool,
@@ -65,7 +110,7 @@ pub fn judge(
 ) -> bool {
     match mode {
         "blocked" => blocked_proven(api_ok, notified, session_locked),
-        "confirm" => confirmed(api_ok, notified, elapsed_us),
+        "confirm" => confirmed(notified, elapsed_us),
         _ => false,
     }
 }
@@ -92,11 +137,72 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmed_path_needs_the_api_the_notification_and_the_deadline() {
-        assert!(confirmed(true, true, 999_999));
-        assert!(!confirmed(true, true, 1_000_000));
-        assert!(!confirmed(false, true, 10));
-        assert!(!confirmed(true, false, 10));
+    fn a_confirmed_path_needs_the_notification_and_the_deadline() {
+        assert!(confirmed(true, 999_999));
+        assert!(!confirmed(true, 1_000_000));
+        assert!(!confirmed(false, 10));
+    }
+
+    #[test]
+    fn the_api_return_does_not_confirm_a_lock() {
+        assert!(confirmed_lock("lock", true, Some(false), 40));
+        assert!(confirmed_lock("none", false, Some(true), 40));
+        assert!(!confirmed_lock("none", false, Some(false), 40));
+        assert!(!confirmed_lock("lock", true, Some(true), 1_000_000));
+        assert!(!confirmed_lock("console-disconnect", true, Some(false), 40));
+    }
+
+    #[test]
+    fn a_disconnect_is_confirmed_by_the_notification_or_the_session_state() {
+        assert!(confirmed_disconnect("console-disconnect", true, false, 80));
+        assert!(confirmed_disconnect("none", false, true, 80));
+        assert!(!confirmed_disconnect("none", false, false, 80));
+        assert!(!confirmed_disconnect("lock", true, false, 80));
+        assert!(!confirmed_disconnect(
+            "console-disconnect",
+            true,
+            true,
+            1_000_000
+        ));
+    }
+
+    #[test]
+    fn a_confirmed_lock_does_not_call_the_disconnect() {
+        let mut disconnects = 0;
+        let outcome = run_close_chain(
+            || true,
+            || {
+                disconnects += 1;
+                true
+            },
+        );
+        assert_eq!(outcome, CloseOutcome::Locked);
+        assert_eq!(disconnects, 0);
+    }
+
+    #[test]
+    fn an_unconfirmed_lock_uses_a_confirmed_disconnect() {
+        let outcome = run_close_chain(|| false, || true);
+        assert_eq!(outcome, CloseOutcome::Locked);
+    }
+
+    #[test]
+    fn both_unconfirmed_steps_fail_closed() {
+        let mut locks = 0;
+        let mut disconnects = 0;
+        let outcome = run_close_chain(
+            || {
+                locks += 1;
+                false
+            },
+            || {
+                disconnects += 1;
+                false
+            },
+        );
+        assert_eq!(outcome, CloseOutcome::Failed);
+        assert_eq!(locks, 1);
+        assert_eq!(disconnects, 1);
     }
 
     #[test]
@@ -150,7 +256,8 @@ mod tests {
         assert!(judge("blocked", false, false, 1_000_000, Some(false)));
         assert!(judge("blocked", true, false, 1_000_000, Some(false)));
         assert!(!judge("blocked", true, true, 10, Some(false)));
-        assert!(judge("confirm", true, true, 40, Some(true)));
+        assert!(judge("confirm", false, true, 40, Some(false)));
+        assert!(!judge("confirm", true, false, 40, Some(false)));
         assert!(!judge("confirm", true, true, 1_000_000, Some(true)));
         assert!(!judge("other", true, true, 10, Some(true)));
     }

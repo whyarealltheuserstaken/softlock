@@ -28,7 +28,11 @@ Clearing only `DisableLockWorkstation` (the other lockdown values stay set) make
 
 `WTSDisconnectSession` from `OsLockProbe` in session 0, aimed at the console session, and `WTSDisconnectSession` from the user-session process on its own session, both report `WTS_CONSOLE_DISCONNECT`. The service's `session_locked` flag was unreadable after the disconnect (`null`). The notification is the confirmation. A heartbeat process kept writing through the lock and both disconnects.
 
-The hosted job reconnects the console between the two disconnects so both can be recorded, then locks again with `LockWorkStation` after the saved values are restored. It does not call an unlock API. The laptop script does not reconnect after its last call.
+The hosted job reconnects the console between the two disconnects so both can be recorded. That reconnect is `WTSConnectSessionW` from `OsLockProbe` running as SYSTEM. The service is installed with `--ci-reconnect` only when `GITHUB_ACTIONS=true` and `RUNNER_ENVIRONMENT=github-hosted`. `--allow-local` does not turn it on, and the laptop script does not write `reconnect.on`. The service binary and its control files live in `C:\ProgramData\os-lock-probe`, which the elevated script creates for SYSTEM and Administrators only. After the saved values are restored, the run confirms a lock. A successful `LockWorkStation` return is not that confirmation.
+
+## Rule
+
+`LockWorkStation`'s return value cannot be trusted. A lock counts only when a `WTS_SESSION_LOCK` notification arrives, or the session state says locked, within one second. If that does not happen, fall back to `WTSDisconnectSession` and confirm it the same way (a console-disconnect notification, or the session state). If both fail, the product fails closed: the result is not a lock, the run exits non-zero, and it never ends Unlocked.
 
 | Row | windows-2022 | windows-2025 |
 | --- | --- | --- |
@@ -42,4 +46,6 @@ The three confirming paths are each under one second. The blocked row is the ful
 
 ## Laptop
 
-`spikes/os-lock/run.ps1` is the client Windows run. It was not executed here. It refuses a school workstation, a prompt that is not elevated, a remote session, and a machine with no console session. It backs up every value before changing it, writes `%LOCALAPPDATA%\os-lock-probe\pending.json`, registers RunOnce `os-lock-restore`, and registers a one-shot SYSTEM logon task of the same name so a crash still restores HKLM. The run ends at the sign-in screen. Recovery is in `spikes/os-lock/README.md`.
+`spikes/os-lock/run.ps1` is the client Windows run. It was not executed here. It refuses a school workstation (the model name or a `30F2`/`30F3` machine type in `SystemFamily`, `SystemVersion`, or `SystemProductName`, and it refuses when any of those cannot be read), a prompt that is not elevated, a remote session, a machine with no console session, and an elevated user who is not the console session user. It journals the eight DWORD lockdown values, absent or present, in `C:\ProgramData\os-lock-probe\pending.json` before changing them, and it refuses any other kind. RunOnce `os-lock-restore` restores the HKCU values. The SYSTEM task of the same name is what restores HKLM, and it deletes itself only after those three values match. The laptop does not time the two disconnects, because the SYSTEM reconnect that lets CI record both is CI only. It ends by confirming a lock, then disconnecting only if that confirmation fails. Recovery is in `spikes/os-lock/README.md`.
+
+The timings in the table are from the run cited above, before the reconnect, journal, and confirmation changes. The next green proof run replaces them.

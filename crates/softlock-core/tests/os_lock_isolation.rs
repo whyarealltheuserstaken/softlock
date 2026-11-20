@@ -120,10 +120,17 @@ fn os_lock_script_restores_and_does_not_record_a_serial() {
     assert!(run.contains("} finally {"));
     assert!(run.contains("pending.json"));
     assert!(run.contains("RunOnce"));
-    assert!(run.contains("stay-disconnected"));
+    assert!(run.contains("fail-closed"));
     assert!(run.contains("thinkstation p7"));
+    assert!(run.contains("30F2"));
+    assert!(run.contains("SystemFamily"));
+    assert!(run.contains(r"C:\ProgramData\os-lock-probe"));
+    assert!(run.contains("schtasks.exe /Run /TN"));
+    assert!(run.contains("reconnect is ci only"));
+    assert!(!run.contains("stay-disconnected"));
     assert!(restore.contains("Invoke-PendingRestore"));
     assert!(restore.contains("OsLockProbe"));
+    assert!(restore.contains(r"C:\ProgramData\os-lock-probe\pending.json"));
     for text in [&run, &restore] {
         assert!(!text.contains("SerialNumber"));
         assert!(!text.contains("SystemSerial"));

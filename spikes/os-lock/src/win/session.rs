@@ -8,20 +8,53 @@ use windows::Win32::System::RemoteDesktop::{
     ProcessIdToSessionId, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK, WTSActive,
     WTSClientProtocolType, WTSConnectSessionW, WTSConnectState, WTSDisconnected, WTSFreeMemory,
     WTSGetActiveConsoleSessionId, WTSINFOEXW, WTSQuerySessionInformationW, WTSSessionInfoEx,
+    WTSUserName,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcessToken};
+use windows::Win32::System::WindowsProgramming::GetUserNameW;
 use windows::core::{PCWSTR, PWSTR, w};
 
 use super::util::success;
+use crate::school::{self, SchoolCheck};
 
 const NO_CONSOLE: u32 = u32::MAX;
 
-pub fn school_workstation() -> bool {
-    reg_sz(
-        w!("HARDWARE\\DESCRIPTION\\System\\BIOS"),
-        w!("SystemProductName"),
+pub fn school_check() -> SchoolCheck {
+    let bios = w!("HARDWARE\\DESCRIPTION\\System\\BIOS");
+    school::classify(
+        reg_sz(bios, w!("SystemFamily")).as_deref(),
+        reg_sz(bios, w!("SystemVersion")).as_deref(),
+        reg_sz(bios, w!("SystemProductName")).as_deref(),
     )
-    .is_some_and(|name| name.to_ascii_lowercase().contains("thinkstation p7"))
+}
+
+pub fn school_workstation() -> bool {
+    !matches!(school_check(), SchoolCheck::No)
+}
+
+/// Field names that could not be read. Values are not included.
+pub fn missing_identity_fields() -> Vec<&'static str> {
+    let bios = w!("HARDWARE\\DESCRIPTION\\System\\BIOS");
+    let mut missing = Vec::new();
+    if reg_sz(bios, w!("SystemFamily"))
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        missing.push("SystemFamily");
+    }
+    if reg_sz(bios, w!("SystemVersion"))
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        missing.push("SystemVersion");
+    }
+    if reg_sz(bios, w!("SystemProductName"))
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        missing.push("SystemProductName");
+    }
+    missing
 }
 
 pub fn preflight() -> u8 {
@@ -59,11 +92,14 @@ struct Preflight {
     ok: bool,
     elevated: bool,
     school: bool,
+    identity_unreadable: bool,
     protocol: i32,
     session: u32,
     console: u32,
     console_present: bool,
     remote: bool,
+    console_user_known: bool,
+    console_user_match: bool,
     build: String,
     installation_type: String,
 }
@@ -87,16 +123,28 @@ fn describe() -> Preflight {
         Some(value) if value > 0 => true,
         _ => console_present && session != console,
     };
-    let ok = elevated() && !school_workstation() && console_present && !remote;
+    let identity = school_check();
+    let account =
+        school::accounts_match(process_user().as_deref(), session_user(console).as_deref());
+    let console_user_known = account.is_ok();
+    let console_user_match = account.unwrap_or(false);
+    let ok = elevated()
+        && identity == SchoolCheck::No
+        && console_present
+        && !remote
+        && console_user_match;
     Preflight {
         ok,
         elevated: elevated(),
-        school: school_workstation(),
+        school: identity == SchoolCheck::Yes,
+        identity_unreadable: identity == SchoolCheck::Unreadable,
         protocol: protocol.unwrap_or(-1),
         session,
         console,
         console_present,
         remote,
+        console_user_known,
+        console_user_match,
         build: reg_sz(
             w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"),
             w!("CurrentBuild"),
@@ -146,10 +194,10 @@ pub fn session_is_active(session: u32) -> bool {
     session_connect_state(session) == Some(WTSActive.0 as u32)
 }
 
-/// Attach `session` to the console. The service calls this so a disconnect
-/// measurement can finish and the proof can still record the result. It is
-/// not an unlock API; the password is empty because the service token, not a
-/// credential, is what the call accepts.
+/// SYSTEM session reconnect. The service calls this only when it was installed
+/// with `--ci-reconnect`, which the installer adds only for a GitHub-hosted
+/// Actions runner. The password is empty because the service token is what
+/// the call accepts. This is not used on a laptop run.
 pub fn connect_session(session: u32) -> bool {
     if session == NO_CONSOLE {
         return false;
@@ -189,6 +237,45 @@ fn session_connect_state(session: u32) -> Option<u32> {
         let state = *buffer.0.cast::<u32>();
         WTSFreeMemory(buffer.0.cast());
         Some(state)
+    }
+}
+
+fn process_user() -> Option<String> {
+    let mut buffer = [0u16; 256];
+    let mut len = buffer.len() as u32;
+    unsafe {
+        GetUserNameW(Some(PWSTR(buffer.as_mut_ptr())), &mut len).ok()?;
+    }
+    let end = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    let name = String::from_utf16_lossy(&buffer[..end]);
+    if name.is_empty() { None } else { Some(name) }
+}
+
+fn session_user(session: u32) -> Option<String> {
+    if session == NO_CONSOLE {
+        return None;
+    }
+    let mut buffer = PWSTR::null();
+    let mut bytes = 0u32;
+    unsafe {
+        if WTSQuerySessionInformationW(None, session, WTSUserName, &mut buffer, &mut bytes).is_err()
+            || buffer.is_null()
+        {
+            return None;
+        }
+        let mut end = 0usize;
+        while *buffer.0.add(end) != 0 {
+            end += 1;
+            if end > 256 {
+                break;
+            }
+        }
+        let name = String::from_utf16_lossy(std::slice::from_raw_parts(buffer.0, end));
+        WTSFreeMemory(buffer.0.cast());
+        if name.is_empty() { None } else { Some(name) }
     }
 }
 

@@ -4,8 +4,13 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, WIN32_ERROR};
+use windows::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+};
+use windows::core::PCWSTR;
 
 pub const SERVICE_NAME: &str = "OsLockProbe";
+pub const PROBE_DIR: &str = r"C:\ProgramData\os-lock-probe";
 
 pub fn explain(error: windows::core::Error, what: &str) -> String {
     format!("{what}: {error} ({:#010x})", error.code().0 as u32)
@@ -96,4 +101,15 @@ pub fn last_error(what: &str) -> String {
 
 pub fn success(status: WIN32_ERROR) -> bool {
     status == ERROR_SUCCESS
+}
+
+/// True when this path itself is a junction, symlink, or other reparse point.
+/// A missing path is not a reparse point.
+pub fn path_is_reparse(path: &Path) -> bool {
+    let wide = wide(&path.to_string_lossy());
+    let attributes = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return false;
+    }
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
 }

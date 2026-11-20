@@ -1,15 +1,18 @@
-# Restores the lockdown values this probe changed.
-# HKCU RunOnce calls this as the signed-in user. A SYSTEM task calls it after a crash
-# so HKLM is restored too. HKCU is written under the saved account SID when the
-# caller is not that account.
+# Restores the eight lockdown values this probe is allowed to change.
+# The journal is only C:\ProgramData\os-lock-probe\pending.json. A SYSTEM task
+# passes that path. HKCU is written under the saved account SID when the caller
+# is not that account. The task is removed only after the three HKLM values match.
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$pending = Join-Path $env:LOCALAPPDATA 'os-lock-probe\pending.json'
+$script:JournalPath = 'C:\ProgramData\os-lock-probe\pending.json'
 $taskName = 'os-lock-restore'
 $runOnceName = 'os-lock-restore'
 $cmdPath = 'C:\ProgramData\os-lock-probe\restore.cmd'
+$hkcuSystem = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'
+$hkcuExplorer = 'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+$hklmSystem = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'
 
 function Get-Items($value) {
     $list = New-Object System.Collections.Generic.List[object]
@@ -26,12 +29,29 @@ function Get-Items($value) {
     return ,$list
 }
 
-function Convert-RegistryData([string]$kind, [string]$data) {
-    switch ($kind) {
-        'DWord' { return [int]$data }
-        'QWord' { return [int64]$data }
-        default { return $data }
+function Test-AllowedEntry($entry) {
+    $hive = [string]$entry.hive
+    $sub = [string]$entry.subkey
+    $name = [string]$entry.name
+    $kind = 'DWord'
+    if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { $kind = [string]$entry.kind }
+    if ($kind -ne 'DWord') { return $false }
+    if ($hive -eq 'HKCU' -and $sub -eq $hkcuSystem) {
+        return $name -eq 'DisableTaskMgr' -or $name -eq 'DisableLockWorkstation' -or $name -eq 'DisableChangePassword'
     }
+    if ($hive -eq 'HKCU' -and $sub -eq $hkcuExplorer) {
+        return $name -eq 'NoLogoff' -or $name -eq 'NoClose'
+    }
+    if ($hive -eq 'HKLM' -and $sub -eq $hklmSystem) {
+        return $name -eq 'HideFastUserSwitching' -or $name -eq 'ConsentPromptBehaviorAdmin' -or $name -eq 'ConsentPromptBehaviorUser'
+    }
+    return $false
+}
+
+function Convert-DwordText([string]$data) {
+    $number = 0
+    if (-not [int]::TryParse($data, [ref]$number)) { return $null }
+    return [int]$number
 }
 
 function Open-UsersKey([string]$sid, [string]$subkey, [bool]$writable) {
@@ -68,7 +88,11 @@ function Read-ValueText($key, [string]$name) {
         $exists = $true
         $kind = $key.GetValueKind($existing).ToString()
         $raw = $key.GetValue($existing, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-        if ($kind -eq 'DWord' -or $kind -eq 'QWord') { $data = "$raw" } else { $data = [string]$raw }
+        if ($kind -eq 'DWord') {
+            $data = "$([int]$raw)"
+        } else {
+            $data = ''
+        }
     }
     return [pscustomobject]@{ exists = $exists; kind = $kind; data = $data }
 }
@@ -79,47 +103,12 @@ function Value-Matches($entry, [string]$sid) {
     if ($null -ne $key) { $key.Close() }
     if (-not ($entry.present -eq $true)) { return -not $read.exists }
     if (-not $read.exists) { return $false }
-    $kindName = 'DWord'
-    if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { $kindName = [string]$entry.kind }
-    return ($read.kind -eq $kindName) -and ($read.data -eq [string]$entry.data)
-}
-
-function Test-CreatedKey($entry) {
-    return ($entry.PSObject.Properties.Name -contains 'created_key') -and ($entry.created_key -eq $true)
-}
-
-function Remove-CreatedKey($entry, [string]$sid) {
-    if (-not (Test-CreatedKey $entry)) { return }
-    $key = Open-Key ([string]$entry.hive) ([string]$entry.subkey) $true $sid
-    if ($null -eq $key) { return }
-    $empty = ($key.ValueCount -eq 0 -and $key.SubKeyCount -eq 0)
-    $key.Close()
-    if (-not $empty) { return }
-    $path = [string]$entry.subkey
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $useSid = $entry.hive -eq 'HKCU' -and $sid -and $identity.User.Value -ne $sid
-    if ($useSid) {
-        $parentPath = $sid
-        $leaf = $path
-        $slash = $path.LastIndexOf('\')
-        if ($slash -ge 0) {
-            $parentPath = $sid + '\' + $path.Substring(0, $slash)
-            $leaf = $path.Substring($slash + 1)
-        }
-        $parent = [Microsoft.Win32.Registry]::Users.OpenSubKey($parentPath, $true)
-        if ($null -eq $parent) { return }
-        try { $parent.DeleteSubKey($leaf, $false) } finally { $parent.Close() }
-        return
-    }
-    $root = if ($entry.hive -eq 'HKLM') { [Microsoft.Win32.Registry]::LocalMachine } else { [Microsoft.Win32.Registry]::CurrentUser }
-    $slash = $path.LastIndexOf('\')
-    if ($slash -lt 0) {
-        $root.DeleteSubKey($path, $false)
-        return
-    }
-    $parent = $root.OpenSubKey($path.Substring(0, $slash), $true)
-    if ($null -eq $parent) { return }
-    try { $parent.DeleteSubKey($path.Substring($slash + 1), $false) } finally { $parent.Close() }
+    if ($read.kind -ne 'DWord') { return $false }
+    $wanted = Convert-DwordText ([string]$entry.data)
+    if ($null -eq $wanted) { return $false }
+    $got = Convert-DwordText $read.data
+    if ($null -eq $got) { return $false }
+    return $got -eq $wanted
 }
 
 function Remove-RunOnce {
@@ -145,14 +134,37 @@ function Remove-ProbeService {
     } finally { $ErrorActionPreference = $previous }
 }
 
-function Invoke-PendingRestore {
-    if (-not (Test-Path -LiteralPath $pending)) {
-        Remove-RunOnce
-        Remove-RestoreTask
-        Remove-ProbeService
-        return 0
+function Find-Allowed([string]$hive, [string]$name) {
+    foreach ($entry in $script:Allowed) {
+        if (([string]$entry.hive) -eq $hive -and ([string]$entry.name) -eq $name) { return $entry }
     }
-    $snapshot = Get-Content -LiteralPath $pending -Raw | ConvertFrom-Json
+    return $null
+}
+
+function Test-HklmConfirmed([string]$sid) {
+    foreach ($name in @('HideFastUserSwitching', 'ConsentPromptBehaviorAdmin', 'ConsentPromptBehaviorUser')) {
+        $found = Find-Allowed 'HKLM' $name
+        if ($null -eq $found) { return $false }
+        if (-not (Value-Matches $found $sid)) { return $false }
+    }
+    return $true
+}
+
+function Test-HkcuConfirmed([string]$sid) {
+    foreach ($name in @('DisableTaskMgr', 'DisableLockWorkstation', 'DisableChangePassword', 'NoLogoff', 'NoClose')) {
+        $found = Find-Allowed 'HKCU' $name
+        if ($null -eq $found) { return $false }
+        if (-not (Value-Matches $found $sid)) { return $false }
+    }
+    return $true
+}
+
+function Invoke-PendingRestore {
+    if (-not (Test-Path -LiteralPath $script:JournalPath)) {
+        Write-Host 'probe journal is missing; the restore task was left in place'
+        return 1
+    }
+    $snapshot = Get-Content -LiteralPath $script:JournalPath -Raw | ConvertFrom-Json
     $sid = ''
     if ($snapshot.PSObject.Properties.Name -contains 'sid' -and $snapshot.sid) { $sid = [string]$snapshot.sid }
     $rawValues = $null
@@ -163,71 +175,62 @@ function Invoke-PendingRestore {
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     $system = $identity.User.Value -eq 'S-1-5-18'
-    $held = New-Object System.Collections.Generic.List[object]
-    $failed = $false
+    $script:Allowed = New-Object System.Collections.Generic.List[object]
     foreach ($entry in (Get-Items $rawValues)) {
-        $needsMachine = $entry.hive -eq 'HKLM'
-        if ($needsMachine -and -not $elevated -and -not $system) {
-            $held.Add($entry)
+        if (-not (Test-AllowedEntry $entry)) {
+            Write-Host "ignored $([string]$entry.hive)\$([string]$entry.subkey) $([string]$entry.name)"
             continue
         }
-        if (Value-Matches $entry $sid) {
-            try { Remove-CreatedKey $entry $sid } catch {
-                $failed = $true
-                Write-Host "$($entry.hive)\$($entry.subkey) was created by the probe and was not deleted. $($_.Exception.Message)"
-                $held.Add($entry)
-            }
-            continue
-        }
+        $script:Allowed.Add($entry)
+    }
+    $failed = $false
+    foreach ($entry in $script:Allowed) {
+        $needsMachine = ([string]$entry.hive) -eq 'HKLM'
+        if ($needsMachine -and -not $elevated -and -not $system) { continue }
+        if (Value-Matches $entry $sid) { continue }
         try {
             $key = Open-Key ([string]$entry.hive) ([string]$entry.subkey) $true $sid
             if ($null -eq $key) { throw 'the key could not be opened' }
-            $created = -not ($entry.present -eq $true)
-            if ($created) {
+            if (-not ($entry.present -eq $true)) {
                 $key.DeleteValue([string]$entry.name, $false)
             } else {
-                $kindName = 'DWord'
-                if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { $kindName = [string]$entry.kind }
-                $data = if ($entry.PSObject.Properties.Name -contains 'data') { [string]$entry.data } else { '0' }
-                $kind = [Microsoft.Win32.RegistryValueKind]$kindName
-                $key.SetValue([string]$entry.name, (Convert-RegistryData $kindName $data), $kind)
+                $data = Convert-DwordText ([string]$entry.data)
+                if ($null -eq $data) { throw 'the saved value is not a DWORD' }
+                $key.SetValue([string]$entry.name, $data, [Microsoft.Win32.RegistryValueKind]::DWord)
             }
             $key.Close()
             if (-not (Value-Matches $entry $sid)) { throw 'the saved value was not put back' }
-            Remove-CreatedKey $entry $sid
         } catch {
             $failed = $true
-            $verb = if ($entry.present -eq $true) { 'was changed and was not put back' } else { 'was created by the probe and was not deleted' }
-            Write-Host "$($entry.hive)\$($entry.subkey) value $($entry.name) $verb. $($_.Exception.Message)"
-            $held.Add($entry)
+            Write-Host "$([string]$entry.hive)\$([string]$entry.subkey) value $([string]$entry.name) was not put back. $($_.Exception.Message)"
         }
     }
-    if ($held.Count -gt 0) {
-        $items = @()
-        foreach ($entry in $held) {
-            $present = if ($entry.present -eq $true) { 'true' } else { 'false' }
-            $kind = if ($entry.PSObject.Properties.Name -contains 'kind' -and $entry.kind) { [string]$entry.kind } else { 'DWord' }
-            $data = if ($entry.PSObject.Properties.Name -contains 'data') { [string]$entry.data } else { '' }
-            $created = 'false'
-            if (Test-CreatedKey $entry) { $created = 'true' }
-            $items += '{"hive":"' + [string]$entry.hive + '","subkey":"' + ([string]$entry.subkey).Replace('\', '\\').Replace('"', '\"') + '","name":"' + [string]$entry.name + '","present":' + $present + ',"kind":"' + $kind + '","data":"' + $data.Replace('\', '\\').Replace('"', '\"') + '","created_key":' + $created + '}'
-        }
-        $body = '{"sid":"' + $sid + '","values":[' + ($items -join ',') + ']}'
-        $utf8 = New-Object System.Text.UTF8Encoding $false
-        [System.IO.File]::WriteAllText($pending, $body, $utf8)
-        if (-not $elevated -and -not $system) {
-            Write-Host "HKLM was not restored. From an elevated prompt run: powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-        }
-        if ($failed) { return 1 }
+    $hkcuOk = Test-HkcuConfirmed $sid
+    $hklmOk = Test-HklmConfirmed $sid
+    if ($hkcuOk) { Remove-RunOnce }
+    if ($hklmOk) {
+        Remove-Item -LiteralPath $script:JournalPath -Force
+        Remove-RestoreTask
+        Remove-ProbeService
         return 0
     }
-    Remove-Item -LiteralPath $pending -Force
-    Remove-RunOnce
-    Remove-RestoreTask
-    Remove-ProbeService
-    return 0
+    if (-not $elevated -and -not $system) {
+        Write-Host 'HKLM was not restored. The SYSTEM logon task still has the journal.'
+    }
+    if ($failed) { return 1 }
+    return 1
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
+    $given = ''
+    for ($i = 0; $i -lt $args.Count; $i++) {
+        if ($args[$i] -eq '-Journal' -and ($i + 1) -lt $args.Count) {
+            $given = [string]$args[$i + 1]
+        }
+    }
+    if ($given -ne $script:JournalPath) {
+        Write-Host 'journal path is not the probe journal'
+        exit 2
+    }
     exit (Invoke-PendingRestore)
 }
