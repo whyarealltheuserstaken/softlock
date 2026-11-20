@@ -577,10 +577,65 @@ fn the_fail_closed_job_covers_each_hosted_case() {
     assert!(test.contains("live-fail-closed"));
     assert!(job.contains("live-fail-closed"));
     assert!(job.contains("softlock-fail-closed"));
+    for path in [
+        "crates/softlock-windows/**",
+        "crates/softlock-core/src/**",
+        "**/Cargo.toml",
+        "Cargo.lock",
+    ] {
+        assert!(job.contains(path), "fail-closed path filter omits {path}");
+    }
+    let session = std::fs::read_to_string(root.join("crates/softlock-lockhost/src/win/session.rs"))
+        .expect("session");
+    let quit = session
+        .find("service_quit_locks")
+        .expect("quit does not check the guard");
+    let schedule = session
+        .find("schedule_quit_os_lock()")
+        .expect("quit does not schedule");
+    assert!(
+        quit < schedule,
+        "the guard check must come before the OS lock"
+    );
+    let client = std::fs::read_to_string(root.join("crates/softlock-app/src-tauri/src/client.rs"))
+        .expect("client");
+    assert!(client.contains("runner_may_lock"));
+    let actions =
+        std::fs::read_to_string(root.join("crates/softlock-app/src-tauri/src/actions.rs"))
+            .expect("actions");
+    assert!(actions.contains("SystemTimeToTzSpecificLocalTime"));
+    let script = std::fs::read_to_string(root.join("tests/hardware/windows/os-lock-check.ps1"))
+        .expect("laptop script");
+    for needle in [
+        "ThinkStation P7",
+        "30F2",
+        "30F3",
+        "identity-unreadable",
+        "remote-session",
+        "not-console",
+        "Stop-Process",
+        "NtSuspendProcess",
+        "suite-output",
+        "result.json",
+        "result.txt",
+        "--release",
+        "--locked",
+    ] {
+        assert!(script.contains(needle), "laptop script missing {needle}");
+    }
+    assert!(
+        !script.contains("WTSConnectSession"),
+        "the laptop script reconnects a session"
+    );
+    assert!(
+        !script.contains("live-fail-closed"),
+        "the laptop script enables the hosted test feature"
+    );
     let owner = std::fs::read_to_string(root.join("crates/softlock-app/src-tauri/src/owner.rs"))
         .expect("owner");
     assert!(owner.contains("CMD_HARD_LOCK"));
     assert!(owner.contains("enqueue_hard_lock"));
+    assert!(owner.contains("runner_may_lock"));
 }
 
 #[test]

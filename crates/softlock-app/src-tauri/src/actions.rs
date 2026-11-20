@@ -90,10 +90,60 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 }
 
 /// Offset of the local zone at `utc_ms`, not the offset of the current minute.
+/// Windows asks the system to convert that UTC instant, so daylight rules stay
+/// in the operating system.
 fn local_offset_secs(utc_ms: i64) -> i32 {
-    offset_at(utc_ms, &zone_rules())
+    #[cfg(windows)]
+    {
+        system_local_offset_secs(utc_ms).unwrap_or(0)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = utc_ms;
+        0
+    }
 }
 
+#[cfg(windows)]
+fn system_local_offset_secs(utc_ms: i64) -> Option<i32> {
+    if utc_ms < 0 {
+        return None;
+    }
+    let secs = utc_ms / 1000;
+    let days = secs / 86_400;
+    let tod = (secs % 86_400) as u32;
+    let (year, month, day) = civil_from_days(days);
+    let utc = windows::Win32::Foundation::SYSTEMTIME {
+        wYear: year as u16,
+        wMonth: month as u16,
+        wDay: day as u16,
+        wHour: (tod / 3600) as u16,
+        wMinute: ((tod % 3600) / 60) as u16,
+        wSecond: (tod % 60) as u16,
+        ..windows::Win32::Foundation::SYSTEMTIME::default()
+    };
+    let mut local = windows::Win32::Foundation::SYSTEMTIME::default();
+    let converted = unsafe {
+        windows::Win32::System::Time::SystemTimeToTzSpecificLocalTime(None, &utc, &mut local)
+    };
+    if converted.is_err() {
+        return None;
+    }
+    let utc_day = days_from_civil(year, month, day)?;
+    let local_day = days_from_civil(
+        i32::from(local.wYear),
+        u32::from(local.wMonth),
+        u32::from(local.wDay),
+    )?;
+    let utc_secs = utc_day * 86_400 + i64::from(tod);
+    let local_secs = local_day * 86_400
+        + i64::from(local.wHour) * 3_600
+        + i64::from(local.wMinute) * 60
+        + i64::from(local.wSecond);
+    i32::try_from(local_secs - utc_secs).ok()
+}
+
+#[cfg(test)]
 struct Transition {
     month: u16,
     week: u16,
@@ -102,6 +152,7 @@ struct Transition {
     minute: u16,
 }
 
+#[cfg(test)]
 struct ZoneRules {
     /// Minutes added to standard local time to get UTC. Windows `Bias + StandardBias`.
     standard_bias_min: i32,
@@ -111,6 +162,7 @@ struct ZoneRules {
     standard_start: Transition,
 }
 
+#[cfg(test)]
 fn offset_at(utc_ms: i64, rules: &ZoneRules) -> i32 {
     let bias = if daylight_at(utc_ms, rules) {
         rules.standard_bias_min + rules.daylight_bias_min
@@ -120,6 +172,7 @@ fn offset_at(utc_ms: i64, rules: &ZoneRules) -> i32 {
     -bias * 60
 }
 
+#[cfg(test)]
 fn daylight_at(utc_ms: i64, rules: &ZoneRules) -> bool {
     if rules.daylight_start.month == 0
         || rules.standard_start.month == 0
@@ -148,6 +201,7 @@ fn daylight_at(utc_ms: i64, rules: &ZoneRules) -> bool {
     }
 }
 
+#[cfg(test)]
 fn transition_utc_ms(year: i32, when: &Transition, bias_min: i32) -> Option<i64> {
     let day = nth_weekday(year, when.month, when.week, when.dow)?;
     let local_secs = days_from_civil(year, when.month as u32, day)? * 86_400
@@ -156,6 +210,7 @@ fn transition_utc_ms(year: i32, when: &Transition, bias_min: i32) -> Option<i64>
     Some(local_secs.saturating_add(i64::from(bias_min) * 60) * 1_000)
 }
 
+#[cfg(test)]
 fn nth_weekday(year: i32, month: u16, week: u16, dow: u16) -> Option<u32> {
     if month == 0 || month > 12 || week == 0 || week > 5 || dow > 6 {
         return None;
@@ -170,6 +225,7 @@ fn nth_weekday(year: i32, month: u16, week: u16, dow: u16) -> Option<u32> {
     u32::try_from(day).ok()
 }
 
+#[cfg(test)]
 fn days_in_month(year: i32, month: u32) -> Option<u32> {
     let length = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -181,16 +237,19 @@ fn days_in_month(year: i32, month: u32) -> Option<u32> {
     Some(length)
 }
 
+#[cfg(test)]
 fn is_leap(year: i32) -> bool {
     let year = year as i64;
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
+#[cfg(test)]
 fn day_of_week(year: i32, month: u32, day: u32) -> Option<u16> {
     let days = days_from_civil(year, month, day)?;
     Some(((days.rem_euclid(7) + 4) % 7) as u16)
 }
 
+#[cfg(test)]
 fn year_of_utc(utc_ms: i64) -> Option<i32> {
     if utc_ms < 0 {
         return None;
@@ -199,6 +258,7 @@ fn year_of_utc(utc_ms: i64) -> Option<i32> {
     Some(civil_from_days(days).0)
 }
 
+#[cfg(any(test, windows))]
 fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
     if month == 0 || month > 12 || day == 0 {
         return None;
@@ -213,54 +273,6 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + day as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     Some(era * 146_097 + doe as i64 - 719_468)
-}
-
-fn zone_rules() -> ZoneRules {
-    #[cfg(windows)]
-    {
-        unsafe {
-            let mut info = windows::Win32::System::Time::TIME_ZONE_INFORMATION::default();
-            let _kind = windows::Win32::System::Time::GetTimeZoneInformation(&mut info);
-            ZoneRules {
-                standard_bias_min: info.Bias + info.StandardBias,
-                daylight_bias_min: info.DaylightBias,
-                daylight_start: transition_from(&info.DaylightDate),
-                standard_start: transition_from(&info.StandardDate),
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        ZoneRules {
-            standard_bias_min: 0,
-            daylight_bias_min: 0,
-            daylight_start: Transition {
-                month: 0,
-                week: 0,
-                dow: 0,
-                hour: 0,
-                minute: 0,
-            },
-            standard_start: Transition {
-                month: 0,
-                week: 0,
-                dow: 0,
-                hour: 0,
-                minute: 0,
-            },
-        }
-    }
-}
-
-#[cfg(windows)]
-fn transition_from(time: &windows::Win32::Foundation::SYSTEMTIME) -> Transition {
-    Transition {
-        month: time.wMonth,
-        week: time.wDay,
-        dow: time.wDayOfWeek,
-        hour: time.wHour,
-        minute: time.wMinute,
-    }
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]

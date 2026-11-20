@@ -97,8 +97,7 @@ fn autostart_override_allowed() -> bool {
 
 #[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
 fn autostart_override_allowed() -> bool {
-    std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
-        && std::env::var("RUNNER_ENVIRONMENT").ok().as_deref() == Some("github-hosted")
+    softlock_windows::runner_may_lock().is_ok()
 }
 
 fn status_file_path() -> Option<String> {
@@ -567,8 +566,7 @@ fn show_menu(hwnd: HWND) {
 fn publish_owner_hwnd(hwnd: HWND) {
     #[cfg(feature = "live-fail-closed")]
     {
-        if std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
-            && std::env::var("RUNNER_ENVIRONMENT").ok().as_deref() == Some("github-hosted")
+        if softlock_windows::runner_may_lock().is_ok()
             && let Ok(path) = std::env::var("SOFTLOCK_OWNER_HWND")
         {
             let _ = std::fs::write(path, (hwnd.0 as isize).to_string());

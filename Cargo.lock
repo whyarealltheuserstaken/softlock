@@ -3169,6 +3169,7 @@ dependencies = [
  "softlock-core",
  "softlock-linux",
  "softlock-macos",
+ "softlock-windows",
  "tauri",
  "tauri-build",
  "windows",

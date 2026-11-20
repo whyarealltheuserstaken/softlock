@@ -131,13 +131,14 @@ fn pipe_override_allowed() -> bool {
 
 #[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
 fn pipe_override_allowed() -> bool {
-    hosted_runner()
-}
-
-#[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
-fn hosted_runner() -> bool {
-    std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
-        && std::env::var("RUNNER_ENVIRONMENT").ok().as_deref() == Some("github-hosted")
+    #[cfg(windows)]
+    {
+        softlock_windows::runner_may_lock().is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]

@@ -536,7 +536,9 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
         }
         if service_gone && !quit_tried {
             quit_tried = true;
-            schedule_quit_os_lock();
+            if service_quit_locks(controller.state()) {
+                schedule_quit_os_lock();
+            }
         }
         if let Some(result) = take_quit_os_lock()
             && apply_quit_os_lock(&shared, &mut controller, result)
@@ -813,6 +815,15 @@ static QUIT_OS: AtomicU8 = AtomicU8::new(QUIT_IDLE);
 /// Quit is the service pipe closing. The OS lock can take the whole
 /// confirmation budget, so it runs off the window thread. The hooks stay
 /// until the result says the session is locked, or another host has armed.
+/// A service crash locks the workstation only while the session is guarded.
+/// Unlocked, unlocking, recovering, and an already OS-locked session stay as they are.
+fn service_quit_locks(state: &LockState) -> bool {
+    matches!(
+        state,
+        LockState::Locked { .. } | LockState::Arming { .. } | LockState::FailingClosed { .. }
+    )
+}
+
 fn schedule_quit_os_lock() {
     if QUIT_OS
         .compare_exchange(QUIT_IDLE, QUIT_RUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -1349,6 +1360,41 @@ fn host_write_loop(
             frame.fill(0);
         }
         drop(report);
+    }
+}
+
+#[cfg(test)]
+mod quit_guard {
+    use softlock_core::{ArmStep, DisarmStep, FailReason, LockSource, LockState, PromptState};
+
+    #[test]
+    fn a_guarded_session_still_locks_when_the_service_quits() {
+        let locked = LockState::Locked {
+            source: LockSource::Tray,
+            prompt: PromptState::Idle,
+        };
+        let arming = LockState::Arming {
+            source: LockSource::App,
+            step: ArmStep::Guard,
+        };
+        let failing = LockState::FailingClosed {
+            reason: FailReason::HostExited,
+        };
+        assert!(super::service_quit_locks(&locked));
+        assert!(super::service_quit_locks(&arming));
+        assert!(super::service_quit_locks(&failing));
+    }
+
+    #[test]
+    fn an_unguarded_session_does_not_lock_when_the_service_quits() {
+        assert!(!super::service_quit_locks(&LockState::Unlocked));
+        assert!(!super::service_quit_locks(&LockState::Unlocking {
+            step: DisarmStep::DisarmGuard,
+        }));
+        assert!(!super::service_quit_locks(&LockState::OsLocked {
+            after_fail: None,
+        }));
+        assert!(!super::service_quit_locks(&LockState::Recovering));
     }
 }
 
