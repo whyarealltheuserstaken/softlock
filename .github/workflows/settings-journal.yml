@@ -1,0 +1,71 @@
+name: Settings journal
+
+# Hosted runners only. The restore case kills the Lock Host and the Service
+# during the change and checks DisableTaskMgr. recover-active leaves the
+# Lock Host running, so that case may lock the console. Nothing here runs
+# unless GITHUB_ACTIONS=true and RUNNER_ENVIRONMENT=github-hosted, and the
+# test refuses the school workstation before it changes a setting.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/softlock-core/**'
+      - 'crates/softlock-service/**'
+      - 'crates/softlock-lockhost/**'
+      - 'crates/softlock-windows/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/settings-journal.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  journal:
+    name: ${{ matrix.case }} (${{ matrix.image }})
+    concurrency:
+      group: settings-journal-${{ github.ref }}-${{ matrix.case }}-${{ matrix.image }}
+      cancel-in-progress: false
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-2025]
+        case:
+          - restore
+          - recover-active
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Refuse a runner that is not GitHub-hosted
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            throw 'refusing a runner that is not GitHub-hosted'
+          }
+      - name: Build the service and the Lock Host
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked -p softlock-service -p softlock-lockhost --features live-fail-closed --target-dir target/journal
+      - name: Kill during the change and restore
+        shell: pwsh
+        env:
+          SOFTLOCK_JOURNAL_LIVE: ${{ matrix.case }}
+          SOFTLOCK_SERVICE_EXE: ${{ github.workspace }}\target\journal\release\softlock-service.exe
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --release --locked -p softlock-service --features live-fail-closed --test journal_live --target-dir target/journal -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload the journal report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: settings-journal-${{ matrix.case }}-${{ matrix.image }}
+          path: ${{ runner.temp }}/softlock-journal/result.json
+          if-no-files-found: error

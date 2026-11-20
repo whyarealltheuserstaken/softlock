@@ -234,6 +234,12 @@ pub trait SessionControl {
 pub trait Hardening {
     fn apply(&mut self, plan: &HardeningPlan, journal: &mut Journal) -> Result<(), HardenError>;
     fn revert(&mut self, journal: &Journal) -> Result<(), HardenError>;
+
+    /// Put journaled settings back to their locked values. A failure is returned.
+    fn reassert(&mut self, journal: &Journal) -> Result<(), HardenError> {
+        let _ = journal;
+        Ok(())
+    }
 }
 
 pub trait Power {
