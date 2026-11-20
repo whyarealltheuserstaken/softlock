@@ -2,10 +2,10 @@
 
 Measured on 20 November 2026 UTC by the workspace-excluded probe `spikes/os-lock`.
 
-The lines below are from [OS lock proof run 44686484658](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44686484658), commit `1c33a918fe8bb67a752fb24bd17b2afc5f2f2244`. Both jobs passed 8 rows, restored every value, and finished `state=os-locked`.
+The lines below are from [OS lock proof run 44694585404](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44694585404), commit `80094f1c9df693ac3e8e4b1f11b4443cb87e0c7c`. Both jobs passed 8 rows, restored every value, and finished `state=os-locked`. The windows-2025 check job in that run executed `run.ps1 --self-check` and printed `self-check ok`.
 
-- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44686484658/job/136122258806)
-- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44686484658/job/136122258797)
+- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44694585404/job/136148731450)
+- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44694585404/job/136148731274)
 
 ## Decision
 
@@ -36,16 +36,15 @@ The hosted job reconnects the console between the two disconnects so both can be
 
 | Row | windows-2022 | windows-2025 |
 | --- | --- | --- |
-| `LockWorkStation` while the policy is set | api success, notified false, session unlocked, 1,003,947 µs | api success, notified false, session unlocked, 1,000,026 µs |
-| `LockWorkStation` after clearing it | lock, session locked, 40,290 µs | lock, session locked, 140,014 µs |
-| Service disconnect of the console session | console-disconnect, 67,102 µs | console-disconnect, 114,320 µs |
-| Own-session disconnect | console-disconnect, 74,075 µs | console-disconnect, 104,032 µs |
-| Background heartbeat | alive, 18 lines | alive, 20 lines |
+| `LockWorkStation` while the policy is set | api success, notified false, session unlocked, 1,001,446 µs | api success, notified false, session unlocked, 1,003,849 µs |
+| `LockWorkStation` after clearing it | lock, session locked, 70,027 µs | lock, session locked, 183,188 µs |
+| Service disconnect of the console session | console-disconnect, 79,651 µs | console-disconnect, 115,923 µs |
+| Own-session disconnect | console-disconnect, 90,825 µs | console-disconnect, 82,060 µs |
+| Background heartbeat | alive, 20 lines | alive, 21 lines |
+| Ending confirmed lock | lock, session locked, 33,758 µs | lock, session locked, 56,307 µs |
 
-The three confirming paths are each under one second. The blocked row is the full one-second wait.
+The three confirming paths and the ending lock are each under one second. The blocked row is the full one-second wait. The ending row is the fail-closed chain. On both images the lock confirmed, so the chain did not disconnect.
 
 ## Laptop
 
 `spikes/os-lock/run.ps1` is the client Windows run. It was not executed here. It refuses a school workstation (the model name or a `30F2`/`30F3` machine type in `SystemFamily`, `SystemVersion`, or `SystemProductName`, and it refuses when any of those cannot be read), a prompt that is not elevated, a remote session, a machine with no console session, and an elevated user who is not the console session user. It journals the eight DWORD lockdown values, absent or present, in `C:\ProgramData\os-lock-probe\pending.json` before changing them, and it refuses any other kind. RunOnce `os-lock-restore` restores the HKCU values. The SYSTEM task of the same name is what restores HKLM, and it deletes itself only after those three values match. The laptop does not time the two disconnects, because the SYSTEM reconnect that lets CI record both is CI only. It ends by confirming a lock, then disconnecting only if that confirmation fails. Recovery is in `spikes/os-lock/README.md`.
-
-The timings in the table are from the run cited above, before the reconnect, journal, and confirmation changes. The next green proof run replaces them.
