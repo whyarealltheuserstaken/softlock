@@ -16,6 +16,7 @@ members = [
 exclude = [
     "spikes/desktop-proof",
     "spikes/input-hook",
+    "spikes/os-lock",
     "spikes/macos-desktop-proof",
     "spikes/macos-keep-awake",
     "spikes/macos-physical-input",
