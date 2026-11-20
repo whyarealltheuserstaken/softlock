@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use softlock_core::{SettingValue, sid_is_safe};
+use softlock_core::{
+    HostPresence, SettingValue, expand_profile_image, hive_target_allowed, same_exe_path,
+    sid_is_safe,
+};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_NOTIFY, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD,
@@ -20,6 +23,7 @@ use crate::secrets::{enable_privilege_scoped, wide_str};
 
 const POLICY_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\System";
 const VALUE_NAME: &str = "DisableTaskMgr";
+const REG_OPTION_OPEN_LINK: u32 = 0x0000_0008;
 
 pub fn read_task_manager(sid: &str) -> Result<SettingValue, &'static str> {
     if !sid_is_safe(sid) {
@@ -129,12 +133,19 @@ struct HiveGuard {
 
 impl HiveGuard {
     fn ensure(sid: &str) -> Result<Self, &'static str> {
-        if let Some(key) = open_users(sid, KEY_QUERY_VALUE)? {
+        if let Some(key) = open_checked(HKEY_USERS, sid, KEY_QUERY_VALUE)? {
             close(key);
             return Ok(Self { sid: None });
         }
-        let profile = profile_path(sid)?;
-        let file = Path::new(&profile).join("NTUSER.DAT");
+        let raw = profile_path(sid)?;
+        let root = windows_directory()?;
+        let drive = system_drive(&root)?;
+        let expanded = expand_profile_image(&raw, &root, &drive).map_err(|_| "hive")?;
+        let profile = Path::new(&expanded);
+        let file = profile.join("NTUSER.DAT");
+        let profile_reparse = path_is_reparse(profile)?;
+        let file_reparse = path_is_reparse(&file)?;
+        hive_target_allowed(&expanded, profile_reparse, file_reparse, false).map_err(|_| "link")?;
         let _backup = enable_privilege_scoped(windows::Win32::Security::SE_BACKUP_NAME)
             .map_err(|_| "hive")?;
         let _restore = enable_privilege_scoped(windows::Win32::Security::SE_RESTORE_NAME)
@@ -167,20 +178,9 @@ impl Drop for HiveGuard {
 
 fn profile_path(sid: &str) -> Result<String, &'static str> {
     let key_path = format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}");
-    let name = wide_str(&key_path);
-    let mut opened = HKEY::default();
-    let status = unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(name.as_ptr()),
-            None,
-            KEY_QUERY_VALUE,
-            &mut opened,
-        )
-    };
-    if status != ERROR_SUCCESS {
+    let Some(opened) = open_checked(HKEY_LOCAL_MACHINE, &key_path, KEY_QUERY_VALUE)? else {
         return Err("hive");
-    }
+    };
     let value_name = wide_str("ProfileImagePath");
     let mut kind = REG_VALUE_TYPE::default();
     let mut size = 0u32;
@@ -233,36 +233,144 @@ fn open_users(
     path: &str,
     access: windows::Win32::System::Registry::REG_SAM_FLAGS,
 ) -> Result<Option<HKEY>, &'static str> {
-    let name = wide_str(path);
-    let mut opened = HKEY::default();
-    let status =
-        unsafe { RegOpenKeyExW(HKEY_USERS, PCWSTR(name.as_ptr()), None, access, &mut opened) };
-    if status == ERROR_FILE_NOT_FOUND {
-        return Ok(None);
+    open_checked(HKEY_USERS, path, access)
+}
+
+fn open_checked(
+    root: HKEY,
+    path: &str,
+    access: windows::Win32::System::Registry::REG_SAM_FLAGS,
+) -> Result<Option<HKEY>, &'static str> {
+    let mut current = root;
+    let mut owned: Option<HKEY> = None;
+    for part in path.split('\\').filter(|part| !part.is_empty()) {
+        let name = wide_str(part);
+        let mut opened = HKEY::default();
+        let status = unsafe {
+            RegOpenKeyExW(
+                current,
+                PCWSTR(name.as_ptr()),
+                Some(REG_OPTION_OPEN_LINK),
+                access | KEY_QUERY_VALUE,
+                &mut opened,
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND {
+            if let Some(previous) = owned {
+                close(previous);
+            }
+            return Ok(None);
+        }
+        if let Err(error) = win32(status) {
+            if let Some(previous) = owned {
+                close(previous);
+            }
+            return Err(error);
+        }
+        if key_is_link(opened) {
+            close(opened);
+            if let Some(previous) = owned {
+                close(previous);
+            }
+            return Err("link");
+        }
+        if let Some(previous) = owned {
+            close(previous);
+        }
+        owned = Some(opened);
+        current = opened;
     }
-    win32(status)?;
-    Ok(Some(opened))
+    Ok(owned)
+}
+
+fn key_is_link(key: HKEY) -> bool {
+    let name = wide_str("SymbolicLinkValue");
+    let mut kind = REG_VALUE_TYPE::default();
+    let mut size = 0u32;
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(name.as_ptr()),
+            None,
+            Some(&mut kind),
+            None,
+            Some(&mut size),
+        )
+    };
+    status == ERROR_SUCCESS && kind.0 == 6
+}
+
+fn path_is_reparse(path: &Path) -> Result<bool, &'static str> {
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW};
+    let wide = wide_str(&path.display().to_string());
+    let attr = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
+    if attr == u32::MAX {
+        return Err("hive");
+    }
+    Ok(attr & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0)
+}
+
+fn windows_directory() -> Result<String, &'static str> {
+    let value = std::env::var("SystemRoot").map_err(|_| "hive")?;
+    if value.contains("..") || value.contains('%') || value.contains('\0') {
+        return Err("hive");
+    }
+    Ok(value)
+}
+
+fn system_drive(root: &str) -> Result<String, &'static str> {
+    let drive = root.get(..2).ok_or("hive")?;
+    if !drive.as_bytes()[0].is_ascii_alphabetic() || drive.as_bytes()[1] != b':' {
+        return Err("hive");
+    }
+    Ok(drive.to_string())
 }
 
 fn create_users(path: &str) -> Result<HKEY, &'static str> {
-    let name = wide_str(path);
-    let mut opened = HKEY::default();
-    let mut disposition = windows::Win32::System::Registry::REG_CREATE_KEY_DISPOSITION::default();
-    let status = unsafe {
-        RegCreateKeyExW(
-            HKEY_USERS,
-            PCWSTR(name.as_ptr()),
-            None,
-            None,
-            windows::Win32::System::Registry::REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE | KEY_QUERY_VALUE,
-            None,
-            &mut opened,
-            Some(&mut disposition),
-        )
-    };
-    win32(status)?;
-    Ok(opened)
+    let parts: Vec<&str> = path.split('\\').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        return Err("registry");
+    }
+    let mut current = HKEY_USERS;
+    let mut owned: Option<HKEY> = None;
+    for (index, part) in parts.iter().enumerate() {
+        let name = wide_str(part);
+        let mut opened = HKEY::default();
+        let status = unsafe {
+            RegCreateKeyExW(
+                current,
+                PCWSTR(name.as_ptr()),
+                None,
+                None,
+                windows::Win32::System::Registry::REG_OPTION_NON_VOLATILE
+                    | windows::Win32::System::Registry::REG_OPTION_OPEN_LINK,
+                KEY_SET_VALUE | KEY_QUERY_VALUE,
+                None,
+                &mut opened,
+                None,
+            )
+        };
+        if let Err(error) = win32(status) {
+            if let Some(previous) = owned {
+                close(previous);
+            }
+            return Err(error);
+        }
+        if key_is_link(opened) {
+            close(opened);
+            if let Some(previous) = owned {
+                close(previous);
+            }
+            return Err("link");
+        }
+        if let Some(previous) = owned.take() {
+            close(previous);
+        }
+        let _ = index;
+        current = opened;
+        owned = Some(opened);
+    }
+    owned.ok_or("registry")
 }
 
 fn close(key: HKEY) {
@@ -286,21 +394,9 @@ pub fn console_sid() -> Result<String, &'static str> {
     }
     unsafe {
         let mut token = HANDLE::default();
-        if windows::Win32::System::RemoteDesktop::WTSQueryUserToken(session, &mut token).is_ok() {
-            let sid = token_sid(token);
-            let _ = windows::Win32::Foundation::CloseHandle(token);
-            return sid;
+        if windows::Win32::System::RemoteDesktop::WTSQueryUserToken(session, &mut token).is_err() {
+            return Err("sid");
         }
-    }
-    process_sid()
-}
-
-fn process_sid() -> Result<String, &'static str> {
-    use windows::Win32::Security::TOKEN_QUERY;
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    unsafe {
-        let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(|_| "sid")?;
         let sid = token_sid(token);
         let _ = windows::Win32::Foundation::CloseHandle(token);
         sid
@@ -403,19 +499,36 @@ pub fn watch_policy(sid: &str, stop: &AtomicBool, notified: &AtomicBool) {
     }
 }
 
-pub fn lock_host_running() -> bool {
+pub fn lock_host_running() -> HostPresence {
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
     let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        return false;
+        return HostPresence::Unknown;
     };
+    let Ok(service) = std::env::current_exe() else {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+        }
+        return HostPresence::Unknown;
+    };
+    let Some(expected) = service
+        .parent()
+        .map(|dir| dir.join("softlock-lockhost.exe"))
+    else {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+        }
+        return HostPresence::Unknown;
+    };
+    let console = crate::windows::console_session();
+    let console_user = console_sid().ok();
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..PROCESSENTRY32W::default()
     };
-    let mut found = false;
+    let mut found = HostPresence::Dead;
     unsafe {
         if Process32FirstW(snapshot, &mut entry).is_ok() {
             loop {
@@ -427,8 +540,19 @@ pub fn lock_host_running() -> bool {
                         .unwrap_or(entry.szExeFile.len())],
                 );
                 if name.eq_ignore_ascii_case("softlock-lockhost.exe") {
-                    found = true;
-                    break;
+                    match host_matches(
+                        entry.th32ProcessID,
+                        &expected,
+                        console,
+                        console_user.as_deref(),
+                    ) {
+                        HostPresence::Alive => {
+                            found = HostPresence::Alive;
+                            break;
+                        }
+                        HostPresence::Unknown => found = HostPresence::Unknown,
+                        HostPresence::Dead => {}
+                    }
                 }
                 if Process32NextW(snapshot, &mut entry).is_err() {
                     break;
@@ -438,4 +562,65 @@ pub fn lock_host_running() -> bool {
         let _ = windows::Win32::Foundation::CloseHandle(snapshot);
     }
     found
+}
+
+fn host_matches(
+    pid: u32,
+    expected: &Path,
+    console: u32,
+    console_user: Option<&str>,
+) -> HostPresence {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+    use windows::core::PWSTR;
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+    else {
+        return HostPresence::Unknown;
+    };
+    let mut buffer = vec![0u16; 1024];
+    let mut len = buffer.len() as u32;
+    let image = unsafe {
+        let queried = QueryFullProcessImageNameW(
+            process,
+            windows::Win32::System::Threading::PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        );
+        if queried.is_err() {
+            let _ = windows::Win32::Foundation::CloseHandle(process);
+            return HostPresence::Unknown;
+        }
+        String::from_utf16_lossy(&buffer[..len as usize])
+    };
+    let mut session = 0u32;
+    let session_ok = unsafe {
+        windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(pid, &mut session).is_ok()
+    };
+    let token_ok = process_user_sid(process)
+        .ok()
+        .zip(console_user)
+        .is_some_and(|(sid, expected_sid)| sid == expected_sid);
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+    }
+    if same_exe_path(Path::new(&image), expected) && session_ok && session == console && token_ok {
+        HostPresence::Alive
+    } else if !session_ok || console_user.is_none() {
+        HostPresence::Unknown
+    } else {
+        HostPresence::Dead
+    }
+}
+
+fn process_user_sid(process: HANDLE) -> Result<String, &'static str> {
+    use windows::Win32::Security::TOKEN_QUERY;
+    use windows::Win32::System::Threading::OpenProcessToken;
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(process, TOKEN_QUERY, &mut token).map_err(|_| "sid")?;
+        let sid = token_sid(token);
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+        sid
+    }
 }

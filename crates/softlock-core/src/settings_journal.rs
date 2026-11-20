@@ -42,6 +42,9 @@ pub struct SettingEntry {
 #[serde(deny_unknown_fields)]
 pub struct SettingsJournal {
     pub v: u32,
+    /// The user who was locked. Restore writes this hive and no other.
+    #[serde(default)]
+    pub sid: String,
     pub says_locked: bool,
     pub failures: u32,
     pub entries: Vec<SettingEntry>,
@@ -55,6 +58,8 @@ pub enum JournalFault {
     Value,
     Duplicate,
     NotDurable,
+    Sid,
+    Link,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +73,15 @@ pub enum StartAction {
     Idle,
     Revert,
     FailClosed,
+}
+
+/// Whether the Lock Host from this install is still the locked session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostPresence {
+    Alive,
+    Dead,
+    /// A snapshot or token we could not read. A locked journal fails closed.
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +132,7 @@ impl SettingsJournal {
     pub fn empty() -> Self {
         Self {
             v: JOURNAL_VERSION,
+            sid: String::new(),
             says_locked: false,
             failures: 0,
             entries: Vec::new(),
@@ -150,14 +165,19 @@ pub fn allowed_previous(value: SettingValue) -> bool {
 }
 
 pub fn task_manager_document(
+    sid: &str,
     previous: SettingValue,
     failures: u32,
 ) -> Result<SettingsJournal, JournalFault> {
+    if !sid_is_safe(sid) {
+        return Err(JournalFault::Sid);
+    }
     if !allowed_previous(previous) {
         return Err(JournalFault::Value);
     }
     Ok(SettingsJournal {
         v: JOURNAL_VERSION,
+        sid: sid.to_string(),
         says_locked: true,
         failures,
         entries: vec![SettingEntry {
@@ -185,6 +205,15 @@ pub fn parse_document(bytes: &[u8]) -> Result<SettingsJournal, JournalFault> {
 fn validate(doc: &SettingsJournal) -> Result<(), JournalFault> {
     if doc.v != JOURNAL_VERSION {
         return Err(JournalFault::Version);
+    }
+    if doc.is_empty() {
+        if doc.sid.is_empty() || sid_is_safe(&doc.sid) {
+            return Ok(());
+        }
+        return Err(JournalFault::Sid);
+    }
+    if !sid_is_safe(&doc.sid) {
+        return Err(JournalFault::Sid);
     }
     let mut seen = std::collections::BTreeSet::new();
     for entry in &doc.entries {
@@ -241,16 +270,26 @@ pub fn commit_then_change<E>(
 pub fn service_start_action(
     doc: &SettingsJournal,
     console_active: bool,
-    host_alive: bool,
+    host: HostPresence,
 ) -> StartAction {
     if doc.is_empty() {
         return StartAction::Idle;
     }
-    if doc.says_locked && console_active && host_alive {
+    let live = doc.says_locked
+        && (host == HostPresence::Unknown || (console_active && host == HostPresence::Alive));
+    if live {
         StartAction::FailClosed
     } else {
         StartAction::Revert
     }
+}
+
+/// The hive written at lock time. The console user is not a substitute.
+pub fn restore_sid(doc: &SettingsJournal) -> Result<&str, JournalFault> {
+    if !sid_is_safe(&doc.sid) {
+        return Err(JournalFault::Sid);
+    }
+    Ok(doc.sid.as_str())
 }
 
 pub fn repair_action(state: ProductState) -> RepairAction {
@@ -285,50 +324,184 @@ pub fn admit_directory(facts: DirFacts) -> Result<(), DirFault> {
     Ok(())
 }
 
-/// SYSTEM may run only an installed executable. A user-writable path is refused.
-pub fn executable_may_run_as_system(path: &Path) -> bool {
-    let text = path.to_string_lossy();
-    if text.is_empty() || text.contains('"') || text.contains('\'') {
-        return false;
+/// The task may run only this service image, after `..` is rejected and the
+/// path is one of the installed locations. A prefix or substring match is not enough.
+pub fn executable_may_run_as_system(candidate: &Path, service_image: &Path) -> bool {
+    match (lexical_exe(candidate), lexical_exe(service_image)) {
+        (Some(candidate), Some(image)) => candidate == image && trusted_install(&image),
+        _ => false,
     }
-    let lower = text.replace('/', "\\").to_ascii_lowercase();
-    let absolute =
-        lower.starts_with('\\') || (lower.len() > 2 && lower.as_bytes().get(1) == Some(&b':'));
-    if !absolute {
-        return false;
-    }
-    if !lower.ends_with(".exe") {
-        return false;
-    }
-    const WRITABLE: &[&str] = &[
-        "\\users\\",
-        "\\temp\\",
-        "\\tmp\\",
-        "\\appdata\\",
-        "\\programdata\\",
-        "\\windows\\temp\\",
-    ];
-    if WRITABLE.iter().any(|part| lower.contains(part)) {
-        return false;
-    }
-    const TRUSTED: &[&str] = &[
-        "\\program files\\",
-        "\\program files (x86)\\",
-        "\\windows\\system32\\",
-        "\\windows\\syswow64\\",
-    ];
-    TRUSTED.iter().any(|part| lower.contains(part))
 }
 
+/// Same executable path. `..` and a non-exe are not the same as anything.
+pub fn same_exe_path(left: &Path, right: &Path) -> bool {
+    match (lexical_exe(left), lexical_exe(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn lexical_exe(path: &Path) -> Option<String> {
+    let text = path.to_string_lossy().replace('/', "\\");
+    if text.is_empty()
+        || text.contains('"')
+        || text.contains('\'')
+        || text.contains("..")
+        || text.contains('.') && text.split('\\').any(|part| part == ".")
+    {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    let absolute =
+        lower.starts_with('\\') || (lower.len() > 2 && lower.as_bytes().get(1) == Some(&b':'));
+    if !absolute || !lower.ends_with(".exe") {
+        return None;
+    }
+    Some(lower)
+}
+
+fn trusted_install(lower: &str) -> bool {
+    let parts: Vec<&str> = lower.split('\\').filter(|part| !part.is_empty()).collect();
+    if parts.iter().any(|part| *part == "." || *part == "..") {
+        return false;
+    }
+    let body = if parts.first().is_some_and(|part| part.ends_with(':')) {
+        &parts[1..]
+    } else {
+        &parts[..]
+    };
+    component_prefix(body, &["program files"])
+        || component_prefix(body, &["program files (x86)"])
+        || component_prefix(body, &["windows", "system32"])
+        || component_prefix(body, &["windows", "syswow64"])
+}
+
+fn component_prefix(body: &[&str], prefix: &[&str]) -> bool {
+    body.len() > prefix.len() && body[..prefix.len()] == prefix[..]
+}
+
+/// A locked user is a domain account (`S-1-5-21-` plus a rid). Service accounts are not.
 pub fn sid_is_safe(sid: &str) -> bool {
-    sid.len() > 4
-        && sid.len() < 96
-        && sid.starts_with("S-1-")
-        && !sid.ends_with('-')
-        && !sid.contains("--")
-        && sid[4..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+    let Some(rest) = sid.strip_prefix("S-1-5-21-") else {
+        return false;
+    };
+    if sid.len() >= 96 {
+        return false;
+    }
+    let parts: Vec<&str> = rest.split('-').collect();
+    parts.len() >= 4
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Expand only `%SystemRoot%` and `%SystemDrive%`. Any other variable, `..`, or a
+/// non-absolute result is refused.
+pub fn expand_profile_image(
+    raw: &str,
+    system_root: &str,
+    system_drive: &str,
+) -> Result<String, JournalFault> {
+    if raw.is_empty()
+        || raw.contains('\0')
+        || raw.contains("..")
+        || raw.contains('/')
+        || system_root.is_empty()
+        || system_root.contains('%')
+        || system_root.contains("..")
+        || system_drive.len() != 2
+        || !system_drive.as_bytes()[0].is_ascii_alphabetic()
+        || system_drive.as_bytes()[1] != b':'
+    {
+        return Err(JournalFault::Value);
+    }
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('%') else {
+            return Err(JournalFault::Value);
+        };
+        let value = match &after[..end] {
+            "SystemRoot" => system_root,
+            "SystemDrive" => system_drive,
+            _ => return Err(JournalFault::Value),
+        };
+        out.push_str(value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    hive_target_allowed(&out, false, false, false)?;
+    Ok(out)
+}
+
+/// A reparse point on the profile or hive file, or a REG_LINK on the key path, blocks the load.
+pub fn hive_target_allowed(
+    expanded: &str,
+    profile_reparse: bool,
+    file_reparse: bool,
+    key_is_link: bool,
+) -> Result<(), JournalFault> {
+    if profile_reparse || file_reparse || key_is_link {
+        return Err(JournalFault::Link);
+    }
+    let bytes = expanded.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return Err(JournalFault::Value);
+    }
+    if expanded.contains("..") || expanded.contains('/') || expanded.contains('%') {
+        return Err(JournalFault::Value);
+    }
+    Ok(())
+}
+
+/// The systemprofile parent may grant SYSTEM and Administrators only.
+pub fn parent_dacl_trusted(text: &str) -> bool {
+    let text = text
+        .trim()
+        .replace("S-1-5-18", "SY")
+        .replace("S-1-5-32-544", "BA");
+    let mut trusted = false;
+    for ace in text.split_inclusive(')') {
+        let ace = ace.trim();
+        if !ace.contains(";;;") {
+            continue;
+        }
+        if ace.contains("(D;") {
+            return false;
+        }
+        let allow = ace.ends_with(";;;SY)") || ace.ends_with(";;;BA)") || inherit_only_creator(ace);
+        if allow {
+            trusted = true;
+        } else {
+            return false;
+        }
+    }
+    trusted
+}
+
+fn inherit_only_creator(ace: &str) -> bool {
+    let mut parts = ace.trim_matches(|c| c == '(' || c == ')').split(';');
+    let _kind = parts.next();
+    let flags = parts.next().unwrap_or("");
+    let _rights = parts.next();
+    let _object = parts.next();
+    let _inherited = parts.next();
+    let sid = parts.next().unwrap_or("");
+    sid == "CO" && flag_codes(flags).any(|code| code == "IO")
+}
+
+fn flag_codes(flags: &str) -> impl Iterator<Item = &str> {
+    let mut rest = flags;
+    std::iter::from_fn(move || {
+        if rest.len() < 2 {
+            return None;
+        }
+        let (code, next) = rest.split_at(2);
+        rest = next;
+        Some(code)
+    })
 }
 
 pub fn repair_entry_name() -> String {
@@ -343,6 +516,8 @@ pub fn fault_log(fault: JournalFault) -> &'static str {
         JournalFault::Value => "value",
         JournalFault::Duplicate => "duplicate",
         JournalFault::NotDurable => "not-durable",
+        JournalFault::Sid => "sid",
+        JournalFault::Link => "link",
     }
 }
 
@@ -393,6 +568,9 @@ pub fn dir_fault_log(fault: DirFault) -> &'static str {
 mod tests {
     use super::*;
 
+    const ALICE: &str = "S-1-5-21-1-2-3-1001";
+    const BOB: &str = "S-1-5-21-9-8-7-2002";
+
     #[test]
     fn absent_zero_and_admin_one_restore_exactly() {
         let absent =
@@ -434,14 +612,14 @@ mod tests {
         );
         assert_eq!(err, Err(JournalFault::Value));
         assert_eq!(
-            task_manager_document(SettingValue::Dword { value: 7 }, 0),
+            task_manager_document(ALICE, SettingValue::Dword { value: 7 }, 0),
             Err(JournalFault::Value)
         );
     }
 
     #[test]
     fn the_document_rejects_unknown_targets_and_types() {
-        let ok = task_manager_document(SettingValue::Absent, 3).expect("doc");
+        let ok = task_manager_document(ALICE, SettingValue::Absent, 3).expect("doc");
         let bytes = encode_document(&ok).expect("encode");
         assert_eq!(parse_document(&bytes).expect("parse"), ok);
         assert!(parse_document(br#"{"v":1,"says_locked":true,"failures":0,"entries":[{"target":"NoClose","previous":{"kind":"absent"},"new_value":{"kind":"dword","value":1}}]}"#).is_err());
@@ -458,7 +636,7 @@ mod tests {
 
     #[test]
     fn duplicate_entries_are_rejected() {
-        let mut doc = task_manager_document(SettingValue::Absent, 0).expect("doc");
+        let mut doc = task_manager_document(ALICE, SettingValue::Absent, 0).expect("doc");
         doc.entries.push(doc.entries[0].clone());
         assert_eq!(encode_document(&doc), Err(JournalFault::Duplicate));
     }
@@ -490,29 +668,40 @@ mod tests {
     #[test]
     fn startup_covers_each_session_and_host_branch() {
         let empty = SettingsJournal::empty();
-        assert_eq!(service_start_action(&empty, true, true), StartAction::Idle);
-        let mut locked = task_manager_document(SettingValue::Absent, 0).expect("doc");
         assert_eq!(
-            service_start_action(&locked, true, true),
+            service_start_action(&empty, true, HostPresence::Alive),
+            StartAction::Idle
+        );
+        let mut locked = task_manager_document(ALICE, SettingValue::Absent, 0).expect("doc");
+        assert_eq!(
+            service_start_action(&locked, true, HostPresence::Alive),
             StartAction::FailClosed
         );
         assert_eq!(
-            service_start_action(&locked, true, false),
+            service_start_action(&locked, true, HostPresence::Dead),
             StartAction::Revert
         );
         assert_eq!(
-            service_start_action(&locked, false, true),
+            service_start_action(&locked, false, HostPresence::Alive),
             StartAction::Revert
+        );
+        assert_eq!(
+            service_start_action(&locked, false, HostPresence::Unknown),
+            StartAction::FailClosed
+        );
+        assert_eq!(
+            service_start_action(&locked, true, HostPresence::Unknown),
+            StartAction::FailClosed
         );
         locked.says_locked = false;
         assert_eq!(
-            service_start_action(&locked, true, true),
+            service_start_action(&locked, true, HostPresence::Alive),
             StartAction::Revert
         );
         let mut failures = SettingsJournal::empty();
         failures.failures = 4;
         assert_eq!(
-            service_start_action(&failures, false, false),
+            service_start_action(&failures, false, HostPresence::Dead),
             StartAction::Revert
         );
     }
@@ -605,30 +794,90 @@ mod tests {
 
     #[test]
     fn system_does_not_run_an_executable_from_a_user_writable_path() {
-        assert!(executable_may_run_as_system(Path::new(
-            r"C:\Program Files\SoftLock\softlock-service.exe"
-        )));
-        assert!(executable_may_run_as_system(Path::new(
-            r"C:\Windows\System32\softlock-service.exe"
-        )));
-        assert!(!executable_may_run_as_system(Path::new(
-            r"C:\Users\Public\softlock-service.exe"
-        )));
-        assert!(!executable_may_run_as_system(Path::new(
-            r"C:\Windows\Temp\softlock-service.exe"
-        )));
-        assert!(!executable_may_run_as_system(Path::new(
-            r"C:\ProgramData\SoftLock\softlock-service.exe"
-        )));
-        assert!(!executable_may_run_as_system(Path::new(
-            "softlock-service.exe"
-        )));
-        assert!(!executable_may_run_as_system(Path::new("")));
-        assert_eq!(repair_entry_name(), "Repair SoftLock settings");
-        assert!(sid_is_safe("S-1-5-21-1-2-3-4"));
+        let image_text = format!(r"C:\Program Files\{PRODUCT_DISPLAY_NAME}\softlock-service.exe");
+        let image = Path::new(&image_text);
+        let system = Path::new(r"C:\Windows\System32\softlock-service.exe");
+        assert!(executable_may_run_as_system(image, image));
+        assert!(executable_may_run_as_system(system, system));
+        assert!(!executable_may_run_as_system(system, image));
+        assert!(!executable_may_run_as_system(
+            Path::new(r"C:\Program Files\Other\softlock-service.exe"),
+            image
+        ));
+        assert!(!executable_may_run_as_system(
+            Path::new(r"C:\Program Files\..\Users\Public\softlock-service.exe"),
+            Path::new(r"C:\Program Files\..\Users\Public\softlock-service.exe")
+        ));
+        assert!(!executable_may_run_as_system(
+            Path::new(r"C:\Users\Public\softlock-service.exe"),
+            Path::new(r"C:\Users\Public\softlock-service.exe")
+        ));
+        assert!(!executable_may_run_as_system(
+            Path::new(r"C:\Windows\Temp\softlock-service.exe"),
+            Path::new(r"C:\Windows\Temp\softlock-service.exe")
+        ));
+        assert!(!executable_may_run_as_system(
+            Path::new("softlock-service.exe"),
+            image
+        ));
+        assert!(!executable_may_run_as_system(Path::new(""), image));
+        assert_eq!(
+            repair_entry_name(),
+            format!("Repair {PRODUCT_DISPLAY_NAME} settings")
+        );
+        assert!(sid_is_safe(ALICE));
+        assert!(!sid_is_safe("S-1-5-18"));
+        assert!(!sid_is_safe("S-1-5-19"));
+        assert!(!sid_is_safe("S-1-5-20"));
+        assert!(!sid_is_safe("S-1-5-80-1"));
         assert!(!sid_is_safe("S-1-5-21-1-2-3-4\\ntuser"));
         assert!(!sid_is_safe(""));
         assert!(!sid_is_safe("S-1-"));
+    }
+
+    #[test]
+    fn restore_uses_the_locked_user_not_whoever_is_on_the_console() {
+        let doc = task_manager_document(ALICE, SettingValue::Dword { value: 0 }, 0).expect("doc");
+        assert_eq!(restore_sid(&doc).expect("sid"), ALICE);
+        assert_ne!(restore_sid(&doc).expect("sid"), BOB);
+        let mut bob = doc.clone();
+        bob.sid = BOB.to_string();
+        assert_eq!(restore_sid(&bob).expect("bob"), BOB);
+        assert_ne!(restore_sid(&bob).expect("bob"), ALICE);
+    }
+
+    #[test]
+    fn a_planted_hive_link_is_refused_and_only_two_variables_expand() {
+        let expanded = expand_profile_image(r"%SystemDrive%\Users\Example", r"C:\Windows", "C:")
+            .expect("expand");
+        assert_eq!(expanded, r"C:\Users\Example");
+        assert!(expand_profile_image(r"%SystemRoot%\..\Users", r"C:\Windows", "C:").is_err());
+        assert!(expand_profile_image(r"%USERPROFILE%\ntuser", r"C:\Windows", "C:").is_err());
+        assert_eq!(
+            hive_target_allowed(r"C:\Users\Example", true, false, false),
+            Err(JournalFault::Link)
+        );
+        assert_eq!(
+            hive_target_allowed(r"C:\Users\Example", false, true, false),
+            Err(JournalFault::Link)
+        );
+        assert_eq!(
+            hive_target_allowed(r"C:\Users\Example", false, false, true),
+            Err(JournalFault::Link)
+        );
+        assert!(hive_target_allowed(r"C:\Users\Example", false, false, false).is_ok());
+        assert!(parent_dacl_trusted(
+            "D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)"
+        ));
+        assert!(parent_dacl_trusted(
+            "D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIIO;FA;;;CO)"
+        ));
+        assert!(!parent_dacl_trusted(
+            "D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BU)"
+        ));
+        assert!(!parent_dacl_trusted(
+            "D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;S-1-5-21-1-2-3-1001)"
+        ));
     }
 
     #[test]
@@ -654,6 +903,8 @@ mod tests {
             JournalFault::Value,
             JournalFault::Duplicate,
             JournalFault::NotDurable,
+            JournalFault::Sid,
+            JournalFault::Link,
         ] {
             assert!(!fault_log(fault).is_empty());
         }
@@ -688,6 +939,9 @@ mod tests {
             "SOFTLOCK_JOURNAL_LIVE",
             "restore",
             "recover-active",
+            "LocalSystem",
+            "service.log",
+            "journal-dir.txt",
             "windows-2022",
             "windows-2025",
         ] {

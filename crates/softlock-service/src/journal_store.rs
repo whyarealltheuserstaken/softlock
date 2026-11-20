@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 
 use softlock_core::SERVICE_NAME;
 
-use softlock_core::journal_dacl_exact;
+use softlock_core::{journal_dacl_exact, parent_dacl_trusted};
 
 use crate::secrets::{
-    already_exists_io, create_directory_with, create_relative, dacl_sddl_handle, delete_by_handle,
-    drop_handle, handle_is_reparse, link_count, list_directory_names, not_found, open_directory,
-    open_relative, owner_is_trusted, read_handle_text, rename_relative, write_all_handle,
+    already_exists_io, create_directory_relative, create_relative, dacl_sddl_handle,
+    delete_by_handle, drop_handle, enable_privilege_scoped, handle_is_reparse, link_count,
+    list_directory_names, not_found, open_directory, open_relative, owner_is_trusted,
+    read_handle_text, rename_relative, write_all_handle,
 };
 use crate::service_data_directory;
 
@@ -115,22 +116,52 @@ fn verified_directory() -> io::Result<windows::Win32::Foundation::HANDLE> {
 }
 
 fn create_journal_directory(path: &Path) -> io::Result<()> {
-    let Some(parent) = path.parent() else {
+    let Some(parent_path) = path.parent() else {
         return Err(io::Error::other("unreadable"));
     };
-    match open_directory(parent, false) {
-        Ok(handle) => drop_handle(handle),
-        Err(_) => return Err(io::Error::other("unreadable")),
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(io::Error::other("unreadable"));
+    };
+    let parent = open_directory(parent_path, true)?;
+    if let Err(error) = trusted_parent(parent) {
+        drop_handle(parent);
+        return Err(error);
     }
-    match create_directory_with(path, Some(JOURNAL_SECURITY_SYSTEM)) {
+    let _restore = match enable_privilege_scoped(windows::Win32::Security::SE_RESTORE_NAME) {
+        Ok(guard) => guard,
+        Err(error) => {
+            drop_handle(parent);
+            return Err(error);
+        }
+    };
+    let created =
+        create_directory_relative(name, parent, JOURNAL_SECURITY_SYSTEM).or_else(|error| {
+            if already_exists_io(&error) {
+                Ok(())
+            } else {
+                create_directory_relative(name, parent, JOURNAL_SECURITY_ADMINS)
+            }
+        });
+    drop_handle(parent);
+    match created {
         Ok(()) => Ok(()),
         Err(error) if already_exists_io(&error) => Ok(()),
-        Err(_) => match create_directory_with(path, Some(JOURNAL_SECURITY_ADMINS)) {
-            Ok(()) => Ok(()),
-            Err(error) if already_exists_io(&error) => Ok(()),
-            Err(error) => Err(error),
-        },
+        Err(error) => Err(error),
     }
+}
+
+fn trusted_parent(handle: windows::Win32::Foundation::HANDLE) -> io::Result<()> {
+    if handle_is_reparse(handle)? {
+        return Err(io::Error::other("reparse"));
+    }
+    if !owner_is_trusted(handle)? {
+        return Err(io::Error::other("user-owned"));
+    }
+    let dacl = dacl_sddl_handle(handle)?;
+    if !parent_dacl_trusted(&dacl) {
+        return Err(io::Error::other("acl"));
+    }
+    Ok(())
 }
 
 fn verify_directory(handle: windows::Win32::Foundation::HANDLE) -> io::Result<()> {

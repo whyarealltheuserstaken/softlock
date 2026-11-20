@@ -1134,6 +1134,8 @@ const FILE_OPEN: u32 = 1;
 #[cfg(windows)]
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 #[cfg(windows)]
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+#[cfg(windows)]
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 #[cfg(windows)]
 const FILE_OPEN_REPARSE_POINT_OPTION: u32 = 0x0020_0000;
@@ -1283,6 +1285,62 @@ pub(crate) fn create_relative(
         }
     })?;
     Ok(HANDLE(raw))
+}
+
+#[cfg(windows)]
+pub(crate) fn create_directory_relative(
+    name: &str,
+    directory: windows::Win32::Foundation::HANDLE,
+    sddl: &str,
+) -> io::Result<()> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    let descriptor = security_descriptor_from(sddl)?;
+    let mut wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut unicode = UnicodeString {
+        length: ((wide_name.len() - 1) * 2) as u16,
+        maximum_length: (wide_name.len() * 2) as u16,
+        buffer: wide_name.as_mut_ptr(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: directory.0,
+        object_name: &mut unicode,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: descriptor.0,
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut iosb = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut raw = std::ptr::null_mut();
+    let access = FILE_READ_ACCESS | FILE_WRITE_ACCESS | 0x0002_0000 | 0x0010_0000 | 0x0001_0000;
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw,
+            access,
+            &mut attributes,
+            &mut iosb,
+            std::ptr::null_mut(),
+            FILE_ATTRIBUTE_NORMAL.0,
+            0,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT_OPTION,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    free_descriptor(&descriptor);
+    nt_result(status).map_err(|error| {
+        if already_exists_io(&error) {
+            io::Error::new(io::ErrorKind::AlreadyExists, "directory exists")
+        } else {
+            error
+        }
+    })?;
+    drop_handle(HANDLE(raw));
+    Ok(())
 }
 
 #[cfg(windows)]
