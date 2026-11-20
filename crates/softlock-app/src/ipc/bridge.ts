@@ -23,6 +23,7 @@ export interface OwnerView {
   quit: boolean;
   serviceStop: boolean;
   fieldError: string | null;
+  notice: string;
 }
 
 /** Same shape as the Tauri `platform_status` command. */
@@ -45,6 +46,8 @@ declare global {
     __SOFTLOCK_PLATFORM_STATUS__?: PlatformStatus;
     __SOFTLOCK_PUSH_STATE__?: (state: string) => void;
     __SOFTLOCK_FAIL_PIPE__?: () => void;
+    __SOFTLOCK_PIN_RESULT__?: string;
+    __SOFTLOCK_SET_NOTICE__?: (notice: string) => void;
   }
 }
 
@@ -61,6 +64,9 @@ export function pinErrorText(code: string | null): string | null {
   if (code === "too-short") {
     return ui.pinTooShort;
   }
+  if (code === "confirmation-needed") {
+    return ui.confirmationNeeded;
+  }
   return null;
 }
 
@@ -75,6 +81,7 @@ function emptyView(): OwnerView {
     quit: false,
     serviceStop: false,
     fieldError: null,
+    notice: "",
   };
 }
 
@@ -106,6 +113,10 @@ class FakeBridge implements IpcBridge {
     };
     window.__SOFTLOCK_FAIL_PIPE__ = () => {
       this.view = failClosed(this.view);
+      this.emit();
+    };
+    window.__SOFTLOCK_SET_NOTICE__ = (notice: string) => {
+      this.view = { ...this.view, notice };
       this.emit();
     };
   }
@@ -145,6 +156,11 @@ class FakeBridge implements IpcBridge {
   async setPin(pin: string): Promise<OwnerView> {
     if ([...pin].length < MIN_PIN_LEN) {
       this.view = { ...this.view, fieldError: "too-short" };
+      this.emit();
+      return this.view;
+    }
+    if (window.__SOFTLOCK_PIN_RESULT__ === "needs-confirmation") {
+      this.view = { ...this.view, fieldError: "confirmation-needed" };
       this.emit();
       return this.view;
     }
@@ -282,6 +298,7 @@ class TauriBridge implements IpcBridge {
       lockSource: source,
       sources,
       serviceStop: false,
+      notice: dto.notice ?? this.view.notice,
     };
     this.emit();
   }
@@ -300,6 +317,7 @@ interface ViewDto {
   lock_source: string | null;
   status_line: string;
   service_line: string;
+  notice?: string;
 }
 
 export function createIpcBridge(): IpcBridge {

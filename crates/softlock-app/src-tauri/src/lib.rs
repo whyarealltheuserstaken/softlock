@@ -8,8 +8,6 @@ use zeroize::Zeroize;
 
 use actions::{pin_field_error, service_line, status_line};
 use client::OwnerView;
-#[cfg(windows)]
-use softlock_core::LockSource;
 use softlock_core::Secret;
 
 #[derive(Clone, serde::Serialize)]
@@ -26,6 +24,7 @@ struct OwnerViewDto {
     lock_source: Option<String>,
     status_line: String,
     service_line: String,
+    notice: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -74,6 +73,18 @@ fn view_dto(view: &OwnerView) -> OwnerViewDto {
             .map(str::to_string),
         status_line: status_line(view.service_running, view.state),
         service_line: service_line(view.service_running).to_string(),
+        notice: shown_notice(),
+    }
+}
+
+fn shown_notice() -> String {
+    #[cfg(windows)]
+    {
+        owner::current_notice()
+    }
+    #[cfg(not(windows))]
+    {
+        String::new()
     }
 }
 
@@ -101,7 +112,7 @@ fn owner_view() -> OwnerViewDto {
 #[tauri::command]
 fn lock_from_app() -> OwnerViewDto {
     #[cfg(windows)]
-    owner::send_lock(LockSource::App);
+    owner::lock_from_app();
     view_dto(&shown_view())
 }
 
@@ -117,15 +128,28 @@ fn set_pin(mut pin: String) -> PinOutcome {
     let secret = Secret::new(pin.as_bytes());
     pin.zeroize();
     #[cfg(windows)]
-    let accepted = owner::send_pin(secret);
+    {
+        pin_outcome(owner::send_pin(secret))
+    }
     #[cfg(not(windows))]
-    let accepted = {
+    {
         drop(secret);
-        false
-    };
+        PinOutcome {
+            accepted: false,
+            field_error: None,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn pin_outcome(outcome: owner::PinSend) -> PinOutcome {
     PinOutcome {
-        accepted,
-        field_error: None,
+        accepted: matches!(outcome, owner::PinSend::Stored),
+        field_error: if matches!(outcome, owner::PinSend::NeedsConfirmation) {
+            Some("confirmation-needed".to_string())
+        } else {
+            None
+        },
     }
 }
 

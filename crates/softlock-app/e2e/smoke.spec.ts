@@ -66,6 +66,26 @@ test("settings rejects a too-short pin and sets a long enough pin", async ({ pag
   await expect(page.locator("main")).toHaveAttribute("data-set-pin", "1");
 });
 
+test("a missing hotkey is shown in the window", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => window.__SOFTLOCK_SET_NOTICE__?.("hotkey unavailable"));
+  await expect(page.getByTestId("hotkey-notice")).toHaveText("hotkey unavailable");
+  await expect(page.locator("main")).toHaveAttribute("data-notice", "hotkey unavailable");
+});
+
+test("a pin that needs confirmation is not treated as a lock failure", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    window.__SOFTLOCK_PIN_RESULT__ = "needs-confirmation";
+  });
+  await page.getByTestId("pin").fill("1357");
+  await page.getByTestId("set-pin").click();
+  await expect(page.getByTestId("pin-error")).toHaveText("Confirmation needed");
+  await expect(page.locator("main")).toHaveAttribute("data-locked", "off");
+  await expect(page.locator("main")).toHaveAttribute("data-set-pin", "0");
+  await expect(page.getByTestId("service-line")).toHaveText("Service running");
+});
+
 test("quitting the app does not stop the service", async ({ page }) => {
   await page.goto("/");
   await page.getByTestId("tray-quit").click();
