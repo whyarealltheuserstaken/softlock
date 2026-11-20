@@ -528,9 +528,10 @@ pub fn lock_host_running() -> HostPresence {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..PROCESSENTRY32W::default()
     };
-    let mut found = HostPresence::Dead;
+    let mut found = HostPresence::Unknown;
     unsafe {
         if Process32FirstW(snapshot, &mut entry).is_ok() {
+            found = HostPresence::Dead;
             loop {
                 let name = String::from_utf16_lossy(
                     &entry.szExeFile[..entry
@@ -597,16 +598,19 @@ fn host_matches(
     let session_ok = unsafe {
         windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(pid, &mut session).is_ok()
     };
-    let token_ok = process_user_sid(process)
-        .ok()
-        .zip(console_user)
-        .is_some_and(|(sid, expected_sid)| sid == expected_sid);
+    let token = process_user_sid(process);
     unsafe {
         let _ = windows::Win32::Foundation::CloseHandle(process);
     }
-    if same_exe_path(Path::new(&image), expected) && session_ok && session == console && token_ok {
+    let path_ok = same_exe_path(Path::new(&image), expected);
+    let token_failed = token.is_err();
+    let token_ok = token
+        .ok()
+        .zip(console_user)
+        .is_some_and(|(sid, expected_sid)| sid == expected_sid);
+    if path_ok && session_ok && session == console && token_ok {
         HostPresence::Alive
-    } else if !session_ok || console_user.is_none() {
+    } else if path_ok && (token_failed || !session_ok || console_user.is_none()) {
         HostPresence::Unknown
     } else {
         HostPresence::Dead
