@@ -8,7 +8,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -54,7 +54,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{WTS_SESSION_LOCK, WTS_SESSION_UNLOCK};
 use windows::core::{PCWSTR, PWSTR};
 
-use crate::authority::{Authority, HostAction};
+use crate::authority::{Authority, HostAction, HostLoss};
 use crate::log::FileLog;
 use crate::platform::{ArmWait, OsLock, ServicePlatform};
 use crate::secrets::PinStore;
@@ -78,10 +78,81 @@ pub fn console_session() -> u32 {
 }
 
 pub fn lock_session(session: u32) -> Result<(), OsLockError> {
+    let caller = planned_caller();
+    run_os_lock(session, caller)
+}
+
+pub fn schedule_os_lock(session: u32) {
+    let caller = planned_caller();
+    *DEFERRED.lock().unwrap_or_else(|poison| poison.into_inner()) =
+        Some(DeferredLock { session, caller });
+}
+
+pub fn chain_running() -> bool {
+    CHAIN_RUNNING.load(Ordering::Acquire)
+}
+
+pub fn mark_host_unavailable(loss: HostLoss) {
+    let code = match loss {
+        HostLoss::Exited => LOSS_EXITED,
+        HostLoss::Silent => LOSS_SILENT,
+        HostLoss::GuardDown => LOSS_NONE,
+    };
+    if code != LOSS_NONE {
+        LOSS.store(code, Ordering::Release);
+        forget_host_writer();
+    }
+}
+
+/// Runs a scheduled OS lock. The caller must not hold the authority mutex.
+pub fn drain_os_lock(authority: &Arc<Mutex<Authority>>) {
+    let job = DEFERRED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    let Some(job) = job else {
+        return;
+    };
+    if CHAIN_RUNNING.swap(true, Ordering::AcqRel) {
+        *DEFERRED.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(job);
+        return;
+    }
+    let result = run_os_lock(job.session, job.caller);
+    {
+        let mut guard = authority
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if result.is_ok() {
+            guard.note_os_lock_held();
+            guard.notify(Event::OsLockConfirmed);
+        }
+    }
+    CHAIN_RUNNING.store(false, Ordering::Release);
+}
+
+fn planned_caller() -> softlock_core::Caller {
+    let alive = HOST_TX
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .is_some();
+    let loss = match LOSS.load(Ordering::Acquire) {
+        LOSS_EXITED => Some(softlock_core::FailReason::HostExited),
+        LOSS_SILENT => Some(softlock_core::FailReason::HeartbeatMissed),
+        _ => None,
+    };
+    softlock_core::caller_for_service(alive, loss)
+}
+
+fn run_os_lock(session: u32, caller: softlock_core::Caller) -> Result<(), OsLockError> {
     if stub_os_lock() {
         return Err(OsLockError::Failed);
     }
-    let result = softlock_windows::run_service(session, request_host_primary);
+    let result = match caller {
+        softlock_core::Caller::Service => softlock_windows::run_service_disconnect(session),
+        _ => softlock_windows::run_service(session, request_host_primary),
+    };
+    let elapsed_us = u64::try_from(result.elapsed.as_micros()).unwrap_or(u64::MAX);
+    let elapsed_us = elapsed_us.to_string();
     for error in &result.errors {
         crate::audit("os-lock", &[("error", error)]);
     }
@@ -92,16 +163,15 @@ pub fn lock_session(session: u32) -> Result<(), OsLockError> {
                 &[
                     ("result", "confirmed"),
                     ("method", method.name()),
+                    ("caller", caller.name()),
+                    ("elapsed_us", &elapsed_us),
                     ("policy", softlock_core::policy_seam()),
                 ],
             );
             Ok(())
         }
         softlock_core::Outcome::FailedClosed { attempts } => {
-            let detail = softlock_core::failed_closed_log(
-                softlock_core::Caller::ServiceCoordinated,
-                &attempts,
-            );
+            let detail = softlock_core::failed_closed_log(caller, &attempts);
             crate::audit(
                 "os-lock",
                 &[("result", "failed-closed"), ("detail", &detail)],
@@ -140,6 +210,18 @@ fn forget_host_writer() {
 }
 
 static HOST_TX: Mutex<Option<Sender<Vec<u8>>>> = Mutex::new(None);
+static DEFERRED: Mutex<Option<DeferredLock>> = Mutex::new(None);
+static CHAIN_RUNNING: AtomicBool = AtomicBool::new(false);
+static LOSS: AtomicU8 = AtomicU8::new(LOSS_NONE);
+
+const LOSS_NONE: u8 = 0;
+const LOSS_EXITED: u8 = 1;
+const LOSS_SILENT: u8 = 2;
+
+struct DeferredLock {
+    session: u32,
+    caller: softlock_core::Caller,
+}
 
 pub fn run_foreground() -> i32 {
     serve(None)
@@ -327,6 +409,7 @@ fn serve(probe: Option<PathBuf>) -> i32 {
     };
     while !STOP.load(Ordering::Acquire) {
         apply_session_events(&authority, &session_rx);
+        note_stop_file();
         poll_stop(&authority);
         thread::sleep(Duration::from_millis(20));
     }
@@ -374,6 +457,15 @@ fn apply_session_events(authority: &Arc<Mutex<Authority>>, events: &Receiver<Ses
 
 /// Stop is accepted only from `Unlocked` or after the OS lock is confirmed.
 /// `Locked`, `Arming`, and `FailingClosed` stay up when that confirmation fails.
+fn note_stop_file() {
+    let Ok(path) = std::env::var("SOFTLOCK_STOP_FILE") else {
+        return;
+    };
+    if live_hooks_allowed() && Path::new(&path).is_file() {
+        STOP_REQUESTED.store(true, Ordering::Release);
+    }
+}
+
 fn poll_stop(authority: &Arc<Mutex<Authority>>) {
     if !STOP_REQUESTED.swap(false, Ordering::AcqRel) {
         return;
@@ -388,6 +480,7 @@ fn poll_stop(authority: &Arc<Mutex<Authority>>) {
             LockState::Unlocked | LockState::OsLocked { .. }
         )
     };
+    drain_os_lock(authority);
     if allow {
         crate::audit("service-stop", &[("result", "accepted")]);
         STOP.store(true, Ordering::Release);
@@ -430,6 +523,7 @@ fn supervise(
             .try_lock()
             .map(|mut guard| guard.poll_host(Instant::now(), alive))
             .unwrap_or(HostAction::Hold);
+        drain_os_lock(&authority);
         if let HostAction::Respawn { arm: arm_again } = action {
             if let Some(child) = host
                 .lock()
@@ -564,6 +658,7 @@ fn host_reader(
             };
             guard.accept_host(message)
         };
+        drain_os_lock(authority);
         if announce && reply.is_ok() {
             arm.ready();
         }
@@ -924,7 +1019,10 @@ fn host_env_allowed(key: &str, allow_panic: bool) -> bool {
         return true;
     }
     match key {
-        "SOFTLOCK_STUB_OS_LOCK" | "SOFTLOCK_RUN_NONCE" | "SOFTLOCK_OS_LOCK_MARK" => true,
+        "SOFTLOCK_STUB_OS_LOCK"
+        | "SOFTLOCK_RUN_NONCE"
+        | "SOFTLOCK_OS_LOCK_MARK"
+        | "SOFTLOCK_FORCE_GUARD_DOWN" => true,
         "SOFTLOCK_PANIC" => allow_panic,
         _ => false,
     }
@@ -1025,6 +1123,7 @@ fn serve_client(pipe: HANDLE, authority: &Arc<Mutex<Authority>>) {
                 .unwrap_or_else(|poison| poison.into_inner());
             guard.handle_public_frame(role, &frame)
         };
+        drain_os_lock(authority);
         frame.fill(0);
         if stream_subscription(pipe, authority, &decoded_subscribe, &response) {
             break;
@@ -1193,7 +1292,12 @@ fn stream_subscription(
         return true;
     }
     let mut previous = None;
-    let mut previous_fallback = None;
+    let mut previous_fallback = {
+        let guard = authority
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard.fallback_stream_start()
+    };
     while !STOP.load(Ordering::Acquire) {
         if !subscriber_connected(pipe) {
             break;
@@ -1204,7 +1308,7 @@ fn stream_subscription(
                 .unwrap_or_else(|poison| poison.into_inner());
             (guard.state_name(), guard.last_fallback())
         };
-        if fallback != previous_fallback {
+        if crate::fallback_is_new(previous_fallback, fallback) {
             previous_fallback = fallback;
             if let Some(fallback) = fallback
                 && write_response(
@@ -1329,11 +1433,28 @@ fn open_client_pipe(name: &str) -> Result<std::fs::File, String> {
 }
 
 fn client_role(image: &str) -> softlock_core::Role {
-    #[cfg(feature = "simulated-physical")]
-    if std::env::var("SOFTLOCK_DEV_APP").ok().as_deref() == Some("1") {
+    if dev_app_role() {
         return softlock_core::Role::App;
     }
     role_for_image(Path::new(image), &install_dir())
+}
+
+fn dev_app_role() -> bool {
+    if std::env::var("SOFTLOCK_DEV_APP").ok().as_deref() != Some("1") {
+        return false;
+    }
+    #[cfg(feature = "simulated-physical")]
+    {
+        return true;
+    }
+    #[cfg(not(feature = "simulated-physical"))]
+    {
+        live_hooks_allowed()
+    }
+}
+
+pub fn live_hooks_allowed() -> bool {
+    softlock_windows::runner_may_lock().is_ok()
 }
 
 fn write_self_probe(pipe_name: &str, path: &Path) -> std::io::Result<()> {
@@ -1613,8 +1734,9 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 fn install_dir() -> PathBuf {
-    #[cfg(feature = "simulated-physical")]
-    if let Ok(dir) = std::env::var("SOFTLOCK_INSTALL_DIR") {
+    if let Ok(dir) = std::env::var("SOFTLOCK_INSTALL_DIR")
+        && (cfg!(feature = "simulated-physical") || live_hooks_allowed())
+    {
         return PathBuf::from(dir);
     }
     std::env::current_exe()

@@ -1,7 +1,7 @@
 //! Lock state machine. Events go in, decisions come out. Nothing here calls an OS.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::{ConfigError, ConfigStore};
 use crate::heartbeat::{ARM_STEP_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BEFORE_FAILURE};
@@ -463,6 +463,13 @@ impl<P: Platform> LockController<P> {
         InputGuard::disarm(&mut self.platform);
     }
 
+    /// The Windows service calls this after a lock that ran outside the
+    /// authority mutex has been confirmed.
+    pub fn note_os_lock_held(&mut self) {
+        self.os_lock_unavailable = false;
+        self.recovery_due = false;
+    }
+
     fn request_os_lock(&mut self) {
         self.os_lock_attempts = self.os_lock_attempts.saturating_add(1);
         let session = SessionControl::console_session(&self.platform);
@@ -702,6 +709,7 @@ impl<P: Platform> LockController<P> {
                                 Fallback {
                                     reason: FailReason::Repair,
                                     at_ms: self.now.as_millis(),
+                                    at_utc_ms: wall_unix_ms(),
                                 },
                             );
                             self.enter(LockState::OsLocked { after_fail });
@@ -713,6 +721,7 @@ impl<P: Platform> LockController<P> {
                                 Fallback {
                                     reason,
                                     at_ms: self.now.as_millis(),
+                                    at_utc_ms: wall_unix_ms(),
                                 },
                             );
                         }
@@ -782,6 +791,8 @@ impl<P: Platform> LockController<P> {
                 ResponseKind::Accepted
             }
             RequestKind::HardLock => {
+                // Dispatch already rejected every caller except the App while
+                // Unlocked and the Lock Host while Locked.
                 if matches!(self.state, LockState::Locked { .. }) {
                     self.fail_closed(FailReason::HardLock);
                 } else {
@@ -872,6 +883,13 @@ fn request_name(kind: &RequestKind) -> &'static str {
         RequestKind::CheckUpdate => "CheckUpdate",
         RequestKind::InstallUpdate { .. } => "InstallUpdate",
     }
+}
+
+fn wall_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 fn push_bounded<T>(items: &mut VecDeque<T>, item: T) {

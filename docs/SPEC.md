@@ -343,21 +343,21 @@ Invariants (each one is a test):
 | `Hello { client_version }` | all | all | `{ service_version, state, capabilities }` |
 | `GetStatus` | all | all | state, lock source, guard and overlay health, last fall-back, battery reading and floor, heat-check sources (or "unavailable"), paused and skipped apps |
 | `Lock { source, note? }` | App, LockClient | Unlocked | `Accepted` or `AlreadyLocked` |
-| `HardLock` | App | Unlocked, Locked\* | calls the real OS lock |
+| `HardLock` | App while Unlocked; Lock Host private channel while Locked\* | Unlocked, Locked\* | calls the real OS lock |
 | `GetConfig` | App, LockClient | all | effective config plus revision |
 | `ValidateConfig { toml }` | App, LockClient | all | `Ok` or `Invalid { errors[] }` |
 | `PutConfig { toml, base_revision }` | App | Unlocked only | `Applied`, `NeedsConfirmation { fields[] }`, `Invalid`, `Conflict`, `Locked` |
 | `ConfirmSensitiveChange { token }` | App | Unlocked only | runs a Hello or password check through the Broker, then applies |
 | `SetSoftLockPin { pin }` / `ClearSoftLockPin` | App | Unlocked only, after a confirmation check | `Ok` |
 | `ListRunningApps` | App | Unlocked only | apps with a visible window in the owner's session for the pause picker: name, path, icon, recent CPU, `suggested`, or `not_pausable { reason }` |
-| `Subscribe` | App | all | event stream: `StateChanged`, `ConfigChanged`, `FellBackToOsLock { reason, at }` (reasons include `BatteryFloor { percent }` and `HeatFloor { source }`), `PauseSummary { paused, skipped[], resume_failures[] }`, `UpdateAvailable` |
+| `Subscribe` | App | all | event stream: `StateChanged`, `ConfigChanged`, `FellBackToOsLock { reason, at_ms, at_utc_ms }` (reasons include `BatteryFloor { percent }` and `HeatFloor { source }`; `at_utc_ms` is UTC Unix milliseconds and the App shows it in local time), `PauseSummary { paused, skipped[], resume_failures[] }`, `UpdateAvailable` |
 | `CheckUpdate` / `InstallUpdate { version }` | App | Unlocked only | `UpToDate`, `Available { version, notes }`, or `Installing` |
 
-\* `HardLock` while Locked is accepted only from the App. Every other role is rejected and logged. It fails closed with its own reason. While Unlocked, the App's `HardLock` calls the OS lock and the state stays Unlocked.
+\* `HardLock` while Locked is accepted only from the Lock Host's private channel. The App, a Lock Client, and the Broker are rejected and logged. While Unlocked, the App's `HardLock` calls the OS lock and the state stays Unlocked. A public `HardLock` while Locked does not call the OS lock.
 
 **There is no `Unlock` request on the public pipe.** This is the lock-only agent framework: in a later release, the CLI and remote triggers will be thin `LockClient`s on top of `Lock`.
 
-**Lock Host private channel:** `HostReady { monitors }`, `Heartbeat { seq, guard: GuardHealth, overlay: OverlayHealth }` every 250 ms, `PromptOpened { method }`, `SubmitSecret { method, secret }` (zeroized after use, never logged), `RequestHello` (the Service launches the Broker), and from the Service `Arm`, `Disarm`, `Show(look)`, `PromptResult { verdict, backoff_until? }`.
+**Lock Host private channel:** `HostReady { monitors }`, `Heartbeat { seq, guard: GuardHealth, overlay: OverlayHealth }` every 250 ms, `PromptOpened { method }`, `SubmitSecret { method, secret }` (zeroized after use, never logged), `RequestHello` (the Service launches the Broker), `HardLock` (accepted only while Locked), and from the Service `Arm`, `Disarm`, `OsLock`, `Show(look)`, `PromptResult { verdict, backoff_until? }`.
 
 ### 7. Fail closed and the watchdog
 

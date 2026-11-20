@@ -25,8 +25,8 @@ pub fn denied(
         }
         RequestKind::HardLock => {
             let app_unlocked = role == Role::App && matches!(state, LockState::Unlocked);
-            let app_locked = role == Role::App && matches!(state, LockState::Locked { .. });
-            if app_unlocked || app_locked {
+            let host_locked = role == Role::LockHost && matches!(state, LockState::Locked { .. });
+            if app_unlocked || host_locked {
                 None
             } else {
                 Some(ResponseKind::Unauthorized)

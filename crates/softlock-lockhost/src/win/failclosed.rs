@@ -94,6 +94,19 @@ pub(crate) fn lock_or_disconnect(session: u32) -> RealLock {
 
 /// Workstation lock only. The Service confirms it and disconnects the console
 /// itself when this does not. A stub still makes no Windows call.
+/// The window thread keeps sending heartbeats. The workstation call can take
+/// the whole confirmation budget, so it runs on its own thread.
+pub(crate) fn schedule_workstation_lock() {
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if BUSY.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let _ = lock_workstation_only();
+        BUSY.store(false, std::sync::atomic::Ordering::Release);
+    });
+}
+
 pub(crate) fn lock_workstation_only() -> RealLock {
     if let Some(stubbed) = take_stub() {
         return stubbed;
@@ -128,6 +141,11 @@ fn take_stub() -> Option<RealLock> {
 fn finish(result: softlock_windows::CloseResult, caller: Caller) -> RealLock {
     for error in &result.errors {
         eprintln!("os-lock error={error}");
+    }
+    if matches!(result.outcome, Outcome::Confirmed { .. })
+        && let Ok(path) = std::env::var("SOFTLOCK_OS_LOCK_MARK")
+    {
+        let _ = std::fs::write(path, b"confirmed");
     }
     match result.outcome {
         Outcome::Confirmed {

@@ -530,9 +530,7 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
         }
         match next_command(&shared) {
             Some(PipeCommand::Disarm) => break,
-            Some(PipeCommand::OsLock) => {
-                let _ = failclosed::lock_workstation_only();
-            }
+            Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             Some(PipeCommand::Quit) => service_gone = true,
             Some(PipeCommand::Arm) | None => {}
         }
@@ -628,6 +626,11 @@ fn advance_clock(
     }
 }
 
+fn force_unhealthy_guard() -> bool {
+    std::env::var("SOFTLOCK_FORCE_GUARD_DOWN").ok().as_deref() == Some("1")
+        && softlock_windows::runner_may_lock().is_ok()
+}
+
 fn beat(controller: &mut LockController<WinPlatform>, shared: &Shared) {
     if shared.hold_heartbeats.load(Ordering::Acquire) {
         return;
@@ -637,7 +640,7 @@ fn beat(controller: &mut LockController<WinPlatform>, shared: &Shared) {
     }
     let seq = controller.next_heartbeat_seq();
     let guard = GuardHealth {
-        hook_alive: true,
+        hook_alive: !force_unhealthy_guard(),
         last_physical_input_ms: shared.physical_ms(),
     };
     let overlay = Overlay::health(controller.platform());
@@ -1131,9 +1134,7 @@ fn wait_for_arm(shared: &Shared) -> bool {
         match next_command(shared) {
             Some(PipeCommand::Arm) => return true,
             Some(PipeCommand::Disarm) => return false,
-            Some(PipeCommand::OsLock) => {
-                let _ = failclosed::lock_workstation_only();
-            }
+            Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             // Hooks are installed only after Arm. Quit before that is not
             // Locked, Arming, or FailingClosed, so it must not call the OS lock.
             Some(PipeCommand::Quit) => return false,

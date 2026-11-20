@@ -8,13 +8,13 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use softlock_core::{
-    Caller, Expect, Method, NoticeKind, Observation, OsLockOps, Outcome, StepFault, console_notice,
-    fail_closed,
+    Caller, Expect, Method, NoticeKind, NoticeLog, Observation, OsLockOps, Outcome, StepFault,
+    console_notice, fail_closed,
 };
 use windows::Win32::Foundation::{ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -28,11 +28,12 @@ use windows::Win32::System::RemoteDesktop::{
     WTSUnRegisterSessionNotification,
 };
 use windows::Win32::System::Shutdown::LockWorkStation;
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, HWND_MESSAGE, PM_NOREMOVE,
-    PeekMessageW, RegisterClassExW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY,
-    WNDCLASSEXW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageTime, HWND_MESSAGE,
+    PM_NOREMOVE, PeekMessageW, RegisterClassExW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_DESTROY, WNDCLASSEXW,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -41,14 +42,13 @@ const WTS_CONSOLE_DISCONNECT: u32 = 0x2;
 const WTS_SESSION_LOCK: u32 = 0x7;
 const NOTIFY_FOR_ALL_SESSIONS: u32 = 1;
 const NO_SESSION: u32 = u32::MAX;
-const KIND_NONE: u8 = 0;
-const KIND_LOCK: u8 = 1;
-const KIND_DISCONNECT: u8 = 2;
+const NOTICE_PRESENT: u64 = 1 << 32;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 static GATE: Mutex<()> = Mutex::new(());
 static CONSOLE: AtomicU32 = AtomicU32::new(NO_SESSION);
-static KIND: AtomicU8 = AtomicU8::new(KIND_NONE);
+static LOCK_TICK: AtomicU64 = AtomicU64::new(0);
+static DISCONNECT_TICK: AtomicU64 = AtomicU64::new(0);
 static PUMP_THREAD: AtomicU32 = AtomicU32::new(0);
 
 pub struct CloseResult {
@@ -74,6 +74,14 @@ pub fn run_service(console: u32, ask_host: impl FnMut() -> bool + 'static) -> Cl
         console,
         Some(Box::new(ask_host)),
     )
+}
+
+pub fn run_service_disconnect(console: u32) -> CloseResult {
+    run(Caller::Service, console, None)
+}
+
+pub fn runner_may_lock() -> Result<(), &'static str> {
+    crate::proof_allowed(hosted_from_env(), school_from_registry())
 }
 
 fn run(caller: Caller, console: u32, ask_host: Option<Box<dyn FnMut() -> bool>>) -> CloseResult {
@@ -186,16 +194,19 @@ impl OsLockOps for WindowsOps {
     }
 
     fn observe(&mut self, expect: Expect, started: Instant) -> Result<Observation, StepFault> {
-        let session = match expect {
-            Expect::DisconnectConsole => self.console,
-            Expect::Lock | Expect::DisconnectOwn => self.own,
-        };
+        let session =
+            softlock_core::session_for_expect(self.caller, expect, self.console, self.own);
         let budget = softlock_core::CONFIRM_BUDGET;
+        let started_tick = unsafe { GetTickCount() };
         loop {
             if let Ok(listener) = self.listener.as_mut() {
                 listener.pump();
             }
-            let notice = self.listener.as_ref().ok().and_then(Listener::snapshot);
+            let notice = self
+                .listener
+                .as_ref()
+                .ok()
+                .and_then(|listener| listener.fresh(expect, started_tick));
             let session_locked = self.locked_flag(session);
             let session_disconnected = self.disconnected_flag(session);
             let elapsed = started.elapsed();
@@ -282,21 +293,25 @@ impl Listener {
                 return Err(format!("register-session={}", error.code().0));
             }
             PUMP_THREAD.store(GetCurrentThreadId(), Ordering::Release);
-            KIND.store(KIND_NONE, Ordering::Release);
             Ok(Self { hwnd })
         }
     }
 
-    fn reset(&self) {
-        KIND.store(KIND_NONE, Ordering::SeqCst);
-    }
+    fn reset(&self) {}
 
-    fn snapshot(&self) -> Option<NoticeKind> {
-        match KIND.load(Ordering::SeqCst) {
-            KIND_LOCK => Some(NoticeKind::Lock),
-            KIND_DISCONNECT => Some(NoticeKind::ConsoleDisconnect),
-            _ => None,
+    fn fresh(&self, expect: Expect, started: u32) -> Option<NoticeKind> {
+        let mut log = NoticeLog::default();
+        if let Some(tick) = load_notice(&LOCK_TICK) {
+            log.record(NoticeKind::Lock, tick);
         }
+        if let Some(tick) = load_notice(&DISCONNECT_TICK) {
+            log.record(NoticeKind::ConsoleDisconnect, tick);
+        }
+        let kind = match expect {
+            Expect::Lock => NoticeKind::Lock,
+            Expect::DisconnectConsole | Expect::DisconnectOwn => NoticeKind::ConsoleDisconnect,
+        };
+        log.fresh(kind, started)
     }
 
     fn pump(&self) {
@@ -327,6 +342,25 @@ impl Drop for Listener {
             let _ = WTSUnRegisterSessionNotification(self.hwnd);
             let _ = DestroyWindow(self.hwnd);
         }
+    }
+}
+
+fn store_notice(kind: NoticeKind) {
+    let tick = unsafe { GetMessageTime() } as u32;
+    let slot = match kind {
+        NoticeKind::Lock => &LOCK_TICK,
+        NoticeKind::ConsoleDisconnect => &DISCONNECT_TICK,
+        NoticeKind::Other => return,
+    };
+    slot.store(u64::from(tick) | NOTICE_PRESENT, Ordering::Release);
+}
+
+fn load_notice(slot: &AtomicU64) -> Option<u32> {
+    let value = slot.load(Ordering::Acquire);
+    if value & NOTICE_PRESENT == 0 {
+        None
+    } else {
+        Some(value as u32)
     }
 }
 
@@ -366,15 +400,7 @@ unsafe extern "system" fn wnd_proc(
             };
             let session = lparam.0 as u32;
             if let Some(kind) = console_notice(kind, session, CONSOLE.load(Ordering::Acquire)) {
-                let code = match kind {
-                    NoticeKind::Lock => KIND_LOCK,
-                    NoticeKind::ConsoleDisconnect => KIND_DISCONNECT,
-                    NoticeKind::Other => KIND_NONE,
-                };
-                if code != KIND_NONE {
-                    let _ =
-                        KIND.compare_exchange(KIND_NONE, code, Ordering::SeqCst, Ordering::SeqCst);
-                }
+                store_notice(kind);
             }
         }
         if message == WM_DESTROY {

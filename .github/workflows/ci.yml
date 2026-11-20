@@ -532,7 +532,7 @@ jobs:
           cargo test --locked -p softlock-lockhost --features simulated-physical \
             --target x86_64-pc-windows-msvc --test service_session --no-run \
             --message-format=json > target/service-session-build.json
-          exe_win=$(python .github/lock-host-test-exe.py target/service-session-build.json)
+          exe_win=$(python .github/lock-host-test-exe.py target/service-session-build.json service_session)
           exe=$(cygpath -u "$exe_win")
           test -f "$exe"
           case "$exe" in

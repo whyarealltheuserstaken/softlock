@@ -15,8 +15,9 @@ mod secrets;
 mod windows;
 
 pub use authority::{
-    Authority, HostAction, HostFault, HostLoss, admit_client, dev_pin_allowed, image_is_inside,
-    log_path, pin_directory, pipe_path, role_for_image, service_data_directory, stub_os_lock,
+    Authority, HostAction, HostFault, HostLoss, admit_client, dev_pin_allowed, fallback_is_new,
+    image_is_inside, log_path, pin_directory, pipe_path, role_for_image, service_data_directory,
+    stub_os_lock,
 };
 pub use log::{Capture, FileLog, allowed_field, audit};
 #[cfg(feature = "simulated-physical")]

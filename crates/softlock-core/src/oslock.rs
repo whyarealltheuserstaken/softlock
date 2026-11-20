@@ -9,6 +9,8 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
+use crate::state::FailReason;
+
 /// A lock or disconnect that arrives at this instant or later is not evidence.
 pub const CONFIRM_BUDGET: Duration = Duration::from_secs(1);
 
@@ -25,6 +27,70 @@ pub enum Caller {
     /// Ask the Lock Host to lock, then disconnect the console if that is
     /// not confirmed. A missing host skips the workstation call.
     ServiceCoordinated,
+}
+
+/// The session-0 service disconnects immediately when the Lock Host has
+/// exited, missed heartbeats, or is not alive. It asks the host to call
+/// `LockWorkStation` only while that process can still run the call.
+pub fn caller_for_service(process_alive: bool, loss: Option<FailReason>) -> Caller {
+    let host_cannot_lock = !process_alive
+        || matches!(
+            loss,
+            Some(FailReason::HostExited | FailReason::HeartbeatMissed)
+        );
+    if host_cannot_lock {
+        Caller::Service
+    } else {
+        Caller::ServiceCoordinated
+    }
+}
+
+/// Which session an observation reads. The service runs in session 0, so a
+/// workstation lock it asked the host to take is confirmed on the console
+/// session, not on the service's own session.
+pub fn session_for_expect(caller: Caller, expect: Expect, console: u32, own: u32) -> u32 {
+    match (caller, expect) {
+        (
+            Caller::Service | Caller::ServiceCoordinated,
+            Expect::Lock | Expect::DisconnectConsole,
+        ) => console,
+        (_, Expect::DisconnectConsole) => console,
+        (_, Expect::Lock | Expect::DisconnectOwn) => own,
+    }
+}
+
+/// `GetTickCount` and `GetMessageTime` share this clock. A message posted
+/// before `started` is not evidence for the attempt that just began.
+pub fn tick_is_on_or_after(posted: u32, started: u32) -> bool {
+    posted.wrapping_sub(started) < 0x8000_0000
+}
+
+/// Lock and disconnect notices are stored separately. One does not erase the
+/// other, and a tick from before `started` is ignored.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoticeLog {
+    pub lock_tick: Option<u32>,
+    pub disconnect_tick: Option<u32>,
+}
+
+impl NoticeLog {
+    pub fn record(&mut self, kind: NoticeKind, tick: u32) {
+        match kind {
+            NoticeKind::Lock => self.lock_tick = Some(tick),
+            NoticeKind::ConsoleDisconnect => self.disconnect_tick = Some(tick),
+            NoticeKind::Other => {}
+        }
+    }
+
+    pub fn fresh(&self, kind: NoticeKind, started: u32) -> Option<NoticeKind> {
+        let tick = match kind {
+            NoticeKind::Lock => self.lock_tick,
+            NoticeKind::ConsoleDisconnect => self.disconnect_tick,
+            NoticeKind::Other => None,
+        };
+        tick.is_some_and(|tick| tick_is_on_or_after(tick, started))
+            .then_some(kind)
+    }
 }
 
 impl Caller {

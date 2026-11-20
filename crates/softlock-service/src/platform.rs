@@ -258,7 +258,14 @@ impl SessionControl for ServicePlatform {
             OsLock::System => {
                 #[cfg(windows)]
                 {
-                    crate::windows::lock_session(session.0)
+                    if crate::stub_os_lock() {
+                        return crate::windows::lock_session(session.0);
+                    }
+                    // The chain runs after this mutex is released. Returning
+                    // an error keeps the state fail-closed until `drain_os_lock`
+                    // confirms it.
+                    crate::windows::schedule_os_lock(session.0);
+                    Err(OsLockError::Failed)
                 }
                 #[cfg(not(windows))]
                 {

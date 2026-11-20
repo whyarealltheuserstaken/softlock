@@ -257,6 +257,7 @@ mod tests {
             fallback: softlock_core::Fallback {
                 reason: softlock_core::FailReason::HostExited,
                 at_ms: 2_000,
+                at_utc_ms: 1_763_635_620_000,
             },
         };
         let kept = view_after(&view, &Ok(fallback));

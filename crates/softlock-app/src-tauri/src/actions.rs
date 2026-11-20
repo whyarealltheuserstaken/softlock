@@ -43,16 +43,74 @@ pub fn hard_lock_request() -> RequestKind {
 }
 
 /// Sentence shown after the owner signs back in. The product name comes from
-/// the name constant. `at_ms` is the service clock on the fall-back event.
+/// the name constant. The time is the fall-back's UTC instant in local time.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn fallback_notice(fallback: &softlock_core::Fallback) -> String {
+    fallback_notice_at(fallback, local_offset_secs())
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn fallback_notice_at(fallback: &softlock_core::Fallback, offset_secs: i32) -> String {
     format!(
-        "{} switched to the Windows lock at {} ms because {}",
+        "{} switched to the Windows lock at {} because {}",
         softlock_core::PRODUCT_DISPLAY_NAME,
-        fallback.at_ms,
+        format_local_clock(fallback.at_utc_ms, offset_secs),
         fallback_reason(fallback.reason)
     )
 }
 
+/// `YYYY-MM-DD HH:MM:SS` for `utc_ms` shifted by `offset_secs`.
+pub fn format_local_clock(utc_ms: i64, offset_secs: i32) -> String {
+    let adjusted = utc_ms.saturating_add(i64::from(offset_secs).saturating_mul(1000));
+    if adjusted < 0 {
+        return "unknown time".to_string();
+    }
+    let secs = (adjusted / 1000) as u64;
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let hour = tod / 3600;
+    let minute = (tod % 3600) / 60;
+    let second = tod % 60;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year as i32, month as u32, day)
+}
+
+fn local_offset_secs() -> i32 {
+    #[cfg(windows)]
+    {
+        unsafe {
+            let mut info = windows::Win32::System::Time::TIME_ZONE_INFORMATION::default();
+            let kind = windows::Win32::System::Time::GetTimeZoneInformation(&mut info);
+            let bias = match kind {
+                windows::Win32::System::Time::TIME_ZONE_ID_DAYLIGHT => {
+                    info.Bias + info.DaylightBias
+                }
+                _ => info.Bias + info.StandardBias,
+            };
+            -bias * 60
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
 fn fallback_reason(reason: softlock_core::FailReason) -> &'static str {
     use softlock_core::FailReason;
     match reason {
@@ -206,17 +264,22 @@ mod tests {
     #[test]
     fn a_fake_fall_back_event_names_the_time_and_the_reason() {
         use softlock_core::{FailReason, Fallback};
-        let notice = fallback_notice(&Fallback {
+        let fallback = Fallback {
             reason: FailReason::HeartbeatMissed,
             at_ms: 1_500,
-        });
+            at_utc_ms: 1_795_176_000_000,
+        };
+        let notice = fallback_notice_at(&fallback, 0);
         let name = softlock_core::PRODUCT_DISPLAY_NAME;
         assert_eq!(
             notice,
             format!(
-                "{name} switched to the Windows lock at 1500 ms because the lock host stopped answering"
+                "{name} switched to the Windows lock at 2026-11-20 12:00:00 because the lock host stopped answering"
             )
         );
+        assert!(!notice.contains("1500 ms"));
+        let local = fallback_notice_at(&fallback, 2 * 60 * 60);
+        assert!(local.contains("2026-11-20 14:00:00"));
         assert!(!notice.contains("Unlocked"));
     }
 }

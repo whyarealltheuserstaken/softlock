@@ -180,20 +180,10 @@ fn locked_leaves_only_on_a_verified_broker_verdict() {
     for role in [Role::App, Role::LockClient] {
         for kind in sample_requests() {
             let mut controller = locked_started();
-            let hard_lock = role == Role::App && matches!(kind, RequestKind::HardLock);
             let label = format!("{role:?} {kind:?}");
             controller.handle(Event::Public { role, kind });
             assert!(
-                if hard_lock {
-                    matches!(
-                        controller.state(),
-                        LockState::OsLocked {
-                            after_fail: Some(FailReason::HardLock)
-                        }
-                    )
-                } else {
-                    matches!(controller.state(), LockState::Locked { .. })
-                },
+                matches!(controller.state(), LockState::Locked { .. }),
                 "{label} left the lock path for {:?}",
                 controller.state()
             );
@@ -1074,6 +1064,7 @@ fn ipc_response_kinds_serialize_to_versioned_json_snapshots() {
                 fallback: Fallback {
                     reason: FailReason::HeartbeatMissed,
                     at_ms: 750,
+                    at_utc_ms: 1_763_635_620_000,
                 },
             },
         ),
@@ -1553,8 +1544,8 @@ fn backend_instance_ids_stay_in_the_controller_journal() {
 }
 
 #[test]
-fn only_the_app_may_hard_lock_while_locked() {
-    for role in [Role::LockHost, Role::LockClient, Role::Broker] {
+fn hard_lock_while_locked_is_rejected_from_the_app_and_other_public_roles() {
+    for role in [Role::App, Role::LockClient, Role::Broker] {
         let mut controller = locked_started();
         controller.handle(Event::Public {
             role,
@@ -1741,10 +1732,26 @@ fn failure_events_and_notifications_stay_within_the_ring() {
 }
 
 #[test]
-fn hard_lock_from_the_app_while_locked_fails_closed() {
+fn hard_lock_from_the_app_while_locked_is_rejected() {
     let mut controller = locked_started();
+    let attempts = controller.os_lock_attempts();
     controller.handle(Event::Public {
         role: Role::App,
+        kind: RequestKind::HardLock,
+    });
+    assert_eq!(
+        controller.last_response(),
+        Some(&ResponseKind::Unauthorized)
+    );
+    assert!(matches!(controller.state(), LockState::Locked { .. }));
+    assert_eq!(controller.os_lock_attempts(), attempts);
+    assert!(!controller.returned_to_unlocked());
+}
+
+fn hard_lock_from_the_lock_host_while_locked_fails_closed() {
+    let mut controller = locked_started();
+    controller.handle(Event::Public {
+        role: Role::LockHost,
         kind: RequestKind::HardLock,
     });
     assert!(matches!(
@@ -1753,6 +1760,18 @@ fn hard_lock_from_the_app_while_locked_fails_closed() {
             after_fail: Some(FailReason::HardLock)
         }
     ));
+    assert!(!controller.returned_to_unlocked());
+}
+
+fn hard_lock_from_the_app_while_unlocked_calls_the_os_lock_and_stays_unlocked() {
+    let mut controller = started(FakePlatform::new());
+    controller.handle(Event::Public {
+        role: Role::App,
+        kind: RequestKind::HardLock,
+    });
+    assert_eq!(controller.last_response(), Some(&ResponseKind::Accepted));
+    assert!(matches!(controller.state(), LockState::Unlocked));
+    assert!(controller.os_lock_attempts() >= 1);
     assert!(!controller.returned_to_unlocked());
 }
 

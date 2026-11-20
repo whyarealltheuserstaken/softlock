@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --all -- --check
-          cargo clippy -p softlock-core -p softlock-windows -p softlock-service -p softlock-lockhost --all-targets -- -D warnings
+          cargo clippy -p softlock-core -p softlock-windows -p softlock-service -p softlock-lockhost --all-targets --features softlock-windows/confirm -- -D warnings
           cargo test -p softlock-core --test os_lock --locked
           cargo test -p softlock-windows --locked
 
@@ -74,7 +74,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cargo build --release --locked -p softlock-windows --bin os-lock-confirm
+          cargo build --release --locked -p softlock-windows --bin os-lock-confirm --features confirm
           & .\target\release\os-lock-confirm.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload the confirm report

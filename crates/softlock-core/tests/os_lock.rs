@@ -9,8 +9,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
 use softlock_core::{
-    Attempt, Caller, Expect, Method, NoticeKind, Observation, OsLockOps, Outcome, StepFault,
-    confirmed, console_notice, fail_closed, failed_closed_log, policy_seam, stays_guarded,
+    Attempt, Caller, Expect, FailReason, Method, NoticeKind, NoticeLog, Observation, OsLockOps,
+    Outcome, StepFault, caller_for_service, confirmed, console_notice, fail_closed,
+    failed_closed_log, policy_seam, session_for_expect, stays_guarded, tick_is_on_or_after,
     within_budget,
 };
 
@@ -426,6 +427,156 @@ fn product_code_does_not_reconnect_a_session() {
             path.display()
         );
     }
+}
+
+#[test]
+fn a_dead_or_silent_host_does_not_wait_on_the_workstation_lock() {
+    assert_eq!(
+        caller_for_service(false, Some(FailReason::HostExited)),
+        Caller::Service
+    );
+    assert_eq!(
+        caller_for_service(true, Some(FailReason::HeartbeatMissed)),
+        Caller::Service
+    );
+    assert_eq!(caller_for_service(false, None), Caller::Service);
+    assert_eq!(caller_for_service(true, None), Caller::ServiceCoordinated);
+    assert_eq!(
+        caller_for_service(true, Some(FailReason::GuardUnhealthy)),
+        Caller::ServiceCoordinated
+    );
+    let mut script = Script::new();
+    script.console_obs = Observation {
+        notice: Some(NoticeKind::ConsoleDisconnect),
+        session_locked: None,
+        session_disconnected: Some(true),
+        elapsed: Duration::from_millis(5),
+    };
+    let started = Instant::now();
+    let outcome = fail_closed(Caller::Service, &mut script);
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "disconnect-only caller waited out the workstation budget"
+    );
+    assert!(matches!(
+        outcome,
+        Outcome::Confirmed {
+            method: Method::DisconnectConsole
+        }
+    ));
+    assert!(!script.calls.contains(&Method::LockWorkStation));
+}
+
+#[test]
+fn the_service_confirms_a_workstation_lock_on_the_console_session() {
+    assert_eq!(
+        session_for_expect(Caller::ServiceCoordinated, Expect::Lock, 2, 0),
+        2
+    );
+    assert_eq!(session_for_expect(Caller::Service, Expect::Lock, 2, 0), 2);
+    assert_eq!(session_for_expect(Caller::LockHost, Expect::Lock, 2, 4), 4);
+    assert_eq!(
+        session_for_expect(Caller::ServiceCoordinated, Expect::DisconnectConsole, 2, 0),
+        2
+    );
+}
+
+#[test]
+fn a_stale_lock_notice_does_not_mask_a_later_disconnect() {
+    assert!(!tick_is_on_or_after(10, 15));
+    assert!(tick_is_on_or_after(15, 15));
+    assert!(tick_is_on_or_after(20, 15));
+    let mut log = NoticeLog::default();
+    log.record(NoticeKind::Lock, 10);
+    log.record(NoticeKind::ConsoleDisconnect, 20);
+    assert_eq!(log.fresh(NoticeKind::Lock, 15), None);
+    assert_eq!(
+        log.fresh(NoticeKind::ConsoleDisconnect, 15),
+        Some(NoticeKind::ConsoleDisconnect)
+    );
+    assert_eq!(log.lock_tick, Some(10));
+    assert_eq!(log.disconnect_tick, Some(20));
+}
+
+#[test]
+fn clippy_disallows_reconnecting_a_session() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join("clippy.toml")).expect("clippy.toml");
+    let needle = format!("{}{}", "WTSConnect", "SessionW");
+    assert!(
+        text.contains("disallowed-methods"),
+        "clippy does not disallow methods"
+    );
+    assert!(
+        text.contains(&needle),
+        "clippy still allows reconnecting a session"
+    );
+}
+
+#[test]
+fn the_lock_host_ui_thread_does_not_call_the_workstation_lock() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../softlock-lockhost/src/win/session.rs");
+    let text = std::fs::read_to_string(path).expect("session");
+    assert!(text.contains("schedule_workstation_lock"));
+    assert!(
+        !text.contains("failclosed::lock_workstation_only()"),
+        "the UI thread still calls the workstation lock inline"
+    );
+}
+
+#[test]
+fn the_confirm_binary_is_not_a_default_product_binary() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../softlock-windows/Cargo.toml");
+    let text = std::fs::read_to_string(path).expect("windows manifest");
+    assert!(
+        text.contains("required-features = [\"confirm\"]"),
+        "os-lock-confirm is still built and smoke-launched on macOS"
+    );
+}
+
+#[test]
+fn seam3_selects_the_service_session_test_binary() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci");
+    let finder =
+        std::fs::read_to_string(root.join(".github/lock-host-test-exe.py")).expect("finder");
+    assert!(
+        ci.contains("service_session"),
+        "ci.yml does not name the service_session test executable"
+    );
+    assert!(
+        finder.contains("service_session") || finder.contains("needle"),
+        "the test-binary finder still returns the last executable"
+    );
+}
+
+#[test]
+fn the_fail_closed_job_covers_each_hosted_case() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let job = std::fs::read_to_string(root.join(".github/workflows/os-lock-fail-closed.yml"))
+        .expect("fail-closed workflow");
+    for case in [
+        "kill-host",
+        "suspend-host",
+        "kill-service",
+        "stop-while-locked",
+        "unhealthy-guard",
+        "tray-hard-lock",
+    ] {
+        assert!(job.contains(case), "missing {case}");
+    }
+    let test =
+        std::fs::read_to_string(root.join("crates/softlock-lockhost/tests/fail_closed_live.rs"))
+            .expect("live test");
+    assert!(test.contains("SOFTLOCK_FAIL_CLOSED_LIVE"));
+    assert!(test.contains("from_secs(1)"));
+    assert!(test.contains("Unlocked"));
+    let owner = std::fs::read_to_string(root.join("crates/softlock-app/src-tauri/src/owner.rs"))
+        .expect("owner");
+    assert!(owner.contains("CMD_HARD_LOCK"));
+    assert!(owner.contains("enqueue_hard_lock"));
 }
 
 fn collect(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
