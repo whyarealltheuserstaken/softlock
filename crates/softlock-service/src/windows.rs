@@ -963,6 +963,7 @@ fn serve_client(pipe: HANDLE, authority: &Arc<Mutex<Authority>>) {
         if !read_exact(pipe, &mut frame[4..]) {
             break;
         }
+        let decoded_subscribe = subscribe_request(&frame);
         let mut response = {
             let mut guard = authority
                 .lock()
@@ -970,6 +971,9 @@ fn serve_client(pipe: HANDLE, authority: &Arc<Mutex<Authority>>) {
             guard.handle_public_frame(role, &frame)
         };
         frame.fill(0);
+        if stream_subscription(pipe, authority, &decoded_subscribe, &response) {
+            break;
+        }
         // Lock has marked the arm slot. Wait only after the authority mutex
         // is released, and only once HostReady has been accepted.
         if matches!(response, softlock_core::ResponseKind::Accepted) {
@@ -1088,6 +1092,57 @@ fn security_descriptor(sddl: &str) -> std::io::Result<SecurityDescriptor> {
         .map_err(|error| std::io::Error::from_raw_os_error(error.code().0))?;
     }
     Ok(SecurityDescriptor(descriptor))
+}
+
+fn subscribe_request(frame: &[u8]) -> Option<u64> {
+    match softlock_core::decode_request_frame(frame) {
+        Ok(decoded) if matches!(decoded.kind, softlock_core::RequestKind::Subscribe) => {
+            Some(decoded.id)
+        }
+        _ => None,
+    }
+}
+
+/// After `Subscribe` is accepted, the connection stays open and the service
+/// writes `StateChanged` whenever the public state name changes. A write
+/// error ends the stream. The function returns whether it took the connection.
+fn stream_subscription(
+    pipe: HANDLE,
+    authority: &Arc<Mutex<Authority>>,
+    subscribe_id: &Option<u64>,
+    response: &softlock_core::ResponseKind,
+) -> bool {
+    let Some(id) = subscribe_id else {
+        return false;
+    };
+    if !matches!(response, softlock_core::ResponseKind::Accepted) {
+        return false;
+    }
+    if write_response(pipe, *id, response).is_err() {
+        return true;
+    }
+    let mut previous = None;
+    while !STOP.load(Ordering::Acquire) {
+        let name = authority
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .state_name();
+        if previous == Some(name) {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        previous = Some(name);
+        if write_response(
+            pipe,
+            *id,
+            &softlock_core::ResponseKind::StateChanged { state: name },
+        )
+        .is_err()
+        {
+            break;
+        }
+    }
+    true
 }
 
 fn write_response(

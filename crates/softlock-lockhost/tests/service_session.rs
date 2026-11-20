@@ -117,6 +117,10 @@ impl Session {
         session
     }
 
+    fn pipe(&self) -> &str {
+        &self.pipe
+    }
+
     fn hello(&self) -> Result<String, String> {
         self.transact(r#"{"v":1,"id":1,"kind":"Hello","client_version":"0"}"#)
     }
@@ -1359,6 +1363,230 @@ fn physical_reached(probe: &Probe, extra: u64) -> bool {
         .filter(|input| input.virtual_key == VK_F14)
         .count()
         > before
+}
+
+#[test]
+fn global_hotkey_locks_and_the_probe_confirms() {
+    let _guard = gate();
+    let session = Session::start(None, true);
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let status_path = session.pin_dir.join("owner-status.txt");
+    let _owner = KillChild(Some(spawn_owner(&session, &status_path, false)));
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            status_file(&status_path).contains("hotkey=ok")
+                && status_file(&status_path).contains("service=running")
+        }),
+        "the app did not register the hotkey: {}",
+        status_file(&status_path)
+    );
+    send_default_hotkey();
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let text = status_file(&status_path);
+            text.contains("tray=on") && text.contains("state=Locked")
+        }),
+        "the hotkey did not lock: {}",
+        status_file(&status_path)
+    );
+    assert!(
+        physical_is_blocked(&probe, session.extra),
+        "physical input reached the probe"
+    );
+    send_virtual_key(VK_F13, 0).expect("injected");
+    probe
+        .wait_for_key(VK_F13, Duration::from_secs(3))
+        .expect("injected input did not reach the probe");
+    let status = session.status().expect("status");
+    assert!(
+        status.contains("Hotkey"),
+        "GetStatus did not record the hotkey: {status}"
+    );
+    assert!(
+        !status.contains("Unlocked"),
+        "status reported Unlocked: {status}"
+    );
+}
+
+#[test]
+fn app_subscribe_shows_locked_then_unlocked_after_the_pin() {
+    let _guard = gate();
+    let session = Session::start(None, true);
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let stored = session.set_pin().expect("set pin");
+    assert!(stored.contains("Ok"), "pin was not stored: {stored}");
+    let status_path = session.pin_dir.join("owner-status.txt");
+    let _owner = KillChild(Some(spawn_owner(&session, &status_path, false)));
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            status_file(&status_path).contains("service=running")
+        }),
+        "the app did not subscribe: {}",
+        status_file(&status_path)
+    );
+    let locked = session.lock().expect("lock");
+    assert!(
+        locked.contains("Accepted"),
+        "lock was not accepted: {locked}"
+    );
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            let text = status_file(&status_path);
+            text.contains("tray=on") && text.contains("state=Locked")
+        }),
+        "subscribe did not show the lock: {}",
+        status_file(&status_path)
+    );
+    type_pin(session.extra);
+    assert!(
+        wait_for(Duration::from_secs(30), || {
+            status_file(&status_path).contains("state=Unlocked")
+                && status_file(&status_path).contains("tray=off")
+        }),
+        "the pin did not return the app to unlocked: {}",
+        status_file(&status_path)
+    );
+    let status = session.status().expect("status");
+    assert!(
+        status.contains("Unlocked"),
+        "GetStatus stayed locked: {status}"
+    );
+}
+
+#[test]
+fn app_quitting_leaves_the_service_running_for_a_lock_client() {
+    let _guard = gate();
+    let install = std::env::temp_dir().join(format!("softlock-app-inst-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&install);
+    fs::create_dir_all(&install).expect("install dir");
+    let app = app_exe();
+    let dest = install.join("softlock-app.exe");
+    fs::copy(&app, &dest).expect("copy app");
+    let install_text = install.display().to_string();
+    let session = Session::launch_extra(
+        None,
+        false,
+        "1",
+        None,
+        &[("SOFTLOCK_INSTALL_DIR", install_text.as_str())],
+    );
+    let mut child = Command::new(&dest)
+        .arg("--owner-session")
+        .env("SOFTLOCK_PIPE", session.pipe())
+        .env("SOFTLOCK_QUIT_AFTER_HELLO", "1")
+        .env("SOFTLOCK_NO_AUTOSTART", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("app process");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let finished = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the app did not quit");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(finished.success(), "the app quit with {finished}");
+    let hello = session.hello().expect("service still answers");
+    assert!(
+        hello.contains("Hello"),
+        "quitting the app stopped the service: {hello}"
+    );
+    let locked = session.lock().expect("lock client");
+    assert!(
+        locked.contains("Accepted"),
+        "a lock client could not lock after the app quit: {locked}"
+    );
+    let _ = fs::remove_dir_all(&install);
+}
+
+fn spawn_owner(session: &Session, status_path: &Path, quit: bool) -> std::process::Child {
+    let mut command = Command::new(app_exe());
+    command
+        .arg("--owner-session")
+        .env("SOFTLOCK_PIPE", session.pipe())
+        .env("SOFTLOCK_STATUS_FILE", status_path)
+        .env("SOFTLOCK_NO_AUTOSTART", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if quit {
+        command.env("SOFTLOCK_QUIT_AFTER_HELLO", "1");
+    }
+    command.spawn().expect("owner session")
+}
+
+fn app_exe() -> PathBuf {
+    let host = PathBuf::from(env!("CARGO_BIN_EXE_softlock-lockhost"));
+    let app = host.with_file_name("softlock-app.exe");
+    let mut command = Command::new("cargo");
+    command.args([
+        "build",
+        "-p",
+        "softlock-app",
+        "--bin",
+        "softlock-app",
+        "--features",
+        "simulated-physical",
+    ]);
+    if host.to_string_lossy().contains("x86_64-pc-windows-msvc") {
+        command.args(["--target", "x86_64-pc-windows-msvc"]);
+    }
+    let status = command.status().expect("cargo build");
+    assert!(status.success(), "app build failed");
+    assert!(app.is_file(), "missing {}", app.display());
+    app
+}
+
+fn status_file(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+fn send_default_hotkey() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
+    let keys = [0xA2u16, 0xA4, 0xA0, u16::from(b'L')];
+    let mut inputs = Vec::new();
+    for key in keys {
+        inputs.push(chord_key(key, false));
+    }
+    for key in keys.into_iter().rev() {
+        inputs.push(chord_key(key, true));
+    }
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    assert_eq!(
+        sent,
+        inputs.len() as u32,
+        "SendInput did not deliver the hotkey"
+    );
+}
+
+fn chord_key(virtual_key: u16, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    };
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(virtual_key),
+                wScan: 0,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
 }
 
 fn physical_is_blocked(probe: &Probe, extra: u64) -> bool {

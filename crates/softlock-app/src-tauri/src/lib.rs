@@ -1,9 +1,37 @@
+mod actions;
+mod client;
+#[cfg(windows)]
+mod owner;
+
 use tauri::Manager;
+use zeroize::Zeroize;
+
+use actions::{pin_field_error, service_line, status_line};
+use client::OwnerView;
+#[cfg(windows)]
+use softlock_core::LockSource;
+use softlock_core::Secret;
 
 #[derive(Clone, serde::Serialize)]
 struct PlatformStatus {
     supported: bool,
     message: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct OwnerViewDto {
+    service_running: bool,
+    locked: bool,
+    state: String,
+    lock_source: Option<String>,
+    status_line: String,
+    service_line: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PinOutcome {
+    accepted: bool,
+    field_error: Option<String>,
 }
 
 fn current_platform_status() -> PlatformStatus {
@@ -32,9 +60,82 @@ fn current_platform_status() -> PlatformStatus {
     }
 }
 
+fn view_dto(view: &OwnerView) -> OwnerViewDto {
+    OwnerViewDto {
+        service_running: view.service_running,
+        locked: view.locked(),
+        state: view
+            .state
+            .map(|state| format!("{state:?}"))
+            .unwrap_or_else(|| "Locked".to_string()),
+        lock_source: view
+            .lock_source
+            .map(client::lock_source_name)
+            .map(str::to_string),
+        status_line: status_line(view.service_running, view.state),
+        service_line: service_line(view.service_running).to_string(),
+    }
+}
+
+fn shown_view() -> OwnerView {
+    #[cfg(windows)]
+    {
+        owner::current_view()
+    }
+    #[cfg(not(windows))]
+    {
+        OwnerView::unknown()
+    }
+}
+
 #[tauri::command]
 fn platform_status() -> PlatformStatus {
     current_platform_status()
+}
+
+#[tauri::command]
+fn owner_view() -> OwnerViewDto {
+    view_dto(&shown_view())
+}
+
+#[tauri::command]
+fn lock_from_app() -> OwnerViewDto {
+    #[cfg(windows)]
+    owner::send_lock(LockSource::App);
+    view_dto(&shown_view())
+}
+
+#[tauri::command]
+fn set_pin(mut pin: String) -> PinOutcome {
+    if let Some(code) = pin_field_error(&pin) {
+        pin.zeroize();
+        return PinOutcome {
+            accepted: false,
+            field_error: Some(code.to_string()),
+        };
+    }
+    let secret = Secret::new(pin.as_bytes());
+    pin.zeroize();
+    #[cfg(windows)]
+    let accepted = owner::send_pin(secret);
+    #[cfg(not(windows))]
+    let accepted = {
+        drop(secret);
+        false
+    };
+    PinOutcome {
+        accepted,
+        field_error: None,
+    }
+}
+
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    #[cfg(windows)]
+    if owner::request_quit() {
+        return;
+    }
+    app.exit(0);
 }
 
 pub fn run() {
@@ -54,11 +155,36 @@ pub fn run() {
                 .get_webview_window("main")
                 .expect("the config declares the main window");
             window.set_title(softlock_core::PRODUCT_DISPLAY_NAME)?;
+            #[cfg(windows)]
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    owner::run(Some(handle));
+                });
+            }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![platform_status])
+        .invoke_handler(tauri::generate_handler![
+            platform_status,
+            owner_view,
+            lock_from_app,
+            set_pin,
+            quit_app
+        ])
         .run(tauri::generate_context!())
         .expect("error while running the application");
+}
+
+pub fn run_owner_session() -> i32 {
+    #[cfg(windows)]
+    {
+        owner::run(None)
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("the owner session runs on Windows");
+        1
+    }
 }
 
 #[cfg(test)]
