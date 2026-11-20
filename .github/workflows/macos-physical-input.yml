@@ -1,0 +1,86 @@
+name: macOS physical-input kit
+
+# Runner slice: listen-only session tap and second-process posts.
+# No physical key, no password field, no USB keyboard, no launchd.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'spikes/macos-physical-input/**'
+      - 'spikes/macos-desktop-proof/**'
+      - 'tests/hardware/macos/**'
+      - '.github/workflows/macos-physical-input.yml'
+      - 'docs/findings/m05-physical-input/**'
+      - 'crates/softlock-core/tests/macos_physical_input_isolation.rs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  kit:
+    name: macos physical-input runner (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [macos-latest, macos-15-intel, macos-26-intel]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: macos-physical-input
+          workspaces: spikes/macos-physical-input -> spikes/macos-physical-input/target
+      - name: Record the runner
+        run: |
+          sw_vers
+          uname -m
+          echo "uid=$(id -u) user=$(whoami)"
+      - name: Format
+        run: cargo fmt --manifest-path spikes/macos-physical-input/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path spikes/macos-physical-input/Cargo.toml --all-targets -- -D warnings
+      - name: Hardware suite clippy
+        run: cargo clippy --locked --manifest-path tests/hardware/macos/Cargo.toml --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --locked --manifest-path spikes/macos-physical-input/Cargo.toml
+      - name: Hardware suite unit tests
+        run: cargo test --locked --manifest-path tests/hardware/macos/Cargo.toml
+      - name: Hardware suite CI
+        run: |
+          set -euo pipefail
+          ./tests/hardware/macos/run.sh --ci
+          shopt -s nullglob
+          files=(suite-output/*/result.txt)
+          result="${files[0]:-}"
+          test -n "$result"
+          grep -F "softlock-hardware-suite/1" "$result"
+          grep -E "pass=[0-9]+ fail=[0-9]+ skip=[0-9]+" "$result"
+          grep -F "serial-collected=false" "$result"
+          python3 tests/hardware/check-schema.py "${result%.txt}.json"
+          echo "----- suite result.txt -----"
+          cat "$result"
+      - name: Runner slice
+        run: |
+          set -euo pipefail
+          cargo run --locked --release --manifest-path spikes/macos-physical-input/Cargo.toml -- --runner --output-dir physical-input-output
+          test -f physical-input-output/result.json
+          test -f physical-input-output/result.txt
+          grep -F "result=pass" physical-input-output/result.txt
+          grep -F "tap-option=listen-only" physical-input-output/result.txt
+          grep -F "tap-released=true" physical-input-output/result.txt
+          grep -F "interrupted=false" physical-input-output/result.txt
+          grep -F "serial-collected=false" physical-input-output/result.txt
+          grep -F "post-private-poster=second-process" physical-input-output/result.txt
+          grep -F "post-combined-poster=second-process" physical-input-output/result.txt
+          grep -F "post-hid-poster=second-process" physical-input-output/result.txt
+          echo "----- result.txt -----"
+          cat physical-input-output/result.txt

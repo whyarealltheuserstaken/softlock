@@ -209,6 +209,178 @@ fn hardware_row(id: &str, name: &str, key: &str, text: &str, mode: &str) -> Row 
     }
 }
 
+pub fn physical_input_rows(text: &str) -> Vec<Row> {
+    let released = field(text, "tap-released").as_deref() == Some("true");
+    let created = field(text, "tap-created").as_deref() == Some("true");
+    let option = field(text, "tap-option").unwrap_or_default();
+    let process_ok = (!created || released) && option == "listen-only";
+    let mut rows = vec![row(
+        "m05-tap-released",
+        "Listen-only tap released",
+        if process_ok { "pass" } else { "fail" },
+        None,
+        false,
+        format!("created={created} released={released} option={option}"),
+    )];
+    rows[0].measurements.insert(
+        "assertion-released".into(),
+        json!(if released { "true" } else { "false" }),
+    );
+    for (id, name, key, physical) in [
+        ("m05-physical-key", "Physical key", "physical-key", true),
+        (
+            "m05-physical-click",
+            "Physical click",
+            "physical-click",
+            true,
+        ),
+        (
+            "m05-physical-scroll",
+            "Trackpad scroll",
+            "physical-scroll",
+            true,
+        ),
+        (
+            "m05-post-private",
+            "Posted private source",
+            "post-private",
+            false,
+        ),
+        (
+            "m05-post-combined",
+            "Posted combined-session source",
+            "post-combined",
+            false,
+        ),
+        ("m05-post-hid", "Posted HID source", "post-hid", false),
+        ("m05-secure-input", "Secure input", "secure", true),
+        (
+            "m05-usb-keyboard",
+            "USB keyboard hot-plug",
+            "usb-keyboard",
+            true,
+        ),
+    ] {
+        rows.push(physical_row(id, name, key, text, physical));
+    }
+    rows.push(classification_row(text));
+    if field(text, "interrupted").as_deref() == Some("true") {
+        rows.push(row(
+            "m05-interrupted",
+            "Physical-input interrupt",
+            "fail",
+            None,
+            false,
+            "Ctrl-C".into(),
+        ));
+    }
+    rows
+}
+
+fn physical_row(id: &str, name: &str, key: &str, text: &str, physical: bool) -> Row {
+    let value = field(text, key).unwrap_or_else(|| "missing".into());
+    let method = field(text, &format!("{key}-detection")).unwrap_or_default();
+    let state = field(text, &format!("{key}-state-id")).unwrap_or_else(|| "none".into());
+    let pid = field(text, &format!("{key}-source-pid")).unwrap_or_else(|| "none".into());
+    let received = field(text, &format!("{key}-window-received")).unwrap_or_else(|| "none".into());
+    let detail = format!("{value} state={state} pid={pid} window={received} method={method}");
+    if value == "not-run-on-runner" {
+        return row(id, name, "skip", Some("ci"), physical, detail);
+    }
+    match value.as_str() {
+        "recorded" if key.starts_with("post-") => {
+            let tap_saw = field(text, &format!("{key}-tap-saw")).as_deref() == Some("true");
+            let poster = field(text, &format!("{key}-poster")).unwrap_or_default();
+            if tap_saw && poster == "second-process" && state != "none" && pid != "none" {
+                row(id, name, "pass", None, physical, detail)
+            } else {
+                row(id, name, "fail", None, physical, detail)
+            }
+        }
+        "recorded" if key.starts_with("physical-") => {
+            if state != "none" && pid != "none" {
+                row(id, name, "pass", None, physical, detail)
+            } else {
+                row(id, name, "fail", None, physical, detail)
+            }
+        }
+        "recorded"
+            if key == "secure"
+                && matches!(
+                    field(text, "secure").as_deref(),
+                    Some("quiet" | "disabled-by-user-input" | "still-seeing")
+                ) =>
+        {
+            row(id, name, "pass", None, physical, detail)
+        }
+        "quiet" | "disabled-by-user-input" | "still-seeing" => {
+            row(id, name, "pass", None, physical, detail)
+        }
+        "recorded" if key == "usb-keyboard" => {
+            if field(text, "usb-keyboard-state-id").as_deref() != Some("none")
+                && field(text, "usb-keyboard-source-pid").as_deref() != Some("none")
+            {
+                row(id, name, "pass", None, physical, detail)
+            } else {
+                row(id, name, "fail", None, physical, detail)
+            }
+        }
+        "no-keyboard" | "no-pointing-device" | "no-trackpad" | "no-second-keyboard" | "no-tap" => {
+            row(id, name, "skip", Some("not-applicable"), physical, detail)
+        }
+        "skip" => row(id, name, "skip", Some("operator"), physical, detail),
+        "no-input" => row(id, name, "skip", Some("no-input"), physical, detail),
+        "interrupted" => row(id, name, "skip", Some("interrupted"), physical, detail),
+        "not-detected" | "missing" | "error" | "tap-disabled" => {
+            row(id, name, "fail", None, physical, detail)
+        }
+        _ => row(id, name, "fail", None, physical, detail),
+    }
+}
+
+fn classification_row(text: &str) -> Row {
+    let value = field(text, "classification").unwrap_or_else(|| "missing".into());
+    let rule = field(text, "classification-rule").unwrap_or_default();
+    let named = field(text, "m14-named").as_deref() == Some("true") || rule.contains("m14");
+    let detail = format!("{value} rule={rule} m14={named}");
+    if value == "pending-physical" {
+        return row(
+            "m05-classification",
+            "Classification rule",
+            "skip",
+            Some("ci"),
+            false,
+            detail,
+        );
+    }
+    match value.as_str() {
+        "confirmed" | "replaced" if named => row(
+            "m05-classification",
+            "Classification rule",
+            "pass",
+            None,
+            true,
+            detail,
+        ),
+        "confirmed" | "replaced" => row(
+            "m05-classification",
+            "Classification rule",
+            "fail",
+            None,
+            true,
+            detail,
+        ),
+        _ => row(
+            "m05-classification",
+            "Classification rule",
+            "fail",
+            None,
+            true,
+            detail,
+        ),
+    }
+}
+
 pub fn lock_read_only_row(text: &str) -> Row {
     let result = field(text, "result").unwrap_or_else(|| "missing".into());
     let status = if result == "pass" { "pass" } else { "fail" };
@@ -812,6 +984,247 @@ power-key=not-run-on-runner
 
     fn plan_row(status: &str) -> Row {
         row("x", "x", status, None, false, String::new())
+    }
+
+    #[test]
+    fn physical_key_click_and_trackpad_scroll_each_have_a_row() {
+        let text = runner_m05();
+        let rows = physical_input_rows(&text);
+        assert!(rows.iter().any(|row| row.id == "m05-physical-key"));
+        assert!(rows.iter().any(|row| row.id == "m05-physical-click"));
+        assert!(rows.iter().any(|row| row.id == "m05-physical-scroll"));
+        for id in [
+            "m05-physical-key",
+            "m05-physical-click",
+            "m05-physical-scroll",
+        ] {
+            let row = rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.status, "skip");
+            assert_eq!(row.skip_reason.as_deref(), Some("ci"));
+            assert!(row.physical);
+            assert!(row.detail.contains("state="));
+            assert!(row.detail.contains("pid="));
+        }
+        let kit = physical_input_rows(&kit_m05());
+        for id in [
+            "m05-physical-key",
+            "m05-physical-click",
+            "m05-physical-scroll",
+        ] {
+            assert_eq!(kit.iter().find(|row| row.id == id).unwrap().status, "pass");
+        }
+    }
+
+    #[test]
+    fn a_post_under_each_of_the_three_source_states_has_the_same_columns_from_a_second_process() {
+        let rows = physical_input_rows(&runner_m05());
+        for id in ["m05-post-private", "m05-post-combined", "m05-post-hid"] {
+            let row = rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.status, "pass");
+            assert!(row.detail.contains("state="));
+            assert!(row.detail.contains("pid="));
+            assert!(row.detail.contains("window="));
+        }
+        let kit = physical_input_rows(&kit_m05());
+        assert_eq!(
+            kit.iter()
+                .find(|row| row.id == "m05-post-private")
+                .unwrap()
+                .status,
+            "pass"
+        );
+    }
+
+    #[test]
+    fn secure_input_has_a_row_for_disable_silence_or_keys() {
+        let runner = physical_input_rows(&runner_m05());
+        let row = runner
+            .iter()
+            .find(|row| row.id == "m05-secure-input")
+            .unwrap();
+        assert_eq!(row.skip_reason.as_deref(), Some("ci"));
+        let mut quiet = kit_m05();
+        quiet = quiet.replace("secure=still-seeing", "secure=quiet");
+        let row = physical_input_rows(&quiet)
+            .into_iter()
+            .find(|row| row.id == "m05-secure-input")
+            .unwrap();
+        assert_eq!(row.status, "pass");
+        let mut disabled = kit_m05();
+        disabled = disabled.replace("secure=still-seeing", "secure=disabled-by-user-input");
+        assert_eq!(
+            physical_input_rows(&disabled)
+                .iter()
+                .find(|row| row.id == "m05-secure-input")
+                .unwrap()
+                .status,
+            "pass"
+        );
+    }
+
+    #[test]
+    fn usb_keyboard_hot_plug_has_a_row_or_says_no_second_keyboard() {
+        let none = physical_input_rows(&kit_m05())
+            .into_iter()
+            .find(|row| row.id == "m05-usb-keyboard")
+            .unwrap();
+        assert_eq!(none.status, "skip");
+        assert_eq!(none.skip_reason.as_deref(), Some("not-applicable"));
+        assert!(none.detail.contains("no-second-keyboard"));
+        let plugged = "\
+mode=kit
+tap-created=true
+tap-released=true
+tap-option=listen-only
+usb-keyboard=recorded
+usb-keyboard-state-id=1
+usb-keyboard-source-pid=0
+usb-keyboard-window-received=true
+usb-keyboard-detection=listen-only-tap
+";
+        assert_eq!(
+            physical_input_rows(plugged)
+                .iter()
+                .find(|row| row.id == "m05-usb-keyboard")
+                .unwrap()
+                .status,
+            "pass"
+        );
+    }
+
+    #[test]
+    fn the_classification_rule_is_confirmed_or_replaced_and_m14_is_named() {
+        let pending = physical_input_rows(&runner_m05())
+            .into_iter()
+            .find(|row| row.id == "m05-classification")
+            .unwrap();
+        assert_eq!(pending.skip_reason.as_deref(), Some("ci"));
+        let confirmed = physical_input_rows(&kit_m05())
+            .into_iter()
+            .find(|row| row.id == "m05-classification")
+            .unwrap();
+        assert_eq!(confirmed.status, "pass");
+        assert!(confirmed.detail.contains("m14"));
+        let replaced = "\
+mode=kit
+tap-created=true
+tap-released=true
+tap-option=listen-only
+classification=replaced
+classification-rule=measured-table; m14 must use the measured rows
+m14-named=true
+";
+        assert_eq!(
+            physical_input_rows(replaced)
+                .iter()
+                .find(|row| row.id == "m05-classification")
+                .unwrap()
+                .status,
+            "pass"
+        );
+        let unnamed = "\
+mode=kit
+tap-created=true
+tap-released=true
+tap-option=listen-only
+classification=confirmed
+classification-rule=hid-and-pid-0-is-physical
+m14-named=false
+";
+        assert_eq!(
+            physical_input_rows(unnamed)
+                .iter()
+                .find(|row| row.id == "m05-classification")
+                .unwrap()
+                .status,
+            "fail"
+        );
+    }
+
+    fn runner_m05() -> String {
+        "\
+mode=runner
+tap-created=true
+tap-released=true
+tap-option=listen-only
+physical-key=not-run-on-runner
+physical-key-state-id=none
+physical-key-source-pid=none
+physical-key-window-received=none
+physical-click=not-run-on-runner
+physical-scroll=not-run-on-runner
+post-private=recorded
+post-private-state-id=1102520059
+post-private-source-pid=8451
+post-private-window-received=true
+post-private-tap-saw=true
+post-private-poster=second-process
+post-combined=recorded
+post-combined-state-id=0
+post-combined-source-pid=8488
+post-combined-window-received=true
+post-combined-tap-saw=true
+post-combined-poster=second-process
+post-hid=recorded
+post-hid-state-id=1
+post-hid-source-pid=8489
+post-hid-window-received=true
+post-hid-tap-saw=true
+post-hid-poster=second-process
+secure=not-run-on-runner
+usb-keyboard=not-run-on-runner
+classification=pending-physical
+classification-rule=hid-and-pid-0-is-physical
+m14-named=true
+"
+        .into()
+    }
+
+    fn kit_m05() -> String {
+        "\
+mode=kit
+tap-created=true
+tap-released=true
+tap-option=listen-only
+physical-key=recorded
+physical-key-state-id=1
+physical-key-source-pid=0
+physical-key-window-received=true
+physical-click=recorded
+physical-click-state-id=1
+physical-click-source-pid=0
+physical-click-window-received=true
+physical-scroll=recorded
+physical-scroll-state-id=1
+physical-scroll-source-pid=0
+physical-scroll-window-received=true
+post-private=recorded
+post-private-state-id=1102520059
+post-private-source-pid=11
+post-private-window-received=true
+post-private-tap-saw=true
+post-private-poster=second-process
+post-combined=recorded
+post-combined-state-id=0
+post-combined-source-pid=12
+post-combined-window-received=true
+post-combined-tap-saw=true
+post-combined-poster=second-process
+post-hid=recorded
+post-hid-state-id=1
+post-hid-source-pid=13
+post-hid-window-received=true
+post-hid-tap-saw=true
+post-hid-poster=second-process
+secure=still-seeing
+secure-disable-event=none
+secure-window-received=false
+usb-keyboard=no-second-keyboard
+classification=confirmed
+classification-rule=hid-and-pid-0-is-physical; m14 swallows that row and passes the rest
+m14-named=true
+"
+        .into()
     }
 
     #[test]

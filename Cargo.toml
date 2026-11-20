@@ -18,6 +18,7 @@ exclude = [
     "spikes/input-hook",
     "spikes/macos-desktop-proof",
     "spikes/macos-keep-awake",
+    "spikes/macos-physical-input",
     "spikes/macos-lock-kit",
     "tests/hardware/macos",
     "tests/hardware/linux",

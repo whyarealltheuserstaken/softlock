@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use macos_hardware_suite::{
     Config, SCHEMA, SuiteResult, budget_skip, decided_skip, exit_row, fail_closed, keep_awake_rows,
-    keep_process_row, lock_exercise_row, lock_read_only_row, over_budget, restored_from,
-    scrub_model, smoke_row, suite_exit, summary_of,
+    keep_process_row, lock_exercise_row, lock_read_only_row, over_budget, physical_input_rows,
+    restored_from, scrub_model, smoke_row, suite_exit, summary_of,
 };
 
 const BUDGET_MS: u64 = 300_000;
@@ -93,6 +93,26 @@ fn run() -> i32 {
             &grants.input_note(),
             false,
         ));
+        for (id, name, physical) in [
+            ("m05-tap-released", "Listen-only tap released", false),
+            ("m05-physical-key", "Physical key", true),
+            ("m05-physical-click", "Physical click", true),
+            ("m05-physical-scroll", "Trackpad scroll", true),
+            ("m05-post-private", "Posted private source", false),
+            ("m05-post-combined", "Posted combined-session source", false),
+            ("m05-post-hid", "Posted HID source", false),
+            ("m05-secure-input", "Secure input", true),
+            ("m05-usb-keyboard", "USB keyboard hot-plug", true),
+            ("m05-classification", "Classification rule", true),
+        ] {
+            rows.push(decided_skip(
+                id,
+                name,
+                "not-applicable",
+                &grants.input_note(),
+                physical,
+            ));
+        }
     } else {
         let m03 = spawn(
             &desktop_bin(),
@@ -107,6 +127,30 @@ fn run() -> i32 {
             false,
             &format!("exit {m03}"),
         ));
+        let m05_dir = out.join("m05").to_string_lossy().into_owned();
+        let m05_flag = if ci { "--runner" } else { "--kit" };
+        let m05 = spawn(
+            &release_bin("macos-physical-input"),
+            &[m05_flag, "--output-dir", &m05_dir],
+            &out.join("m05.log"),
+            !ci,
+        );
+        let mut m05_text = read_text(&out.join("m05").join("result.txt"));
+        if m05_text.is_empty() {
+            m05_text = read_text(&out.join("m05.log"));
+        }
+        rows.extend(physical_input_rows(&m05_text));
+        if m05 != 0 {
+            let released =
+                macos_hardware_suite::field(&m05_text, "tap-released").as_deref() == Some("true");
+            rows.push(exit_row(
+                "m05-process",
+                "Physical-input process",
+                released,
+                false,
+                &format!("exit {m05} tap-released={released}"),
+            ));
+        }
     }
     if !grants.screen {
         rows.push(decided_skip(
@@ -506,6 +550,16 @@ fn fill_interrupted(rows: &mut Vec<macos_hardware_suite::Row>) {
     }
     for (id, name, physical) in [
         ("m03-posted-input", "Posted input", false),
+        ("m05-tap-released", "Listen-only tap released", false),
+        ("m05-physical-key", "Physical key", true),
+        ("m05-physical-click", "Physical click", true),
+        ("m05-physical-scroll", "Trackpad scroll", true),
+        ("m05-post-private", "Posted private source", false),
+        ("m05-post-combined", "Posted combined-session source", false),
+        ("m05-post-hid", "Posted HID source", false),
+        ("m05-secure-input", "Secure input", true),
+        ("m05-usb-keyboard", "USB keyboard hot-plug", true),
+        ("m05-classification", "Classification rule", true),
         ("m04-sharing", "Sharing probe", false),
         ("m11-smoke", "Native Intel smoke", false),
         ("m07-assertions", "Idle-sleep assertions", false),
