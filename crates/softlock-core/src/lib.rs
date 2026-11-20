@@ -46,8 +46,8 @@ pub use name::{
     SERVICE_NAME, pipe_name, registry_key,
 };
 pub use pin::{
-    PIN_MEMORY_KIB, PIN_PARALLELISM, PIN_SALT_LEN, PIN_TIME_COST, PinHashError, hash_softlock_pin,
-    verify_softlock_pin,
+    MIN_PIN_LEN, PIN_MEMORY_KIB, PIN_PARALLELISM, PIN_SALT_LEN, PIN_TIME_COST, PinHashError,
+    hash_softlock_pin, verify_softlock_pin,
 };
 pub use platform::{
     AwakeGuard, AwakeRequest, CapabilityReport, Credentials, DiskEncryption, EncryptionStatus,

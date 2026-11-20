@@ -117,6 +117,10 @@ impl Session {
         session
     }
 
+    fn pipe(&self) -> &str {
+        &self.pipe
+    }
+
     fn hello(&self) -> Result<String, String> {
         self.transact(r#"{"v":1,"id":1,"kind":"Hello","client_version":"0"}"#)
     }
@@ -1359,6 +1363,435 @@ fn physical_reached(probe: &Probe, extra: u64) -> bool {
         .filter(|input| input.virtual_key == VK_F14)
         .count()
         > before
+}
+
+#[test]
+fn global_hotkey_locks_and_the_probe_confirms() {
+    let _guard = gate();
+    let session = Session::start(None, true);
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let status_path = session.pin_dir.join("owner-status.txt");
+    let _owner = KillChild(Some(spawn_owner(&session, &status_path)));
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            status_file(&status_path).contains("hotkey=ok")
+                && status_file(&status_path).contains("service=running")
+        }),
+        "the app did not register the hotkey: {}",
+        status_file(&status_path)
+    );
+    let before = status_seq(&status_file(&status_path));
+    send_default_hotkey();
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let text = status_file(&status_path);
+            status_seq(&text) > before && text.contains("tray=on") && text.contains("state=Locked")
+        }),
+        "the hotkey did not lock: {}",
+        status_file(&status_path)
+    );
+    assert!(
+        physical_is_blocked(&probe, session.extra),
+        "physical input reached the probe"
+    );
+    send_virtual_key(VK_F13, 0).expect("injected");
+    probe
+        .wait_for_key(VK_F13, Duration::from_secs(3))
+        .expect("injected input did not reach the probe");
+    let status = session.status().expect("status");
+    assert!(
+        status.contains("Hotkey"),
+        "GetStatus did not record the hotkey: {status}"
+    );
+    assert!(
+        !status.contains("Unlocked"),
+        "status reported Unlocked: {status}"
+    );
+}
+
+#[test]
+fn app_subscribe_shows_locked_then_unlocked_after_the_pin() {
+    let _guard = gate();
+    let session = Session::start(None, true);
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let stored = session.set_pin().expect("set pin");
+    assert!(stored.contains("Ok"), "pin was not stored: {stored}");
+    let status_path = session.pin_dir.join("owner-status.txt");
+    let _owner = KillChild(Some(spawn_owner(&session, &status_path)));
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            status_file(&status_path).contains("service=running")
+        }),
+        "the app did not subscribe: {}",
+        status_file(&status_path)
+    );
+    let before = status_seq(&status_file(&status_path));
+    let locked = session.lock().expect("lock");
+    assert!(
+        locked.contains("Accepted"),
+        "lock was not accepted: {locked}"
+    );
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            let text = status_file(&status_path);
+            status_seq(&text) > before && text.contains("tray=on") && text.contains("state=Locked")
+        }),
+        "subscribe did not show the lock: {}",
+        status_file(&status_path)
+    );
+    let before_unlock = status_seq(&status_file(&status_path));
+    type_pin(session.extra);
+    assert!(
+        wait_for(Duration::from_secs(30), || {
+            let text = status_file(&status_path);
+            status_seq(&text) > before_unlock
+                && text.contains("state=Unlocked")
+                && text.contains("tray=off")
+        }),
+        "the pin did not return the app to unlocked: {}",
+        status_file(&status_path)
+    );
+    let status = session.status().expect("status");
+    assert!(
+        status.contains("Unlocked"),
+        "GetStatus stayed locked: {status}"
+    );
+}
+
+#[test]
+fn app_quitting_leaves_the_service_running_for_a_lock_client() {
+    let _guard = gate();
+    let install = std::env::temp_dir().join(format!("softlock-app-inst-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&install);
+    fs::create_dir_all(&install).expect("install dir");
+    let dest = install.join("softlock-app.exe");
+    fs::copy(app_exe(), &dest).expect("copy app");
+    let install_text = install.display().to_string();
+    let session = Session::launch_extra(
+        None,
+        false,
+        "1",
+        None,
+        &[("SOFTLOCK_INSTALL_DIR", install_text.as_str())],
+    );
+    let status_path = session.pin_dir.join("owner-status.txt");
+    let mut child = Command::new(&dest)
+        .arg("--owner-session")
+        .env("SOFTLOCK_PIPE", session.pipe())
+        .env("SOFTLOCK_STATUS_FILE", &status_path)
+        .env("SOFTLOCK_NO_AUTOSTART", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("app process");
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let text = status_file(&status_path);
+            text.contains("service=running") && owner_hwnd(&text).is_some()
+        }),
+        "the owner session did not publish a window: {}",
+        status_file(&status_path)
+    );
+    let hwnd = owner_hwnd(&status_file(&status_path)).expect("hwnd");
+    post_owner(hwnd, WM_COMMAND, CMD_QUIT as isize);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let finished = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("Quit did not exit within 5s: {}", status_file(&status_path));
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(finished.success(), "the app quit with {finished}");
+    let hello = session.hello().expect("service still answers");
+    assert!(
+        hello.contains("Hello"),
+        "quitting the app stopped the service: {hello}"
+    );
+    let locked = session.lock().expect("lock client");
+    assert!(
+        locked.contains("Accepted"),
+        "a lock client could not lock after the app quit: {locked}"
+    );
+    let _ = fs::remove_dir_all(&install);
+}
+
+#[test]
+fn tray_command_and_app_lock_show_sources_in_get_status() {
+    let _guard = gate();
+    assert_lock_source(WM_COMMAND, CMD_LOCK as isize, "Tray");
+    assert_lock_source(WM_LOCK_APP, 0, "App");
+}
+
+#[test]
+fn hotkey_unavailable_is_shown_when_registration_fails() {
+    let _guard = gate();
+    let session = Session::start(None, true);
+    let first_path = session.pin_dir.join("hotkey-first.txt");
+    let second_path = session.pin_dir.join("hotkey-second.txt");
+    let _first = KillChild(Some(spawn_owner(&session, &first_path)));
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            status_file(&first_path).contains("hotkey=ok")
+        }),
+        "the first owner did not register the hotkey: {}",
+        status_file(&first_path)
+    );
+    let _second = KillChild(Some(spawn_owner(&session, &second_path)));
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let text = status_file(&second_path);
+            text.contains("hotkey=failed") && text.contains("notice=hotkey unavailable")
+        }),
+        "a failed hotkey was not shown: {}",
+        status_file(&second_path)
+    );
+}
+
+fn assert_lock_source(message: u32, wparam: isize, source: &str) {
+    let session = Session::start(None, true);
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let status_path = session.pin_dir.join(format!("source-{source}.txt"));
+    let _owner = KillChild(Some(spawn_owner(&session, &status_path)));
+    assert!(
+        wait_for(Duration::from_secs(20), || owner_hwnd(&status_file(
+            &status_path
+        ))
+        .is_some()),
+        "no owner window: {}",
+        status_file(&status_path)
+    );
+    let hwnd = owner_hwnd(&status_file(&status_path)).expect("hwnd");
+    let before = status_seq(&status_file(&status_path));
+    post_owner(hwnd, message, wparam);
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            session
+                .status()
+                .ok()
+                .is_some_and(|status| status.contains(&format!("\"{source}\"")))
+                && status_seq(&status_file(&status_path)) > before
+        }),
+        "GetStatus did not record {source}: {:?} file {}",
+        session.status().ok(),
+        status_file(&status_path)
+    );
+}
+
+fn spawn_owner(session: &Session, status_path: &Path) -> std::process::Child {
+    Command::new(app_exe())
+        .arg("--owner-session")
+        .env("SOFTLOCK_PIPE", session.pipe())
+        .env("SOFTLOCK_STATUS_FILE", status_path)
+        .env("SOFTLOCK_NO_AUTOSTART", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("owner session")
+}
+
+fn app_exe() -> PathBuf {
+    static BUILD: Mutex<()> = Mutex::new(());
+    let _build = BUILD.lock().unwrap_or_else(|poison| poison.into_inner());
+    let host = PathBuf::from(env!("CARGO_BIN_EXE_softlock-lockhost"));
+    let app = host.with_file_name("softlock-app.exe");
+    let mut command = Command::new("cargo");
+    command.args([
+        "build",
+        "-p",
+        "softlock-app",
+        "--bin",
+        "softlock-app",
+        "--features",
+        "simulated-physical",
+    ]);
+    if host.to_string_lossy().contains("x86_64-pc-windows-msvc") {
+        command.args(["--target", "x86_64-pc-windows-msvc"]);
+    }
+    // Nested cargo output splits libtest's "... ok" line and fails the CI grep.
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let status = command.status().expect("cargo build");
+    assert!(status.success(), "app build failed");
+    assert!(app.is_file(), "missing {}", app.display());
+    app
+}
+
+fn status_file(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+fn status_seq(text: &str) -> u64 {
+    text.lines()
+        .find_map(|line| line.strip_prefix("seq=")?.parse().ok())
+        .unwrap_or(0)
+}
+
+fn owner_hwnd(text: &str) -> Option<isize> {
+    let raw = text.lines().find_map(|line| line.strip_prefix("hwnd="))?;
+    let value: isize = raw.parse().ok()?;
+    if value == 0 { None } else { Some(value) }
+}
+
+const WM_COMMAND: u32 = 0x0111;
+const WM_LOCK_APP: u32 = 0x8002;
+const CMD_LOCK: usize = 10;
+const CMD_QUIT: usize = 11;
+
+fn post_owner(hwnd: isize, message: u32, wparam: isize) {
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+    let posted = unsafe {
+        PostMessageW(
+            Some(HWND(hwnd as *mut core::ffi::c_void)),
+            message,
+            WPARAM(wparam as usize),
+            LPARAM(0),
+        )
+    };
+    assert!(posted.is_ok(), "PostMessage failed");
+}
+
+#[test]
+fn a_closed_subscriber_frees_its_stream_slot() {
+    let _guard = gate();
+    let session = Session::start(None, true);
+    let mut held = Vec::new();
+    for index in 0..8 {
+        held.push(subscribe_live(&session, index));
+    }
+    let extra = open_pipe(&session.pipe).expect("ninth pipe");
+    write_all(extra, &subscribe_frame(90)).expect("ninth subscribe");
+    let accepted = read_frame(extra).expect("ninth accepted");
+    let accepted = String::from_utf8_lossy(&accepted);
+    assert!(
+        accepted.contains("Accepted"),
+        "the extra subscriber was not answered: {accepted}"
+    );
+    let closed = read_frame_deadline(extra, Duration::from_secs(2));
+    assert!(
+        closed.is_err(),
+        "the ninth subscriber stayed open past the cap: {closed:?}"
+    );
+    for handle in held {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+        }
+    }
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(extra);
+    }
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            subscribe_receives_state(&session)
+        }),
+        "a freed subscriber slot did not accept a new stream"
+    );
+}
+
+fn subscribe_frame(id: u64) -> Vec<u8> {
+    let json = format!(r#"{{"v":1,"id":{id},"kind":"Subscribe"}}"#);
+    let mut frame = (json.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(json.as_bytes());
+    frame
+}
+
+fn subscribe_live(session: &Session, index: u64) -> HANDLE {
+    let handle = open_pipe(session.pipe()).expect("subscribe pipe");
+    write_all(handle, &subscribe_frame(10 + index)).expect("subscribe");
+    let first = read_frame(handle).expect("accepted");
+    assert!(
+        String::from_utf8_lossy(&first).contains("Accepted"),
+        "subscribe was not accepted"
+    );
+    let state = read_frame(handle).expect("state");
+    assert!(
+        String::from_utf8_lossy(&state).contains("StateChanged"),
+        "the stream did not send the state"
+    );
+    handle
+}
+
+fn subscribe_receives_state(session: &Session) -> bool {
+    let Ok(handle) = open_pipe(session.pipe()) else {
+        return false;
+    };
+    if write_all(handle, &subscribe_frame(200)).is_err() {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+        }
+        return false;
+    }
+    let ok = read_frame_deadline(handle, Duration::from_secs(2))
+        .ok()
+        .is_some_and(|frame| String::from_utf8_lossy(&frame).contains("Accepted"))
+        && read_frame_deadline(handle, Duration::from_secs(2))
+            .ok()
+            .is_some_and(|frame| String::from_utf8_lossy(&frame).contains("StateChanged"));
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+    }
+    ok
+}
+
+fn read_frame_deadline(handle: HANDLE, timeout: Duration) -> Result<Vec<u8>, String> {
+    let raw = handle.0 as usize;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let handle = HANDLE(raw as *mut core::ffi::c_void);
+        let _ = sender.send(read_frame(handle));
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err("timeout".to_string()),
+    }
+}
+
+fn send_default_hotkey() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
+    let keys = [0xA2u16, 0xA4, 0xA0, u16::from(b'L')];
+    let mut inputs = Vec::new();
+    for key in keys {
+        inputs.push(chord_key(key, false));
+    }
+    for key in keys.into_iter().rev() {
+        inputs.push(chord_key(key, true));
+    }
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    assert_eq!(
+        sent,
+        inputs.len() as u32,
+        "SendInput did not deliver the hotkey"
+    );
+}
+
+fn chord_key(virtual_key: u16, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    };
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(virtual_key),
+                wScan: 0,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
 }
 
 fn physical_is_blocked(probe: &Probe, extra: u64) -> bool {

@@ -21,6 +21,79 @@ test("Linux shows the unsupported platform message", async ({ browser }) => {
   await expectUnsupported(browser);
 });
 
+test("tray lock now and the app button record tray and app sources", async ({ page }) => {
+  await page.goto("/");
+  await page.getByTestId("tray-lock").click();
+  await expect(page.locator("main")).toHaveAttribute("data-lock-source", "Tray");
+  await page.getByTestId("lock").click();
+  await expect(page.locator("main")).toHaveAttribute("data-lock-source", "App");
+  await expect(page.locator("main")).toHaveAttribute("data-sources", "Tray,App");
+  await expect(page.locator("main")).toHaveAttribute("data-locked", "on");
+});
+
+test("subscribe shows locked and returns to unlocked after the pin stream", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByTestId("status-line")).toContainText("is off");
+  await expect(page.getByTestId("tray-status")).toContainText("is off");
+  await page.evaluate(() => window.__SOFTLOCK_PUSH_STATE__?.("Locked"));
+  await expect(page.getByTestId("status-line")).toContainText("is on");
+  await expect(page.getByTestId("tray-status")).toContainText("is on");
+  await expect(page.locator("main")).toHaveAttribute("data-locked", "on");
+  await page.evaluate(() => window.__SOFTLOCK_PUSH_STATE__?.("Unlocked"));
+  await expect(page.getByTestId("status-line")).toContainText("is off");
+  await expect(page.getByTestId("tray-status")).toContainText("is off");
+  await expect(page.locator("main")).toHaveAttribute("data-locked", "off");
+});
+
+test("a pipe error does not show the unlocked state", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => window.__SOFTLOCK_PUSH_STATE__?.("Unlocked"));
+  await page.evaluate(() => window.__SOFTLOCK_FAIL_PIPE__?.());
+  await expect(page.getByTestId("status-line")).toContainText("is on");
+  await expect(page.getByTestId("service-line")).toHaveText("Service not running");
+  await expect(page.locator("main")).toHaveAttribute("data-locked", "on");
+});
+
+test("settings rejects a too-short pin and sets a long enough pin", async ({ page }) => {
+  await page.goto("/");
+  await page.getByTestId("pin").fill("abc");
+  await page.getByTestId("set-pin").click();
+  await expect(page.getByTestId("pin-error")).toHaveText("PIN is too short");
+  await expect(page.locator("main")).toHaveAttribute("data-set-pin", "0");
+  await page.getByTestId("pin").fill("1357");
+  await page.getByTestId("set-pin").click();
+  await expect(page.getByTestId("pin-error")).toHaveCount(0);
+  await expect(page.locator("main")).toHaveAttribute("data-set-pin", "1");
+});
+
+test("a missing hotkey is shown in the window", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => window.__SOFTLOCK_SET_NOTICE__?.("hotkey unavailable"));
+  await expect(page.getByTestId("hotkey-notice")).toHaveText("hotkey unavailable");
+  await expect(page.locator("main")).toHaveAttribute("data-notice", "hotkey unavailable");
+});
+
+test("a pin that needs confirmation is not treated as a lock failure", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    window.__SOFTLOCK_PIN_RESULT__ = "needs-confirmation";
+  });
+  await page.getByTestId("pin").fill("1357");
+  await page.getByTestId("set-pin").click();
+  await expect(page.getByTestId("pin-error")).toHaveText("Confirmation needed");
+  await expect(page.locator("main")).toHaveAttribute("data-locked", "off");
+  await expect(page.locator("main")).toHaveAttribute("data-set-pin", "0");
+  await expect(page.getByTestId("service-line")).toHaveText("Service running");
+});
+
+test("quitting the app does not stop the service", async ({ page }) => {
+  await page.goto("/");
+  await page.getByTestId("tray-quit").click();
+  await expect(page.locator("main")).toHaveAttribute("data-quit", "local");
+  await expect(page.locator("main")).toHaveAttribute("data-service-stop", "false");
+  await expect(page.getByTestId("service-line")).toHaveText("Service running");
+});
+
 async function expectUnsupported(browser: Browser) {
   const context = await browser.newContext({ baseURL: origin });
   await context.addInitScript((message) => {

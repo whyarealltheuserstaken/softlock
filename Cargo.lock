@@ -3165,11 +3165,14 @@ name = "softlock-app"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "softlock-core",
  "softlock-linux",
  "softlock-macos",
  "tauri",
  "tauri-build",
+ "windows",
+ "zeroize",
 ]
 
 [[package]]

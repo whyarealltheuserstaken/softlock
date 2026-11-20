@@ -1,0 +1,15 @@
+{
+  "lockNow": "Lock now",
+  "lock": "Lock",
+  "quit": "Quit",
+  "setPin": "Set PIN",
+  "pinLabel": "PIN",
+  "pinTooShort": "PIN is too short",
+  "serviceRunning": "Service running",
+  "serviceStopped": "Service not running",
+  "statusOn": "is on",
+  "statusOff": "is off",
+  "hotkeyUnavailable": "hotkey unavailable",
+  "confirmationNeeded": "Confirmation needed",
+  "autostartFailed": "autostart failed"
+}

@@ -8,7 +8,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,7 +35,7 @@ use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_AC
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, CreatePipe, DisconnectNamedPipe,
     GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe,
 };
 use windows::Win32::System::RemoteDesktop::{
     WTSDisconnectSession, WTSGetActiveConsoleSessionId, WTSSESSION_NOTIFICATION,
@@ -963,6 +963,7 @@ fn serve_client(pipe: HANDLE, authority: &Arc<Mutex<Authority>>) {
         if !read_exact(pipe, &mut frame[4..]) {
             break;
         }
+        let decoded_subscribe = subscribe_request(&frame);
         let mut response = {
             let mut guard = authority
                 .lock()
@@ -970,6 +971,9 @@ fn serve_client(pipe: HANDLE, authority: &Arc<Mutex<Authority>>) {
             guard.handle_public_frame(role, &frame)
         };
         frame.fill(0);
+        if stream_subscription(pipe, authority, &decoded_subscribe, &response) {
+            break;
+        }
         // Lock has marked the arm slot. Wait only after the authority mutex
         // is released, and only once HostReady has been accepted.
         if matches!(response, softlock_core::ResponseKind::Accepted) {
@@ -1088,6 +1092,82 @@ fn security_descriptor(sddl: &str) -> std::io::Result<SecurityDescriptor> {
         .map_err(|error| std::io::Error::from_raw_os_error(error.code().0))?;
     }
     Ok(SecurityDescriptor(descriptor))
+}
+
+fn subscribe_request(frame: &[u8]) -> Option<u64> {
+    match softlock_core::decode_request_frame(frame) {
+        Ok(decoded) if matches!(decoded.kind, softlock_core::RequestKind::Subscribe) => {
+            Some(decoded.id)
+        }
+        _ => None,
+    }
+}
+
+/// Live Subscribe streams. A client that has already gone away must not keep a
+/// slot until the next state change.
+const SUBSCRIBE_CAP: usize = 8;
+static SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
+
+/// After `Subscribe` is accepted, the connection stays open and the service
+/// writes `StateChanged` whenever the public state name changes. A write
+/// error or a disconnected client ends the stream. The function returns
+/// whether it took the connection.
+fn stream_subscription(
+    pipe: HANDLE,
+    authority: &Arc<Mutex<Authority>>,
+    subscribe_id: &Option<u64>,
+    response: &softlock_core::ResponseKind,
+) -> bool {
+    let Some(id) = subscribe_id else {
+        return false;
+    };
+    if !matches!(response, softlock_core::ResponseKind::Accepted) {
+        return false;
+    }
+    if write_response(pipe, *id, response).is_err() {
+        return true;
+    }
+    let held = SUBSCRIBERS.fetch_add(1, Ordering::AcqRel);
+    if held >= SUBSCRIBE_CAP {
+        SUBSCRIBERS.fetch_sub(1, Ordering::AcqRel);
+        // DisconnectNamedPipe drops unread bytes. Wait until the client has
+        // the rejection frame so it can tell a full stream from a broken pipe.
+        unsafe {
+            let _ = windows::Win32::Storage::FileSystem::FlushFileBuffers(pipe);
+        }
+        return true;
+    }
+    let mut previous = None;
+    while !STOP.load(Ordering::Acquire) {
+        if !subscriber_connected(pipe) {
+            break;
+        }
+        let name = authority
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .state_name();
+        if previous == Some(name) {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        previous = Some(name);
+        if write_response(
+            pipe,
+            *id,
+            &softlock_core::ResponseKind::StateChanged { state: name },
+        )
+        .is_err()
+        {
+            break;
+        }
+    }
+    SUBSCRIBERS.fetch_sub(1, Ordering::AcqRel);
+    true
+}
+
+fn subscriber_connected(pipe: HANDLE) -> bool {
+    let mut available = 0u32;
+    unsafe { PeekNamedPipe(pipe, None, 0, None, Some(&mut available), None) }.is_ok()
 }
 
 fn write_response(

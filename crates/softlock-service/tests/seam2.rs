@@ -368,6 +368,24 @@ fn spec_invariant_3_names_the_emergency_path() {
 }
 
 #[test]
+fn tray_and_app_lock_sources_are_visible_in_get_status() {
+    for source in [LockSource::Tray, LockSource::App] {
+        let mut authority = authority();
+        lock(&mut authority, source);
+        let status = authority.handle_public(Role::App, RequestKind::GetStatus);
+        match status {
+            ResponseKind::Status {
+                state, lock_source, ..
+            } => {
+                assert_eq!(state, softlock_core::StateName::Locked);
+                assert_eq!(lock_source, Some(source));
+            }
+            other => panic!("GetStatus was not a status: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn subscribe_is_accepted_for_the_app_only() {
     let mut authority = authority();
     assert_eq!(

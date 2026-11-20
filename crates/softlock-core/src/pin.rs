@@ -17,6 +17,8 @@ pub const PIN_TIME_COST: u32 = 3;
 pub const PIN_PARALLELISM: u32 = 1;
 /// Salt length in bytes.
 pub const PIN_SALT_LEN: usize = 16;
+/// Minimum PIN length the settings field accepts, in Unicode scalar values.
+pub const MIN_PIN_LEN: usize = 4;
 
 /// Hashing failed before a PHC string existed. The secret is not part of this error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

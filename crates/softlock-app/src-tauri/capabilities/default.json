@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Empty shell window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:event:default"]
 }

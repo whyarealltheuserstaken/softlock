@@ -16,13 +16,34 @@ crate-type = ["rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# Test-only. Release builds do not enable this. It lets a seam test point
+# the app at the service's temporary pipe. The product tree leaves it off.
+simulated-physical = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 softlock-core = { path = "../../softlock-core" }
 tauri = { version = "2", features = [] }
+zeroize = { version = "1.8.2", default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 softlock-linux = { path = "../../softlock-linux" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 softlock-macos = { path = "../../softlock-macos" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
