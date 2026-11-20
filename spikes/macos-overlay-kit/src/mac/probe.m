@@ -54,6 +54,10 @@ typedef struct {
     int accessibility;
     int listen;
     int frontmost_restored;
+    int saved_pid;
+    int front_pid;
+    int self_pid;
+    int self_active;
     char click_route[16];
     char error[256];
 } ClickOut;
@@ -118,6 +122,10 @@ static void ensure_app(void) {
 }
 
 static NSRunningApplication *g_saved_front = nil;
+static int g_saved_pid = 0;
+static int g_front_pid = 0;
+static int g_self_pid = 0;
+static int g_self_active = 0;
 static BOOL wait_until(NSTimeInterval seconds, int (^pred)(void));
 
 static void activate_for_measure(void) {
@@ -156,8 +164,21 @@ static int restore_frontmost(void) {
       }
       return front_pid == want ? 1 : 0;
     });
+    NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    g_saved_pid = want;
+    g_front_pid = front != nil ? (int)front.processIdentifier : 0;
+    g_self_pid = (int)self_pid;
+    g_self_active = app.isActive ? 1 : 0;
     g_saved_front = nil;
     return ok ? 1 : 0;
+}
+
+static void stamp_front(ClickOut *out, int restored) {
+    out->frontmost_restored = restored;
+    out->saved_pid = g_saved_pid;
+    out->front_pid = g_front_pid;
+    out->self_pid = g_self_pid;
+    out->self_active = g_self_active;
 }
 
 static BOOL wait_until(NSTimeInterval seconds, int (^pred)(void)) {
@@ -660,14 +681,14 @@ int m06_posted_click_focus(ClickOut *out) {
         snprintf(out->click_route, sizeof out->click_route, "none");
         if (g_target == nil) {
             snprintf(out->error, sizeof out->error, "target window missing");
-            out->frontmost_restored = restore_frontmost();
+            stamp_front(out, restore_frontmost());
             return 0;
         }
         if (out->accessibility == 0) {
             snprintf(out->error, sizeof out->error, "Accessibility not granted");
             out->click_count = atomic_load(&g_clicks);
             out->key_count = atomic_load(&g_keys);
-            out->frontmost_restored = restore_frontmost();
+            stamp_front(out, restore_frontmost());
             return 0;
         }
         activate_for_measure();
@@ -683,7 +704,7 @@ int m06_posted_click_focus(ClickOut *out) {
             out->target_is_key = g_target.isKeyWindow ? 1 : 0;
             out->click_count = atomic_load(&g_clicks);
             out->key_count = atomic_load(&g_keys);
-            out->frontmost_restored = restore_frontmost();
+            stamp_front(out, restore_frontmost());
             return 0;
         }
         int baseline_clicks = atomic_load(&g_clicks);
@@ -728,7 +749,7 @@ int m06_posted_click_focus(ClickOut *out) {
         out->target_is_key = g_target.isKeyWindow ? 1 : 0;
         out->click_count = atomic_load(&g_clicks);
         out->key_count = atomic_load(&g_keys);
-        out->frontmost_restored = restore_frontmost();
+        stamp_front(out, restore_frontmost());
     }
     return 0;
 }

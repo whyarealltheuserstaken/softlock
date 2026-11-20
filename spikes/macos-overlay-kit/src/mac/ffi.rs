@@ -3,7 +3,9 @@
 use std::os::raw::c_char;
 
 use crate::claim::{SCREEN_CAPTURE_ENTRY, SCSTREAM_ENTRY};
-use crate::report::{CaptureSample, ClickFocus, OverlayWindow, score_posted_click};
+use crate::report::{
+    CaptureSample, ClickFocus, OverlayWindow, frontmost_is_restored, score_posted_click,
+};
 use crate::text::one_line;
 use crate::wait::click_wait_finished;
 
@@ -44,6 +46,10 @@ struct ClickOut {
     accessibility: i32,
     listen: i32,
     frontmost_restored: i32,
+    saved_pid: i32,
+    front_pid: i32,
+    self_pid: i32,
+    self_active: i32,
     click_route: [u8; 16],
     error: [u8; 256],
 }
@@ -257,6 +263,10 @@ impl TargetWindow {
             accessibility: 0,
             listen: 0,
             frontmost_restored: 0,
+            saved_pid: 0,
+            front_pid: 0,
+            self_pid: 0,
+            self_active: 0,
             click_route: [0; 16],
             error: [0; 256],
         };
@@ -277,6 +287,10 @@ impl TargetWindow {
             accessibility: 0,
             listen: 0,
             frontmost_restored: 0,
+            saved_pid: 0,
+            front_pid: 0,
+            self_pid: 0,
+            self_active: 0,
             click_route: [0; 16],
             error: [0; 256],
         };
@@ -291,7 +305,12 @@ impl TargetWindow {
         let route = optional_text(&out.click_route).unwrap_or_else(|| "none".to_string());
         let _ = click_wait_finished(out.click_count, out.key_count, 0, 0, false);
         let click = score_posted_click(&route, out.click_count, granted, untrusted);
-        let restored = out.frontmost_restored != 0;
+        let restored = frontmost_is_restored(
+            out.saved_pid,
+            out.front_pid,
+            out.self_pid,
+            out.self_active != 0,
+        );
         let outcome = if restored {
             click
         } else {
