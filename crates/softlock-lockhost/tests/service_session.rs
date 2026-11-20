@@ -1599,6 +1599,8 @@ fn spawn_owner(session: &Session, status_path: &Path) -> std::process::Child {
 }
 
 fn app_exe() -> PathBuf {
+    static BUILD: Mutex<()> = Mutex::new(());
+    let _build = BUILD.lock().unwrap_or_else(|poison| poison.into_inner());
     let host = PathBuf::from(env!("CARGO_BIN_EXE_softlock-lockhost"));
     let app = host.with_file_name("softlock-app.exe");
     let mut command = Command::new("cargo");
@@ -1614,6 +1616,8 @@ fn app_exe() -> PathBuf {
     if host.to_string_lossy().contains("x86_64-pc-windows-msvc") {
         command.args(["--target", "x86_64-pc-windows-msvc"]);
     }
+    // Nested cargo output splits libtest's "... ok" line and fails the CI grep.
+    command.stdout(Stdio::null()).stderr(Stdio::null());
     let status = command.status().expect("cargo build");
     assert!(status.success(), "app build failed");
     assert!(app.is_file(), "missing {}", app.display());
