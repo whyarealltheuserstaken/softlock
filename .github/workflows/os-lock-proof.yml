@@ -85,6 +85,7 @@ jobs:
           sc.exe stop OsLockProbe
           sc.exe delete OsLockProbe
           schtasks.exe /Delete /TN os-lock-restore /F
+          cmd.exe /c rmdir /s /q C:\ProgramData\os-lock-probe
           exit 0
       - name: Upload the proof report
         if: always()

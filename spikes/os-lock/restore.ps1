@@ -5,6 +5,9 @@
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($null -eq (Get-Variable -Name DeferProbeCleanup -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:DeferProbeCleanup = $false
+}
 
 $script:JournalPath = 'C:\ProgramData\os-lock-probe\pending.json'
 $taskName = 'os-lock-restore'
@@ -134,6 +137,71 @@ function Remove-ProbeService {
     } finally { $ErrorActionPreference = $previous }
 }
 
+function Test-ReparsePath([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    $item = Get-Item -LiteralPath $path -Force
+    return [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+}
+
+function Test-OwnerTrusted([string]$path) {
+    if (Test-ReparsePath $path) { return $false }
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    $acl = (Get-Item -LiteralPath $path -Force).GetAccessControl()
+    $owner = [string]$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    if ($owner -ne 'S-1-5-18' -and $owner -ne 'S-1-5-32-544') { return $false }
+    if (-not $acl.AreAccessRulesProtected) { return $false }
+    $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -lt 1) { return $false }
+    foreach ($ace in $rules) {
+        $who = [string]$ace.IdentityReference.Value
+        if ($who -ne 'S-1-5-18' -and $who -ne 'S-1-5-32-544') { return $false }
+    }
+    return $true
+}
+
+function Test-KnownProbeName([string]$name) {
+    foreach ($allowed in @('restore.ps1', 'restore.cmd', 'pending.json', 'os-lock-proof.exe', 'ready', 'service.json', 'request', 'stop', 'reconnect.on')) {
+        if ($name -eq $allowed) { return $true }
+    }
+    return $false
+}
+
+function Test-ProbeDirTrusted {
+    $root = 'C:\ProgramData\os-lock-probe'
+    if (Test-ReparsePath 'C:\ProgramData') { return $false }
+    if (-not (Test-OwnerTrusted $root)) { return $false }
+    $item = Get-Item -LiteralPath $root -Force
+    if (-not $item.PSIsContainer) { return $false }
+    foreach ($child in @(Get-ChildItem -LiteralPath $root -Force)) {
+        if (-not (Test-KnownProbeName $child.Name)) { return $false }
+        if ($child.PSIsContainer) { return $false }
+        if (-not (Test-OwnerTrusted $child.FullName)) { return $false }
+    }
+    return $true
+}
+
+function Remove-ProbeFolder {
+    $root = 'C:\ProgramData\os-lock-probe'
+    if (-not (Test-Path -LiteralPath $root)) { return }
+    if (-not (Test-ProbeDirTrusted)) {
+        Write-Host 'refusing to delete an untrusted probe directory'
+        return
+    }
+    foreach ($child in @(Get-ChildItem -LiteralPath $root -Force)) {
+        try { Remove-Item -LiteralPath $child.FullName -Force -ErrorAction Stop } catch { }
+    }
+    try { Remove-Item -LiteralPath $root -Force -ErrorAction Stop } catch { }
+    if (Test-Path -LiteralPath $root) {
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & cmd.exe /c 'rmdir /s /q C:\ProgramData\os-lock-probe' | Out-Null
+        if (Test-Path -LiteralPath $root) {
+            Start-Process -FilePath cmd.exe -ArgumentList @('/c', 'ping 127.0.0.1 -n 3 >nul & rmdir /s /q C:\ProgramData\os-lock-probe') -WindowStyle Hidden
+        }
+        $ErrorActionPreference = $previous
+    }
+}
+
 function Find-Allowed([string]$hive, [string]$name) {
     foreach ($entry in $script:Allowed) {
         if (([string]$entry.hive) -eq $hive -and ([string]$entry.name) -eq $name) { return $entry }
@@ -160,6 +228,10 @@ function Test-HkcuConfirmed([string]$sid) {
 }
 
 function Invoke-PendingRestore {
+    if ((Test-Path -LiteralPath 'C:\ProgramData\os-lock-probe') -and -not (Test-ProbeDirTrusted)) {
+        Write-Host 'refusing: probe directory is not owned by SYSTEM or Administrators'
+        return 2
+    }
     if (-not (Test-Path -LiteralPath $script:JournalPath)) {
         Write-Host 'probe journal is missing; the restore task was left in place'
         return 1
@@ -209,9 +281,10 @@ function Invoke-PendingRestore {
     $hklmOk = Test-HklmConfirmed $sid
     if ($hkcuOk) { Remove-RunOnce }
     if ($hklmOk) {
-        Remove-Item -LiteralPath $script:JournalPath -Force
         Remove-RestoreTask
         Remove-ProbeService
+        if (Test-Path -LiteralPath $script:JournalPath) { Remove-Item -LiteralPath $script:JournalPath -Force }
+        if (-not $script:DeferProbeCleanup) { Remove-ProbeFolder }
         return 0
     }
     if (-not $elevated -and -not $system) {
@@ -222,6 +295,18 @@ function Invoke-PendingRestore {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
+    $scriptPath = $MyInvocation.MyCommand.Path
+    if ($scriptPath -like 'C:\ProgramData\os-lock-probe\*') {
+        if (-not (Test-ProbeDirTrusted) -or -not (Test-OwnerTrusted $scriptPath)) {
+            Write-Host 'refusing: probe directory is not owned by SYSTEM or Administrators'
+            exit 2
+        }
+    } elseif (Test-Path -LiteralPath 'C:\ProgramData\os-lock-probe') {
+        if (-not (Test-ProbeDirTrusted)) {
+            Write-Host 'refusing: probe directory is not owned by SYSTEM or Administrators'
+            exit 2
+        }
+    }
     $given = ''
     for ($i = 0; $i -lt $args.Count; $i++) {
         if ($args[$i] -eq '-Journal' -and ($i + 1) -lt $args.Count) {

@@ -3,7 +3,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, WIN32_ERROR};
+use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, HLOCAL, LocalFree, WIN32_ERROR};
+use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+use windows::Win32::Security::{
+    CreateWellKnownSid, EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
+};
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
 };
@@ -112,4 +117,55 @@ pub fn path_is_reparse(path: &Path) -> bool {
         return false;
     }
     attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+}
+
+/// The owner is SYSTEM or the Administrators group. Anything else, including a
+/// missing owner, is refused.
+pub fn require_trusted_owner(path: &Path) -> Result<(), String> {
+    if path_is_reparse(path) {
+        return Err("probe path is a reparse point".to_string());
+    }
+    let wide = wide(&path.to_string_lossy());
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || owner.0.is_null() {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        }
+        return Err("probe path owner could not be read".to_string());
+    }
+    let trusted = sid_is_trusted(owner);
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    if trusted {
+        Ok(())
+    } else {
+        Err("probe path owner is not SYSTEM or Administrators".to_string())
+    }
+}
+
+fn sid_is_trusted(owner: PSID) -> bool {
+    matches_well_known(owner, WinLocalSystemSid)
+        || matches_well_known(owner, WinBuiltinAdministratorsSid)
+}
+
+fn matches_well_known(owner: PSID, kind: windows::Win32::Security::WELL_KNOWN_SID_TYPE) -> bool {
+    let mut buffer = [0u8; 68];
+    let mut size = buffer.len() as u32;
+    let known = PSID(buffer.as_mut_ptr().cast());
+    let created = unsafe { CreateWellKnownSid(kind, None, Some(known), &mut size) };
+    created.is_ok() && unsafe { EqualSid(owner, known).is_ok() }
 }

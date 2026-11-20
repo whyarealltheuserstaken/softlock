@@ -126,6 +126,12 @@ fn os_lock_script_restores_and_does_not_record_a_serial() {
     assert!(run.contains("SystemFamily"));
     assert!(run.contains(r"C:\ProgramData\os-lock-probe"));
     assert!(run.contains("schtasks.exe /Run /TN"));
+    assert!(run.contains("CreateDirectory"));
+    assert!(run.contains("CreateNew"));
+    assert!(run.contains("S-1-5-32-544"));
+    assert!(run.contains("self-check runs only on a GitHub-hosted runner"));
+    assert!(run.contains("a user-owned probe directory was not refused"));
+    assert!(restore.contains("Remove-ProbeFolder"));
     assert!(run.contains("reconnect is ci only"));
     assert!(!run.contains("stay-disconnected"));
     assert!(restore.contains("Invoke-PendingRestore"));

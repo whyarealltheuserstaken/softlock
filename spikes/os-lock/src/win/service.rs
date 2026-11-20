@@ -201,6 +201,10 @@ fn service_body() {
     }
     let _ = util::write_text(&dir.join("ready"), "ready\n");
     while !stop_requested(&dir) {
+        if probe_dir().is_err() {
+            delete_own_service();
+            return;
+        }
         if !watch_alive() {
             delete_own_service();
             return;
@@ -305,6 +309,7 @@ fn probe_dir() -> Result<PathBuf, String> {
     if !path.is_dir() {
         return Err("probe directory is missing".to_string());
     }
+    util::require_trusted_owner(&path)?;
     Ok(path)
 }
 
@@ -313,6 +318,7 @@ fn exe_is_in_probe_dir() -> Result<(), String> {
     if util::path_is_reparse(&exe) {
         return Err("service binary is a reparse point".to_string());
     }
+    util::require_trusted_owner(&exe)?;
     let dir = probe_dir()?;
     let Some(parent) = exe.parent() else {
         return Err("service binary is not in the probe directory".to_string());

@@ -1,5 +1,6 @@
 # OS-lock proof. An elevated prompt on the console. Does not unlock Windows.
-# --ci is the hosted-runner job. --self-check restores a dummy value and does not lock.
+# --ci is the hosted-runner job. --self-check exercises the real lockdown values
+# and the SYSTEM restore task, and only on a GitHub-hosted runner.
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -70,6 +71,7 @@ if ($school -eq 'school') {
 }
 
 . (Join-Path $PSScriptRoot 'restore.ps1')
+$script:DeferProbeCleanup = $true
 
 $probeDir = 'C:\ProgramData\os-lock-probe'
 $pendingPath = Join-Path $probeDir 'pending.json'
@@ -89,41 +91,112 @@ function Current-Sid {
     return $identity.User.Value
 }
 
-function Test-ReparsePath([string]$path) {
-    if (-not (Test-Path -LiteralPath $path)) { return $false }
-    $item = Get-Item -LiteralPath $path -Force
-    return [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+$script:PrivilegesReady = $false
+
+function Enable-ProbePrivileges {
+    if ($script:PrivilegesReady) { return }
+    if (-not ('OsLockPriv' -as [type])) {
+        $source = @'
+using System;
+using System.Runtime.InteropServices;
+public class OsLockPriv {
+    [DllImport("advapi32.dll", SetLastError=true)]
+    public static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool LookupPrivilegeValue(string system, string name, out long luid);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    public static extern bool AdjustTokenPrivileges(IntPtr token, bool disable, ref TokenPrivilege privilege, int length, IntPtr previous, IntPtr returned);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct TokenPrivilege { public int Count; public long Luid; public int Attr; }
+    public static void Enable(string name) {
+        IntPtr token;
+        if (!OpenProcessToken(System.Diagnostics.Process.GetCurrentProcess().Handle, 0x28, out token)) {
+            throw new System.ComponentModel.Win32Exception();
+        }
+        long luid;
+        if (!LookupPrivilegeValue(null, name, out luid)) {
+            throw new System.ComponentModel.Win32Exception();
+        }
+        TokenPrivilege privilege = new TokenPrivilege();
+        privilege.Count = 1;
+        privilege.Luid = luid;
+        privilege.Attr = 2;
+        if (!AdjustTokenPrivileges(token, false, ref privilege, 0, IntPtr.Zero, IntPtr.Zero)) {
+            throw new System.ComponentModel.Win32Exception();
+        }
+    }
+}
+'@
+        Add-Type -TypeDefinition $source
+    }
+    [OsLockPriv]::Enable('SeRestorePrivilege')
+    [OsLockPriv]::Enable('SeTakeOwnershipPrivilege')
+    $script:PrivilegesReady = $true
+}
+
+function New-ProbeDirectorySecurity {
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $system = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-18'
+    $admin = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $prop = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($system, $rights, $inherit, $prop, $allow)))
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($admin, $rights, $inherit, $prop, $allow)))
+    $acl.SetOwner($admin)
+    return $acl
+}
+
+function New-ProbeFileSecurity {
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $system = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-18'
+    $admin = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $inherit = [System.Security.AccessControl.InheritanceFlags]::None
+    $prop = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($system, $rights, $inherit, $prop, $allow)))
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($admin, $rights, $inherit, $prop, $allow)))
+    $acl.SetOwner($admin)
+    return $acl
+}
+
+function Write-ProbeFile([string]$path, [byte[]]$bytes) {
+    $name = [System.IO.Path]::GetFileName($path)
+    if (-not (Test-KnownProbeName $name)) { throw 'refusing to write an unexpected probe file' }
+    if (-not (Test-ProbeDirTrusted)) { throw 'refusing: probe directory is not owned by SYSTEM or Administrators' }
+    if (Test-ReparsePath $path) { throw 'probe file is a reparse point' }
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force
+    }
+    if (Test-Path -LiteralPath $path) { throw 'probe file could not be replaced' }
+    Enable-ProbePrivileges
+    $security = New-ProbeFileSecurity
+    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $stream = [System.IO.FileStream]::new($path, [System.IO.FileMode]::CreateNew, $rights, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::None, $security)
+    try {
+        if ($bytes.Length -gt 0) { $stream.Write($bytes, 0, $bytes.Length) }
+    } finally {
+        $stream.Dispose()
+    }
+    if (-not (Test-OwnerTrusted $path)) { throw 'refusing: probe file is not owned by SYSTEM or Administrators' }
 }
 
 function Initialize-ProbeDir {
     if (Test-ReparsePath 'C:\ProgramData') { throw 'ProgramData is a reparse point' }
-    if (Test-ReparsePath $probeDir) { throw 'probe directory is a reparse point' }
-    if (-not (Test-Path -LiteralPath $probeDir)) {
-        New-Item -ItemType Directory -Path $probeDir | Out-Null
+    if (Test-Path -LiteralPath $probeDir) {
+        if (-not (Test-ProbeDirTrusted)) { throw 'refusing: probe directory is not owned by SYSTEM or Administrators' }
+    } else {
+        Enable-ProbePrivileges
+        $security = New-ProbeDirectorySecurity
+        [System.IO.Directory]::CreateDirectory($probeDir, $security) | Out-Null
+        if (-not (Test-ProbeDirTrusted)) { throw 'refusing: probe directory was not created for SYSTEM and Administrators' }
     }
-    if (Test-ReparsePath $probeDir) { throw 'probe directory is a reparse point' }
-    $acl = New-Object System.Security.AccessControl.DirectorySecurity
-    $acl.SetAccessRuleProtection($true, $false)
-    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
-    $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-    $prop = [System.Security.AccessControl.PropagationFlags]::None
-    $allow = [System.Security.AccessControl.AccessControlType]::Allow
-    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
-        $id = New-Object System.Security.Principal.SecurityIdentifier $sid
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($id, $rights, $inherit, $prop, $allow)
-        $acl.AddAccessRule($rule)
-    }
-    $item = Get-Item -LiteralPath $probeDir -Force
-    $item.SetAccessControl($acl)
-    $read = $item.GetAccessControl()
-    foreach ($ace in @($read.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
-        $who = [string]$ace.IdentityReference.Value
-        if ($who -ne 'S-1-5-18' -and $who -ne 'S-1-5-32-544') {
-            throw 'probe directory grants access to someone other than SYSTEM and Administrators'
-        }
-    }
-    Copy-Item -LiteralPath $restoreScript -Destination (Join-Path $probeDir 'restore.ps1') -Force
-    if (Test-ReparsePath (Join-Path $probeDir 'restore.ps1')) { throw 'restore script is a reparse point' }
+    $bytes = [System.IO.File]::ReadAllBytes($restoreScript)
+    Write-ProbeFile (Join-Path $probeDir 'restore.ps1') $bytes
 }
 
 function Register-RunOnceEntry {
@@ -137,9 +210,11 @@ function Register-RunOnceEntry {
 function Register-RestoreTaskEntry {
     $installed = Join-Path $probeDir 'restore.ps1'
     $cmd = Join-Path $probeDir 'restore.cmd'
+    if (-not (Test-OwnerTrusted $installed)) { throw 'refusing to register an untrusted restore script' }
     $line = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$installed`" -Journal `"$pendingPath`"`r`n"
     $utf8 = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText($cmd, $line, $utf8)
+    Write-ProbeFile $cmd $utf8.GetBytes($line)
+    if (-not (Test-OwnerTrusted $cmd)) { throw 'refusing to register an untrusted restore command' }
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -170,7 +245,7 @@ function Save-PendingFile($entries) {
     }
     $body = '{"sid":"' + (Current-Sid) + '","values":[' + ($items -join ',') + ']}'
     $utf8 = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText($pendingPath, $body, $utf8)
+    Write-ProbeFile $pendingPath $utf8.GetBytes($body)
 }
 
 function Read-Original([string]$hive, [string]$subkey, [string]$name) {
@@ -225,6 +300,9 @@ function Test-TaskPresent {
 }
 
 function Start-SystemRestore {
+    if (-not (Test-ProbeDirTrusted)) { throw 'refusing to run the restore task from an untrusted probe directory' }
+    if (-not (Test-OwnerTrusted (Join-Path $probeDir 'restore.ps1'))) { throw 'refusing to run an untrusted restore script' }
+    if (-not (Test-OwnerTrusted (Join-Path $probeDir 'restore.cmd'))) { throw 'refusing to run an untrusted restore command' }
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -271,9 +349,96 @@ function Wait-PolicyValue($entry, [int]$seconds) {
     throw "timed out waiting for $([string]$entry.name)"
 }
 
+function Clear-ProbeDirForTest {
+    if (-not (Test-Path -LiteralPath $probeDir)) { return }
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & takeown.exe /F $probeDir /A /R /D Y | Out-Null
+    & icacls.exe $probeDir /grant '*S-1-5-32-544:(OI)(CI)F' /T | Out-Null
+    & cmd.exe /c 'rmdir /s /q C:\ProgramData\os-lock-probe' | Out-Null
+    $ErrorActionPreference = $previous
+    if (Test-Path -LiteralPath $probeDir) { throw 'the plant directory could not be removed' }
+}
+
+function Invoke-PlantChecks {
+    $plantUser = 'oslockplant'
+    $plantPassword = 'OsLock-Plant-9a'
+    $plantTask = 'os-lock-plant'
+    $plantScript = 'C:\Users\Public\os-lock-plant.ps1'
+    $previous = $ErrorActionPreference
+    try {
+        Enable-ProbePrivileges
+        Clear-ProbeDirForTest
+        $ErrorActionPreference = 'Continue'
+        & net.exe user $plantUser /delete 2>&1 | Out-Null
+        & net.exe user $plantUser $plantPassword /add | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'could not create the plant user' }
+        $ErrorActionPreference = 'Stop'
+        $plantBody = "Set-StrictMode -Version Latest`r`n`$ErrorActionPreference = 'Stop'`r`nNew-Item -ItemType Directory -Path 'C:\ProgramData\os-lock-probe' | Out-Null`r`nSet-Content -LiteralPath 'C:\ProgramData\os-lock-probe\restore.ps1' -Value 'planted'`r`n"
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($plantScript, $plantBody, $utf8)
+        $ErrorActionPreference = 'Continue'
+        & schtasks.exe /Delete /TN $plantTask /F 2>&1 | Out-Null
+        & schtasks.exe /Create /TN $plantTask /SC ONCE /ST 00:00 /RU $plantUser /RP $plantPassword /RL LIMITED /F /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Users\Public\os-lock-plant.ps1" | Out-Null
+        $scheduled = $LASTEXITCODE -eq 0
+        if ($scheduled) {
+            & schtasks.exe /Run /TN $plantTask | Out-Null
+            $scheduled = $LASTEXITCODE -eq 0
+        }
+        $ErrorActionPreference = 'Stop'
+        if (-not $scheduled) {
+            $plantPasswordSecure = ConvertTo-SecureString $plantPassword -AsPlainText -Force
+            $plantCred = New-Object System.Management.Automation.PSCredential(".\$plantUser", $plantPasswordSecure)
+            $plantProc = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $plantScript) -Credential $plantCred -Wait -PassThru -WindowStyle Hidden
+            if ($null -eq $plantProc -or $plantProc.ExitCode -ne 0) { throw 'the standard user could not plant the probe directory' }
+        }
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        do {
+            if (Test-Path -LiteralPath $probeDir) { break }
+            Start-Sleep -Milliseconds 250
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if (-not (Test-Path -LiteralPath $probeDir)) { throw 'the standard user did not create the probe directory' }
+        $refused = $false
+        try { Initialize-ProbeDir } catch { $refused = $true }
+        if (-not $refused) { throw 'a user-owned probe directory was not refused' }
+        Clear-ProbeDirForTest
+        Initialize-ProbeDir
+        $planted = Join-Path $probeDir 'restore.cmd'
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        Write-ProbeFile $planted $utf8.GetBytes("@echo off`r`n")
+        $sid = (New-Object System.Security.Principal.NTAccount($plantUser)).Translate([System.Security.Principal.SecurityIdentifier])
+        $acl = (Get-Item -LiteralPath $planted -Force).GetAccessControl()
+        $acl.SetOwner($sid)
+        Set-Acl -LiteralPath $planted -AclObject $acl
+        $owner = [string]((Get-Item -LiteralPath $planted -Force).GetAccessControl().GetOwner([System.Security.Principal.SecurityIdentifier]).Value)
+        if ($owner -eq 'S-1-5-18' -or $owner -eq 'S-1-5-32-544') { throw 'could not plant a user-owned file' }
+        $refusedFile = $false
+        try { Initialize-ProbeDir } catch { $refusedFile = $true }
+        if (-not $refusedFile) { throw 'a user-owned file in the probe directory was not refused' }
+    } finally {
+        $ErrorActionPreference = 'Continue'
+        try { Clear-ProbeDirForTest } catch { }
+        if (Test-Path -LiteralPath $plantScript) { Remove-Item -LiteralPath $plantScript -Force }
+        & schtasks.exe /Delete /TN $plantTask /F 2>&1 | Out-Null
+        & net.exe user $plantUser /delete 2>&1 | Out-Null
+        $ErrorActionPreference = $previous
+    }
+}
+
+function Wait-ProbeDirGone([int]$seconds) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+    do {
+        if (-not (Test-Path -LiteralPath $probeDir)) { return }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'probe directory was left behind after HKLM was restored'
+}
+
 function Invoke-SelfCheck {
     if (-not (Test-Elevated)) { throw 'self-check needs an elevated prompt' }
+    if (-not $script:Hosted) { throw 'self-check runs only on a GitHub-hosted runner' }
     if (Test-Path -LiteralPath $pendingPath) { throw 'a restore is already pending; run restore.ps1 before --self-check' }
+    Invoke-PlantChecks
     Initialize-ProbeDir
     $rows = @(
         @{ hive = 'HKCU'; subkey = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'DisableTaskMgr' },
@@ -311,7 +476,7 @@ function Invoke-SelfCheck {
         $evil = ',{"hive":"HKLM","subkey":"Software\\os-lock-evil","name":"Evil","present":true,"kind":"DWord","data":"5","created_key":false}'
         if (-not $text.EndsWith(']}')) { throw 'journal shape was not written by this probe' }
         $text = $text.Substring(0, $text.Length - 2) + $evil + ']}'
-        [System.IO.File]::WriteAllText($pendingPath, $text, $utf8)
+        Write-ProbeFile $pendingPath $utf8.GetBytes($text)
         foreach ($entry in $saved) { Set-ProbeAway $entry }
         $evilRoot = $evilKey.CreateSubKey('Software\os-lock-evil')
         $evilRoot.SetValue('Evil', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
@@ -322,8 +487,9 @@ function Invoke-SelfCheck {
         $evilLeft = Read-Dword 'HKLM' 'Software\os-lock-evil' 'Evil'
         if ($evilLeft -ne 1) { throw 'restore applied a value outside the allow-list' }
         Wait-TaskGone 20
-        if (Test-Path -LiteralPath $pendingPath) { throw 'pending.json was left behind' }
+        Wait-ProbeDirGone 20
 
+        Initialize-ProbeDir
         Save-PendingFile $saved
         Register-RunOnceEntry
         Set-Dword 'HKCU' 'Software\Microsoft\Windows\CurrentVersion\Policies\System' 'DisableLockWorkstation' 7
@@ -333,6 +499,8 @@ function Invoke-SelfCheck {
         $run.Close()
         if ($command -notlike '*C:\ProgramData\os-lock-probe\restore.ps1*') { throw 'RunOnce does not call the protected script' }
         if ($command -notlike '*-Journal *C:\ProgramData\os-lock-probe\pending.json*') { throw 'RunOnce does not pass the journal path' }
+        if (-not (Test-ProbeDirTrusted)) { throw 'refusing to run the restore command from an untrusted probe directory' }
+        if (-not (Test-OwnerTrusted (Join-Path $probeDir 'restore.ps1'))) { throw 'refusing to run an untrusted restore script' }
         $previous = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
@@ -345,8 +513,12 @@ function Invoke-SelfCheck {
         Write-Host 'self-check ok'
     } finally {
         try { $evilKey.DeleteSubKeyTree('Software\os-lock-evil', $false) } catch { }
+        if (-not (Test-Path -LiteralPath $probeDir)) {
+            try { Initialize-ProbeDir } catch { }
+        }
         try { Save-PendingFile $saved } catch { }
         try { Invoke-PendingRestore | Out-Null } catch { }
+        try { Remove-ProbeFolder } catch { }
         try { $evilKey.DeleteSubKeyTree('Software\os-lock-evil', $false) } catch { }
     }
 }
@@ -400,6 +572,11 @@ function Add-Row([string]$id, [string]$name, [string]$status, $skip, [bool]$need
 }
 
 function Invoke-Probe {
+    if ($exe -like 'C:\ProgramData\os-lock-probe\*') {
+        if (-not (Test-ProbeDirTrusted) -or -not (Test-OwnerTrusted $exe)) {
+            throw 'refusing to run a probe executable that is not owned by SYSTEM or Administrators'
+        }
+    }
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -569,8 +746,7 @@ try {
     if (-not (Test-Path -LiteralPath $exe)) { throw 'the probe executable was not built' }
     Initialize-ProbeDir
     $protected = Join-Path $probeDir 'os-lock-proof.exe'
-    Copy-Item -LiteralPath $exe -Destination $protected -Force
-    if (Test-ReparsePath $protected) { throw 'probe executable is a reparse point' }
+    Write-ProbeFile $protected ([System.IO.File]::ReadAllBytes($exe))
     $exe = $protected
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
@@ -599,6 +775,9 @@ try {
     }
 
     $beat = Join-Path $outDir 'heartbeat.txt'
+    if (-not (Test-ProbeDirTrusted) -or -not (Test-OwnerTrusted $exe)) {
+        throw 'refusing to run a probe executable that is not owned by SYSTEM or Administrators'
+    }
     $script:Heartbeat = Start-Process -FilePath $exe -ArgumentList @('heartbeat', '--file', $beat, '--allow-local') -WindowStyle Hidden -PassThru
     Start-Sleep -Milliseconds 500
     $beforeLines = Read-BeatCount $beat
@@ -665,6 +844,7 @@ try {
     if ($script:ReportWritten) {
         try { Invoke-PendingRestore | Out-Null } catch { }
         try { Invoke-Probe 'uninstall-service' | Out-Null } catch { }
+        try { Remove-ProbeFolder } catch { }
     } else {
         $restoreCode = 1
         try { $restoreCode = Invoke-PendingRestore } catch { $restoreCode = 1; $script:SuiteError = $_.Exception.Message }
@@ -713,6 +893,7 @@ try {
             }
             try { Write-ProofReport $script:Restored $state $primary $fallback } catch { Write-Host $_.Exception.Message }
         }
+        if ($script:Restored) { try { Remove-ProbeFolder } catch { } }
         $anyFail = $false
         foreach ($row in (Get-Items $script:Rows)) { if ($row.status -eq 'fail') { $anyFail = $true } }
         if ($script:Failed -or -not $script:Restored -or $anyFail) { $script:ExitCode = 1 } else { $script:ExitCode = 0 }
