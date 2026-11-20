@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_ACCESS_RIGHTS};
+use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_ACCESS_RIGHTS};
 
 #[test]
 fn live_fail_closed() {
@@ -81,6 +81,9 @@ fn live_fail_closed() {
         }
     }
     let host_before = host_pid();
+    let host_watch = host_before
+        .filter(|_| case == "kill-service")
+        .map(HostWatch::open);
     if case == "tray-hard-lock" {
         let ready = wait_until(Duration::from_secs(15), || hwnd_file.is_file());
         assert!(ready, "the owner window did not publish its handle");
@@ -102,7 +105,6 @@ fn live_fail_closed() {
         }
         "kill-service" => {
             child.kill().expect("kill service");
-            let _ = child.wait();
         }
         "stop-while-locked" => {
             fs::write(&stop_file, b"stop").expect("stop file");
@@ -131,8 +133,7 @@ fn live_fail_closed() {
         let os_locked = fresh.contains("result=confirmed") || marked.contains("confirmed");
         let host_done = case == "kill-service"
             && os_locked
-            && host_before.is_some()
-            && host_pid() != host_before;
+            && host_watch.as_ref().is_some_and(HostWatch::exited);
         if (case != "kill-service" && os_locked) || host_done {
             confirmed_at = Some(started.elapsed());
             break;
@@ -275,6 +276,32 @@ fn service_exe() -> PathBuf {
         return PathBuf::from(path);
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/softlock-service.exe")
+}
+
+struct HostWatch {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+impl HostWatch {
+    fn open(pid: u32) -> Self {
+        let handle =
+            unsafe { OpenProcess(PROCESS_ACCESS_RIGHTS(0x1000), false, pid).expect("query host") };
+        Self { handle }
+    }
+
+    fn exited(&self) -> bool {
+        let mut code = 0u32;
+        let ok = unsafe { GetExitCodeProcess(self.handle, &mut code) };
+        ok.is_ok() && code != 259
+    }
+}
+
+impl Drop for HostWatch {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
 }
 
 fn host_pid() -> Option<u32> {
