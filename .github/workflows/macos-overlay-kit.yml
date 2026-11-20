@@ -1,0 +1,75 @@
+name: macOS overlay kit
+
+# Runner slice: covering overlay, marker counts, posted click/focus when granted.
+# No Spaces, no full-screen app, no hot-plug, no power key.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'spikes/macos-overlay-kit/**'
+      - 'tests/hardware/macos/**'
+      - '.github/workflows/macos-overlay-kit.yml'
+      - 'docs/findings/m06-overlay/**'
+      - 'crates/softlock-core/tests/macos_overlay_isolation.rs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  kit:
+    name: macos overlay runner (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [macos-latest, macos-15-intel, macos-26-intel]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: macos-overlay-kit
+          workspaces: spikes/macos-overlay-kit -> spikes/macos-overlay-kit/target
+      - name: Record the runner
+        run: |
+          sw_vers
+          uname -m
+          echo "uid=$(id -u) user=$(whoami)"
+      - name: Format
+        run: cargo fmt --manifest-path spikes/macos-overlay-kit/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path spikes/macos-overlay-kit/Cargo.toml --all-targets -- -D warnings
+      - name: Hardware suite clippy
+        run: cargo clippy --locked --manifest-path tests/hardware/macos/Cargo.toml --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --locked --manifest-path spikes/macos-overlay-kit/Cargo.toml
+      - name: Hardware suite unit tests
+        run: cargo test --locked --manifest-path tests/hardware/macos/Cargo.toml
+      - name: Runner slice
+        run: |
+          set -euo pipefail
+          cargo run --locked --release --manifest-path spikes/macos-overlay-kit/Cargo.toml -- --runner --output-dir overlay-output
+          test -f overlay-output/result.json
+          test -f overlay-output/result.txt
+          grep -F "kit=m06-overlay" overlay-output/result.txt
+          grep -F "shielding-called=false" overlay-output/result.txt
+          grep -F "overlay-torn-down=true" overlay-output/result.txt
+          grep -F "dismissible=true" overlay-output/result.txt
+          grep -F "serial-collected=false" overlay-output/result.txt
+          grep -F "locked-session=false" overlay-output/result.txt
+          grep -E "^sharing-m14-CGWindowListCreateImage=do-not-claim removed=" overlay-output/result.txt
+          grep -E "^sharing-m14-CGDisplayCreateImage=do-not-claim removed=" overlay-output/result.txt
+          grep -E "^sharing-m14-screencapture=do-not-claim removed=" overlay-output/result.txt
+          grep -E "^sharing-m14-ScreenCaptureKit=do-not-claim removed=" overlay-output/result.txt
+          grep -E "^sharing-m14-SCStream=do-not-claim removed=" overlay-output/result.txt
+          grep -F "result=pass" overlay-output/result.txt
+          echo "----- result.txt -----"
+          cat overlay-output/result.txt

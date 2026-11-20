@@ -12,7 +12,7 @@
 
 **Type:** Hardware kit. Deliverable is the filled sheet and the probe log under `docs/findings/`.
 
-**Status:** waiting for Henry. Not ready-for-agent. Not a GitHub issue.
+**Status:** kit in tree. Waiting for Henry's Intel Mac run. GitHub issue #55.
 
 - [ ] Marker counts on his OS for each capture path, sharing type default and `.none` (sheet)
 - [ ] The overlay is visible on every display that was already attached when the probe started (sheet). A display plugged in during the run is m23
