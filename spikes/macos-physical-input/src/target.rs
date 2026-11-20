@@ -19,11 +19,11 @@ pub struct TargetState {
 pub fn parse_target_state(text: &str) -> TargetState {
     TargetState {
         ready: int_field(text, "ready=") == 1,
-        count_key: int_field(text, "count-key="),
-        count_click: int_field(text, "count-click="),
-        count_scroll: int_field(text, "count-scroll="),
-        count_probe: int_field(text, "count-probe="),
-        written_ms: int_field(text, "written-ms=") as i64,
+        count_key: int_field(text, "count-key=") as i32,
+        count_click: int_field(text, "count-click=") as i32,
+        count_scroll: int_field(text, "count-scroll=") as i32,
+        count_probe: int_field(text, "count-probe=") as i32,
+        written_ms: int_field(text, "written-ms="),
         key: int_field(text, "key=") == 1,
     }
 }
@@ -53,7 +53,7 @@ pub fn post_kind(source: &str) -> &'static str {
     }
 }
 
-fn int_field(text: &str, key: &str) -> i32 {
+fn int_field(text: &str, key: &str) -> i64 {
     let Some(rest) = text.split(key).nth(1) else {
         return 0;
     };
@@ -108,6 +108,11 @@ mod tests {
         assert!(is_stale(0, 10_000));
         assert!(!is_stale(9_000, 10_000));
         assert!(is_stale(1_000, 10_000));
+        let live = parse_target_state(
+            "ready=1\ncount-key=0\ncount-click=0\ncount-scroll=0\ncount-probe=0\nwritten-ms=1732060000000\nkey=1\n",
+        );
+        assert_eq!(live.written_ms, 1_732_060_000_000);
+        assert!(!is_stale(live.written_ms, 1_732_060_001_000));
         assert_eq!(TARGET_CAP_SECS / 60, 30);
         assert_eq!(post_kind("kCGEventSourceStatePrivate"), "post-private");
         assert_eq!(
