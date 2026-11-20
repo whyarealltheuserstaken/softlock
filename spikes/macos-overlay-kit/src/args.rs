@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::wait::DEFAULT_TIMEOUT_MS;
+
 pub const DEFAULT_OUTPUT_DIR: &str = "overlay-output";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +24,7 @@ pub struct Args {
     pub force_quit: Option<String>,
     pub power_key: Option<String>,
     pub hotplug: Option<String>,
+    pub timeout_ms: u64,
 }
 
 pub fn parse_env() -> Result<Args, String> {
@@ -43,6 +46,7 @@ where
     let mut force_quit = None;
     let mut power_key = None;
     let mut hotplug = None;
+    let mut timeout_ms = DEFAULT_TIMEOUT_MS;
     let mut tokens = tokens.into_iter();
     while let Some(token) = tokens.next() {
         match token.as_str() {
@@ -122,6 +126,13 @@ where
                     "--hotplug",
                 )?);
             }
+            "--timeout-ms" => {
+                timeout_ms = tokens
+                    .next()
+                    .ok_or("--timeout-ms needs a value")?
+                    .parse()
+                    .map_err(|_| "--timeout-ms needs a millisecond count".to_string())?;
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -139,6 +150,7 @@ where
         force_quit,
         power_key,
         hotplug,
+        timeout_ms,
     })
 }
 
@@ -173,6 +185,11 @@ mod tests {
         let args = parse(tokens(&[])).unwrap();
         assert_eq!(args.mode, Mode::Runner);
         assert!(args.output_dir.ends_with(DEFAULT_OUTPUT_DIR));
+        assert_eq!(args.timeout_ms, DEFAULT_TIMEOUT_MS);
+        assert_eq!(
+            parse(tokens(&["--timeout-ms", "50"])).unwrap().timeout_ms,
+            50
+        );
     }
 
     #[test]

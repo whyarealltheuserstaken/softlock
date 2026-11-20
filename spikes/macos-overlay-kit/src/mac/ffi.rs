@@ -62,6 +62,10 @@ unsafe extern "C" {
     fn m06_overlay_sync(out: *mut OverlayOut) -> i32;
     fn m06_overlay_escape_seen() -> i32;
     fn m06_overlay_pump(millis: u32);
+    fn m06_overlay_wait_visible(timeout_ms: u32) -> i32;
+    fn m06_overlay_wait_hidden(timeout_ms: u32) -> i32;
+    fn m06_overlay_set_banner(utf8: *const c_char) -> i32;
+    fn m06_screen_capture_access() -> i32;
     fn m06_control_open() -> i32;
     fn m06_target_open(out: *mut ClickOut) -> i32;
     fn m06_target_close() -> i32;
@@ -168,6 +172,21 @@ impl OverlayGuard {
     pub fn pump(millis: u32) {
         unsafe {
             m06_overlay_pump(millis);
+        }
+    }
+
+    pub fn wait_visible(timeout_ms: u32) -> bool {
+        unsafe { m06_overlay_wait_visible(timeout_ms) != 0 }
+    }
+
+    pub fn wait_hidden(timeout_ms: u32) -> bool {
+        unsafe { m06_overlay_wait_hidden(timeout_ms) != 0 }
+    }
+
+    pub fn set_banner(text: &str) {
+        let c_text = std::ffi::CString::new(text).unwrap_or_default();
+        unsafe {
+            let _ = m06_overlay_set_banner(c_text.as_ptr());
         }
     }
 
@@ -279,6 +298,10 @@ impl TargetWindow {
             posted_click_count: out.click_count,
             posted_key_count: out.key_count,
             accessibility: granted,
+            measured_click: click.to_string(),
+            measured_focus: focus.to_string(),
+            typed_click: String::new(),
+            typed_focus: String::new(),
             click_outcome: click.to_string(),
             focus_outcome: focus.to_string(),
             note: optional_text(&out.error).unwrap_or_default(),
@@ -333,6 +356,10 @@ pub fn presentation_clear() {
 
 pub fn display_count() -> i32 {
     unsafe { m06_display_count() }
+}
+
+pub fn screen_capture_access() -> bool {
+    unsafe { m06_screen_capture_access() != 0 }
 }
 
 pub fn hw_model() -> String {

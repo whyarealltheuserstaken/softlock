@@ -8,6 +8,7 @@ mod report;
 mod scrub;
 mod text;
 mod version;
+mod wait;
 
 #[cfg(target_os = "macos")]
 mod mac;

@@ -384,15 +384,30 @@ pub fn overlay_rows(text: &str) -> Vec<Row> {
     let result = field(text, "result").unwrap_or_else(|| "missing".to_string());
     let torn = field(text, "overlay-torn-down").as_deref() == Some("true");
     let dismissible = field(text, "dismissible").as_deref() == Some("true");
-    let markers_ok = result == "pass" || result == "incomplete";
-    let mut markers = row(
-        "m06-markers",
-        "Capture marker counts",
-        if markers_ok && torn { "pass" } else { "fail" },
-        None,
-        false,
-        format!("result={result} torn-down={torn} dismissible={dismissible}"),
-    );
+    let recording = field(text, "screen-recording");
+    let mut markers = if recording.as_deref() == Some("false") {
+        row(
+            "m06-markers",
+            "Capture marker counts",
+            "skip",
+            Some("operator"),
+            false,
+            format!("screen-recording=false result={result} torn-down={torn}"),
+        )
+    } else {
+        row(
+            "m06-markers",
+            "Capture marker counts",
+            if result == "pass" && torn {
+                "pass"
+            } else {
+                "fail"
+            },
+            None,
+            false,
+            format!("result={result} torn-down={torn} dismissible={dismissible}"),
+        )
+    };
     markers.measurements.insert(
         "overlay-torn-down".into(),
         json!(if torn { "true" } else { "false" }),
@@ -472,21 +487,20 @@ fn overlay_operator_row(
     }
     match value.as_str() {
         "stayed-up"
-        | "covered-by-space"
-        | "covered-by-fullscreen"
         | "covered"
-        | "miss"
         | "fell-through"
         | "held"
-        | "blocked"
-        | "moved"
         | "swallowed"
         | "presentation-option-worked"
         | "desktop-reachable" => row(id, name, "pass", None, physical, detail),
+        "miss" | "covered-by-space" | "covered-by-fullscreen" | "blocked" | "moved" => {
+            row(id, name, "fail", None, physical, detail)
+        }
+        value if value.starts_with("fail:") => row(id, name, "fail", None, physical, detail),
         "no-external-display" => row(id, name, "skip", Some("not-applicable"), physical, detail),
         "skip" => row(id, name, "skip", Some("operator"), physical, detail),
         "no-input" => row(id, name, "skip", Some("no-input"), physical, detail),
-        "interrupted" => row(id, name, "skip", Some("interrupted"), physical, detail),
+        "interrupted" | "timeout" => row(id, name, "skip", Some("interrupted"), physical, detail),
         "not-applicable" => row(id, name, "skip", Some("not-applicable"), physical, detail),
         "missing" | "error" => row(id, name, "fail", None, physical, detail),
         _ => row(id, name, "fail", None, physical, detail),
@@ -1164,10 +1178,11 @@ dismissible=true
 displays-covered=true
 display-count=1
 covered-count=1
+screen-recording=true
 click=fell-through
 focus=held
 spaces=stayed-up
-fullscreen=covered-by-fullscreen
+fullscreen=stayed-up
 hotplug=no-external-display
 command-tab=desktop-reachable
 force-quit=presentation-option-worked
@@ -1231,6 +1246,77 @@ power-key=swallowed
                 .status,
             "pass"
         );
+    }
+
+    fn overlay_case(key: &str, value: &str) -> Row {
+        overlay_operator_row(
+            "m06-case",
+            "case",
+            key,
+            &format!("{key}={value}\nmode=kit\n"),
+            "kit",
+            true,
+        )
+    }
+
+    #[test]
+    fn overlay_stayed_up_covered_fell_through_held_and_swallowed_pass() {
+        for (key, value) in [
+            ("spaces", "stayed-up"),
+            ("hotplug", "covered"),
+            ("click", "fell-through"),
+            ("focus", "held"),
+            ("command-tab", "swallowed"),
+        ] {
+            assert_eq!(overlay_case(key, value).status, "pass", "{key}={value}");
+        }
+    }
+
+    #[test]
+    fn overlay_miss_covered_by_blocked_and_moved_fail() {
+        for (key, value) in [
+            ("spaces", "miss"),
+            ("spaces", "covered-by-space"),
+            ("fullscreen", "covered-by-fullscreen"),
+            ("click", "blocked"),
+            ("focus", "moved"),
+            ("hotplug", "fail:no-external-display"),
+        ] {
+            assert_eq!(overlay_case(key, value).status, "fail", "{key}={value}");
+        }
+    }
+
+    #[test]
+    fn overlay_desktop_reachable_is_recorded_pass() {
+        let row = overlay_case("command-tab", "desktop-reachable");
+        assert_eq!(row.status, "pass");
+        assert!(row.detail.contains("desktop-reachable"));
+    }
+
+    #[test]
+    fn overlay_capture_without_screen_recording_never_passes() {
+        let text = "\
+mode=kit
+result=incomplete
+overlay-torn-down=true
+dismissible=true
+displays-covered=true
+screen-recording=false
+click=fell-through
+focus=held
+spaces=stayed-up
+fullscreen=stayed-up
+hotplug=no-external-display
+command-tab=swallowed
+force-quit=swallowed
+power-key=swallowed
+";
+        let markers = overlay_rows(text)
+            .into_iter()
+            .find(|row| row.id == "m06-markers")
+            .unwrap();
+        assert_ne!(markers.status, "pass");
+        assert_eq!(markers.status, "skip");
     }
 
     fn plan_row(status: &str) -> Row {

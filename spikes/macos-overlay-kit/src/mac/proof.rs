@@ -1,11 +1,12 @@
 //! Overlay kit orchestrator. Any stop path closes the covering windows.
 
 use std::fs;
-use std::io::{self, BufRead, ErrorKind};
+use std::io::{self, BufRead};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -13,13 +14,17 @@ use crate::args::{Args, Mode};
 use crate::claim::SHARING_APIS;
 use crate::mac::ffi::{self, OverlayGuard, TargetWindow};
 use crate::report::{
-    CaptureSample, ClickFocus, KIT_ID, KitReport, OperatorRow, PresentationRow,
-    claims_from_samples, exit_nonzero, operator_row, render, runner_operator_row,
+    CaptureSample, ClickFocus, KIT_ID, KitReport, OperatorRow, PRESENTATION_RECORDED_NOTE,
+    PresentationRow, claims_from_samples, exit_nonzero, operator_row, render, row_is_failure,
+    runner_operator_row, score_hotplug,
 };
 use crate::scrub::{contains_serial, scrub};
 use crate::version::parse_sw_vers;
+use crate::wait::{POLL_MS, WaitOutcome, poll_stdin, wait_slice};
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+static TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(600_000);
 
 extern "C" fn handle_stop(_signal: i32) {
     STOP.store(true, Ordering::Relaxed);
@@ -50,6 +55,8 @@ pub fn dispatch(args: Args) -> i32 {
 
 fn dispatch_inner(args: &Args) -> i32 {
     install_stop_handler();
+    TIMEOUT_MS.store(args.timeout_ms, Ordering::Relaxed);
+    spawn_watchdog_onto_stop(args.timeout_ms);
     if let Err(error) = fs::create_dir_all(&args.output_dir) {
         eprintln!("output dir: {error}");
         return 1;
@@ -58,29 +65,42 @@ fn dispatch_inner(args: &Args) -> i32 {
     crate::report::write_stdout(crate::report::instructions(kit));
     let mut version = read_version();
     version.hw_model = scrub(&ffi::hw_model());
+    let screen_recording = ffi::screen_capture_access();
+    let screens_before = ffi::display_count();
     let mut overlay = OverlayGuard::open();
+    OverlayGuard::set_banner("m06 overlay. Esc needs Accessibility. Ctrl-C or the timeout quits.");
+    let _ = OverlayGuard::wait_visible(2000);
+    let covered_before = overlay.window.covered_count;
+    let mut max_screens = screens_before.max(overlay.window.display_count);
     let mut samples = capture_phase("default", &args.output_dir);
     overlay.set_none();
     ffi::control_open();
-    OverlayGuard::pump(400);
+    let _ = OverlayGuard::wait_visible(2000);
     samples.extend(capture_phase("none", &args.output_dir));
     OverlayGuard::order_out();
-    OverlayGuard::pump(300);
+    let _ = OverlayGuard::wait_hidden(2000);
     samples.extend(capture_phase("baseline", &args.output_dir));
     overlay = OverlayGuard::open();
     overlay.set_none();
-    let _target = TargetWindow::open();
+    OverlayGuard::set_banner("m06 overlay. Esc needs Accessibility. Ctrl-C or the timeout quits.");
+    let _ = OverlayGuard::wait_visible(2000);
+    let target = TargetWindow::open();
     let mut click_focus = TargetWindow::posted_click_focus();
+    click_focus.accessibility = click_focus.accessibility || target.accessibility;
+    let accessibility = click_focus.accessibility;
     let bits = ffi::presentation_apply();
     let mut presentation = presentation_rows(&bits, kit);
     let mut no_input = false;
     let mut interrupted = stop_requested() || OverlayGuard::escape_seen();
-    let (spaces, fullscreen, hotplug) = if interrupted {
-        skipped_rows("interrupted")
+    let (spaces, fullscreen, hotplug) = if interrupted || timed_out_flag() {
+        skipped_rows(if timed_out_flag() {
+            "timeout"
+        } else {
+            "interrupted"
+        })
     } else if kit {
         fill_click_from_args(args, &mut click_focus);
-        fill_presentation_from_args(args, &mut presentation);
-        let rows = kit_rows(args, &mut overlay);
+        let rows = kit_rows(args, &mut overlay, screens_before, &mut max_screens);
         no_input = row_no_input(&rows.0) || row_no_input(&rows.1) || row_no_input(&rows.2);
         rows
     } else {
@@ -90,15 +110,30 @@ fn dispatch_inner(args: &Args) -> i32 {
             runner_operator_row("an external display"),
         )
     };
+    overlay.sync();
+    max_screens = max_screens
+        .max(ffi::display_count())
+        .max(overlay.window.display_count);
+    let screens_after = ffi::display_count().max(overlay.window.display_count);
+    let covered_after = overlay.window.covered_count;
+    if kit && !interrupted && !timed_out_flag() {
+        fill_presentation_from_args(args, &mut presentation, false);
+    }
+    OverlayGuard::close();
+    let _ = OverlayGuard::wait_hidden(2000);
+    ffi::presentation_clear();
+    TargetWindow::close();
+    if kit && !interrupted && !timed_out_flag() {
+        fill_power_key_last(args, &mut presentation);
+    }
     interrupted = interrupted || stop_requested() || OverlayGuard::escape_seen();
-    if interrupted {
+    let timed_out = timed_out_flag();
+    if interrupted || timed_out {
         no_input = false;
+        interrupted = interrupted && !timed_out;
     }
     let claims = claims_from_samples(&samples, overlay.window.window_area);
     let serial_collected = contains_serial(&version.hw_model);
-    OverlayGuard::close();
-    ffi::presentation_clear();
-    TargetWindow::close();
     let report = KitReport {
         kit: KIT_ID.to_string(),
         mode: if kit { "kit" } else { "runner" }.to_string(),
@@ -111,6 +146,15 @@ fn dispatch_inner(args: &Args) -> i32 {
         spaces,
         fullscreen,
         hotplug,
+        screens_before,
+        screens_after,
+        covered_before,
+        covered_after,
+        max_screens,
+        screen_recording,
+        accessibility,
+        timed_out,
+        timeout_ms: args.timeout_ms,
         dismissible: true,
         overlay_torn_down: true,
         serial_collected,
@@ -175,32 +219,65 @@ fn presentation_rows(bits: &ffi::PresentationBits, kit: bool) -> Vec<Presentatio
     ]
 }
 
-fn kit_rows(args: &Args, overlay: &mut OverlayGuard) -> (OperatorRow, OperatorRow, OperatorRow) {
-    let spaces = prompt_row(
+fn kit_rows(
+    args: &Args,
+    overlay: &mut OverlayGuard,
+    screens_before: i32,
+    max_screens: &mut i32,
+) -> (OperatorRow, OperatorRow, OperatorRow) {
+    let spaces = score_named_row(prompt_row(
         args.spaces.as_deref(),
         "Switch to another Space, look at every display, then type stayed-up, covered-by-space, miss, or skip.",
         &["stayed-up", "covered-by-space", "miss", "skip"],
         "spaces",
-    );
+    ));
     overlay.sync();
-    let fullscreen = prompt_row(
+    *max_screens = (*max_screens)
+        .max(ffi::display_count())
+        .max(overlay.window.display_count);
+    let fullscreen = score_named_row(prompt_row(
         args.fullscreen.as_deref(),
         "Open one full-screen app, look at the overlay, then type stayed-up, covered-by-fullscreen, miss, or skip.",
         &["stayed-up", "covered-by-fullscreen", "miss", "skip"],
         "fullscreen",
-    );
+    ));
     overlay.sync();
-    let hotplug = prompt_row(
+    *max_screens = (*max_screens)
+        .max(ffi::display_count())
+        .max(overlay.window.display_count);
+    let typed_hotplug = prompt_row(
         args.hotplug.as_deref(),
         "Plug in an external display if you have one, wait for a covering window, then type covered, miss, no-external-display, or skip.",
         &["covered", "miss", "no-external-display", "skip"],
         "hotplug",
     );
     overlay.sync();
+    *max_screens = (*max_screens)
+        .max(ffi::display_count())
+        .max(overlay.window.display_count);
+    let hotplug = match typed_hotplug.outcome.as_deref() {
+        Some("skip" | "no-input" | "interrupted" | "timeout") => typed_hotplug,
+        Some(typed) => score_hotplug(
+            typed,
+            screens_before,
+            overlay.window.display_count.max(ffi::display_count()),
+            overlay.window.covered_count,
+            *max_screens,
+        ),
+        None => typed_hotplug,
+    };
     (spaces, fullscreen, hotplug)
 }
 
-fn fill_presentation_from_args(args: &Args, rows: &mut [PresentationRow]) {
+fn score_named_row(row: OperatorRow) -> OperatorRow {
+    if row_is_failure(row.outcome.as_deref()) {
+        operator_row("fail", row.outcome.as_deref(), &row.note)
+    } else {
+        row
+    }
+}
+
+fn fill_presentation_from_args(args: &Args, rows: &mut [PresentationRow], power_key: bool) {
     let values = [
         args.command_tab.as_deref(),
         args.force_quit.as_deref(),
@@ -209,15 +286,26 @@ fn fill_presentation_from_args(args: &Args, rows: &mut [PresentationRow]) {
     let prompts = [
         "Press Command-Tab. Type swallowed, presentation-option-worked, desktop-reachable, or skip.",
         "Press Command-Option-Escape. Type swallowed, presentation-option-worked, desktop-reachable, or skip.",
-        "Tap the power key once (Touch ID button). Type swallowed, presentation-option-worked, desktop-reachable, or skip.",
+        "POWER KEY LAST: overlay is gone. A Touch ID MacBook Pro may lock or sleep. Tap the power key once only if you accept that. Type swallowed, presentation-option-worked, desktop-reachable, or skip.",
     ];
     for (index, row) in rows.iter_mut().enumerate() {
-        if stop_requested() {
-            row.outcome = "interrupted".to_string();
+        let is_power = row.name == "power-key";
+        if is_power != power_key {
+            continue;
+        }
+        if stop_requested() || timed_out_flag() {
+            row.outcome = if timed_out_flag() {
+                "timeout".to_string()
+            } else {
+                "interrupted".to_string()
+            };
             continue;
         }
         if let Some(value) = values[index] {
             row.outcome = value.to_string();
+            if row.outcome == "desktop-reachable" {
+                row.note = PRESENTATION_RECORDED_NOTE.to_string();
+            }
             continue;
         }
         let answer = prompt_value(
@@ -230,31 +318,51 @@ fn fill_presentation_from_args(args: &Args, rows: &mut [PresentationRow]) {
             ],
         );
         row.outcome = answer;
+        if row.outcome == "desktop-reachable" {
+            row.note = PRESENTATION_RECORDED_NOTE.to_string();
+        }
     }
 }
 
+fn fill_power_key_last(args: &Args, rows: &mut [PresentationRow]) {
+    fill_presentation_from_args(args, rows, true);
+}
+
 fn fill_click_from_args(args: &Args, click: &mut ClickFocus) {
+    OverlayGuard::set_banner(&format!(
+        "{}\nEsc needs Accessibility. Ctrl-C / timeout quits.",
+        "Click the window under the overlay, then type fell-through, blocked, or skip."
+    ));
     if let Some(value) = args.click.as_deref() {
-        click.click_outcome = value.to_string();
+        click.typed_click = value.to_string();
     } else {
         let answer = prompt_value(
             "Click the window under the overlay. Type fell-through, blocked, or skip.",
             &["fell-through", "blocked", "skip"],
         );
-        if answer != "no-input" && answer != "interrupted" {
-            click.click_outcome = answer;
+        if answer != "no-input" && answer != "interrupted" && answer != "timeout" {
+            click.typed_click = answer;
         }
     }
+    OverlayGuard::set_banner(
+        "Did keyboard focus stay on the window under the overlay? Type held, moved, or skip.\nEsc needs Accessibility. Ctrl-C / timeout quits.",
+    );
     if let Some(value) = args.focus.as_deref() {
-        click.focus_outcome = value.to_string();
+        click.typed_focus = value.to_string();
     } else {
         let answer = prompt_value(
             "Did keyboard focus stay on the window under the overlay? Type held, moved, or skip.",
             &["held", "moved", "skip"],
         );
-        if answer != "no-input" && answer != "interrupted" {
-            click.focus_outcome = answer;
+        if answer != "no-input" && answer != "interrupted" && answer != "timeout" {
+            click.typed_focus = answer;
         }
+    }
+    if !click.typed_click.is_empty() {
+        click.click_outcome = click.typed_click.clone();
+    }
+    if !click.typed_focus.is_empty() {
+        click.focus_outcome = click.typed_focus.clone();
     }
 }
 
@@ -264,9 +372,15 @@ fn prompt_row(
     allowed: &[&str],
     label: &str,
 ) -> OperatorRow {
+    if timed_out_flag() {
+        return operator_row("timeout", Some("timeout"), "timeout");
+    }
     if stop_requested() {
         return operator_row("interrupted", Some("interrupted"), "interrupted");
     }
+    OverlayGuard::set_banner(&format!(
+        "{instruction}\nEsc needs Accessibility. Ctrl-C / timeout quits."
+    ));
     if let Some(value) = preset {
         return operator_row("recorded", Some(value), "preset");
     }
@@ -274,12 +388,16 @@ fn prompt_row(
     match answer.as_str() {
         "no-input" => operator_row("no-input", Some("no-input"), "stdin closed"),
         "interrupted" => operator_row("interrupted", Some("interrupted"), "interrupted"),
+        "timeout" => operator_row("timeout", Some("timeout"), "timeout"),
         "skip" => operator_row("skip", Some("skip"), label),
         other => operator_row("recorded", Some(other), "operator"),
     }
 }
 
 fn prompt_value(instruction: &str, allowed: &[&str]) -> String {
+    if timed_out_flag() {
+        return "timeout".to_string();
+    }
     if stop_requested() {
         return "interrupted".to_string();
     }
@@ -287,53 +405,78 @@ fn prompt_value(instruction: &str, allowed: &[&str]) -> String {
         return "no-input".to_string();
     }
     drain_stdin();
+    OverlayGuard::set_banner(&format!(
+        "{instruction}\nEsc needs Accessibility. Ctrl-C / timeout quits."
+    ));
     crate::report::write_stdout(instruction);
+    crate::report::write_stdout("Esc needs Accessibility. Ctrl-C or the timeout quits.");
     loop {
-        if stop_requested() {
-            return "interrupted".to_string();
-        }
-        match read_line() {
-            LineRead::Eof => return "no-input".to_string(),
-            LineRead::Interrupted => return "interrupted".to_string(),
-            LineRead::Line(line) => {
-                let value = line.trim().to_ascii_lowercase();
-                if value.is_empty() {
-                    crate::report::write_stdout(instruction);
-                    continue;
+        match wait_for_line() {
+            WaitOutcome::Eof => return "no-input".to_string(),
+            WaitOutcome::Interrupted => return "interrupted".to_string(),
+            WaitOutcome::Timeout => return "timeout".to_string(),
+            WaitOutcome::Escape => return "interrupted".to_string(),
+            WaitOutcome::Line => {
+                let mut line = String::new();
+                match io::stdin().lock().read_line(&mut line) {
+                    Ok(0) => return "no-input".to_string(),
+                    Ok(_) => {
+                        let value = line.trim().to_ascii_lowercase();
+                        if value.is_empty() {
+                            crate::report::write_stdout(instruction);
+                            continue;
+                        }
+                        if allowed.contains(&value.as_str()) {
+                            return value;
+                        }
+                        crate::report::write_stdout(&format!(
+                            "Type one of: {}",
+                            allowed.join(", ")
+                        ));
+                    }
+                    Err(_) => return "no-input".to_string(),
                 }
-                if allowed.contains(&value.as_str()) {
-                    return value;
-                }
-                crate::report::write_stdout(&format!("Type one of: {}", allowed.join(", ")));
             }
         }
     }
 }
 
-enum LineRead {
-    Line(String),
-    Eof,
-    Interrupted,
-}
-
-fn read_line() -> LineRead {
-    let mut line = String::new();
+fn wait_for_line() -> WaitOutcome {
+    let started = Instant::now();
+    let timeout_ms = TIMEOUT_MS.load(Ordering::Relaxed);
     loop {
-        if stop_requested() {
-            return LineRead::Interrupted;
+        OverlayGuard::pump(0);
+        let stop = stop_requested();
+        let escape = OverlayGuard::escape_seen();
+        if TIMED_OUT.load(Ordering::Relaxed) {
+            return WaitOutcome::Timeout;
         }
-        match io::stdin().lock().read_line(&mut line) {
-            Ok(0) => return LineRead::Eof,
-            Ok(_) => return LineRead::Line(line),
-            Err(error) if error.kind() == ErrorKind::Interrupted => {
-                if stop_requested() {
-                    return LineRead::Interrupted;
-                }
-                line.clear();
+        if let Some(outcome) = wait_slice(started, timeout_ms, stop, escape, poll_stdin(POLL_MS)) {
+            if outcome == WaitOutcome::Interrupted && TIMED_OUT.load(Ordering::Relaxed) {
+                return WaitOutcome::Timeout;
             }
-            Err(_) => return LineRead::Eof,
+            return outcome;
         }
     }
+}
+
+fn timed_out_flag() -> bool {
+    TIMED_OUT.load(Ordering::Relaxed)
+}
+
+fn spawn_watchdog_onto_stop(timeout_ms: u64) {
+    std::thread::spawn(move || {
+        let slice = Duration::from_millis(POLL_MS as u64);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        while Instant::now() < deadline {
+            if STOP.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(slice.min(deadline.saturating_duration_since(Instant::now())));
+        }
+        TIMED_OUT.store(true, Ordering::Relaxed);
+        STOP.store(true, Ordering::Relaxed);
+    });
 }
 
 fn drain_stdin() {

@@ -81,6 +81,10 @@ pub struct ClickFocus {
     pub posted_click_count: i32,
     pub posted_key_count: i32,
     pub accessibility: bool,
+    pub measured_click: String,
+    pub measured_focus: String,
+    pub typed_click: String,
+    pub typed_focus: String,
     pub click_outcome: String,
     pub focus_outcome: String,
     pub note: String,
@@ -116,6 +120,15 @@ pub struct KitReport {
     pub spaces: OperatorRow,
     pub fullscreen: OperatorRow,
     pub hotplug: OperatorRow,
+    pub screens_before: i32,
+    pub screens_after: i32,
+    pub covered_before: i32,
+    pub covered_after: i32,
+    pub max_screens: i32,
+    pub screen_recording: bool,
+    pub accessibility: bool,
+    pub timed_out: bool,
+    pub timeout_ms: u64,
     pub dismissible: bool,
     pub overlay_torn_down: bool,
     pub serial_collected: bool,
@@ -184,6 +197,93 @@ pub fn displays_covered(overlay: &OverlayWindow) -> bool {
         && overlay.ordered_front
 }
 
+pub fn cover_matches_screens(covered: i32, screens: i32) -> bool {
+    screens > 0 && covered == screens
+}
+
+/// Operator `no-external-display` is only valid when a second screen was never attached.
+pub fn reject_no_external_display(max_screens: i32) -> bool {
+    max_screens > 1
+}
+
+pub fn score_hotplug(
+    typed: &str,
+    screens_before: i32,
+    screens_after: i32,
+    covered_after: i32,
+    max_screens: i32,
+) -> OperatorRow {
+    if typed == "no-external-display" && reject_no_external_display(max_screens) {
+        return operator_row(
+            "fail",
+            Some("no-external-display"),
+            "no-external-display is invalid because more than one screen was attached",
+        );
+    }
+    if typed == "skip" || typed == "no-input" || typed == "interrupted" {
+        return operator_row("recorded", Some(typed), "operator");
+    }
+    if !cover_matches_screens(covered_after, screens_after) {
+        return operator_row(
+            "fail",
+            Some("miss"),
+            &format!("covered {covered_after} of {screens_after} screens after sync"),
+        );
+    }
+    if typed == "no-external-display" {
+        return operator_row(
+            "recorded",
+            Some("no-external-display"),
+            &format!(
+                "screens-before={screens_before} screens-after={screens_after} max-screens={max_screens}"
+            ),
+        );
+    }
+    let outcome = if screens_after > screens_before {
+        "covered"
+    } else {
+        typed
+    };
+    operator_row(
+        "recorded",
+        Some(outcome),
+        &format!(
+            "screens-before={screens_before} screens-after={screens_after} covered-after={covered_after}"
+        ),
+    )
+}
+
+pub fn measured_and_typed_disagree(measured: &str, typed: &str) -> bool {
+    if typed.is_empty()
+        || typed == "skip"
+        || typed == "no-input"
+        || typed == "interrupted"
+        || measured.is_empty()
+        || measured == "not-applicable"
+        || measured == "not-run-on-runner"
+    {
+        return false;
+    }
+    measured != typed
+}
+
+pub fn row_is_failure(outcome: Option<&str>) -> bool {
+    matches!(
+        outcome,
+        Some("miss" | "covered-by-space" | "covered-by-fullscreen" | "blocked" | "moved")
+    )
+}
+
+pub fn row_is_success(outcome: Option<&str>) -> bool {
+    matches!(
+        outcome,
+        Some("stayed-up" | "covered" | "fell-through" | "held" | "swallowed")
+    )
+}
+
+pub const PRESENTATION_RECORDED_NOTE: &str =
+    "recorded; Decision 20 remote pass and D6 capture claim stay out of this kit";
+
 pub fn hardware_only_list() -> Vec<&'static str> {
     vec![
         "Space switch",
@@ -200,10 +300,10 @@ pub fn instructions(kit: bool) -> &'static str {
     if kit {
         "Magenta covering windows appear on every attached display. Escape or Control-C tears them down and still writes the result.\n\
          Capture runs first. Then switch Spaces, open one full-screen app, click the window under the overlay, try Command-Tab, Force Quit, and the power key, and optionally plug in a display.\n\
-         Type skip to skip a row. Type no-external-display if you have no second panel. Send result.json and result.txt."
+         Type skip to skip a row. Type no-external-display if you have no second panel. Esc needs Accessibility; Ctrl-C and the timeout always tear the overlay down. Send result.json and result.txt."
     } else {
         "Runner slice: covering overlay on every attached display, marker counts for default and sharing none, posted click/focus when Accessibility is granted.\n\
-         Spaces, full-screen, chords, the power key, and hot-plug stay not-run-on-runner. Escape and Control-C still tear the overlay down."
+         Spaces, full-screen, chords, the power key, and hot-plug stay not-run-on-runner. Control-C, SIGHUP, SIGTERM, panic, and the timeout tear the overlay down. Escape needs Accessibility."
     }
 }
 
@@ -241,23 +341,6 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
     if report.overlay.is_key || report.overlay.is_main {
         reasons.push("the overlay became key or main".to_string());
     }
-    if !displays_covered(&report.overlay) {
-        reasons.push(format!(
-            "covered {} of {} displays",
-            report.overlay.covered_count, report.overlay.display_count
-        ));
-    }
-    if report.claims.len() != SHARING_APIS.len() {
-        reasons.push("marker counts are missing for a capture path".to_string());
-    }
-    for claim in &report.claims {
-        if claim.default_marker < 0 || claim.none_marker < 0 || claim.baseline_marker < 0 {
-            reasons.push(format!("{} marker count is missing", claim.api));
-        }
-        if claim.m14 != "do-not-claim" {
-            reasons.push(format!("{} m14 token is {}", claim.api, claim.m14));
-        }
-    }
     if !report.dismissible {
         reasons.push("the overlay is not dismissible".to_string());
     }
@@ -270,14 +353,85 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
     if contains_serial(&report.version.hw_model) {
         reasons.push("serial text reached the report".to_string());
     }
+    if report.timed_out {
+        reasons.push("the timeout watchdog tore the overlay down".to_string());
+    }
+    if report.screen_recording {
+        if report.claims.len() != SHARING_APIS.len() {
+            reasons.push("marker counts are missing for a capture path".to_string());
+        }
+        for claim in &report.claims {
+            if claim.default_marker < 0 || claim.none_marker < 0 || claim.baseline_marker < 0 {
+                reasons.push(format!("{} marker count is missing", claim.api));
+            }
+        }
+    }
+    if report
+        .claims
+        .iter()
+        .any(|claim| claim.m14 != "do-not-claim")
+    {
+        for claim in &report.claims {
+            if claim.m14 != "do-not-claim" {
+                reasons.push(format!("{} m14 token is {}", claim.api, claim.m14));
+            }
+        }
+    }
+    if !displays_covered(&report.overlay) {
+        reasons.push(format!(
+            "covered {} of {} displays",
+            report.overlay.covered_count, report.overlay.display_count
+        ));
+    }
+    if report.screens_after > 0
+        && !cover_matches_screens(report.covered_after, report.screens_after)
+    {
+        reasons.push(format!(
+            "after sync covered {} of {} screens",
+            report.covered_after, report.screens_after
+        ));
+    }
+    if measured_and_typed_disagree(
+        &report.click_focus.measured_click,
+        &report.click_focus.typed_click,
+    ) {
+        reasons.push("measured click disagrees with typed click".to_string());
+    }
+    if measured_and_typed_disagree(
+        &report.click_focus.measured_focus,
+        &report.click_focus.typed_focus,
+    ) {
+        reasons.push("measured focus disagrees with typed focus".to_string());
+    }
+    push_row_failure(&mut reasons, "spaces", &report.spaces);
+    push_row_failure(&mut reasons, "fullscreen", &report.fullscreen);
+    push_row_failure(&mut reasons, "hotplug", &report.hotplug);
+    if row_is_failure(Some(&report.click_focus.click_outcome)) {
+        reasons.push(format!("click={}", report.click_focus.click_outcome));
+    }
+    if row_is_failure(Some(&report.click_focus.focus_outcome)) {
+        reasons.push(format!("focus={}", report.click_focus.focus_outcome));
+    }
     reasons
 }
 
-pub fn incomplete_reasons(report: &KitReport) -> Vec<String> {
-    if report.mode != "kit" {
-        return Vec::new();
+fn push_row_failure(reasons: &mut Vec<String>, label: &str, row: &OperatorRow) {
+    if row.status == "fail" || row_is_failure(row.outcome.as_deref()) {
+        reasons.push(format!(
+            "{label}={}",
+            row.outcome.as_deref().unwrap_or(&row.status)
+        ));
     }
+}
+
+pub fn incomplete_reasons(report: &KitReport) -> Vec<String> {
     let mut reasons = Vec::new();
+    if !report.screen_recording {
+        reasons.push("CGPreflightScreenCaptureAccess is false".to_string());
+    }
+    if report.mode != "kit" {
+        return reasons;
+    }
     for (label, row) in [
         ("spaces", &report.spaces),
         ("fullscreen", &report.fullscreen),
@@ -308,6 +462,10 @@ fn row_filled(row: &OperatorRow) -> bool {
                 | "miss"
                 | "covered"
                 | "no-external-display"
+                | "fell-through"
+                | "blocked"
+                | "held"
+                | "moved"
         )
     )
 }
@@ -376,6 +534,15 @@ pub fn render(report: &KitReport) -> String {
     ));
     out.push_str(&format!("display-count={}\n", report.overlay.display_count));
     out.push_str(&format!("covered-count={}\n", report.overlay.covered_count));
+    out.push_str(&format!("screens-before={}\n", report.screens_before));
+    out.push_str(&format!("screens-after={}\n", report.screens_after));
+    out.push_str(&format!("covered-before={}\n", report.covered_before));
+    out.push_str(&format!("covered-after={}\n", report.covered_after));
+    out.push_str(&format!("max-screens={}\n", report.max_screens));
+    out.push_str(&format!("screen-recording={}\n", report.screen_recording));
+    out.push_str(&format!("accessibility={}\n", report.accessibility));
+    out.push_str(&format!("timed-out={}\n", report.timed_out));
+    out.push_str(&format!("timeout-ms={}\n", report.timeout_ms));
     out.push_str(&format!(
         "displays-covered={}\n",
         displays_covered(&report.overlay)
@@ -425,6 +592,22 @@ pub fn render(report: &KitReport) -> String {
         one_line(&report.click_focus.focus_outcome)
     ));
     out.push_str(&format!(
+        "measured-click={}\n",
+        one_line(&report.click_focus.measured_click)
+    ));
+    out.push_str(&format!(
+        "measured-focus={}\n",
+        one_line(&report.click_focus.measured_focus)
+    ));
+    out.push_str(&format!(
+        "typed-click={}\n",
+        one_line(&report.click_focus.typed_click)
+    ));
+    out.push_str(&format!(
+        "typed-focus={}\n",
+        one_line(&report.click_focus.typed_focus)
+    ));
+    out.push_str(&format!(
         "overlay-became-key={}\n",
         report.click_focus.overlay_became_key
     ));
@@ -446,6 +629,12 @@ pub fn render(report: &KitReport) -> String {
             "{}-app-was-active={}\n",
             row.name, row.app_was_active
         ));
+        if row.outcome == "desktop-reachable" {
+            out.push_str(&format!(
+                "{}-detail={}\n",
+                row.name, PRESENTATION_RECORDED_NOTE
+            ));
+        }
     }
     out.push_str(&format!("spaces={}\n", row_token(&report.spaces)));
     out.push_str(&format!("fullscreen={}\n", row_token(&report.fullscreen)));
@@ -482,7 +671,11 @@ pub fn render(report: &KitReport) -> String {
 }
 
 fn row_token(row: &OperatorRow) -> String {
-    row.outcome.clone().unwrap_or_else(|| row.status.clone())
+    if row.status == "fail" {
+        format!("fail:{}", row.outcome.as_deref().unwrap_or("fail"))
+    } else {
+        row.outcome.clone().unwrap_or_else(|| row.status.clone())
+    }
 }
 
 #[cfg(test)]
@@ -528,6 +721,10 @@ fn passing_runner_fixture() -> KitReport {
             posted_click_count: 0,
             posted_key_count: 0,
             accessibility: false,
+            measured_click: "not-run-on-runner".to_string(),
+            measured_focus: "not-run-on-runner".to_string(),
+            typed_click: String::new(),
+            typed_focus: String::new(),
             click_outcome: "not-run-on-runner".to_string(),
             focus_outcome: "not-run-on-runner".to_string(),
             note: "runner has no Accessibility grant".to_string(),
@@ -561,6 +758,15 @@ fn passing_runner_fixture() -> KitReport {
         spaces: runner_operator_row("a Space switch"),
         fullscreen: runner_operator_row("a full-screen app"),
         hotplug: runner_operator_row("an external display"),
+        screens_before: 1,
+        screens_after: 1,
+        covered_before: 1,
+        covered_after: 1,
+        max_screens: 1,
+        screen_recording: true,
+        accessibility: false,
+        timed_out: false,
+        timeout_ms: crate::wait::DEFAULT_TIMEOUT_MS,
         dismissible: true,
         overlay_torn_down: true,
         serial_collected: false,
@@ -601,10 +807,15 @@ fn passing_kit_fixture() -> KitReport {
     report.mode = "kit".to_string();
     report.version.uname_m = "x86_64".to_string();
     report.version.hw_model = "MacBookPro16,2".to_string();
+    report.click_focus.measured_click = "fell-through".to_string();
+    report.click_focus.measured_focus = "held".to_string();
+    report.click_focus.typed_click = "fell-through".to_string();
+    report.click_focus.typed_focus = "held".to_string();
     report.click_focus.click_outcome = "fell-through".to_string();
     report.click_focus.focus_outcome = "held".to_string();
     report.click_focus.posted_click_count = 1;
     report.click_focus.accessibility = true;
+    report.accessibility = true;
     report.spaces = operator_row("recorded", Some("stayed-up"), "operator");
     report.fullscreen = operator_row("recorded", Some("stayed-up"), "operator");
     report.hotplug = operator_row(
@@ -667,12 +878,17 @@ mod tests {
         assert_eq!(kit.fullscreen.outcome.as_deref(), Some("stayed-up"));
         let mut named = passing_kit_fixture();
         named.fullscreen = operator_row(
-            "recorded",
+            "fail",
             Some("covered-by-fullscreen"),
             "Safari full-screen covered the overlay",
         );
-        assert!(incomplete_reasons(&named).is_empty());
-        assert!(render(&named).contains("fullscreen=covered-by-fullscreen"));
+        assert!(
+            failure_reasons(&named)
+                .iter()
+                .any(|reason| reason.contains("covered-by-fullscreen"))
+        );
+        assert!(render(&named).contains("result=fail"));
+        assert!(render(&named).contains("fullscreen=fail:covered-by-fullscreen"));
     }
 
     #[test]
@@ -796,5 +1012,169 @@ mod tests {
             }
         }
         write_line(Closed, "report after Terminal closed");
+    }
+
+    #[test]
+    fn stayed_up_covered_fell_through_held_and_swallowed_are_passes() {
+        for outcome in ["stayed-up", "covered", "fell-through", "held", "swallowed"] {
+            assert!(row_is_success(Some(outcome)), "{outcome}");
+            assert!(!row_is_failure(Some(outcome)), "{outcome}");
+        }
+        let kit = passing_kit_fixture();
+        assert!(failure_reasons(&kit).is_empty());
+        assert!(render(&kit).contains("result=pass"));
+    }
+
+    #[test]
+    fn miss_covered_by_blocked_and_moved_are_fails() {
+        for outcome in [
+            "miss",
+            "covered-by-space",
+            "covered-by-fullscreen",
+            "blocked",
+            "moved",
+        ] {
+            assert!(row_is_failure(Some(outcome)), "{outcome}");
+            assert!(!row_is_success(Some(outcome)), "{outcome}");
+        }
+        let mut miss = passing_kit_fixture();
+        miss.spaces = operator_row("fail", Some("miss"), "operator");
+        assert!(failure_reasons(&miss).iter().any(|r| r.contains("miss")));
+
+        let mut space = passing_kit_fixture();
+        space.spaces = operator_row("fail", Some("covered-by-space"), "operator");
+        assert!(
+            failure_reasons(&space)
+                .iter()
+                .any(|r| r.contains("covered-by-space"))
+        );
+
+        let mut full = passing_kit_fixture();
+        full.fullscreen = operator_row("fail", Some("covered-by-fullscreen"), "operator");
+        assert!(
+            failure_reasons(&full)
+                .iter()
+                .any(|r| r.contains("covered-by-fullscreen"))
+        );
+
+        let mut blocked = passing_kit_fixture();
+        blocked.click_focus.click_outcome = "blocked".to_string();
+        assert!(
+            failure_reasons(&blocked)
+                .iter()
+                .any(|r| r.contains("click=blocked"))
+        );
+
+        let mut moved = passing_kit_fixture();
+        moved.click_focus.focus_outcome = "moved".to_string();
+        assert!(
+            failure_reasons(&moved)
+                .iter()
+                .any(|r| r.contains("focus=moved"))
+        );
+        assert!(render(&miss).contains("result=fail"));
+    }
+
+    #[test]
+    fn presentation_records_swallowed_as_pass_and_desktop_reachable_with_d20_d6() {
+        let kit = passing_kit_fixture();
+        assert!(failure_reasons(&kit).is_empty());
+        let text = render(&kit);
+        assert!(text.contains("command-tab=desktop-reachable"));
+        assert!(text.contains("Decision 20"));
+        assert!(text.contains("D6"));
+        let mut swallowed = passing_kit_fixture();
+        for row in &mut swallowed.presentation {
+            row.outcome = "swallowed".to_string();
+        }
+        assert!(failure_reasons(&swallowed).is_empty());
+        assert!(render(&swallowed).contains("result=pass"));
+        assert!(render(&swallowed).contains("command-tab=swallowed"));
+    }
+
+    #[test]
+    fn cover_count_must_match_screen_count_after_sync() {
+        assert!(cover_matches_screens(2, 2));
+        assert!(!cover_matches_screens(1, 2));
+        let mut report = passing_kit_fixture();
+        report.screens_after = 2;
+        report.covered_after = 1;
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("after sync"))
+        );
+        assert_eq!(score_hotplug("covered", 1, 2, 1, 2).status, "fail");
+        assert_eq!(
+            score_hotplug("covered", 1, 2, 2, 2).outcome.as_deref(),
+            Some("covered")
+        );
+    }
+
+    #[test]
+    fn no_external_display_is_rejected_when_a_second_screen_was_attached() {
+        assert!(reject_no_external_display(2));
+        assert!(!reject_no_external_display(1));
+        let row = score_hotplug("no-external-display", 2, 2, 2, 2);
+        assert_eq!(row.status, "fail");
+        let ok = score_hotplug("no-external-display", 1, 1, 1, 1);
+        assert_eq!(ok.status, "recorded");
+        let mut report = passing_kit_fixture();
+        report.max_screens = 2;
+        report.hotplug = score_hotplug("no-external-display", 1, 2, 2, 2);
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("no-external-display"))
+        );
+    }
+
+    #[test]
+    fn screen_recording_preflight_never_passes_capture() {
+        let mut report = passing_runner_fixture();
+        report.screen_recording = false;
+        assert!(
+            incomplete_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("CGPreflightScreenCaptureAccess"))
+        );
+        assert!(!render(&report).contains("result=pass"));
+        assert!(render(&report).contains("result=incomplete"));
+    }
+
+    #[test]
+    fn measured_and_typed_click_and_focus_must_agree() {
+        assert!(measured_and_typed_disagree("fell-through", "blocked"));
+        assert!(!measured_and_typed_disagree("fell-through", "fell-through"));
+        assert!(!measured_and_typed_disagree("fell-through", ""));
+        let mut report = passing_kit_fixture();
+        report.click_focus.measured_click = "fell-through".to_string();
+        report.click_focus.typed_click = "blocked".to_string();
+        report.click_focus.click_outcome = "blocked".to_string();
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("measured click"))
+        );
+        report.click_focus.typed_click = "fell-through".to_string();
+        report.click_focus.click_outcome = "fell-through".to_string();
+        report.click_focus.measured_focus = "held".to_string();
+        report.click_focus.typed_focus = "moved".to_string();
+        report.click_focus.focus_outcome = "moved".to_string();
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("measured focus"))
+        );
+    }
+
+    #[test]
+    fn accessibility_and_display_count_are_on_the_report() {
+        let report = passing_kit_fixture();
+        let text = render(&report);
+        assert!(text.contains("accessibility=true"));
+        assert!(text.contains("display-count=1"));
+        assert!(text.contains("max-screens=1"));
+        assert!(text.contains("timeout-ms="));
     }
 }

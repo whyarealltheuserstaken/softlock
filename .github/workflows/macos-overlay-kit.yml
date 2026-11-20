@@ -56,7 +56,10 @@ jobs:
       - name: Runner slice
         run: |
           set -euo pipefail
+          set +e
           cargo run --locked --release --manifest-path spikes/macos-overlay-kit/Cargo.toml -- --runner --output-dir overlay-output
+          run_code=$?
+          set -e
           test -f overlay-output/result.json
           test -f overlay-output/result.txt
           grep -F "kit=m06-overlay" overlay-output/result.txt
@@ -70,6 +73,15 @@ jobs:
           grep -E "^sharing-m14-screencapture=do-not-claim removed=" overlay-output/result.txt
           grep -E "^sharing-m14-ScreenCaptureKit=do-not-claim removed=" overlay-output/result.txt
           grep -E "^sharing-m14-SCStream=do-not-claim removed=" overlay-output/result.txt
-          grep -F "result=pass" overlay-output/result.txt
+          grep -E "^screen-recording=" overlay-output/result.txt
+          grep -E "^timed-out=false" overlay-output/result.txt
+          if grep -F "screen-recording=false" overlay-output/result.txt; then
+            grep -F "result=incomplete" overlay-output/result.txt
+            grep -F "CGPreflightScreenCaptureAccess" overlay-output/result.txt
+            test "$run_code" -ne 0
+          else
+            grep -F "result=pass" overlay-output/result.txt
+            test "$run_code" -eq 0
+          fi
           echo "----- result.txt -----"
           cat overlay-output/result.txt

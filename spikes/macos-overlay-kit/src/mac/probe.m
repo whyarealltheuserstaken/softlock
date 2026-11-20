@@ -76,7 +76,20 @@ static id g_local_escape = nil;
 static id g_screen_observer = nil;
 static int g_pixel_control = -1;
 
+static NSString *g_banner = nil;
+
 static void pump(NSTimeInterval seconds) {
+    NSEvent *pending = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                          untilDate:[NSDate distantPast]
+                                             inMode:NSDefaultRunLoopMode
+                                            dequeue:YES];
+    while (pending) {
+        [NSApp sendEvent:pending];
+        pending = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                     untilDate:[NSDate distantPast]
+                                        inMode:NSDefaultRunLoopMode
+                                       dequeue:YES];
+    }
     if (seconds <= 0) {
         return;
     }
@@ -205,6 +218,28 @@ static void install_escape_monitor(void) {
                                                            }];
 }
 
+static void apply_banner(NSWindow *window) {
+    NSView *content = window.contentView;
+    if (content == nil) {
+        return;
+    }
+    NSTextField *label = [content viewWithTag:42];
+    NSString *text = g_banner != nil ? g_banner : @"";
+    if (label == nil) {
+        label = [NSTextField wrappingLabelWithString:text];
+        label.tag = 42;
+        label.textColor = [NSColor whiteColor];
+        label.backgroundColor = [NSColor colorWithWhite:0 alpha:0.4];
+        label.drawsBackground = YES;
+        label.font = [NSFont boldSystemFontOfSize:28];
+        label.frame = NSInsetRect(content.bounds, 48, 96);
+        label.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [content addSubview:label];
+    } else {
+        label.stringValue = text;
+    }
+}
+
 static CoverWindow *make_cover(NSRect frame) {
     CoverWindow *window = [[CoverWindow alloc] initWithContentRect:frame
                                                          styleMask:NSWindowStyleMaskBorderless
@@ -220,7 +255,72 @@ static CoverWindow *make_cover(NSRect frame) {
     window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                 NSWindowCollectionBehaviorFullScreenAuxiliary;
     [window orderFrontRegardless];
+    apply_banner(window);
     return window;
+}
+
+static BOOL overlays_visible(void) {
+    if (g_overlay.count == 0) {
+        return NO;
+    }
+    for (NSWindow *window in g_overlay) {
+        if (!window.isVisible || (window.occlusionState & NSWindowOcclusionStateVisible) == 0) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+static BOOL overlays_hidden(void) {
+    if (g_overlay.count == 0) {
+        return YES;
+    }
+    for (NSWindow *window in g_overlay) {
+        if (window.isVisible && (window.occlusionState & NSWindowOcclusionStateVisible) != 0) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+int m06_overlay_wait_visible(uint32_t timeout_ms) {
+    @autoreleasepool {
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:timeout_ms / 1000.0];
+        while ([until timeIntervalSinceNow] > 0) {
+            if (overlays_visible()) {
+                return 1;
+            }
+            pump(0.05);
+        }
+        return overlays_visible() ? 1 : 0;
+    }
+}
+
+int m06_overlay_wait_hidden(uint32_t timeout_ms) {
+    @autoreleasepool {
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:timeout_ms / 1000.0];
+        while ([until timeIntervalSinceNow] > 0) {
+            if (overlays_hidden()) {
+                return 1;
+            }
+            pump(0.05);
+        }
+        return overlays_hidden() ? 1 : 0;
+    }
+}
+
+int m06_overlay_set_banner(const char *utf8) {
+    @autoreleasepool {
+        g_banner = utf8 != NULL ? [NSString stringWithUTF8String:utf8] : @"";
+        for (NSWindow *window in g_overlay) {
+            apply_banner(window);
+        }
+    }
+    return 0;
+}
+
+int m06_screen_capture_access(void) {
+    return CGPreflightScreenCaptureAccess() ? 1 : 0;
 }
 
 static void fill_overlay_out(OverlayOut *out) {
@@ -302,7 +402,7 @@ int m06_overlay_open(OverlayOut *out) {
                           rebuild_covers();
                         }];
         }
-        pump(0.3);
+        m06_overlay_wait_visible(2000);
         fill_overlay_out(out);
     }
     return 0;
@@ -317,7 +417,7 @@ int m06_overlay_set_none(OverlayOut *out) {
         for (NSWindow *window in g_overlay) {
             window.sharingType = NSWindowSharingNone;
         }
-        pump(0.4);
+        m06_overlay_wait_visible(2000);
         fill_overlay_out(out);
     }
     return 0;
@@ -331,7 +431,7 @@ int m06_overlay_order_out(void) {
         if (g_control != nil) {
             [g_control orderOut:nil];
         }
-        pump(0.2);
+        m06_overlay_wait_hidden(2000);
     }
     return 0;
 }
@@ -373,7 +473,7 @@ int m06_overlay_sync(OverlayOut *out) {
         if ((int)g_overlay.count != (int)[NSScreen screens].count) {
             rebuild_covers();
         }
-        pump(0.2);
+        m06_overlay_wait_visible(2000);
         fill_overlay_out(out);
     }
     return 0;

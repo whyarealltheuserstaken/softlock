@@ -29,6 +29,15 @@ const ACCEPTANCE_TESTS: &[&str] = &[
     "fn a_click_falls_through_and_keyboard_focus_does_not_move",
     "fn command_tab_force_quit_and_power_key_each_have_a_row",
     "fn the_finding_tells_m14_which_capture_paths_it_may_claim",
+    "fn stayed_up_covered_fell_through_held_and_swallowed_are_passes",
+    "fn miss_covered_by_blocked_and_moved_are_fails",
+    "fn presentation_records_swallowed_as_pass_and_desktop_reachable_with_d20_d6",
+    "fn cover_count_must_match_screen_count_after_sync",
+    "fn no_external_display_is_rejected_when_a_second_screen_was_attached",
+    "fn screen_recording_preflight_never_passes_capture",
+    "fn measured_and_typed_click_and_focus_must_agree",
+    "fn ctrl_c_during_a_prompt_does_not_wait_for_enter",
+    "fn timeout_watchdog_sets_stop_without_an_enter_key",
 ];
 
 #[test]
@@ -198,17 +207,32 @@ fn each_acceptance_checkbox_has_a_named_test_and_the_overlay_is_always_torn_down
     let root = common::repo_root();
     let report =
         fs::read_to_string(root.join("spikes/macos-overlay-kit/src/report.rs")).expect("report");
-    for name in ACCEPTANCE_TESTS {
-        assert!(report.contains(name), "missing {name}");
-    }
     let proof =
         fs::read_to_string(root.join("spikes/macos-overlay-kit/src/mac/proof.rs")).expect("proof");
+    let wait = fs::read_to_string(root.join("spikes/macos-overlay-kit/src/wait.rs")).expect("wait");
+    let sources = format!("{report}\n{wait}\n{proof}");
+    for name in ACCEPTANCE_TESTS {
+        assert!(sources.contains(name), "missing {name}");
+    }
     assert!(proof.contains("SIGHUP"));
     assert!(proof.contains("m06_overlay_close") || proof.contains("OverlayGuard::close"));
     assert!(proof.contains("no-input"));
     assert!(proof.contains("result.json"));
     assert!(proof.contains("result.txt"));
     assert!(proof.contains("no-external-display"));
+    assert!(proof.contains("POWER KEY LAST"));
+    assert!(proof.contains("poll_stdin"));
+    assert!(proof.contains("wait_visible"));
+    assert!(report.contains("CGPreflightScreenCaptureAccess"));
+    let probe =
+        fs::read_to_string(root.join("spikes/macos-overlay-kit/src/mac/probe.m")).expect("probe");
+    assert!(probe.contains("CGPreflightScreenCaptureAccess"));
+    assert!(probe.contains("m06_overlay_wait_visible"));
+    let readme =
+        fs::read_to_string(root.join("spikes/macos-overlay-kit/README.md")).expect("readme");
+    assert!(readme.contains("cursor/m06-overlay-intel-kit-feda"));
+    assert!(readme.contains("Accessibility"));
+    assert!(readme.contains("timeout"));
 }
 
 #[test]
