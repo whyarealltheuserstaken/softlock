@@ -158,6 +158,10 @@ mod tests {
         assert!(hard_exit_due(false, true, true));
         assert!(!hard_exit_due(true, true, true));
         assert!(!hard_exit_due(false, true, false));
+    }
+
+    #[test]
+    fn click_wait_finished_when_counts_change_or_deadline() {
         assert!(click_wait_finished(1, 0, 0, 0, false));
         assert!(click_wait_finished(0, 1, 0, 0, false));
         assert!(click_wait_finished(0, 0, 0, 0, true));

@@ -39,6 +39,7 @@ const ACCEPTANCE_TESTS: &[&str] = &[
     "fn ctrl_c_during_a_prompt_does_not_wait_for_enter",
     "fn timeout_watchdog_sets_stop_without_an_enter_key",
     "fn measured_blocked_with_no_typed_answer_fails",
+    "fn click_wait_finished_when_counts_change_or_deadline",
 ];
 
 #[test]

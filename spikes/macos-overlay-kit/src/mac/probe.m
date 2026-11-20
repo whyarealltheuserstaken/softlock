@@ -115,6 +115,36 @@ static void ensure_app(void) {
     [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
 }
 
+static void activate_app(void) {
+    NSApplication *app = [NSApplication sharedApplication];
+    [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [app activateIgnoringOtherApps:YES];
+}
+
+static BOOL wait_until(NSTimeInterval seconds, BOOL (^pred)(void)) {
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    while ([until timeIntervalSinceNow] > 0) {
+        if (pred()) {
+            return YES;
+        }
+        pump(0.02);
+    }
+    return pred();
+}
+
+static CGPoint quartz_point_in_view(NSView *view) {
+    NSRect bounds = view.bounds;
+    NSRect window_rect = [view convertRect:bounds toView:nil];
+    NSWindow *window = view.window;
+    NSRect screen_rect = [window convertRectToScreen:window_rect];
+    NSScreen *screen = window.screen;
+    if (screen == nil) {
+        screen = [NSScreen mainScreen];
+    }
+    NSRect frame = screen != nil ? screen.frame : NSMakeRect(0, 0, 1024, 768);
+    return CGPointMake(NSMidX(screen_rect), NSMaxY(frame) - NSMidY(screen_rect));
+}
+
 @interface CoverWindow : NSWindow
 @end
 @implementation CoverWindow
@@ -141,6 +171,10 @@ static void ensure_app(void) {
 @end
 @implementation TargetView
 - (BOOL)acceptsFirstResponder {
+    return YES;
+}
+- (BOOL)acceptsFirstMouse:(NSEvent *)event {
+    (void)event;
     return YES;
 }
 - (void)mouseDown:(NSEvent *)event {
@@ -511,13 +545,9 @@ int m06_control_open(void) {
         window.backgroundColor = [NSColor colorWithSRGBRed:0.05 green:0.82 blue:0.08 alpha:1];
         g_control = window;
         [window orderFrontRegardless];
-        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:2];
-        while ([until timeIntervalSinceNow] > 0) {
-            if (window.isVisible && (window.occlusionState & NSWindowOcclusionStateVisible) != 0) {
-                break;
-            }
-            pump(0.02);
-        }
+        wait_until(2, ^{
+          return window.isVisible && (window.occlusionState & NSWindowOcclusionStateVisible) != 0;
+        });
     }
     return 0;
 }
@@ -543,12 +573,14 @@ int m06_target_open(ClickOut *out) {
         window.level = NSNormalWindowLevel;
         TargetView *view = [[TargetView alloc] initWithFrame:NSMakeRect(0, 0, 280, 160)];
         window.contentView = view;
+        activate_app();
         [window makeKeyAndOrderFront:nil];
+        [window makeFirstResponder:view];
         g_target = window;
-        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:2];
-        while ([until timeIntervalSinceNow] > 0 && !window.isKeyWindow) {
-            pump(0.02);
-        }
+        wait_until(2, ^{
+          [window makeKeyAndOrderFront:nil];
+          return window.isKeyWindow;
+        });
         out->target_is_key = window.isKeyWindow ? 1 : 0;
         out->accessibility = AXIsProcessTrusted() ? 1 : 0;
         out->listen = CGPreflightListenEventAccess() ? 1 : 0;
@@ -594,17 +626,29 @@ int m06_posted_click_focus(ClickOut *out) {
             out->key_count = atomic_load(&g_keys);
             return 0;
         }
-        if (!g_target.isKeyWindow) {
+        activate_app();
+        [g_target makeKeyAndOrderFront:nil];
+        [g_target makeFirstResponder:g_target.contentView];
+        BOOL became_key = wait_until(2, ^{
+          [g_target makeKeyAndOrderFront:nil];
+          return g_target.isKeyWindow;
+        });
+        if (!became_key) {
             snprintf(out->error, sizeof out->error, "target never became key");
+            out->overlay_is_key = overlay_key ? 1 : 0;
+            out->target_is_key = g_target.isKeyWindow ? 1 : 0;
+            out->click_count = atomic_load(&g_clicks);
+            out->key_count = atomic_load(&g_keys);
+            return 0;
         }
         int baseline_clicks = atomic_load(&g_clicks);
         int baseline_keys = atomic_load(&g_keys);
-        NSRect frame = g_target.frame;
-        CGFloat display_h = CGDisplayBounds(CGMainDisplayID()).size.height;
-        CGPoint point = CGPointMake(NSMidX(frame), display_h - NSMidY(frame));
+        CGPoint point = quartz_point_in_view(g_target.contentView);
         CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, point, kCGMouseButtonLeft);
         CGEventRef up = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp, point, kCGMouseButtonLeft);
         if (down != NULL && up != NULL) {
+            CGEventSetIntegerValueField(down, kCGMouseEventClickState, 1);
+            CGEventSetIntegerValueField(up, kCGMouseEventClickState, 1);
             CGEventPost(kCGSessionEventTap, down);
             CGEventPost(kCGSessionEventTap, up);
         }
@@ -623,12 +667,28 @@ int m06_posted_click_focus(ClickOut *out) {
             }
             CFRelease(source);
         }
-        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:2];
-        while ([until timeIntervalSinceNow] > 0) {
-            if (atomic_load(&g_clicks) > baseline_clicks || atomic_load(&g_keys) > baseline_keys) {
-                break;
+        wait_until(2, ^{
+          return atomic_load(&g_clicks) > baseline_clicks || atomic_load(&g_keys) > baseline_keys;
+        });
+        if (atomic_load(&g_clicks) <= baseline_clicks) {
+            pid_t pid = getpid();
+            CGEventRef hid_down =
+                CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, point, kCGMouseButtonLeft);
+            CGEventRef hid_up =
+                CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp, point, kCGMouseButtonLeft);
+            if (hid_down != NULL && hid_up != NULL) {
+                CGEventPostToPid(pid, hid_down);
+                CGEventPostToPid(pid, hid_up);
             }
-            pump(0.02);
+            if (hid_down != NULL) {
+                CFRelease(hid_down);
+            }
+            if (hid_up != NULL) {
+                CFRelease(hid_up);
+            }
+            wait_until(2, ^{
+              return atomic_load(&g_clicks) > baseline_clicks || atomic_load(&g_keys) > baseline_keys;
+            });
         }
         overlay_key = NO;
         for (NSWindow *window in g_overlay) {

@@ -5,6 +5,7 @@ use std::os::raw::c_char;
 use crate::claim::{SCREEN_CAPTURE_ENTRY, SCSTREAM_ENTRY};
 use crate::report::{CaptureSample, ClickFocus, OverlayWindow};
 use crate::text::one_line;
+use crate::wait::click_wait_finished;
 
 #[repr(C)]
 struct OverlayOut {
@@ -278,14 +279,15 @@ impl TargetWindow {
         }
         let granted = out.accessibility != 0;
         let error = optional_text(&out.error);
-        let untrusted = error
-            .as_deref()
-            .is_some_and(|value| value.contains("target never became key"));
+        let untrusted = error.as_deref().is_some_and(|value| {
+            value.contains("target never became key") || value.contains("target window missing")
+        });
+        let saw_click_or_key = click_wait_finished(out.click_count, out.key_count, 0, 0, false);
         let click = if !granted {
             "not-applicable"
         } else if out.click_count > 0 {
             "fell-through"
-        } else if untrusted {
+        } else if untrusted && !saw_click_or_key {
             "measurement-unreliable"
         } else {
             "blocked"
