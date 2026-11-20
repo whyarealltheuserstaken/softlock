@@ -5,6 +5,8 @@
 //! cannot unlock itself.
 
 mod authority;
+#[cfg(windows)]
+mod journal_store;
 #[cfg(feature = "live-fail-closed")]
 mod live_marker;
 mod log;
@@ -12,6 +14,10 @@ mod log;
 mod pincheck;
 mod platform;
 mod secrets;
+#[cfg(windows)]
+mod settings;
+#[cfg(windows)]
+mod taskmgr;
 
 #[cfg(windows)]
 mod windows;
@@ -33,6 +39,9 @@ pub use secrets::PinStore;
 
 #[cfg(windows)]
 pub use secrets::{SYSTEM_ONLY_SDDL, dacl_sddl, is_reparse_point, user_read_denied};
+
+#[cfg(windows)]
+pub use settings::repair_main;
 
 #[cfg(windows)]
 pub use windows::{

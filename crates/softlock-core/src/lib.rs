@@ -19,6 +19,7 @@ mod name;
 mod oslock;
 mod pin;
 mod platform;
+mod settings_journal;
 mod state;
 
 pub use backoff::delay_after_failure;
@@ -63,6 +64,14 @@ pub use platform::{
     PhysicalInputSink, PlannedChange, Platform, PolicySetting, PolicySettings, Power, PowerCaps,
     PowerError, PromptView, SessionControl, SessionId, SessionInfo, Support,
     UNSUPPORTED_PLATFORM_MESSAGE, UnsupportedPlatform, UserId, Verdict,
+};
+pub use settings_journal::{
+    CommitFault, DirFacts, DirFault, DirOwner, JournalFault, ProductState, REASSERT_AFTER,
+    RepairAction, SettingEntry, SettingValue, SettingsJournal, StartAction, TASK_MANAGER,
+    admit_directory, allowed_previous, commit_then_change, dir_fault_log, encode_document,
+    executable_may_run_as_system, fault_log, journal_dacl_exact, parse_document, reassert_due,
+    repair_action, repair_entry_name, restore_action, service_start_action, sid_is_safe,
+    task_manager_document,
 };
 pub use state::{
     ArmStep, DisarmStep, FailReason, Fallback, HeartbeatReport, LaunchNonce, LockSource, LockState,

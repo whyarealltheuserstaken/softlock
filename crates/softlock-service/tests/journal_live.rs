@@ -1,0 +1,469 @@
+//! Hosted-runner proof that a kill between the journal and the registry,
+//! and a kill after the change, restores DisableTaskMgr exactly.
+//! A normal `cargo test` returns immediately. The settings-journal workflow
+//! sets `SOFTLOCK_JOURNAL_LIVE` and builds with `live-fail-closed`.
+
+#![cfg(windows)]
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use softlock_core::SERVICE_NAME;
+
+const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System";
+
+#[test]
+fn live_settings_journal() {
+    let Ok(case) = std::env::var("SOFTLOCK_JOURNAL_LIVE") else {
+        return;
+    };
+    match softlock_windows::runner_may_lock() {
+        Ok(()) => {}
+        Err(reason) => panic!("refusing the settings journal on this machine: {reason}"),
+    }
+    if installed_service_running() {
+        panic!("refusing while the installed service is running");
+    }
+    let original = query_taskmgr();
+    let mut guard = Guard {
+        original: original.clone(),
+        child: None,
+        reported: false,
+    };
+    let outcome = match case.as_str() {
+        "restore" => restore(&mut guard),
+        "recover-active" => recover_active(&mut guard),
+        other => Err(format!("unknown case {other}")),
+    };
+    match outcome {
+        Ok(()) => {
+            guard.reported = true;
+            write_result(r#"{"ok":true}"#);
+        }
+        Err(reason) => {
+            guard.reported = true;
+            write_result(&format!(r#"{{"ok":false,"reason":"{reason}"}}"#));
+            panic!("{reason}");
+        }
+    }
+}
+
+fn restore(guard: &mut Guard) -> Result<(), String> {
+    for previous in ["absent", "0", "1"] {
+        kill_before_apply(guard, previous)?;
+    }
+    kill_after_apply(guard)?;
+    reassert_and_repair(guard)?;
+    Ok(())
+}
+
+fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
+    set_taskmgr(previous)?;
+    let pause = guard_dir().join(format!("pause-{previous}"));
+    let _ = fs::remove_file(&pause);
+    spawn_service(guard, true, &pause)?;
+    wait_pipe()?;
+    transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+    let journal = journal_file();
+    let saw = wait_until(Duration::from_secs(20), || {
+        journal_ready(&journal) && query_taskmgr() == previous
+    });
+    if !saw {
+        return Err(format!(
+            "journal was not durable before the {previous} change"
+        ));
+    }
+    // The service is blocked after the flush. A stop file is not read until
+    // that pause ends, which would apply the value. Kill it.
+    hard_stop(guard);
+    if query_taskmgr() != previous {
+        return Err(format!("kill changed DisableTaskMgr from {previous}"));
+    }
+    spawn_service(guard, false, &pause)?;
+    let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == previous);
+    hard_stop(guard);
+    if !restored {
+        return Err(format!("restart did not restore {previous}"));
+    }
+    if query_taskmgr() != previous {
+        return Err(format!("restored value was not {previous}"));
+    }
+    Ok(())
+}
+
+fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
+    set_taskmgr("absent")?;
+    let pause = guard_dir().join("pause-after");
+    fs::write(&pause, b"go").map_err(|_| "pause file".to_string())?;
+    spawn_service(guard, true, &pause)?;
+    wait_pipe()?;
+    transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+    let applied = wait_until(Duration::from_secs(20), || query_taskmgr() == "1");
+    if !applied {
+        return Err("DisableTaskMgr was not set to 1".to_string());
+    }
+    hard_stop(guard);
+    spawn_service(guard, false, &pause)?;
+    let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == "absent");
+    hard_stop(guard);
+    if !restored {
+        return Err("restart did not restore an absent value".to_string());
+    }
+    Ok(())
+}
+
+fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
+    set_taskmgr("absent")?;
+    let pause = guard_dir().join("pause-reassert");
+    fs::write(&pause, b"go").map_err(|_| "pause file".to_string())?;
+    spawn_service(guard, true, &pause)?;
+    wait_pipe()?;
+    transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+    if !wait_until(Duration::from_secs(20), || query_taskmgr() == "1") {
+        return Err("lock did not set DisableTaskMgr".to_string());
+    }
+    set_taskmgr("absent")?;
+    if !wait_until(Duration::from_secs(8), || query_taskmgr() == "1") {
+        return Err("cleared DisableTaskMgr was not re-asserted within 5 s".to_string());
+    }
+    let repair = repair_settings()?;
+    if repair == 0 {
+        return Err("repair ran while locked".to_string());
+    }
+    if query_taskmgr() != "1" {
+        return Err("repair changed DisableTaskMgr while locked".to_string());
+    }
+    hard_stop(guard);
+    let first = repair_settings()?;
+    let second = repair_settings()?;
+    if first != 0 || second != 0 {
+        return Err(format!(
+            "repair after the kill returned {first} then {second}"
+        ));
+    }
+    if query_taskmgr() != "absent" {
+        return Err("repair did not restore the absent value".to_string());
+    }
+    Ok(())
+}
+
+fn recover_active(guard: &mut Guard) -> Result<(), String> {
+    set_taskmgr("0")?;
+    let pause = guard_dir().join("pause-active");
+    fs::write(&pause, b"go").map_err(|_| "pause file".to_string())?;
+    spawn_service(guard, true, &pause)?;
+    wait_pipe()?;
+    transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+    if !wait_until(Duration::from_secs(20), || {
+        query_taskmgr() == "1" && host_running()
+    }) {
+        return Err("the lock host was not running with DisableTaskMgr set".to_string());
+    }
+    if let Some(child) = guard.child.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    guard.child = None;
+    if !host_running() {
+        return Err("the lock host died with the service".to_string());
+    }
+    spawn_service(guard, false, &pause)?;
+    let mut last = String::new();
+    let mut saw_unlocked = false;
+    let closed = wait_until(Duration::from_secs(25), || {
+        let status = transact(&pipe_name(), status_body()).unwrap_or_default();
+        let state = status_state(&status);
+        if state.as_deref() == Some("Unlocked") {
+            saw_unlocked = true;
+        }
+        last = status;
+        query_taskmgr() == "0" && state.as_deref() == Some("OsLocked")
+    });
+    if saw_unlocked {
+        return Err("an active lock returned to Unlocked".to_string());
+    }
+    if !closed {
+        return Err(format!(
+            "an active journal did not fail closed: {last} value {}",
+            query_taskmgr()
+        ));
+    }
+    Ok(())
+}
+
+fn status_state(json: &str) -> Option<String> {
+    let key = "\"state\":\"";
+    let start = json.find(key)? + key.len();
+    let rest = json.get(start..)?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+struct Guard {
+    original: String,
+    child: Option<Child>,
+    reported: bool,
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "softlock-lockhost.exe"])
+            .status();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "softlock-service.exe"])
+            .status();
+        let _ = set_taskmgr(&self.original);
+        if !self.reported {
+            write_result(r#"{"ok":false,"reason":"ended"}"#);
+        }
+    }
+}
+
+fn spawn_service(guard: &mut Guard, pause: bool, pause_file: &Path) -> Result<(), String> {
+    if let Some(child) = guard.child.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let root = guard_dir();
+    fs::create_dir_all(&root).map_err(|_| "temp".to_string())?;
+    let mut command = Command::new(service_exe());
+    command
+        .arg("--foreground")
+        .env("SOFTLOCK_PIN_DIR", root.join("pin"))
+        .env("SOFTLOCK_LOG", root.join("service.log"))
+        .env("SOFTLOCK_PIPE", pipe_name())
+        .env("SOFTLOCK_DEV_APP", "1")
+        .env("SOFTLOCK_STOP_FILE", root.join("stop"))
+        .env_remove("SOFTLOCK_STUB_OS_LOCK")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if pause {
+        command
+            .env("SOFTLOCK_JOURNAL_PAUSE", "1")
+            .env("SOFTLOCK_JOURNAL_PAUSE_FILE", pause_file);
+    } else {
+        command.env_remove("SOFTLOCK_JOURNAL_PAUSE");
+    }
+    let _ = fs::remove_file(root.join("stop"));
+    guard.child = Some(command.spawn().map_err(|_| "spawn service".to_string())?);
+    Ok(())
+}
+
+fn hard_stop(guard: &mut Guard) {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "softlock-lockhost.exe"])
+        .status();
+    if let Some(child) = guard.child.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    guard.child = None;
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "softlock-service.exe"])
+        .status();
+}
+
+fn repair_settings() -> Result<i32, String> {
+    let output = Command::new(service_exe())
+        .arg("--repair-settings")
+        .env("SOFTLOCK_PIPE", pipe_name())
+        .output()
+        .map_err(|_| "repair".to_string())?;
+    Ok(output.status.code().unwrap_or(1))
+}
+
+fn wait_pipe() -> Result<(), String> {
+    let ok = wait_until(Duration::from_secs(20), || {
+        transact(&pipe_name(), hello()).is_ok()
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err("pipe did not open".to_string())
+    }
+}
+
+fn journal_ready(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    text.contains("DisableTaskMgr") && text.contains("\"says_locked\":true")
+}
+
+fn journal_file() -> PathBuf {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    PathBuf::from(root)
+        .join("System32")
+        .join("config")
+        .join("systemprofile")
+        .join("AppData")
+        .join("Local")
+        .join(format!("{SERVICE_NAME}Journal"))
+        .join("journal.json")
+}
+
+fn query_taskmgr() -> String {
+    let output = Command::new("reg")
+        .args(["query", KEY, "/v", "DisableTaskMgr"])
+        .output();
+    let Ok(output) = output else {
+        return "absent".to_string();
+    };
+    if !output.status.success() {
+        return "absent".to_string();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    if text.contains("0x1") {
+        "1".to_string()
+    } else if text.contains("0x0") {
+        "0".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn set_taskmgr(value: &str) -> Result<(), String> {
+    if value == "absent" {
+        let _ = Command::new("reg")
+            .args(["delete", KEY, "/v", "DisableTaskMgr", "/f"])
+            .status();
+        if query_taskmgr() != "absent" {
+            return Err("could not delete DisableTaskMgr".to_string());
+        }
+        return Ok(());
+    }
+    let status = Command::new("reg")
+        .args([
+            "add",
+            KEY,
+            "/v",
+            "DisableTaskMgr",
+            "/t",
+            "REG_DWORD",
+            "/d",
+            value,
+            "/f",
+        ])
+        .status()
+        .map_err(|_| "reg add".to_string())?;
+    if status.success() && query_taskmgr() == value {
+        Ok(())
+    } else {
+        Err("could not set DisableTaskMgr".to_string())
+    }
+}
+
+fn installed_service_running() -> bool {
+    let Ok(output) = Command::new("sc").args(["query", SERVICE_NAME]).output() else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout).contains("RUNNING")
+}
+
+fn host_running() -> bool {
+    let Ok(output) = Command::new("tasklist")
+        .args([
+            "/FI",
+            "IMAGENAME eq softlock-lockhost.exe",
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .to_ascii_lowercase()
+        .contains("softlock-lockhost.exe")
+}
+
+fn service_exe() -> PathBuf {
+    std::env::var("SOFTLOCK_SERVICE_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("target/journal/release/softlock-service.exe"))
+}
+
+fn pipe_name() -> String {
+    format!(r"\\.\pipe\softlock-journal-{}", std::process::id())
+}
+
+fn guard_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("softlock-journal-{}", std::process::id()))
+}
+
+fn hello() -> &'static str {
+    r#"{"v":1,"id":1,"kind":"Hello","client_version":"0"}"#
+}
+
+fn lock_now() -> &'static str {
+    r#"{"v":1,"id":2,"kind":"Lock","source":"App"}"#
+}
+
+fn status_body() -> &'static str {
+    r#"{"v":1,"id":3,"kind":"GetStatus"}"#
+}
+
+fn wait_until(limit: Duration, mut probe: impl FnMut() -> bool) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if probe() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    probe()
+}
+
+fn write_result(body: &str) {
+    let base = std::env::var("RUNNER_TEMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let dir = base.join("softlock-journal");
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(dir.join("result.json"), body);
+}
+
+fn transact(pipe: &str, json: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::os::windows::io::FromRawHandle;
+    let mut frame = (json.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(json.as_bytes());
+    let wide: Vec<u16> = pipe.encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        windows::Win32::Storage::FileSystem::CreateFileW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            0xC000_0000,
+            windows::Win32::Storage::FileSystem::FILE_SHARE_READ
+                | windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+            None,
+            windows::Win32::Storage::FileSystem::OPEN_EXISTING,
+            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        .map_err(|error| format!("open: {error}"))?
+    };
+    let mut file = unsafe { std::fs::File::from_raw_handle(handle.0) };
+    file.write_all(&frame)
+        .map_err(|error| format!("write: {error}"))?;
+    let mut prefix = [0u8; 4];
+    file.read_exact(&mut prefix)
+        .map_err(|error| format!("read: {error}"))?;
+    let length = u32::from_le_bytes(prefix) as usize;
+    if length > 64 * 1024 {
+        return Err("frame".to_string());
+    }
+    let mut body = vec![0u8; length];
+    file.read_exact(&mut body)
+        .map_err(|error| format!("body: {error}"))?;
+    String::from_utf8(body).map_err(|_| "utf8".to_string())
+}
