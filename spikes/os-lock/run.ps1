@@ -362,7 +362,7 @@ function Clear-ProbeDirForTest {
 
 function Invoke-PlantChecks {
     $plantUser = 'oslockplant'
-    $plantPassword = 'OsLock-Plant-9a!'
+    $plantPassword = 'OsLock-Plant9!'
     $plantTask = 'os-lock-plant'
     $plantScript = 'C:\Users\Public\os-lock-plant.ps1'
     $previous = $ErrorActionPreference
