@@ -1022,7 +1022,9 @@ fn host_env_allowed(key: &str, allow_panic: bool) -> bool {
         "SOFTLOCK_STUB_OS_LOCK"
         | "SOFTLOCK_RUN_NONCE"
         | "SOFTLOCK_OS_LOCK_MARK"
-        | "SOFTLOCK_FORCE_GUARD_DOWN" => true,
+        | "SOFTLOCK_FORCE_GUARD_DOWN"
+        | "GITHUB_ACTIONS"
+        | "RUNNER_ENVIRONMENT" => true,
         "SOFTLOCK_PANIC" => allow_panic,
         _ => false,
     }

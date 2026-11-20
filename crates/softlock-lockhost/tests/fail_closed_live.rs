@@ -12,10 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-};
-use windows::Win32::System::Threading::{OpenThread, SuspendThread, THREAD_SUSPEND_RESUME};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_ACCESS_RIGHTS};
 
 #[test]
 fn live_fail_closed() {
@@ -183,26 +180,18 @@ fn host_pid() -> Option<u32> {
 
 fn suspend_process(pid: u32) {
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).expect("snapshot");
-        let mut entry = THREADENTRY32 {
-            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-            ..THREADENTRY32::default()
-        };
-        if Thread32First(snapshot, &mut entry).is_ok() {
-            loop {
-                if entry.th32OwnerProcessID == pid
-                    && let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
-                {
-                    let _ = SuspendThread(thread);
-                    let _ = CloseHandle(thread);
-                }
-                if Thread32Next(snapshot, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snapshot);
+        // PROCESS_SUSPEND_RESUME. Suspending every thread from the snapshot
+        // missed the UI thread, so heartbeats kept the host healthy.
+        let process = OpenProcess(PROCESS_ACCESS_RIGHTS(0x0800), false, pid).expect("open host");
+        let status = NtSuspendProcess(process.0);
+        let _ = CloseHandle(process);
+        assert_eq!(status, 0, "suspend host returned {status}");
     }
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtSuspendProcess(process: *mut core::ffi::c_void) -> i32;
 }
 
 fn transact(pipe: &str, json: &str) -> Result<String, String> {
