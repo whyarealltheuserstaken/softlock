@@ -59,6 +59,9 @@ name = "macos_keep_awake_isolation"
 name = "macos_physical_input_isolation"
 
 [[test]]
+name = "macos_overlay_isolation"
+
+[[test]]
 name = "macos_lock_kit"
 
 [[test]]

@@ -15,6 +15,7 @@ pub const SKIP_REASONS: &[&str] = &[
     "ci",
     "operator",
     "interrupted",
+    "screen-recording-not-granted",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,6 +378,175 @@ fn classification_row(text: &str) -> Row {
             detail,
         ),
     }
+}
+
+pub fn overlay_rows(text: &str) -> Vec<Row> {
+    let mode = field(text, "mode").unwrap_or_default();
+    let result = field(text, "result").unwrap_or_else(|| "missing".to_string());
+    let torn = field(text, "overlay-torn-down").as_deref() == Some("true");
+    let dismissible = field(text, "dismissible").as_deref() == Some("true");
+    let recording = field(text, "screen-recording");
+    let mut markers = if recording.as_deref() == Some("false") {
+        row(
+            "m06-markers",
+            "Capture marker counts",
+            "skip",
+            Some("screen-recording-not-granted"),
+            false,
+            format!("screen-recording=false result={result} torn-down={torn}"),
+        )
+    } else {
+        row(
+            "m06-markers",
+            "Capture marker counts",
+            if torn && result != "fail" {
+                "pass"
+            } else {
+                "fail"
+            },
+            None,
+            false,
+            format!("result={result} torn-down={torn} dismissible={dismissible}"),
+        )
+    };
+    markers.measurements.insert(
+        "overlay-torn-down".into(),
+        json!(if torn { "true" } else { "false" }),
+    );
+    let mut rows = vec![markers];
+    let covered = field(text, "displays-covered").as_deref() == Some("true");
+    rows.push(row(
+        "m06-displays",
+        "Every attached display covered",
+        if covered { "pass" } else { "fail" },
+        None,
+        false,
+        format!(
+            "display-count={} covered-count={}",
+            field(text, "display-count").unwrap_or_else(|| "missing".into()),
+            field(text, "covered-count").unwrap_or_else(|| "missing".into())
+        ),
+    ));
+    rows.push(overlay_operator_row(
+        "m06-hotplug",
+        "External display while overlay is up",
+        "hotplug",
+        text,
+        &mode,
+        true,
+    ));
+    rows.push(overlay_operator_row(
+        "m06-spaces",
+        "Space switch",
+        "spaces",
+        text,
+        &mode,
+        true,
+    ));
+    rows.push(overlay_operator_row(
+        "m06-fullscreen",
+        "Full-screen app",
+        "fullscreen",
+        text,
+        &mode,
+        true,
+    ));
+    rows.push(overlay_click_row(text, &mode));
+    rows.push(overlay_focus_row(text, &mode));
+    for (id, name, key) in [
+        ("m06-command-tab", "Command-Tab", "command-tab"),
+        ("m06-force-quit", "Force Quit", "force-quit"),
+        ("m06-power-key", "Power key presentation", "power-key"),
+    ] {
+        rows.push(overlay_operator_row(id, name, key, text, &mode, true));
+    }
+    if field(text, "interrupted").as_deref() == Some("true") {
+        rows.push(row(
+            "m06-interrupted",
+            "Overlay interrupt",
+            "fail",
+            None,
+            false,
+            "Ctrl-C or Escape".into(),
+        ));
+    }
+    rows
+}
+
+fn overlay_operator_row(
+    id: &str,
+    name: &str,
+    key: &str,
+    text: &str,
+    mode: &str,
+    physical: bool,
+) -> Row {
+    overlay_operator_row_scored(id, name, key, text, mode, physical, false)
+}
+
+fn overlay_operator_row_scored(
+    id: &str,
+    name: &str,
+    key: &str,
+    text: &str,
+    mode: &str,
+    physical: bool,
+    score_on_runner: bool,
+) -> Row {
+    let value = field(text, key).unwrap_or_else(|| "missing".into());
+    let detail = value.clone();
+    if value == "not-run-on-runner" || (mode == "runner" && !score_on_runner) {
+        return row(id, name, "skip", Some("ci"), physical, detail);
+    }
+    match value.as_str() {
+        "stayed-up"
+        | "covered"
+        | "fell-through"
+        | "held"
+        | "swallowed"
+        | "presentation-option-worked"
+        | "desktop-reachable" => row(id, name, "pass", None, physical, detail),
+        "miss"
+        | "covered-by-space"
+        | "covered-by-fullscreen"
+        | "blocked"
+        | "moved"
+        | "measurement-unreliable"
+        | "no-hotplug-observed"
+        | "frontmost-not-restored" => row(id, name, "fail", None, physical, detail),
+        value if value.starts_with("fail:") => row(id, name, "fail", None, physical, detail),
+        "no-external-display" => row(id, name, "skip", Some("not-applicable"), physical, detail),
+        "skip" => row(id, name, "skip", Some("operator"), physical, detail),
+        "no-input" => row(id, name, "skip", Some("no-input"), physical, detail),
+        "interrupted" | "timeout" => row(id, name, "skip", Some("interrupted"), physical, detail),
+        "not-applicable" => row(id, name, "skip", Some("not-applicable"), physical, detail),
+        "missing" | "error" => row(id, name, "fail", None, physical, detail),
+        _ => row(id, name, "fail", None, physical, detail),
+    }
+}
+
+fn overlay_click_row(text: &str, mode: &str) -> Row {
+    overlay_operator_row_scored(
+        "m06-click",
+        "Click through overlay",
+        "click",
+        text,
+        mode,
+        false,
+        true,
+    )
+}
+
+fn overlay_focus_row(text: &str, mode: &str) -> Row {
+    overlay_operator_row_scored(
+        "m06-focus",
+        "Keyboard focus held",
+        "focus",
+        text,
+        mode,
+        false,
+        true,
+    )
 }
 
 pub fn lock_read_only_row(text: &str) -> Row {
@@ -977,6 +1147,234 @@ power-key=not-run-on-runner
                 .skip_reason
                 .as_deref(),
             Some("budget")
+        );
+    }
+
+    #[test]
+    fn overlay_runner_skips_operator_rows_and_passes_markers() {
+        let text = "\
+mode=runner
+result=pass
+overlay-torn-down=true
+dismissible=true
+displays-covered=true
+display-count=1
+covered-count=1
+click=not-run-on-runner
+focus=not-run-on-runner
+spaces=not-run-on-runner
+fullscreen=not-run-on-runner
+hotplug=not-run-on-runner
+command-tab=not-run-on-runner
+force-quit=not-run-on-runner
+power-key=not-run-on-runner
+";
+        let rows = overlay_rows(text);
+        assert_eq!(rows[0].id, "m06-markers");
+        assert_eq!(rows[0].status, "pass");
+        assert_eq!(rows[1].status, "pass");
+        for id in [
+            "m06-hotplug",
+            "m06-spaces",
+            "m06-fullscreen",
+            "m06-command-tab",
+            "m06-force-quit",
+            "m06-power-key",
+            "m06-click",
+            "m06-focus",
+        ] {
+            let row = rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.status, "skip", "{id}");
+            assert_eq!(row.skip_reason.as_deref(), Some("ci"), "{id}");
+        }
+    }
+
+    #[test]
+    fn overlay_kit_records_no_external_display_as_not_applicable() {
+        let text = "\
+mode=kit
+result=pass
+overlay-torn-down=true
+dismissible=true
+displays-covered=true
+display-count=1
+covered-count=1
+screen-recording=true
+click=fell-through
+focus=held
+spaces=stayed-up
+fullscreen=stayed-up
+hotplug=no-external-display
+command-tab=desktop-reachable
+force-quit=presentation-option-worked
+power-key=swallowed
+";
+        let rows = overlay_rows(text);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-hotplug")
+                .unwrap()
+                .skip_reason
+                .as_deref(),
+            Some("not-applicable")
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-spaces")
+                .unwrap()
+                .status,
+            "pass"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-fullscreen")
+                .unwrap()
+                .status,
+            "pass"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-click")
+                .unwrap()
+                .status,
+            "pass"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-focus")
+                .unwrap()
+                .status,
+            "pass"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-command-tab")
+                .unwrap()
+                .status,
+            "pass"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-force-quit")
+                .unwrap()
+                .status,
+            "pass"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-power-key")
+                .unwrap()
+                .status,
+            "pass"
+        );
+    }
+
+    fn overlay_case(key: &str, value: &str) -> Row {
+        overlay_operator_row(
+            "m06-case",
+            "case",
+            key,
+            &format!("{key}={value}\nmode=kit\n"),
+            "kit",
+            true,
+        )
+    }
+
+    #[test]
+    fn overlay_stayed_up_covered_fell_through_held_and_swallowed_pass() {
+        for (key, value) in [
+            ("spaces", "stayed-up"),
+            ("hotplug", "covered"),
+            ("click", "fell-through"),
+            ("focus", "held"),
+            ("command-tab", "swallowed"),
+        ] {
+            assert_eq!(overlay_case(key, value).status, "pass", "{key}={value}");
+        }
+    }
+
+    #[test]
+    fn overlay_miss_covered_by_blocked_and_moved_fail() {
+        for (key, value) in [
+            ("spaces", "miss"),
+            ("spaces", "covered-by-space"),
+            ("fullscreen", "covered-by-fullscreen"),
+            ("click", "blocked"),
+            ("focus", "moved"),
+            ("hotplug", "fail:no-external-display"),
+        ] {
+            assert_eq!(overlay_case(key, value).status, "fail", "{key}={value}");
+        }
+    }
+
+    #[test]
+    fn overlay_desktop_reachable_is_recorded_pass() {
+        let row = overlay_case("command-tab", "desktop-reachable");
+        assert_eq!(row.status, "pass");
+        assert!(row.detail.contains("desktop-reachable"));
+    }
+
+    #[test]
+    fn overlay_capture_without_screen_recording_never_passes() {
+        let text = "\
+mode=kit
+result=incomplete
+overlay-torn-down=true
+dismissible=true
+displays-covered=true
+screen-recording=false
+click=fell-through
+focus=held
+spaces=stayed-up
+fullscreen=stayed-up
+hotplug=no-external-display
+command-tab=swallowed
+force-quit=swallowed
+power-key=swallowed
+";
+        let markers = overlay_rows(text)
+            .into_iter()
+            .find(|row| row.id == "m06-markers")
+            .unwrap();
+        assert_ne!(markers.status, "pass");
+        assert_eq!(markers.status, "skip");
+        assert_eq!(
+            markers.skip_reason.as_deref(),
+            Some("screen-recording-not-granted")
+        );
+    }
+
+    #[test]
+    fn overlay_runner_measured_blocked_and_moved_fail() {
+        let text = "\
+mode=runner
+result=fail
+overlay-torn-down=true
+dismissible=true
+displays-covered=true
+click=blocked
+focus=moved
+spaces=not-run-on-runner
+fullscreen=not-run-on-runner
+hotplug=not-run-on-runner
+command-tab=not-run-on-runner
+force-quit=not-run-on-runner
+power-key=not-run-on-runner
+";
+        let rows = overlay_rows(text);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-click")
+                .unwrap()
+                .status,
+            "fail"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "m06-focus")
+                .unwrap()
+                .status,
+            "fail"
         );
     }
 

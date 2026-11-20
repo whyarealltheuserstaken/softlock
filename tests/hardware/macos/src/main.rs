@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use macos_hardware_suite::{
     Config, SCHEMA, SuiteResult, budget_skip, decided_skip, exit_row, fail_closed, keep_awake_rows,
-    keep_process_row, lock_exercise_row, lock_read_only_row, over_budget, physical_input_rows,
-    restored_from, scrub_model, smoke_row, suite_exit, summary_of,
+    keep_process_row, lock_exercise_row, lock_read_only_row, over_budget, overlay_rows,
+    physical_input_rows, restored_from, scrub_model, smoke_row, suite_exit, summary_of,
 };
 
 const BUDGET_MS: u64 = 300_000;
@@ -183,6 +183,53 @@ fn run() -> i32 {
         return finish(
             rows, ci, started_at, started, build_ms, &out, arch, os_version, model,
         );
+    }
+    if !grants.screen {
+        for (id, name, physical) in overlay_row_meta() {
+            rows.push(decided_skip(
+                id,
+                name,
+                "not-applicable",
+                "missing Screen Recording; grant Screen Recording, then restart Terminal",
+                physical,
+            ));
+        }
+    } else if over_budget(build_ms + started.elapsed().as_millis() as u64, BUDGET_MS) {
+        for (id, name, physical) in overlay_row_meta() {
+            rows.push(budget_skip(id, name, physical));
+        }
+    } else {
+        let overlay_dir = out.join("m06").to_string_lossy().to_string();
+        let overlay_code = if ci {
+            spawn(
+                &release_bin("macos-overlay-kit"),
+                &["--runner", "--output-dir", &overlay_dir],
+                &out.join("m06.log"),
+                false,
+            )
+        } else {
+            spawn(
+                &release_bin("macos-overlay-kit"),
+                &["--kit", "--output-dir", &overlay_dir],
+                &out.join("m06.log"),
+                true,
+            )
+        };
+        let overlay_text = read_text(&out.join("m06").join("result.txt"));
+        let body = if overlay_text.is_empty() {
+            read_text(&out.join("m06.log"))
+        } else {
+            overlay_text
+        };
+        let mut overlay = overlay_rows(&body);
+        if overlay_code != 0
+            && let Some(markers) = overlay.iter_mut().find(|row| row.id == "m06-markers")
+            && markers.status == "pass"
+        {
+            markers.status = "fail".into();
+            markers.detail = format!("exit {overlay_code}; {}", markers.detail);
+        }
+        rows.extend(overlay);
     }
     let smoke_code = run_smoke(&out.join("m11"), &out.join("m11.log"), arch.trim());
     rows.push(smoke_row(
@@ -561,6 +608,16 @@ fn fill_interrupted(rows: &mut Vec<macos_hardware_suite::Row>) {
         ("m05-usb-keyboard", "USB keyboard hot-plug", true),
         ("m05-classification", "Classification rule", true),
         ("m04-sharing", "Sharing probe", false),
+        ("m06-markers", "Capture marker counts", false),
+        ("m06-displays", "Every attached display covered", false),
+        ("m06-hotplug", "External display while overlay is up", true),
+        ("m06-spaces", "Space switch", true),
+        ("m06-fullscreen", "Full-screen app", true),
+        ("m06-click", "Click through overlay", false),
+        ("m06-focus", "Keyboard focus held", false),
+        ("m06-command-tab", "Command-Tab", true),
+        ("m06-force-quit", "Force Quit", true),
+        ("m06-power-key", "Power key presentation", true),
         ("m11-smoke", "Native Intel smoke", false),
         ("m07-assertions", "Idle-sleep assertions", false),
         ("m07-app-nap", "App Nap sample", false),
@@ -636,6 +693,21 @@ fn sw_version() -> String {
         }
     }
     String::new()
+}
+
+fn overlay_row_meta() -> [(&'static str, &'static str, bool); 10] {
+    [
+        ("m06-markers", "Capture marker counts", false),
+        ("m06-displays", "Every attached display covered", false),
+        ("m06-hotplug", "External display while overlay is up", true),
+        ("m06-spaces", "Space switch", true),
+        ("m06-fullscreen", "Full-screen app", true),
+        ("m06-click", "Click through overlay", false),
+        ("m06-focus", "Keyboard focus held", false),
+        ("m06-command-tab", "Command-Tab", true),
+        ("m06-force-quit", "Force Quit", true),
+        ("m06-power-key", "Power key presentation", true),
+    ]
 }
 
 fn iso_utc(now: SystemTime) -> String {

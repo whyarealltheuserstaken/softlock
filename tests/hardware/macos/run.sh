@@ -42,6 +42,7 @@ build_all() {
   for manifest in \
     spikes/macos-keep-awake/Cargo.toml \
     spikes/macos-physical-input/Cargo.toml \
+    spikes/macos-overlay-kit/Cargo.toml \
     spikes/macos-lock-kit/Cargo.toml \
     spikes/macos-desktop-proof/Cargo.toml \
     tests/hardware/macos/Cargo.toml
