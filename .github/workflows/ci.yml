@@ -522,6 +522,9 @@ jobs:
           grep -F "global_hotkey_locks_and_the_probe_confirms ... ok" target/seam3-service.txt
           grep -F "app_subscribe_shows_locked_then_unlocked_after_the_pin ... ok" target/seam3-service.txt
           grep -F "app_quitting_leaves_the_service_running_for_a_lock_client ... ok" target/seam3-service.txt
+          grep -F "tray_command_and_app_lock_show_sources_in_get_status ... ok" target/seam3-service.txt
+          grep -F "hotkey_unavailable_is_shown_when_registration_fails ... ok" target/seam3-service.txt
+          grep -F "a_closed_subscriber_frees_its_stream_slot ... ok" target/seam3-service.txt
       - name: Service race loops
         shell: bash
         run: |
