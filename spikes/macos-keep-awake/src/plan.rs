@@ -6,36 +6,49 @@ pub struct SetupSkip {
     pub note: &'static str,
 }
 
-pub fn lid_on_power(laptop: bool, on_ac: Option<bool>) -> Option<SetupSkip> {
-    if !laptop {
-        return Some(SetupSkip {
-            outcome: "no-lid",
-            note: "this Mac has no lid",
-        });
-    }
-    if on_ac == Some(false) {
-        return Some(SetupSkip {
-            outcome: "on-battery",
-            note: "on battery; lid close on power needs AC",
-        });
-    }
-    None
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LidPresence {
+    Present,
+    Absent,
+    Unknown,
 }
 
-pub fn lid_external(laptop: bool, displays: i32) -> Option<SetupSkip> {
-    if !laptop {
-        return Some(SetupSkip {
-            outcome: "no-lid",
-            note: "this Mac has no lid",
-        });
+fn no_lid_skip() -> SetupSkip {
+    SetupSkip {
+        outcome: "no-lid",
+        note: "this Mac has no lid",
     }
-    if displays < 2 {
-        return Some(SetupSkip {
+}
+
+fn lid_unknown_skip() -> SetupSkip {
+    SetupSkip {
+        outcome: "lid-unknown",
+        note: "lid unknown",
+    }
+}
+
+pub fn lid_on_power(lid: LidPresence, on_ac: Option<bool>) -> Option<SetupSkip> {
+    match lid {
+        LidPresence::Absent => Some(no_lid_skip()),
+        LidPresence::Unknown => Some(lid_unknown_skip()),
+        LidPresence::Present if on_ac == Some(false) => Some(SetupSkip {
+            outcome: "on-battery",
+            note: "on battery; lid close on power needs AC",
+        }),
+        LidPresence::Present => None,
+    }
+}
+
+pub fn lid_external(lid: LidPresence, displays: i32) -> Option<SetupSkip> {
+    match lid {
+        LidPresence::Absent => Some(no_lid_skip()),
+        LidPresence::Unknown => Some(lid_unknown_skip()),
+        LidPresence::Present if displays < 2 => Some(SetupSkip {
             outcome: "no-external-display",
             note: "skipped before the prompt: fewer than two displays",
-        });
+        }),
+        LidPresence::Present => None,
     }
-    None
 }
 
 pub fn power_key(touch_id: Option<bool>) -> Option<SetupSkip> {
@@ -53,12 +66,23 @@ pub fn laptop_model(model: &str) -> bool {
     lower.contains("macbook")
 }
 
+pub fn desktop_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("macmini")
+        || lower.contains("imac")
+        || lower.contains("macpro")
+        || lower.contains("macstudio")
+}
+
 /// `registry` is `Some` when the clamshell property or an internal battery was checked.
 /// Mac14 and Mac15 laptops do not contain "MacBook" in `hw.model`.
-pub fn has_lid(model: &str, registry: Option<bool>) -> bool {
+pub fn lid_presence(model: &str, registry: Option<bool>) -> LidPresence {
     match registry {
-        Some(present) => present,
-        None => laptop_model(model),
+        Some(true) => LidPresence::Present,
+        Some(false) => LidPresence::Absent,
+        None if laptop_model(model) => LidPresence::Present,
+        None if desktop_model(model) => LidPresence::Absent,
+        None => LidPresence::Unknown,
     }
 }
 
@@ -90,22 +114,22 @@ mod tests {
     #[test]
     fn each_setup_skips_with_a_precise_reason_or_runs() {
         assert_eq!(
-            lid_on_power(false, Some(true)).map(|skip| skip.outcome),
+            lid_on_power(LidPresence::Absent, Some(true)).map(|skip| skip.outcome),
             Some("no-lid")
         );
         assert_eq!(
-            lid_on_power(true, Some(false)).map(|skip| skip.outcome),
+            lid_on_power(LidPresence::Present, Some(false)).map(|skip| skip.outcome),
             Some("on-battery")
         );
-        assert!(lid_on_power(true, Some(true)).is_none());
-        assert!(lid_on_power(true, None).is_none());
+        assert!(lid_on_power(LidPresence::Present, Some(true)).is_none());
+        assert!(lid_on_power(LidPresence::Present, None).is_none());
         assert_eq!(
-            lid_external(true, 1).map(|skip| skip.outcome),
+            lid_external(LidPresence::Present, 1).map(|skip| skip.outcome),
             Some("no-external-display")
         );
-        assert!(lid_external(true, 2).is_none());
+        assert!(lid_external(LidPresence::Present, 2).is_none());
         assert_eq!(
-            lid_external(false, 2).map(|skip| skip.outcome),
+            lid_external(LidPresence::Absent, 2).map(|skip| skip.outcome),
             Some("no-lid")
         );
         assert_eq!(
@@ -117,16 +141,76 @@ mod tests {
         assert!(laptop_model("MacBookPro16,2"));
         assert!(!laptop_model("Macmini6,2"));
         assert!(!laptop_model("Mac14,2"));
-        assert!(has_lid("Mac14,2", Some(true)));
-        assert!(has_lid("Mac15,12", Some(true)));
-        assert!(!has_lid("Macmini8,1", Some(false)));
-        assert!(!has_lid("Mac14,2", None));
-        assert!(has_lid("MacBookPro16,2", None));
+        assert_eq!(lid_presence("Mac14,2", Some(true)), LidPresence::Present);
+        assert_eq!(lid_presence("Mac15,12", Some(true)), LidPresence::Present);
+        assert_eq!(lid_presence("Macmini8,1", Some(false)), LidPresence::Absent);
+        assert_eq!(lid_presence("Mac14,2", None), LidPresence::Unknown);
+        assert_eq!(lid_presence("MacBookPro16,2", None), LidPresence::Present);
         assert_eq!(ac_power("Now drawing from 'AC Power'"), Some(true));
         assert_eq!(ac_power("Now drawing from 'Battery Power'"), Some(false));
         assert_eq!(ac_power(""), None);
         assert_eq!(touch_id_sensor(1), Some(true));
         assert_eq!(touch_id_sensor(0), Some(false));
         assert_eq!(touch_id_sensor(-1), None);
+    }
+
+    #[test]
+    fn unknown_lid_skips_as_lid_unknown_not_no_lid() {
+        assert_eq!(lid_presence("Mac14,2", None), LidPresence::Unknown);
+        assert_eq!(lid_presence("Mac15,12", None), LidPresence::Unknown);
+        let skip = lid_on_power(LidPresence::Unknown, Some(true)).expect("skip");
+        assert_eq!(skip.outcome, "lid-unknown");
+        assert_eq!(skip.note, "lid unknown");
+        assert_ne!(skip.outcome, "no-lid");
+        let external = lid_external(LidPresence::Unknown, 2).expect("skip");
+        assert_eq!(external.outcome, "lid-unknown");
+        assert_eq!(external.note, "lid unknown");
+    }
+
+    #[test]
+    fn known_laptop_without_registry_still_runs_or_skips_for_setup() {
+        assert_eq!(lid_presence("MacBookPro16,2", None), LidPresence::Present);
+        assert!(lid_on_power(LidPresence::Present, Some(true)).is_none());
+        assert!(lid_on_power(LidPresence::Present, None).is_none());
+        assert_eq!(
+            lid_on_power(LidPresence::Present, Some(false)).map(|skip| skip.outcome),
+            Some("on-battery")
+        );
+        assert_eq!(
+            lid_external(LidPresence::Present, 1).map(|skip| skip.outcome),
+            Some("no-external-display")
+        );
+        assert!(lid_external(LidPresence::Present, 2).is_none());
+    }
+
+    #[test]
+    fn known_desktop_or_registry_no_lid_skips_as_no_lid() {
+        assert_eq!(lid_presence("Macmini8,1", None), LidPresence::Absent);
+        assert_eq!(lid_presence("iMac20,1", None), LidPresence::Absent);
+        assert_eq!(lid_presence("Macmini8,1", Some(false)), LidPresence::Absent);
+        assert_eq!(
+            lid_on_power(LidPresence::Absent, Some(true)).map(|skip| skip.outcome),
+            Some("no-lid")
+        );
+        assert_eq!(
+            lid_external(LidPresence::Absent, 2).map(|skip| skip.outcome),
+            Some("no-lid")
+        );
+    }
+
+    #[test]
+    fn registry_overrides_the_model_name() {
+        assert_eq!(
+            lid_presence("MacBookPro16,2", Some(false)),
+            LidPresence::Absent
+        );
+        assert_eq!(
+            lid_on_power(LidPresence::Absent, Some(true)).map(|skip| skip.outcome),
+            Some("no-lid")
+        );
+        assert_eq!(lid_presence("Mac14,2", Some(true)), LidPresence::Present);
+        assert_eq!(lid_presence("Mac15,12", Some(true)), LidPresence::Present);
+        assert!(lid_on_power(LidPresence::Present, Some(true)).is_none());
+        assert!(lid_external(LidPresence::Present, 2).is_none());
     }
 }
