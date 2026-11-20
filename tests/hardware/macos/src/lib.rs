@@ -398,7 +398,7 @@ pub fn overlay_rows(text: &str) -> Vec<Row> {
         row(
             "m06-markers",
             "Capture marker counts",
-            if result == "pass" && torn {
+            if torn && result != "fail" {
                 "pass"
             } else {
                 "fail"

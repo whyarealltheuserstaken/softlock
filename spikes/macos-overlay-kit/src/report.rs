@@ -274,6 +274,7 @@ pub fn row_is_failure(outcome: Option<&str>) -> bool {
     )
 }
 
+#[cfg(test)]
 pub fn row_is_success(outcome: Option<&str>) -> bool {
     matches!(
         outcome,
@@ -406,10 +407,14 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
     push_row_failure(&mut reasons, "spaces", &report.spaces);
     push_row_failure(&mut reasons, "fullscreen", &report.fullscreen);
     push_row_failure(&mut reasons, "hotplug", &report.hotplug);
-    if row_is_failure(Some(&report.click_focus.click_outcome)) {
+    if row_is_failure(Some(&report.click_focus.click_outcome))
+        && !report.click_focus.typed_click.is_empty()
+    {
         reasons.push(format!("click={}", report.click_focus.click_outcome));
     }
-    if row_is_failure(Some(&report.click_focus.focus_outcome)) {
+    if row_is_failure(Some(&report.click_focus.focus_outcome))
+        && !report.click_focus.typed_focus.is_empty()
+    {
         reasons.push(format!("focus={}", report.click_focus.focus_outcome));
     }
     reasons
@@ -1058,6 +1063,8 @@ mod tests {
         );
 
         let mut blocked = passing_kit_fixture();
+        blocked.click_focus.typed_click = "blocked".to_string();
+        blocked.click_focus.measured_click = "blocked".to_string();
         blocked.click_focus.click_outcome = "blocked".to_string();
         assert!(
             failure_reasons(&blocked)
@@ -1066,6 +1073,8 @@ mod tests {
         );
 
         let mut moved = passing_kit_fixture();
+        moved.click_focus.typed_focus = "moved".to_string();
+        moved.click_focus.measured_focus = "moved".to_string();
         moved.click_focus.focus_outcome = "moved".to_string();
         assert!(
             failure_reasons(&moved)

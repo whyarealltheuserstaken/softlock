@@ -5,6 +5,7 @@ use std::io::{self, BufRead};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,7 +21,7 @@ use crate::report::{
 };
 use crate::scrub::{contains_serial, scrub};
 use crate::version::parse_sw_vers;
-use crate::wait::{POLL_MS, WaitOutcome, poll_stdin, wait_slice};
+use crate::wait::{POLL_MS, WaitOutcome, poll_stdin, spawn_watchdog, wait_slice};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static TIMED_OUT: AtomicBool = AtomicBool::new(false);
@@ -465,17 +466,22 @@ fn timed_out_flag() -> bool {
 }
 
 fn spawn_watchdog_onto_stop(timeout_ms: u64) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let timed = Arc::new(AtomicBool::new(false));
+    spawn_watchdog(timeout_ms, stop.clone(), timed.clone());
     std::thread::spawn(move || {
         let slice = Duration::from_millis(POLL_MS as u64);
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        while Instant::now() < deadline {
+        loop {
+            if timed.load(Ordering::Relaxed) {
+                TIMED_OUT.store(true, Ordering::Relaxed);
+                STOP.store(true, Ordering::Relaxed);
+                return;
+            }
             if STOP.load(Ordering::Relaxed) {
                 return;
             }
-            std::thread::sleep(slice.min(deadline.saturating_duration_since(Instant::now())));
+            std::thread::sleep(slice);
         }
-        TIMED_OUT.store(true, Ordering::Relaxed);
-        STOP.store(true, Ordering::Relaxed);
     });
 }
 
