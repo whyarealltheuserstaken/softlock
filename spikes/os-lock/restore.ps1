@@ -143,20 +143,29 @@ function Test-ReparsePath([string]$path) {
     return [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }
 
-function Test-OwnerTrusted([string]$path) {
-    if (Test-ReparsePath $path) { return $false }
-    if (-not (Test-Path -LiteralPath $path)) { return $false }
+function Get-TrustIssue([string]$path) {
+    if (Test-ReparsePath $path) { return 'reparse' }
+    if (-not (Test-Path -LiteralPath $path)) { return 'missing' }
     $acl = (Get-Item -LiteralPath $path -Force).GetAccessControl()
     $owner = [string]$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-    if ($owner -ne 'S-1-5-18' -and $owner -ne 'S-1-5-32-544') { return $false }
-    if (-not $acl.AreAccessRulesProtected) { return $false }
-    $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-    if ($rules.Count -lt 1) { return $false }
-    foreach ($ace in $rules) {
-        $who = [string]$ace.IdentityReference.Value
-        if ($who -ne 'S-1-5-18' -and $who -ne 'S-1-5-32-544') { return $false }
+    $protected = 'unprotected'
+    if ($acl.AreAccessRulesProtected) { $protected = 'protected' }
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($ace in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+        $names.Add([string]$ace.IdentityReference.Value)
     }
-    return $true
+    $listed = $names -join ','
+    if ($owner -ne 'S-1-5-18' -and $owner -ne 'S-1-5-32-544') { return "owner=$owner $protected aces=$listed" }
+    if (-not $acl.AreAccessRulesProtected) { return "owner=$owner $protected aces=$listed" }
+    if ($names.Count -lt 1) { return "owner=$owner no-aces" }
+    foreach ($who in $names) {
+        if ($who -ne 'S-1-5-18' -and $who -ne 'S-1-5-32-544') { return "owner=$owner ace=$who aces=$listed" }
+    }
+    return ''
+}
+
+function Test-OwnerTrusted([string]$path) {
+    return -not (Get-TrustIssue $path)
 }
 
 function Test-KnownProbeName([string]$name) {
@@ -166,18 +175,24 @@ function Test-KnownProbeName([string]$name) {
     return $false
 }
 
-function Test-ProbeDirTrusted {
+function Get-ProbeDirIssue {
     $root = 'C:\ProgramData\os-lock-probe'
-    if (Test-ReparsePath 'C:\ProgramData') { return $false }
-    if (-not (Test-OwnerTrusted $root)) { return $false }
+    if (Test-ReparsePath 'C:\ProgramData') { return 'ProgramData reparse' }
+    $own = Get-TrustIssue $root
+    if ($own) { return "dir $own" }
     $item = Get-Item -LiteralPath $root -Force
-    if (-not $item.PSIsContainer) { return $false }
+    if (-not $item.PSIsContainer) { return 'dir is a file' }
     foreach ($child in @(Get-ChildItem -LiteralPath $root -Force)) {
-        if (-not (Test-KnownProbeName $child.Name)) { return $false }
-        if ($child.PSIsContainer) { return $false }
-        if (-not (Test-OwnerTrusted $child.FullName)) { return $false }
+        if (-not (Test-KnownProbeName $child.Name)) { return "child $($child.Name) unexpected" }
+        if ($child.PSIsContainer) { return "child $($child.Name) directory" }
+        $issue = Get-TrustIssue $child.FullName
+        if ($issue) { return "child $($child.Name) $issue" }
     }
-    return $true
+    return ''
+}
+
+function Test-ProbeDirTrusted {
+    return -not (Get-ProbeDirIssue)
 }
 
 function Remove-ProbeFolder {

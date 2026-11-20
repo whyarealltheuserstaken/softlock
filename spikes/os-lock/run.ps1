@@ -643,8 +643,10 @@ function Add-Row([string]$id, [string]$name, [string]$status, $skip, [bool]$need
 
 function Invoke-Probe {
     if ($exe -like 'C:\ProgramData\os-lock-probe\*') {
-        if (-not (Test-ProbeDirTrusted) -or -not (Test-OwnerTrusted $exe)) {
-            throw 'refusing to run a probe executable that is not owned by SYSTEM or Administrators'
+        $dirIssue = Get-ProbeDirIssue
+        $fileIssue = Get-TrustIssue $exe
+        if ($dirIssue -or $fileIssue) {
+            throw "refusing to run a probe executable that is not owned by SYSTEM or Administrators ($dirIssue) ($fileIssue)"
         }
     }
     $previous = $ErrorActionPreference
@@ -845,8 +847,10 @@ try {
     }
 
     $beat = Join-Path $outDir 'heartbeat.txt'
-    if (-not (Test-ProbeDirTrusted) -or -not (Test-OwnerTrusted $exe)) {
-        throw 'refusing to run a probe executable that is not owned by SYSTEM or Administrators'
+    $dirIssue = Get-ProbeDirIssue
+    $fileIssue = Get-TrustIssue $exe
+    if ($dirIssue -or $fileIssue) {
+        throw "refusing to run a probe executable that is not owned by SYSTEM or Administrators ($dirIssue) ($fileIssue)"
     }
     $script:Heartbeat = Start-Process -FilePath $exe -ArgumentList @('heartbeat', '--file', $beat, '--allow-local') -WindowStyle Hidden -PassThru
     Start-Sleep -Milliseconds 500
