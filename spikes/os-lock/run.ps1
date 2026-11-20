@@ -360,6 +360,77 @@ function Clear-ProbeDirForTest {
     if (Test-Path -LiteralPath $probeDir) { throw 'the plant directory could not be removed' }
 }
 
+function Grant-PlantBatchLogon([string]$user) {
+    if (-not ('OsLockRights' -as [type])) {
+        $source = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public class OsLockRights {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LsaUnicodeString {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LsaObjectAttributes {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+    [DllImport("advapi32.dll", SetLastError=true)]
+    public static extern uint LsaOpenPolicy(IntPtr system, ref LsaObjectAttributes attributes, uint access, out IntPtr handle);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    public static extern uint LsaAddAccountRights(IntPtr policy, IntPtr sid, LsaUnicodeString[] rights, uint count);
+    [DllImport("advapi32.dll")]
+    public static extern uint LsaClose(IntPtr handle);
+    [DllImport("advapi32.dll")]
+    public static extern uint LsaNtStatusToWinError(uint status);
+    public static void Grant(byte[] sidBytes, string right) {
+        LsaObjectAttributes attributes = new LsaObjectAttributes();
+        attributes.Length = Marshal.SizeOf(typeof(LsaObjectAttributes));
+        IntPtr policy;
+        uint status = LsaOpenPolicy(IntPtr.Zero, ref attributes, 0x810, out policy);
+        if (status != 0) { throw new Win32Exception((int)LsaNtStatusToWinError(status)); }
+        IntPtr sid = Marshal.AllocHGlobal(sidBytes.Length);
+        Marshal.Copy(sidBytes, 0, sid, sidBytes.Length);
+        LsaUnicodeString name = new LsaUnicodeString();
+        name.Buffer = Marshal.StringToHGlobalUni(right);
+        name.Length = (ushort)(right.Length * 2);
+        name.MaximumLength = (ushort)((right.Length + 1) * 2);
+        try {
+            status = LsaAddAccountRights(policy, sid, new LsaUnicodeString[] { name }, 1);
+        } finally {
+            Marshal.FreeHGlobal(name.Buffer);
+            Marshal.FreeHGlobal(sid);
+            LsaClose(policy);
+        }
+        if (status != 0) { throw new Win32Exception((int)LsaNtStatusToWinError(status)); }
+    }
+}
+'@
+        Add-Type -TypeDefinition $source
+    }
+    $account = New-Object System.Security.Principal.NTAccount($user)
+    $sid = $account.Translate([System.Security.Principal.SecurityIdentifier])
+    $bytes = New-Object byte[] $sid.BinaryLength
+    $sid.GetBinaryForm($bytes, 0)
+    [OsLockRights]::Grant($bytes, 'SeBatchLogonRight')
+}
+
+function Wait-PlantDir([int]$seconds) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+    do {
+        if (Test-Path -LiteralPath $probeDir) { return $true }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return (Test-Path -LiteralPath $probeDir)
+}
+
 function Invoke-PlantChecks {
     $plantUser = 'oslockplant'
     $plantPassword = 'OsLock-Plant9!'
@@ -371,11 +442,12 @@ function Invoke-PlantChecks {
         Clear-ProbeDirForTest
         $ErrorActionPreference = 'Continue'
         $added = @(& net.exe user $plantUser $plantPassword /add 2>&1 | ForEach-Object { "$_" })
-        if ($LASTEXITCODE -ne 0) {
+        if ($LASTEXITCODE -ne 0 -and (($added -join ' ') -notmatch 'already exists')) {
             $detail = $added -join ' '
             throw "could not create the plant user: $detail"
         }
         $ErrorActionPreference = 'Stop'
+        Grant-PlantBatchLogon $plantUser
         $plantBody = "Set-StrictMode -Version Latest`r`n`$ErrorActionPreference = 'Stop'`r`nNew-Item -ItemType Directory -Path 'C:\ProgramData\os-lock-probe' | Out-Null`r`nSet-Content -LiteralPath 'C:\ProgramData\os-lock-probe\restore.ps1' -Value 'planted'`r`n"
         $utf8 = New-Object System.Text.UTF8Encoding $false
         [System.IO.File]::WriteAllText($plantScript, $plantBody, $utf8)
@@ -388,18 +460,14 @@ function Invoke-PlantChecks {
             $scheduled = $LASTEXITCODE -eq 0
         }
         $ErrorActionPreference = 'Stop'
+        if ($scheduled) { $scheduled = Wait-PlantDir 8 }
         if (-not $scheduled) {
             $plantPasswordSecure = ConvertTo-SecureString $plantPassword -AsPlainText -Force
             $plantCred = New-Object System.Management.Automation.PSCredential(".\$plantUser", $plantPasswordSecure)
             $plantProc = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $plantScript) -Credential $plantCred -Wait -PassThru -WindowStyle Hidden
             if ($null -eq $plantProc -or $plantProc.ExitCode -ne 0) { throw 'the standard user could not plant the probe directory' }
+            if (-not (Wait-PlantDir 15)) { throw 'the standard user did not create the probe directory' }
         }
-        $deadline = [DateTime]::UtcNow.AddSeconds(20)
-        do {
-            if (Test-Path -LiteralPath $probeDir) { break }
-            Start-Sleep -Milliseconds 250
-        } while ([DateTime]::UtcNow -lt $deadline)
-        if (-not (Test-Path -LiteralPath $probeDir)) { throw 'the standard user did not create the probe directory' }
         $refused = $false
         try { Initialize-ProbeDir } catch { $refused = $true }
         if (-not $refused) { throw 'a user-owned probe directory was not refused' }
