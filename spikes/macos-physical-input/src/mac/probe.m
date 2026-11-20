@@ -276,10 +276,6 @@ int m05_tap_wait(const char *kind, int timeout_ms, WaitOut *out) {
     return 0;
 }
 
-int m05_last_disable(void) {
-    return (int)atomic_load(&g_disable_type);
-}
-
 static int count_hid(uint32_t usage_page, uint32_t usage) {
     IOHIDManagerRef manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
     if (manager == NULL) {

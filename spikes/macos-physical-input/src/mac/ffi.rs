@@ -27,6 +27,7 @@ pub struct WaitResult {
     pub state_id: i64,
     pub source_pid: i64,
     pub disable_type: i64,
+    #[allow(dead_code)]
     pub error: Option<String>,
 }
 
@@ -45,7 +46,6 @@ unsafe extern "C" {
     fn m05_wait_saw() -> i32;
     fn m05_last_event(out: *mut WaitOut) -> i32;
     fn m05_tap_wait(kind: *const c_char, timeout_ms: i32, out: *mut WaitOut) -> i32;
-    fn m05_last_disable() -> i32;
     fn m05_hid_inventory(out: *mut InventoryOut) -> i32;
     fn m05_secure_enabled() -> i32;
     fn m05_classify_target(dir: *const c_char) -> i32;
@@ -146,10 +146,6 @@ pub fn tap_wait(kind: &str, timeout_ms: i32) -> WaitResult {
         disable_type: out.disable_type,
         error: optional_text(&out.error),
     }
-}
-
-pub fn last_disable() -> i64 {
-    i64::from(unsafe { m05_last_disable() })
 }
 
 pub fn hid_inventory() -> Inventory {

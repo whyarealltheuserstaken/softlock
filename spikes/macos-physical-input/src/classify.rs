@@ -3,8 +3,11 @@
 //! State ids are the `CGEventSourceStateID` values in Apple's 10.15 SDK
 //! `CGEventTypes.h`: private is -1, combined session is 0, HID system is 1.
 
+#[allow(dead_code)]
 pub const HEARTBEAT_MS: u64 = 250;
+#[allow(dead_code)]
 pub const HEARTBEAT_MISSES: u32 = 3;
+#[allow(dead_code)]
 pub const DEAD_CALLBACK_LIMIT_MS: u64 = 1_000;
 
 pub const STATE_PRIVATE: i64 = -1;
@@ -40,6 +43,7 @@ pub fn draft_name(class: DraftClass) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 pub fn state_name(state_id: i64) -> &'static str {
     match state_id {
         STATE_PRIVATE => "kCGEventSourceStatePrivate",
@@ -57,10 +61,12 @@ pub fn disable_event_name(event_type: i64) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 pub fn dead_callback_reported_in_time(misses: u32, detect_ms: u64) -> bool {
     misses >= HEARTBEAT_MISSES && detect_ms <= DEAD_CALLBACK_LIMIT_MS
 }
 
+#[allow(dead_code)]
 pub fn healthy_callback_within_one_heartbeat(detect_ms: u64) -> bool {
     detect_ms <= HEARTBEAT_MS
 }

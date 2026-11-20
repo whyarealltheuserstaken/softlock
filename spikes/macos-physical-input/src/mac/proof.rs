@@ -46,6 +46,9 @@ pub fn dispatch(args: Args) -> i32 {
 }
 
 fn dispatch_inner(args: &Args) -> i32 {
+    if args.mode.holds_tap() {
+        return run_orchestrator(args);
+    }
     match args.mode {
         Mode::ClassifyTarget => ffi::classify_target(&args.output_dir),
         Mode::ClassifyPost => {
@@ -55,7 +58,7 @@ fn dispatch_inner(args: &Args) -> i32 {
             };
             ffi::classify_post(source, &args.output_dir)
         }
-        Mode::Runner | Mode::Kit => run_orchestrator(args),
+        Mode::Runner | Mode::Kit => 2,
     }
 }
 
@@ -441,7 +444,6 @@ fn wait_secure(args: &Args) -> SecureRow {
     let before = count_for(args, "any-key");
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut pending = String::new();
-    let mut quiet = true;
     loop {
         if stop_requested() {
             return skipped_secure("interrupted");
@@ -468,7 +470,6 @@ fn wait_secure(args: &Args) -> SecureRow {
             };
         }
         if wait.saw {
-            quiet = false;
             let after = count_for(args, "any-key");
             return SecureRow {
                 status: "recorded".into(),
@@ -484,11 +485,7 @@ fn wait_secure(args: &Args) -> SecureRow {
             let after = count_for(args, "any-key");
             return SecureRow {
                 status: "recorded".into(),
-                outcome: Some(if quiet {
-                    "quiet".to_string()
-                } else {
-                    "not-detected".to_string()
-                }),
+                outcome: Some("quiet".to_string()),
                 disable_event: "none".into(),
                 secure_enabled: enabled.into(),
                 window_received: Some(target::window_received(before, after)),
