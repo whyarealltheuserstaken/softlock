@@ -50,6 +50,9 @@ name = "publish_guard"
 name = "spike_isolation"
 
 [[test]]
+name = "os_lock_isolation"
+
+[[test]]
 name = "macos_spike_isolation"
 
 [[test]]
