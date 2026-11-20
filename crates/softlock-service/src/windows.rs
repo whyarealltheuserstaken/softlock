@@ -1521,17 +1521,17 @@ fn client_role(image: &str) -> softlock_core::Role {
 }
 
 fn dev_app_role() -> bool {
-    if std::env::var("SOFTLOCK_DEV_APP").ok().as_deref() != Some("1") {
-        return false;
-    }
-    #[cfg(feature = "simulated-physical")]
-    {
-        return true;
-    }
-    #[cfg(not(feature = "simulated-physical"))]
-    {
-        live_hooks_allowed()
-    }
+    std::env::var("SOFTLOCK_DEV_APP").ok().as_deref() == Some("1") && dev_app_role_allowed()
+}
+
+#[cfg(feature = "simulated-physical")]
+fn dev_app_role_allowed() -> bool {
+    true
+}
+
+#[cfg(not(feature = "simulated-physical"))]
+fn dev_app_role_allowed() -> bool {
+    live_hooks_allowed()
 }
 
 pub fn live_hooks_allowed() -> bool {
