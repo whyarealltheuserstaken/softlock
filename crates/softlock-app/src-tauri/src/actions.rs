@@ -61,7 +61,18 @@ pub fn autostart_value_name() -> &'static str {
 
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn autostart_command(exe: &Path) -> String {
-    exe.display().to_string()
+    let text = exe.display().to_string().replace('"', "\\\"");
+    format!("\"{text}\"")
+}
+
+/// `None` when the registry write succeeded. Any other code is surfaced.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn autostart_failure_notice(code: u32) -> Option<&'static str> {
+    if code == 0 {
+        None
+    } else {
+        Some("autostart failed")
+    }
 }
 
 /// Tray and window copy. The product name comes from the name constant.
@@ -150,7 +161,9 @@ mod tests {
     fn sign_in_run_value_uses_the_product_name() {
         assert_eq!(autostart_value_name(), softlock_core::PRODUCT_DISPLAY_NAME);
         let command = autostart_command(Path::new(r"C:\Program Files\app.exe"));
-        assert!(command.ends_with("app.exe"));
+        assert_eq!(command, "\"C:\\Program Files\\app.exe\"");
         assert!(!command.contains("stop"));
+        assert_eq!(autostart_failure_notice(0), None);
+        assert_eq!(autostart_failure_notice(5), Some("autostart failed"));
     }
 }

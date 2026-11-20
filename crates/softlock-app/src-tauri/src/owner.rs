@@ -4,20 +4,23 @@
 
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use softlock_core::{LockSource, RequestKind, ResponseKind, Secret};
 use tauri::{AppHandle, Emitter};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+use windows::Win32::System::IO::CancelSynchronousIo;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
+use windows::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_TERMINATE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey,
 };
@@ -29,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW, HWND_MESSAGE, IDI_APPLICATION, LoadIconW,
     MF_GRAYED, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_COMMAND, WM_DESTROY, WM_HOTKEY,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_HOTKEY,
     WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
 };
 use windows::core::PCWSTR;
@@ -39,14 +42,58 @@ use crate::client::{self, OwnerView, exchange, public_pipe_name, status_text, vi
 
 const WM_TRAY: u32 = 0x8000;
 const WM_REFRESH: u32 = 0x8001;
-const CMD_LOCK: usize = 10;
-const CMD_QUIT: usize = 11;
+/// The settings command posts this. The window proc runs the same lock as the tray.
+pub const WM_LOCK_APP: u32 = 0x8002;
+pub const CMD_LOCK: usize = 10;
+pub const CMD_QUIT: usize = 11;
 
 static VIEW: OnceLock<Mutex<OwnerView>> = OnceLock::new();
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static QUIT: AtomicBool = AtomicBool::new(false);
-static HOTKEY: Mutex<Option<&'static str>> = Mutex::new(None);
+static HOTKEY_OK: AtomicBool = AtomicBool::new(true);
+static AUTOSTART_CODE: AtomicU32 = AtomicU32::new(0);
+static WATCH_THREAD: AtomicU32 = AtomicU32::new(0);
+static STATUS_SEQ: AtomicU64 = AtomicU64::new(0);
 static APP: OnceLock<AppHandle> = OnceLock::new();
+static LOCK_WAKE: OnceLock<Sender<LockSource>> = OnceLock::new();
+
+fn owner_class_name() -> String {
+    format!("{}-owner", softlock_core::SERVICE_ID)
+}
+
+fn ui_text(key: &str) -> String {
+    let parsed: serde_json::Value = serde_json::from_str(include_str!("../../src/strings/ui.json"))
+        .unwrap_or(serde_json::Value::Null);
+    parsed
+        .get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or(key)
+        .to_string()
+}
+
+fn skip_autostart() -> bool {
+    #[cfg(feature = "simulated-physical")]
+    {
+        std::env::var("SOFTLOCK_NO_AUTOSTART").ok().as_deref() == Some("1")
+    }
+    #[cfg(not(feature = "simulated-physical"))]
+    {
+        false
+    }
+}
+
+fn status_file_path() -> Option<String> {
+    #[cfg(feature = "simulated-physical")]
+    {
+        std::env::var("SOFTLOCK_STATUS_FILE")
+            .ok()
+            .filter(|value| !value.is_empty())
+    }
+    #[cfg(not(feature = "simulated-physical"))]
+    {
+        None
+    }
+}
 
 fn view_slot() -> &'static Mutex<OwnerView> {
     VIEW.get_or_init(|| Mutex::new(OwnerView::unknown()))
@@ -63,21 +110,19 @@ pub fn run(app: Option<AppHandle>) -> i32 {
     if let Some(app) = app {
         let _ = APP.set(app);
     }
-    if std::env::var("SOFTLOCK_NO_AUTOSTART").ok().as_deref() != Some("1") {
+    if !skip_autostart() {
         register_autostart();
     }
-    if std::env::var("SOFTLOCK_QUIT_AFTER_HELLO").ok().as_deref() == Some("1") {
-        let view = match transact(RequestKind::GetStatus) {
-            Ok(response) => view_from_status(&response),
-            Err(_) => OwnerView::unknown(),
-        };
-        publish(view.clone());
-        return if view.service_running { 0 } else { 1 };
-    }
-    let watch = thread::spawn(watch_states);
+    start_lock_worker();
+    thread::spawn(watch_states);
     let code = window_loop();
+    // The watch thread blocks in ReadFile until the next StateChanged. Cancelling
+    // that read lets the process leave without joining it.
     QUIT.store(true, Ordering::Release);
-    let _ = watch.join();
+    cancel_watch_read();
+    if let Some(sender) = LOCK_WAKE.get() {
+        let _ = sender.send(LockSource::Hotkey);
+    }
     if let Some(app) = APP.get() {
         app.exit(0);
     }
@@ -90,10 +135,36 @@ pub fn request_quit() -> bool {
         return false;
     }
     let hwnd = HWND(raw as *mut core::ffi::c_void);
-    unsafe { PostMessageW(Some(hwnd), WM_DESTROY, WPARAM(0), LPARAM(0)) }.is_ok()
+    unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok()
 }
 
-pub fn send_lock(source: LockSource) {
+/// Same lock the settings button uses. The window proc only queues it.
+pub fn lock_from_app() {
+    enqueue_lock(LockSource::App);
+}
+
+fn enqueue_lock(source: LockSource) {
+    if let Some(sender) = LOCK_WAKE.get() {
+        let _ = sender.send(source);
+    } else {
+        perform_lock(source);
+    }
+}
+
+fn start_lock_worker() {
+    let (sender, receiver) = mpsc::channel::<LockSource>();
+    let _ = LOCK_WAKE.set(sender);
+    thread::spawn(move || {
+        while let Ok(source) = receiver.recv() {
+            if QUIT.load(Ordering::Acquire) {
+                break;
+            }
+            perform_lock(source);
+        }
+    });
+}
+
+fn perform_lock(source: LockSource) {
     let outcome = transact(actions::lock_request(source));
     match outcome {
         Ok(ResponseKind::Accepted | ResponseKind::AlreadyLocked) => {
@@ -119,8 +190,22 @@ pub fn send_lock(source: LockSource) {
     }
 }
 
-pub fn send_pin(pin: Secret) -> bool {
-    matches!(transact(RequestKind::SetPin { pin }), Ok(ResponseKind::Ok))
+pub enum PinSend {
+    Stored,
+    NeedsConfirmation,
+    Failed,
+}
+
+pub fn send_pin(pin: Secret) -> PinSend {
+    match transact(RequestKind::SetPin { pin }) {
+        Ok(ResponseKind::Ok) => PinSend::Stored,
+        Ok(ResponseKind::NeedsConfirmation { .. }) => PinSend::NeedsConfirmation,
+        _ => PinSend::Failed,
+    }
+}
+
+pub fn current_notice() -> String {
+    notice_text()
 }
 
 fn publish(view: OwnerView) {
@@ -149,6 +234,7 @@ fn publish(view: OwnerView) {
                     .map(str::to_string),
                 status_line: status_line(view.service_running, view.state),
                 service_line: service_line(view.service_running).to_string(),
+                notice: notice_text(),
             },
         );
     }
@@ -162,6 +248,7 @@ struct ViewEvent {
     lock_source: Option<String>,
     status_line: String,
     service_line: String,
+    notice: String,
 }
 
 fn state_label(state: Option<softlock_core::StateName>) -> String {
@@ -170,23 +257,52 @@ fn state_label(state: Option<softlock_core::StateName>) -> String {
         .unwrap_or_else(|| "Locked".to_string())
 }
 
+fn notice_text() -> String {
+    let mut parts = Vec::new();
+    if !HOTKEY_OK.load(Ordering::Acquire) {
+        parts.push(ui_text("hotkeyUnavailable"));
+    }
+    if let Some(notice) = actions::autostart_failure_notice(AUTOSTART_CODE.load(Ordering::Acquire))
+    {
+        parts.push(notice.to_string());
+    }
+    parts.join("; ")
+}
+
 fn write_status(view: &OwnerView) {
-    let Ok(path) = std::env::var("SOFTLOCK_STATUS_FILE") else {
+    let Some(path) = status_file_path() else {
         return;
     };
-    if path.is_empty() {
-        return;
-    }
-    let hotkey = HOTKEY
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .unwrap_or("pending");
+    let seq = STATUS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let hotkey = if HOTKEY_OK.load(Ordering::Acquire) {
+        "ok"
+    } else {
+        "failed"
+    };
     let mut text = status_text(view);
     text.push_str(&format!("hotkey={hotkey}\n"));
+    text.push_str(&format!("notice={}\n", notice_text()));
+    text.push_str(&format!("seq={seq}\n"));
+    text.push_str(&format!("hwnd={}\n", WINDOW.load(Ordering::Acquire)));
     let _ = std::fs::write(path, text);
 }
 
+fn cancel_watch_read() {
+    let tid = WATCH_THREAD.load(Ordering::Acquire);
+    if tid == 0 {
+        return;
+    }
+    let Ok(thread) = (unsafe { OpenThread(THREAD_TERMINATE, false, tid) }) else {
+        return;
+    };
+    unsafe {
+        let _ = CancelSynchronousIo(thread);
+        let _ = CloseHandle(thread);
+    }
+}
+
 fn watch_states() {
+    WATCH_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
     while !QUIT.load(Ordering::Acquire) {
         let mut io = match connect_retry() {
             Ok(io) => io,
@@ -226,7 +342,7 @@ fn watch_states() {
 }
 
 fn window_loop() -> i32 {
-    let class_name = wide("softlock-owner");
+    let class_name = wide(&owner_class_name());
     let instance = match unsafe { GetModuleHandleW(None) } {
         Ok(instance) => instance,
         Err(_) => return 1,
@@ -269,10 +385,7 @@ fn window_loop() -> i32 {
             u32::from(hotkey.virtual_key),
         )
     };
-    {
-        let mut slot = HOTKEY.lock().unwrap_or_else(|poison| poison.into_inner());
-        *slot = Some(if registered.is_ok() { "ok" } else { "failed" });
-    }
+    HOTKEY_OK.store(registered.is_ok(), Ordering::Release);
     add_tray(hwnd);
     publish(current_view());
     let mut message = MSG::default();
@@ -299,7 +412,17 @@ unsafe extern "system" fn wndproc(
 ) -> LRESULT {
     match message {
         WM_HOTKEY => {
-            send_lock(LockSource::Hotkey);
+            enqueue_lock(LockSource::Hotkey);
+            LRESULT(0)
+        }
+        WM_LOCK_APP => {
+            lock_from_app();
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
             LRESULT(0)
         }
         WM_TRAY => {
@@ -311,10 +434,10 @@ unsafe extern "system" fn wndproc(
         }
         WM_COMMAND => {
             match wparam.0 & 0xffff {
-                CMD_LOCK => send_lock(LockSource::Tray),
-                CMD_QUIT => unsafe {
-                    let _ = DestroyWindow(hwnd);
-                },
+                CMD_LOCK => enqueue_lock(LockSource::Tray),
+                CMD_QUIT => {
+                    let _ = request_quit();
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -340,11 +463,15 @@ fn show_menu(hwnd: HWND) {
     let view = current_view();
     let status = wide(&status_line(view.service_running, view.state));
     let service = wide(service_line(view.service_running));
-    let lock_now = wide("Lock now");
-    let quit = wide("Quit");
+    let lock_now = wide(&ui_text("lockNow"));
+    let quit = wide(&ui_text("quit"));
+    let notice = wide(&notice_text());
     unsafe {
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 1, PCWSTR(status.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 2, PCWSTR(service.as_ptr()));
+        if !notice_text().is_empty() {
+            let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 3, PCWSTR(notice.as_ptr()));
+        }
         let _ = AppendMenuW(menu, MF_STRING, CMD_LOCK, PCWSTR(lock_now.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, PCWSTR(quit.as_ptr()));
         let mut point = windows::Win32::Foundation::POINT::default();
@@ -379,10 +506,16 @@ fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
     data.uCallbackMessage = WM_TRAY;
     data.hIcon = unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() };
     let view = current_view();
+    let notice = notice_text();
     let tip = wide(&format!(
-        "{} — {}",
+        "{} — {}{}",
         status_line(view.service_running, view.state),
-        service_line(view.service_running)
+        service_line(view.service_running),
+        if notice.is_empty() {
+            String::new()
+        } else {
+            format!(" — {notice}")
+        }
     ));
     for (index, unit) in tip.iter().take(data.szTip.len()).enumerate() {
         data.szTip[index] = *unit;
@@ -397,7 +530,7 @@ fn register_autostart() {
     let key = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
     let name = wide(autostart_value_name());
     let command = wide(&autostart_command(&exe));
-    let _ = unsafe {
+    let code = unsafe {
         RegSetKeyValueW(
             HKEY_CURRENT_USER,
             PCWSTR(key.as_ptr()),
@@ -407,6 +540,7 @@ fn register_autostart() {
             (command.len() * 2) as u32,
         )
     };
+    AUTOSTART_CODE.store(code.0, Ordering::Release);
 }
 
 fn transact(kind: RequestKind) -> Result<ResponseKind, String> {
