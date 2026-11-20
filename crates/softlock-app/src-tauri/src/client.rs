@@ -107,20 +107,37 @@ pub fn view_after(previous: &OwnerView, event: &Result<ResponseKind, IpcError>) 
     match event {
         Ok(response @ ResponseKind::StateChanged { .. })
         | Ok(response @ ResponseKind::Status { .. }) => view_from_status(response),
-        Ok(ResponseKind::Accepted) => previous.clone(),
+        Ok(ResponseKind::Accepted) | Ok(ResponseKind::FellBackToOsLock { .. }) => previous.clone(),
         _ => OwnerView::unknown(),
     }
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn public_pipe_name() -> String {
-    #[cfg(feature = "simulated-physical")]
-    if let Ok(name) = std::env::var("SOFTLOCK_PIPE") {
-        if !name.is_empty() {
-            return name;
-        }
+    #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+    if pipe_override_allowed()
+        && let Ok(name) = std::env::var("SOFTLOCK_PIPE")
+        && !name.is_empty()
+    {
+        return name;
     }
     softlock_core::pipe_name()
+}
+
+#[cfg(feature = "simulated-physical")]
+fn pipe_override_allowed() -> bool {
+    true
+}
+
+#[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
+fn pipe_override_allowed() -> bool {
+    hosted_runner()
+}
+
+#[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
+fn hosted_runner() -> bool {
+    std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
+        && std::env::var("RUNNER_ENVIRONMENT").ok().as_deref() == Some("github-hosted")
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -252,5 +269,16 @@ mod tests {
         let view = view_after(&view, &Ok(decoded));
         assert!(!view.locked());
         assert!(status_text(&view).contains("tray=off"));
+
+        let fallback = ResponseKind::FellBackToOsLock {
+            fallback: softlock_core::Fallback {
+                reason: softlock_core::FailReason::HostExited,
+                at_ms: 2_000,
+                at_utc_ms: 1_763_635_620_000,
+            },
+        };
+        let kept = view_after(&view, &Ok(fallback));
+        assert!(!kept.locked());
+        assert!(shows_unlocked(kept.service_running, kept.state));
     }
 }

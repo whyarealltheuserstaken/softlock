@@ -253,7 +253,10 @@ pub enum FailReason {
 #[serde(deny_unknown_fields)]
 pub struct Fallback {
     pub reason: FailReason,
+    /// Monotonic service clock, in milliseconds.
     pub at_ms: u64,
+    /// Wall clock at the fall-back, milliseconds since the Unix epoch, UTC.
+    pub at_utc_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

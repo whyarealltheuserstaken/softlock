@@ -14,6 +14,9 @@ pub use real_lock::{RealLock, decide};
 #[cfg(feature = "dev-launch")]
 mod dev_marker;
 
+#[cfg(feature = "live-fail-closed")]
+mod live_marker;
+
 #[cfg(feature = "simulated-physical")]
 mod marker;
 #[cfg(windows)]
@@ -24,6 +27,8 @@ pub use classify::{HookInput, InputClass, classify};
 pub use classify::{RunNonce, clear_run_nonce, set_run_nonce};
 #[cfg(feature = "dev-launch")]
 pub use dev_marker::dev_launch_marker_bytes;
+#[cfg(feature = "live-fail-closed")]
+pub use live_marker::marker_bytes as live_fail_closed_marker_bytes;
 #[cfg(windows)]
 pub use win::{
     DevConfig, DevError, DevLock, OVERLAY_MARKER, current_session_id, disconnect_session,

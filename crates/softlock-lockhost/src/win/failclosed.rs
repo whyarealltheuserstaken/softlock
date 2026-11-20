@@ -1,27 +1,26 @@
 //! Real Windows lock when the guard can no longer be guaranteed.
 //!
-//! Finding 04: `LockWorkStation` does not lock while `DisableLockWorkstation`
-//! is set, and it does lock once that value is clear. This dev launch never
-//! sets that value and never clears it. Ticket 15 clears it before calling
-//! `LockWorkStation`. If the session is not actually locked, the in-session
-//! fall-back is `WTSDisconnectSession`, which does not depend on the policy.
-//! If that fails too, the guard and the overlay stay up. The PIN is the only
+//! Finding 04: `LockWorkStation` returns success while `DisableLockWorkstation`
+//! is set and the session stays open. This path never trusts that return. A
+//! lock counts only after a console-session notification or the session state
+//! says so, within one second. The fall-back is `WTSDisconnectSession` on this
+//! process's session, confirmed the same way. Ticket 17 clears
+//! `DisableLockWorkstation` before the workstation call. This path does not.
+//! If both fail, the guard and the overlay stay up. The PIN is the only
 //! release, and the OS lock is retried. A hook that has already died is not
 //! blocking input; the overlay still shows the error and the retry still runs.
 //! Ctrl+Alt+Del is the secure attention sequence and is not swallowed.
 
-#[cfg(feature = "simulated-physical")]
+#[cfg(any(test, feature = "simulated-physical"))]
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "simulated-physical")]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS, GetLastError,
-    HANDLE, HLOCAL, HWND, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, SetLastError,
-    WAIT_OBJECT_0, WIN32_ERROR,
+    HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, SetLastError, WAIT_OBJECT_0,
+    WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
@@ -37,19 +36,13 @@ use windows::Win32::System::Memory::{
     PAGE_READWRITE, UnmapViewOfFile,
 };
 use windows::Win32::System::RemoteDesktop::{
-    ProcessIdToSessionId, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK, WTSConnectState,
-    WTSDisconnectSession, WTSDisconnected, WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSINFOEXW,
-    WTSQuerySessionInformationW, WTSSessionInfoEx,
+    ProcessIdToSessionId, WTSDisconnectSession, WTSGetActiveConsoleSessionId,
 };
-use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::System::Threading::{
     CreateEventW, EVENT_ALL_ACCESS, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess,
     OpenEventW, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResetEvent, SetEvent,
     WaitForSingleObject,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
 };
 use windows::core::{PCWSTR, PWSTR};
 static ARMED_MAPPING: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -83,6 +76,7 @@ const ARMED_SLOT_BYTES: usize = 16;
 
 use super::session::Shared;
 use crate::real_lock::{RealLock, decide};
+use softlock_core::{Caller, Method, Outcome, failed_closed_log};
 
 /// Last stub seen by a test build. A panic can clear the installed session
 /// before a second lock attempt. The default is failure, so that attempt
@@ -90,7 +84,65 @@ use crate::real_lock::{RealLock, decide};
 #[cfg(feature = "simulated-physical")]
 static OS_LOCK_STUB: AtomicU8 = AtomicU8::new(1);
 
+#[cfg(test)]
+static BLOCK_OS_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Holds `lock_or_disconnect` on the worker so a test can see that the
+/// window thread already returned. The held call does not touch Windows.
+#[cfg(test)]
+pub(crate) fn block_os_lock_for_test(block: bool) {
+    BLOCK_OS_LOCK.store(block, Ordering::Release);
+}
+
 pub(crate) fn lock_or_disconnect(session: u32) -> RealLock {
+    let _ = session;
+    #[cfg(test)]
+    if held_for_test() {
+        return decide(false, false);
+    }
+    if let Some(stubbed) = take_stub() {
+        return stubbed;
+    }
+    finish(softlock_windows::run_lock_host(), Caller::LockHost)
+}
+
+#[cfg(test)]
+fn held_for_test() -> bool {
+    if !BLOCK_OS_LOCK.load(Ordering::Acquire) {
+        return false;
+    }
+    while BLOCK_OS_LOCK.load(Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    true
+}
+
+/// Workstation lock only. The Service confirms it and disconnects the console
+/// itself when this does not. A stub still makes no Windows call.
+/// The window thread keeps sending heartbeats. The workstation call can take
+/// the whole confirmation budget, so it runs on its own thread.
+pub(crate) fn schedule_workstation_lock() {
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if BUSY.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let _ = lock_workstation_only();
+        BUSY.store(false, std::sync::atomic::Ordering::Release);
+    });
+}
+
+pub(crate) fn lock_workstation_only() -> RealLock {
+    if let Some(stubbed) = take_stub() {
+        return stubbed;
+    }
+    finish(
+        softlock_windows::run_lock_host_primary(),
+        Caller::LockHostPrimary,
+    )
+}
+
+fn take_stub() -> Option<RealLock> {
     note_os_lock_attempt();
     let mut stub = os_lock_stub_fallback();
     if let Some(shared) = super::session::installed_session() {
@@ -103,25 +155,33 @@ pub(crate) fn lock_or_disconnect(session: u32) -> RealLock {
         remember_os_lock_stub(stub);
     }
     match stub {
-        0 => {}
+        0 => None,
         // Confirmed workstation lock, without calling Windows.
-        2 => return decide(true, false),
+        2 => Some(decide(true, false)),
         // The Windows calls are not made. Neither path confirmed.
-        _ => return decide(false, false),
+        _ => Some(decide(false, false)),
     }
-    let _ = unsafe { LockWorkStation() };
-    let session = if session == u32::MAX {
-        own_session().unwrap_or_else(console_session)
-    } else {
-        session
-    };
-    if wait_until_locked(session, Duration::from_secs(1)) {
-        return decide(true, false);
+}
+
+fn finish(result: softlock_windows::CloseResult, caller: Caller) -> RealLock {
+    for error in &result.errors {
+        eprintln!("os-lock error={error}");
     }
-    let target = own_session().unwrap_or(session);
-    let api_ok = disconnect_session(target);
-    let disconnected = api_ok && wait_until_disconnected(target, Duration::from_secs(1));
-    decide(false, disconnected)
+    if matches!(result.outcome, Outcome::Confirmed { .. }) {
+        write_os_lock_mark(b"confirmed");
+    }
+    match result.outcome {
+        Outcome::Confirmed {
+            method: Method::LockWorkStation,
+        } => decide(true, false),
+        Outcome::Confirmed {
+            method: Method::DisconnectOwnSession | Method::DisconnectConsole,
+        } => decide(false, true),
+        Outcome::FailedClosed { attempts } => {
+            eprintln!("{}", failed_closed_log(caller, &attempts));
+            decide(false, false)
+        }
+    }
 }
 
 /// `WTS_CURRENT_SESSION` is `0xFFFFFFFF`. Callers that only want to see the
@@ -160,8 +220,23 @@ fn remember_os_lock_stub(stub: u8) {
 
 fn note_os_lock_attempt() {
     #[cfg(feature = "simulated-physical")]
-    if let Ok(path) = std::env::var("SOFTLOCK_OS_LOCK_MARK") {
-        let _ = std::fs::write(path, b"called");
+    write_os_lock_mark(b"called");
+}
+
+fn write_os_lock_mark(bytes: &[u8]) {
+    #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+    {
+        #[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
+        if softlock_windows::runner_may_lock().is_err() {
+            return;
+        }
+        if let Ok(path) = std::env::var("SOFTLOCK_OS_LOCK_MARK") {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+    #[cfg(not(any(feature = "simulated-physical", feature = "live-fail-closed")))]
+    {
+        let _ = bytes;
     }
 }
 
@@ -169,78 +244,6 @@ fn own_session() -> Option<u32> {
     let mut session = 0u32;
     unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session).ok()? };
     Some(session)
-}
-
-fn wait_until_locked(session: u32, timeout: Duration) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if session_is_locked(session) {
-            return true;
-        }
-        pump_one();
-        thread::sleep(Duration::from_millis(20));
-    }
-    session_is_locked(session)
-}
-
-fn wait_until_disconnected(session: u32, timeout: Duration) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if session_is_disconnected(session) {
-            return true;
-        }
-        pump_one();
-        thread::sleep(Duration::from_millis(20));
-    }
-    session_is_disconnected(session)
-}
-
-fn session_is_disconnected(session: u32) -> bool {
-    session_connect_state(session) == Some(WTSDisconnected.0 as u32)
-}
-
-fn session_connect_state(session: u32) -> Option<u32> {
-    let mut buffer = PWSTR::null();
-    let mut bytes = 0u32;
-    unsafe {
-        if WTSQuerySessionInformationW(None, session, WTSConnectState, &mut buffer, &mut bytes)
-            .is_err()
-            || buffer.is_null()
-        {
-            return None;
-        }
-        let state = *buffer.0.cast::<u32>();
-        WTSFreeMemory(buffer.0.cast());
-        Some(state)
-    }
-}
-
-fn session_is_locked(session: u32) -> bool {
-    let mut buffer = PWSTR::null();
-    let mut bytes = 0u32;
-    unsafe {
-        if WTSQuerySessionInformationW(None, session, WTSSessionInfoEx, &mut buffer, &mut bytes)
-            .is_err()
-            || buffer.is_null()
-        {
-            return false;
-        }
-        let info = &*buffer.0.cast::<WTSINFOEXW>();
-        let level = info.Level;
-        let flags = info.Data.WTSInfoExLevel1.SessionFlags as u32;
-        WTSFreeMemory(buffer.0.cast());
-        level == 1 && flags == WTS_SESSIONSTATE_LOCK && flags != WTS_SESSIONSTATE_UNLOCK
-    }
-}
-
-fn pump_one() {
-    unsafe {
-        let mut message = MSG::default();
-        if PeekMessageW(&mut message, Some(HWND::default()), 0, 0, PM_REMOVE).as_bool() {
-            let _ = TranslateMessage(&message);
-            let _ = DispatchMessageW(&message);
-        }
-    }
 }
 
 /// Publish this process as the armed host. A mapping that already exists is

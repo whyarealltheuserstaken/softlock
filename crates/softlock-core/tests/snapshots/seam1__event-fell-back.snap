@@ -4,6 +4,7 @@ expression: value
 ---
 {
   "at_ms": 750,
+  "at_utc_ms": 1763635620000,
   "id": 11,
   "kind": "FellBackToOsLock",
   "reason": "HeartbeatMissed",

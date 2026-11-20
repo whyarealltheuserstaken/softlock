@@ -12,6 +12,10 @@ rust-version.workspace = true
 # and ask the Lock Host to panic. The cargo-tree check rejects it on a
 # product build.
 simulated-physical = []
+# Test-only. Release, universal, and product builds do not enable this.
+# Hosted fail-closed jobs pass it explicitly. The hooks are not compiled
+# without it. The cargo-tree check and the release-binary scan reject it.
+live-fail-closed = []
 
 [dependencies]
 serde_json = "1"
@@ -20,6 +24,7 @@ tracing = "0.1.41"
 zeroize = { version = "1.8.2", default-features = false, features = ["alloc"] }
 
 [target.'cfg(windows)'.dependencies]
+softlock-windows = { path = "../softlock-windows" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -34,6 +39,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Services",
     "Win32_System_Shutdown",
     "Win32_System_SystemServices",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     "Win32_UI_WindowsAndMessaging",

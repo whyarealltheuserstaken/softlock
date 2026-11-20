@@ -109,6 +109,8 @@ fn universal_job_lipos_thins_and_scans_each_slice_and_the_app() {
     assert!(script.contains("softlock_dev_launch_marker"));
     assert!(script.contains("softlock-simulated-physical-marker"));
     assert!(script.contains("softlock_simulated_physical_marker"));
+    assert!(script.contains("softlock-live-fail-closed-marker"));
+    assert!(script.contains("softlock_live_fail_closed_marker"));
     assert!(script.contains("string=true symbol=true dev_string=true dev_symbol=true"));
     assert!(script.contains("Decision D2"));
     assert!(!script.contains("D3"));

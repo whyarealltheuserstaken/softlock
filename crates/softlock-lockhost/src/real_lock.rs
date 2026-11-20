@@ -1,11 +1,11 @@
 //! Which real Windows lock was reached.
 //!
-//! This dev launch does not clear `DisableLockWorkstation`. Ticket 15 does.
-//! `LockWorkStation` is tried first and accepted only when the session flags
-//! show a lock. Otherwise `WTSDisconnectSession` is the fallback. If both
-//! fail, the result is `Unavailable`. The guard and the overlay stay up, the
-//! PIN stays usable, and the OS lock is retried. An `Arming` or `Locked`
-//! failure does not end `Unlocked`.
+//! `LockWorkStation` is tried first. Its return value is not evidence: the
+//! session has to report a lock. Otherwise `WTSDisconnectSession` is the
+//! fallback. Ticket 17 clears `DisableLockWorkstation` before the workstation
+//! call. This code does not. If both fail, the result is `Unavailable`. The
+//! guard and the overlay stay up, the PIN stays usable, and the OS lock is
+//! retried. An `Arming` or `Locked` failure does not end `Unlocked`.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -49,5 +49,14 @@ mod tests {
     #[test]
     fn both_paths_failing_is_unavailable() {
         assert_eq!(decide(false, false), RealLock::Unavailable);
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn live_fail_closed_stays_off_in_the_default_build() {
+        assert!(
+            !cfg!(feature = "live-fail-closed"),
+            "the default build compiled the hosted fail-closed hooks"
+        );
     }
 }

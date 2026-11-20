@@ -18,9 +18,9 @@ use softlock_core::{
 /// How [`SessionControl::os_lock`] behaves.
 ///
 /// `Succeeds` reports the lock as held and does not call the operating
-/// system. Seam 2 uses that. `System` is the service process, which calls
-/// `LockWorkStation` or disconnects the console session. `Fails` is the stub
-/// and every test where the OS lock is down.
+/// system. Seam 2 uses that. `System` asks the Lock Host to call
+/// `LockWorkStation` and, if that is not confirmed, disconnects the console
+/// session. `Fails` is the stub and every test where the OS lock is down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OsLock {
     Fails,
@@ -258,7 +258,14 @@ impl SessionControl for ServicePlatform {
             OsLock::System => {
                 #[cfg(windows)]
                 {
-                    crate::windows::lock_session(session.0)
+                    if crate::stub_os_lock() {
+                        return crate::windows::lock_session(session.0);
+                    }
+                    // The chain runs after this mutex is released. Returning
+                    // an error keeps the state fail-closed until `drain_os_lock`
+                    // confirms it.
+                    crate::windows::schedule_os_lock(session.0);
+                    Err(OsLockError::Failed)
                 }
                 #[cfg(not(windows))]
                 {

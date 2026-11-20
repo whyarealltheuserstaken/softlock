@@ -86,6 +86,30 @@ test("a pin that needs confirmation is not treated as a lock failure", async ({ 
   await expect(page.getByTestId("service-line")).toHaveText("Service running");
 });
 
+test("lock for real is a separate tray action", async ({ page }) => {
+  await page.goto("/");
+  await page.getByTestId("tray-hard-lock").click();
+  await expect(page.locator("main")).toHaveAttribute("data-hard-lock", "1");
+  await expect(page.locator("main")).toHaveAttribute("data-lock-source", "");
+  await expect(page.getByTestId("tray-hard-lock")).toHaveText("Lock for real");
+});
+
+test("a fall-back event shows the local time and the reason after sign-in", async ({ page }) => {
+  await page.goto("/");
+  const atUtcMs = Date.UTC(2026, 10, 20, 12, 0, 0);
+  await page.evaluate(
+    (atUtcMs) => window.__SOFTLOCK_FALLBACK__?.(atUtcMs, "the lock host stopped answering"),
+    atUtcMs,
+  );
+  const shown = await page.getByTestId("hotkey-notice").innerText();
+  const local = new Date(atUtcMs);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const clock = `${local.getFullYear()}-${pad(local.getMonth() + 1)}-${pad(local.getDate())} ${pad(local.getHours())}:${pad(local.getMinutes())}:${pad(local.getSeconds())}`;
+  expect(shown).toContain(`switched to the Windows lock at ${clock} because the lock host stopped answering`);
+  expect(shown).not.toContain("1500 ms");
+  await expect(page.locator("main")).toHaveAttribute("data-locked", "off");
+});
+
 test("quitting the app does not stop the service", async ({ page }) => {
   await page.goto("/");
   await page.getByTestId("tray-quit").click();

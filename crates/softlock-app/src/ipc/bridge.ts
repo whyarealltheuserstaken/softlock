@@ -20,6 +20,7 @@ export interface OwnerView {
   lockSource: string | null;
   sources: string;
   setPinCount: number;
+  hardLockCount: number;
   quit: boolean;
   serviceStop: boolean;
   fieldError: string | null;
@@ -35,6 +36,7 @@ export interface PlatformStatus {
 export interface IpcBridge {
   readonly kind: IpcBridgeKind;
   lock(source: LockSourceName): Promise<OwnerView>;
+  hardLock(): Promise<OwnerView>;
   setPin(pin: string): Promise<OwnerView>;
   subscribe(onChange: (view: OwnerView) => void): () => void;
   quit(): OwnerView;
@@ -48,7 +50,18 @@ declare global {
     __SOFTLOCK_FAIL_PIPE__?: () => void;
     __SOFTLOCK_PIN_RESULT__?: string;
     __SOFTLOCK_SET_NOTICE__?: (notice: string) => void;
+    __SOFTLOCK_FALLBACK__?: (atUtcMs: number, reason: string) => void;
   }
+}
+
+export function formatLocalClock(atUtcMs: number): string {
+  const date = new Date(atUtcMs);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+export function fallbackNotice(atUtcMs: number, reason: string): string {
+  return `${product.productName} switched to the Windows lock at ${formatLocalClock(atUtcMs)} because ${reason}`;
 }
 
 export function statusLine(view: OwnerView): string {
@@ -78,6 +91,7 @@ function emptyView(): OwnerView {
     lockSource: null,
     sources: "",
     setPinCount: 0,
+    hardLockCount: 0,
     quit: false,
     serviceStop: false,
     fieldError: null,
@@ -119,6 +133,16 @@ class FakeBridge implements IpcBridge {
       this.view = { ...this.view, notice };
       this.emit();
     };
+    window.__SOFTLOCK_FALLBACK__ = (atUtcMs: number, reason: string) => {
+      this.view = {
+        ...this.view,
+        serviceRunning: true,
+        locked: false,
+        state: "Unlocked",
+        notice: fallbackNotice(atUtcMs, reason),
+      };
+      this.emit();
+    };
   }
 
   current(): OwnerView {
@@ -147,6 +171,21 @@ class FakeBridge implements IpcBridge {
       state: "Locked",
       lockSource: source,
       sources,
+      serviceStop: false,
+    };
+    this.emit();
+    return this.view;
+  }
+
+  async hardLock(): Promise<OwnerView> {
+    if (!this.view.serviceRunning) {
+      this.view = failClosed(this.view);
+      this.emit();
+      return this.view;
+    }
+    this.view = {
+      ...this.view,
+      hardLockCount: this.view.hardLockCount + 1,
       serviceStop: false,
     };
     this.emit();
@@ -219,6 +258,19 @@ class TauriBridge implements IpcBridge {
       const { invoke } = await import("@tauri-apps/api/core");
       const dto = await invoke<ViewDto>("lock_from_app");
       this.apply(dto);
+    } catch {
+      this.view = failClosed(this.view);
+      this.emit();
+    }
+    return this.view;
+  }
+
+  async hardLock(): Promise<OwnerView> {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const dto = await invoke<ViewDto>("lock_for_real");
+      this.apply(dto);
+      this.view = { ...this.view, hardLockCount: this.view.hardLockCount + 1 };
     } catch {
       this.view = failClosed(this.view);
       this.emit();

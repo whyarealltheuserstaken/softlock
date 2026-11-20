@@ -14,10 +14,18 @@ use crate::state::{LaunchNonce, Secret};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum ServiceToHost {
-    Welcome { nonce: NonceBytes },
+    Welcome {
+        nonce: NonceBytes,
+    },
     Arm,
     Disarm,
-    PromptResult { accepted: bool, backoff_ms: u64 },
+    /// Lock the signed-in session. The Service confirms it and disconnects
+    /// the console itself when this does not. The host must not disconnect.
+    OsLock,
+    PromptResult {
+        accepted: bool,
+        backoff_ms: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -43,6 +51,11 @@ pub enum HostToService {
     GuardDown {
         nonce: LaunchNonce,
     },
+    /// Hard lock while the session is already Locked. The public pipe cannot
+    /// do this. The App's public HardLock is only accepted while Unlocked.
+    HardLock {
+        nonce: LaunchNonce,
+    },
 }
 
 impl HostToService {
@@ -52,7 +65,8 @@ impl HostToService {
             | Self::HostReady { nonce, .. }
             | Self::Heartbeat { nonce, .. }
             | Self::SubmitSecret { nonce, .. }
-            | Self::GuardDown { nonce } => nonce,
+            | Self::GuardDown { nonce }
+            | Self::HardLock { nonce } => nonce,
         }
     }
 }
@@ -144,6 +158,9 @@ enum HostWire {
     GuardDown {
         nonce: NonceBytes,
     },
+    HardLock {
+        nonce: NonceBytes,
+    },
 }
 
 pub fn encode_service(id: u64, body: &ServiceToHost) -> Result<Vec<u8>, IpcError> {
@@ -221,6 +238,9 @@ fn decode_host_json(json: &str) -> Result<HostToService, IpcError> {
         HostWire::GuardDown { nonce } => Ok(HostToService::GuardDown {
             nonce: nonce.to_nonce()?,
         }),
+        HostWire::HardLock { nonce } => Ok(HostToService::HardLock {
+            nonce: nonce.to_nonce()?,
+        }),
     }
 }
 
@@ -273,6 +293,15 @@ pub fn host_secret_frame(
         &HostWire::SubmitSecret {
             method: method.to_string(),
             secret: Secret::new(secret.expose()),
+            nonce: NonceBytes::from_nonce(nonce),
+        },
+    )
+}
+
+pub fn host_hard_lock_frame(id: u64, nonce: &LaunchNonce) -> Result<Vec<u8>, IpcError> {
+    encode_host(
+        id,
+        &HostWire::HardLock {
             nonce: NonceBytes::from_nonce(nonce),
         },
     )

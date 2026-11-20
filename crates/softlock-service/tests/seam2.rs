@@ -386,6 +386,74 @@ fn tray_and_app_lock_sources_are_visible_in_get_status() {
 }
 
 #[test]
+fn hard_lock_from_the_app_while_locked_is_rejected() {
+    let mut authority = authority();
+    let _nonce = lock(&mut authority, LockSource::Hotkey);
+    let attempts = authority.os_lock_attempts();
+    assert_eq!(
+        authority.handle_public(Role::App, RequestKind::HardLock),
+        ResponseKind::Unauthorized
+    );
+    assert!(matches!(authority.state(), LockState::Locked { .. }));
+    assert_eq!(authority.os_lock_attempts(), attempts);
+}
+
+#[test]
+fn hard_lock_from_the_app_while_unlocked_stays_unlocked() {
+    let mut authority = Authority::new(ServicePlatform::new(OsLock::Succeeds), true);
+    assert_eq!(
+        authority.handle_public(Role::App, RequestKind::HardLock),
+        ResponseKind::Accepted
+    );
+    assert!(matches!(authority.state(), LockState::Unlocked));
+    assert!(authority.os_lock_attempts() >= 1);
+}
+
+#[test]
+fn hard_lock_on_the_private_channel_while_locked_fails_closed() {
+    let mut authority = Authority::new(ServicePlatform::new(OsLock::Succeeds), true);
+    let nonce = lock(&mut authority, LockSource::Hotkey);
+    let again = LaunchNonce::from_bytes(*nonce.as_bytes());
+    authority
+        .accept_host(HostToService::HostReady { monitors: 1, nonce })
+        .unwrap();
+    authority
+        .accept_host(HostToService::HardLock { nonce: again })
+        .unwrap();
+    assert!(matches!(
+        authority.state(),
+        LockState::OsLocked {
+            after_fail: Some(softlock_core::FailReason::HardLock)
+        }
+    ));
+    assert!(!authority.returned_to_unlocked());
+}
+
+#[test]
+fn a_new_subscriber_does_not_replay_an_old_fallback() {
+    let current = Some(softlock_core::Fallback {
+        reason: softlock_core::FailReason::HostExited,
+        at_ms: 1_500,
+        at_utc_ms: 1_795_176_000_000,
+    });
+    assert!(softlock_service::fallback_is_new(None, current));
+    assert!(!softlock_service::fallback_is_new(current, current));
+    let mut authority = Authority::new(ServicePlatform::new(OsLock::Succeeds), true);
+    let nonce = lock(&mut authority, LockSource::Hotkey);
+    authority
+        .accept_host(HostToService::HostReady { monitors: 1, nonce })
+        .unwrap();
+    authority.note_host_lost(HostLoss::Exited);
+    authority.notify(Event::Session(SessionEvent::OsUnlocked));
+    let start = authority.fallback_stream_start();
+    assert!(start.is_some());
+    assert!(!softlock_service::fallback_is_new(
+        start,
+        authority.last_fallback()
+    ));
+}
+
+#[test]
 fn subscribe_is_accepted_for_the_app_only() {
     let mut authority = authority();
     assert_eq!(

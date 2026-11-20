@@ -11,6 +11,10 @@ rust-version.workspace = true
 # Test-only. Release builds do not enable this. Injected events whose
 # extra-info matches the per-run nonce are classified as simulated-physical.
 simulated-physical = []
+# Test-only. Release, universal, and product builds do not enable this.
+# The hosted fail-closed job passes it explicitly. Guard, mark, and runner
+# hooks are not compiled without it.
+live-fail-closed = []
 # Dev-only marker. Release builds do not enable this. The lock host no longer
 # hashes a PIN or draws its own nonce.
 dev-launch = []
@@ -22,8 +26,12 @@ getrandom = "0.2.16"
 softlock-seam3 = { path = "../softlock-seam3" }
 softlock-service = { path = "../softlock-service" }
 
+[target.'cfg(windows)'.dev-dependencies]
+softlock-windows = { path = "../softlock-windows" }
+
 [target.'cfg(windows)'.dependencies]
 softlock-core = { path = "../softlock-core" }
+softlock-windows = { path = "../softlock-windows" }
 zeroize = { version = "1.8.2", default-features = false, features = ["alloc"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -36,6 +44,7 @@ windows = { version = "0.62", features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_Shutdown",
     "Win32_System_SystemInformation",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

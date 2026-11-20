@@ -43,6 +43,7 @@ pub struct DevConfig {
 pub(crate) enum PipeCommand {
     Arm,
     Disarm,
+    OsLock,
     Quit,
 }
 
@@ -529,14 +530,18 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
         }
         match next_command(&shared) {
             Some(PipeCommand::Disarm) => break,
+            Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             Some(PipeCommand::Quit) => service_gone = true,
-            _ => {}
+            Some(PipeCommand::Arm) | None => {}
         }
         if service_gone && !quit_tried {
             quit_tried = true;
-            if quit_reaches_os_lock(&shared, &mut controller) {
-                break;
-            }
+            schedule_quit_os_lock();
+        }
+        if let Some(result) = take_quit_os_lock()
+            && apply_quit_os_lock(&shared, &mut controller, result)
+        {
+            break;
         }
         if service_gone && failclosed::replacement_host_armed() {
             break;
@@ -624,6 +629,24 @@ fn advance_clock(
     }
 }
 
+fn force_unhealthy_guard() -> bool {
+    #[cfg(feature = "live-fail-closed")]
+    {
+        if softlock_windows::runner_may_lock().is_err() {
+            return false;
+        }
+        match std::env::var("SOFTLOCK_FORCE_GUARD_DOWN") {
+            Ok(value) if value == "1" => true,
+            Ok(value) => std::path::Path::new(&value).is_file(),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(feature = "live-fail-closed"))]
+    {
+        false
+    }
+}
+
 fn beat(controller: &mut LockController<WinPlatform>, shared: &Shared) {
     if shared.hold_heartbeats.load(Ordering::Acquire) {
         return;
@@ -633,7 +656,7 @@ fn beat(controller: &mut LockController<WinPlatform>, shared: &Shared) {
     }
     let seq = controller.next_heartbeat_seq();
     let guard = GuardHealth {
-        hook_alive: true,
+        hook_alive: !force_unhealthy_guard(),
         last_physical_input_ms: shared.physical_ms(),
     };
     let overlay = Overlay::health(controller.platform());
@@ -777,9 +800,59 @@ fn shutdown(shared: &Shared) {
     shared.locked.store(false, Ordering::Release);
 }
 
-/// Quit is the service pipe closing. Release only after the OS lock is
-/// confirmed. Otherwise the hooks stay until another host has armed.
-fn quit_reaches_os_lock(shared: &Shared, controller: &mut LockController<WinPlatform>) -> bool {
+const QUIT_IDLE: u8 = 0;
+const QUIT_RUNNING: u8 = 1;
+const QUIT_WORKSTATION: u8 = 2;
+const QUIT_DISCONNECTED: u8 = 3;
+const QUIT_UNAVAILABLE: u8 = 4;
+const QUIT_DONE: u8 = 5;
+
+/// The quit path's OS lock. The window thread only reads the result.
+static QUIT_OS: AtomicU8 = AtomicU8::new(QUIT_IDLE);
+
+/// Quit is the service pipe closing. The OS lock can take the whole
+/// confirmation budget, so it runs off the window thread. The hooks stay
+/// until the result says the session is locked, or another host has armed.
+fn schedule_quit_os_lock() {
+    if QUIT_OS
+        .compare_exchange(QUIT_IDLE, QUIT_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    thread::spawn(|| {
+        let result = failclosed::lock_or_disconnect(failclosed::console_session());
+        let code = match result {
+            RealLock::Workstation => QUIT_WORKSTATION,
+            RealLock::Disconnected => QUIT_DISCONNECTED,
+            RealLock::Unavailable => QUIT_UNAVAILABLE,
+        };
+        QUIT_OS.store(code, Ordering::Release);
+    });
+}
+
+fn take_quit_os_lock() -> Option<RealLock> {
+    let code = QUIT_OS.load(Ordering::Acquire);
+    let result = match code {
+        QUIT_WORKSTATION => RealLock::Workstation,
+        QUIT_DISCONNECTED => RealLock::Disconnected,
+        QUIT_UNAVAILABLE => RealLock::Unavailable,
+        _ => return None,
+    };
+    if QUIT_OS
+        .compare_exchange(code, QUIT_DONE, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    Some(result)
+}
+
+fn apply_quit_os_lock(
+    shared: &Shared,
+    controller: &mut LockController<WinPlatform>,
+    result: RealLock,
+) -> bool {
     let guarded = matches!(
         controller.state(),
         LockState::Locked { .. } | LockState::Arming { .. } | LockState::FailingClosed { .. }
@@ -787,7 +860,7 @@ fn quit_reaches_os_lock(shared: &Shared, controller: &mut LockController<WinPlat
     if !guarded {
         return false;
     }
-    match failclosed::lock_or_disconnect(failclosed::console_session()) {
+    match result {
         RealLock::Workstation | RealLock::Disconnected => {
             if matches!(
                 controller.state(),
@@ -1127,6 +1200,7 @@ fn wait_for_arm(shared: &Shared) -> bool {
         match next_command(shared) {
             Some(PipeCommand::Arm) => return true,
             Some(PipeCommand::Disarm) => return false,
+            Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             // Hooks are installed only after Arm. Quit before that is not
             // Locked, Arming, or FailingClosed, so it must not call the OS lock.
             Some(PipeCommand::Quit) => return false,
@@ -1229,6 +1303,7 @@ fn host_read_loop(mut file: std::fs::File, commands: std::sync::mpsc::Sender<Pip
         let command = match softlock_core::decode_service_frame(&frame) {
             Ok(softlock_core::ServiceToHost::Arm) => Some(PipeCommand::Arm),
             Ok(softlock_core::ServiceToHost::Disarm) => Some(PipeCommand::Disarm),
+            Ok(softlock_core::ServiceToHost::OsLock) => Some(PipeCommand::OsLock),
             Ok(softlock_core::ServiceToHost::PromptResult { .. }) => None,
             _ => None,
         };
@@ -1274,5 +1349,57 @@ fn host_write_loop(
             frame.fill(0);
         }
         drop(report);
+    }
+}
+
+#[cfg(test)]
+mod quit_thread {
+    use super::{QUIT_IDLE, QUIT_OS, QUIT_RUNNING, schedule_quit_os_lock, take_quit_os_lock};
+    use crate::real_lock::RealLock;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn quit_os_lock_returns_before_the_call_finishes() {
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                super::failclosed::block_os_lock_for_test(false);
+            }
+        }
+        let _release = Release;
+        QUIT_OS.store(QUIT_IDLE, Ordering::Release);
+        super::failclosed::block_os_lock_for_test(true);
+        let started = Instant::now();
+        schedule_quit_os_lock();
+        let queued = started.elapsed();
+        assert!(
+            queued < Duration::from_millis(200),
+            "scheduling the quit lock blocked the caller for {} ms",
+            queued.as_millis()
+        );
+        assert_eq!(QUIT_OS.load(Ordering::Acquire), QUIT_RUNNING);
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            QUIT_OS.load(Ordering::Acquire),
+            QUIT_RUNNING,
+            "the OS lock finished on the caller instead of staying on the worker"
+        );
+        super::failclosed::block_os_lock_for_test(false);
+        let done = Instant::now();
+        let result = loop {
+            if let Some(result) = take_quit_os_lock() {
+                break result;
+            }
+            if done.elapsed() > Duration::from_secs(2) {
+                panic!("the worker did not finish the held OS lock");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(result, RealLock::Unavailable);
+        assert!(
+            started.elapsed() > Duration::from_millis(40),
+            "the held call returned without waiting"
+        );
     }
 }

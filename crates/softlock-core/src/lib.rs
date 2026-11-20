@@ -16,6 +16,7 @@ mod hostmsg;
 mod ipc;
 mod journal;
 mod name;
+mod oslock;
 mod pin;
 mod platform;
 mod state;
@@ -33,8 +34,8 @@ pub use heartbeat::{
 };
 pub use hostmsg::{
     HostToService, NonceBytes, ServiceToHost, decode_host_frame, decode_service_frame,
-    encode_service, host_guard_down_frame, host_heartbeat_frame, host_hello_frame,
-    host_ready_frame, host_secret_frame,
+    encode_service, host_guard_down_frame, host_hard_lock_frame, host_heartbeat_frame,
+    host_hello_frame, host_ready_frame, host_secret_frame,
 };
 pub use ipc::{
     DecodedRequest, IPC_VERSION, IpcError, MAX_FRAME, RequestKind, ResponseKind, checked_body_len,
@@ -44,6 +45,12 @@ pub use journal::{Journal, JournalEntry};
 pub use name::{
     APP_BUNDLE_ID, APP_PACKAGE_NAME, PRODUCT_DISPLAY_NAME, SERVICE_DISPLAY_NAME, SERVICE_ID,
     SERVICE_NAME, pipe_name, registry_key,
+};
+pub use oslock::{
+    Attempt, CONFIRM_BUDGET, Caller, Expect, Method, NoticeKind, NoticeLog, Observation, OsLockOps,
+    Outcome, StepFault, caller_for_service, confirmed, console_notice, fail_closed,
+    failed_closed_log, policy_seam, session_for_expect, stays_guarded, tick_is_on_or_after,
+    within_budget,
 };
 pub use pin::{
     MIN_PIN_LEN, PIN_MEMORY_KIB, PIN_PARALLELISM, PIN_SALT_LEN, PIN_TIME_COST, PinHashError,

@@ -136,10 +136,9 @@ impl SessionControl for WinPlatform {
 }
 
 impl Hardening for WinPlatform {
-    /// Ticket 15 writes the lockdown policies, after the journal from ticket 16.
-    /// This dev launch does not write them and does not clear
-    /// `DisableLockWorkstation`. A success here only lets the state machine
-    /// reach Locked.
+    /// Ticket 17 writes the lockdown policies and clears
+    /// `DisableLockWorkstation` before `LockWorkStation`. This path does not.
+    /// A success here only lets the state machine reach Locked.
     fn apply(&mut self, _plan: &HardeningPlan, _journal: &mut Journal) -> Result<(), HardenError> {
         Ok(())
     }

@@ -5,6 +5,8 @@
 //! cannot unlock itself.
 
 mod authority;
+#[cfg(feature = "live-fail-closed")]
+mod live_marker;
 mod log;
 #[cfg(feature = "simulated-physical")]
 mod pincheck;
@@ -15,9 +17,12 @@ mod secrets;
 mod windows;
 
 pub use authority::{
-    Authority, HostAction, HostFault, HostLoss, admit_client, dev_pin_allowed, image_is_inside,
-    log_path, pin_directory, pipe_path, role_for_image, service_data_directory, stub_os_lock,
+    Authority, HostAction, HostFault, HostLoss, admit_client, dev_pin_allowed, fallback_is_new,
+    image_is_inside, log_path, pin_directory, pipe_path, role_for_image, service_data_directory,
+    stub_os_lock,
 };
+#[cfg(feature = "live-fail-closed")]
+pub use live_marker::marker_bytes as live_fail_closed_marker_bytes;
 pub use log::{Capture, FileLog, allowed_field, audit};
 #[cfg(feature = "simulated-physical")]
 pub use pincheck::PinChecker;

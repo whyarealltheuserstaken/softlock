@@ -3208,6 +3208,7 @@ dependencies = [
  "softlock-core",
  "softlock-seam3",
  "softlock-service",
+ "softlock-windows",
  "windows",
  "zeroize",
 ]
@@ -3237,6 +3238,7 @@ dependencies = [
  "proptest",
  "serde_json",
  "softlock-core",
+ "softlock-windows",
  "tracing",
  "windows",
  "zeroize",
@@ -3253,6 +3255,10 @@ dependencies = [
 [[package]]
 name = "softlock-windows"
 version = "0.1.0"
+dependencies = [
+ "softlock-core",
+ "windows",
+]
 
 [[package]]
 name = "soup3"

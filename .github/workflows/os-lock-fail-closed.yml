@@ -1,0 +1,88 @@
+name: OS lock fail-closed
+
+# Last and isolated. Each case is its own runner because a disconnect ends
+# that session. Nothing waits on these jobs. No push trigger. The test
+# refuses unless GITHUB_ACTIONS=true and RUNNER_ENVIRONMENT=github-hosted,
+# and it refuses the school workstation before any lock call. The binaries
+# are built without simulated-physical so the OS lock is real. The
+# live-fail-closed feature is on for this job only. Release and product
+# builds leave it off, so the test hooks are not compiled. This job
+# never reconnects the session.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/softlock-service/src/windows.rs'
+      - 'crates/softlock-lockhost/src/win/failclosed.rs'
+      - 'crates/softlock-lockhost/src/win/session.rs'
+      - 'crates/softlock-lockhost/tests/fail_closed_live.rs'
+      - 'crates/softlock-app/src-tauri/src/owner.rs'
+      - 'crates/softlock-app/src-tauri/src/client.rs'
+      - 'crates/softlock-service/src/authority.rs'
+      - '.github/workflows/os-lock-fail-closed.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  fail-closed:
+    name: ${{ matrix.case }} (${{ matrix.image }})
+    concurrency:
+      group: os-lock-fail-closed-${{ github.ref }}-${{ matrix.case }}-${{ matrix.image }}
+      cancel-in-progress: false
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-2025]
+        case:
+          - kill-host
+          - suspend-host
+          - kill-service
+          - stop-while-locked
+          - unhealthy-guard
+          - tray-hard-lock
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Refuse a runner that is not GitHub-hosted
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            throw 'refusing a runner that is not GitHub-hosted'
+          }
+      - name: Build the service and the Lock Host with the hosted hooks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked -p softlock-service --features live-fail-closed --target-dir target/fail-closed
+          cargo build --release --locked -p softlock-lockhost --features live-fail-closed --target-dir target/fail-closed
+      - name: Build the owner session for the tray case
+        if: matrix.case == 'tray-hard-lock'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm ci --prefix crates/softlock-app
+          cargo build --release --locked -p softlock-app --features live-fail-closed --bin softlock-app --target-dir target/fail-closed
+      - name: Fail closed within one second
+        shell: pwsh
+        env:
+          SOFTLOCK_FAIL_CLOSED_LIVE: ${{ matrix.case }}
+          SOFTLOCK_SERVICE_EXE: ${{ github.workspace }}\target\fail-closed\release\softlock-service.exe
+          SOFTLOCK_APP_EXE: ${{ github.workspace }}\target\fail-closed\release\softlock-app.exe
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --release --locked -p softlock-lockhost --test fail_closed_live -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload the fail-closed report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: os-lock-fail-closed-${{ matrix.case }}-${{ matrix.image }}
+          path: ${{ runner.temp }}/softlock-fail-closed/result.json
+          if-no-files-found: error

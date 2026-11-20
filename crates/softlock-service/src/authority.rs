@@ -24,6 +24,15 @@ use crate::platform::{ArmWait, ServicePlatform};
 const SILENCE: Duration = Duration::from_millis(750);
 const OS_LOCK_RETRY: Duration = Duration::from_secs(1);
 
+/// True when `current` is a fall-back the subscriber has not been shown.
+/// Starting `previous` at `None` replays a fall-back that already happened.
+pub fn fallback_is_new(
+    previous: Option<softlock_core::Fallback>,
+    current: Option<softlock_core::Fallback>,
+) -> bool {
+    current.is_some() && current != previous
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostLoss {
     Exited,
@@ -90,6 +99,10 @@ impl Authority {
 
     pub fn state_name(&self) -> StateName {
         self.controller.state().name()
+    }
+
+    pub fn last_fallback(&self) -> Option<softlock_core::Fallback> {
+        self.controller.notifications().back().copied()
     }
 
     pub fn recovery_due(&self) -> bool {
@@ -229,15 +242,36 @@ impl Authority {
                 self.note_host_lost(HostLoss::GuardDown);
                 Ok(None)
             }
+            HostToService::HardLock { .. } => {
+                self.controller.handle(Event::Public {
+                    role: Role::LockHost,
+                    kind: RequestKind::HardLock,
+                });
+                Ok(None)
+            }
             HostToService::SubmitSecret { method, secret, .. } => {
                 Ok(Some(self.decide_secret(&method, secret)))
             }
         }
     }
 
+    pub fn note_os_lock_held(&mut self) {
+        self.controller.note_os_lock_held();
+    }
+
+    /// A new subscriber must start from the fall-back already recorded, or the
+    /// stream treats that old value as a new event.
+    pub fn fallback_stream_start(&self) -> Option<softlock_core::Fallback> {
+        self.last_fallback()
+    }
+
     pub fn note_host_lost(&mut self, loss: HostLoss) {
         self.host_ready = false;
         self.last_beat = None;
+        #[cfg(windows)]
+        if matches!(loss, HostLoss::Exited | HostLoss::Silent) {
+            crate::windows::mark_host_unavailable(loss);
+        }
         let (event, kind) = match loss {
             HostLoss::Exited => (Event::HostExited, "exited"),
             HostLoss::Silent => (Event::HostSilent, "silent"),
@@ -255,6 +289,10 @@ impl Authority {
     /// Respawns when the host is gone. Retries the OS lock while it is down.
     /// Neither result is Unlocked.
     pub fn poll_host(&mut self, now: Instant, process_alive: bool) -> HostAction {
+        #[cfg(windows)]
+        if crate::windows::chain_running() {
+            return HostAction::Hold;
+        }
         let stale = self
             .last_beat
             .is_some_and(|last| now.saturating_duration_since(last) >= SILENCE);
@@ -508,9 +546,8 @@ pub fn dev_pin_allowed() -> bool {
 }
 
 pub fn pin_directory() -> PathBuf {
-    #[cfg(feature = "simulated-physical")]
-    if let Ok(dir) = std::env::var("SOFTLOCK_PIN_DIR") {
-        return PathBuf::from(dir);
+    if let Some(dir) = test_path("SOFTLOCK_PIN_DIR") {
+        return dir;
     }
     service_data_directory()
 }
@@ -552,19 +589,38 @@ fn default_pin_directory() -> PathBuf {
 }
 
 pub fn log_path() -> PathBuf {
-    #[cfg(feature = "simulated-physical")]
-    if let Ok(path) = std::env::var("SOFTLOCK_LOG") {
-        return PathBuf::from(path);
+    if let Some(path) = test_path("SOFTLOCK_LOG") {
+        return path;
     }
     pin_directory().join("service.log")
 }
 
 pub fn pipe_path() -> String {
-    #[cfg(feature = "simulated-physical")]
-    if let Ok(name) = std::env::var("SOFTLOCK_PIPE") {
-        return name;
+    if let Some(path) = test_path("SOFTLOCK_PIPE") {
+        return path.to_string_lossy().to_string();
     }
     softlock_core::pipe_name()
+}
+
+fn test_path(name: &str) -> Option<PathBuf> {
+    #[cfg(feature = "simulated-physical")]
+    {
+        if let Ok(path) = std::env::var(name) {
+            return Some(PathBuf::from(path));
+        }
+    }
+    #[cfg(all(
+        windows,
+        feature = "live-fail-closed",
+        not(feature = "simulated-physical")
+    ))]
+    if crate::windows::live_hooks_allowed()
+        && let Ok(path) = std::env::var(name)
+    {
+        return Some(PathBuf::from(path));
+    }
+    let _ = name;
+    None
 }
 
 pub fn stub_os_lock() -> bool {

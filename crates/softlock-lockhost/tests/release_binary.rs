@@ -8,6 +8,8 @@ const MARKER_STRING: &[u8] = b"softlock-simulated-physical-marker";
 const MARKER_SYMBOL: &[u8] = b"softlock_simulated_physical_marker";
 const DEV_STRING: &[u8] = b"softlock-dev-launch-marker";
 const DEV_SYMBOL: &[u8] = b"softlock_dev_launch_marker";
+const LIVE_STRING: &[u8] = b"softlock-live-fail-closed-marker";
+const LIVE_SYMBOL: &[u8] = b"softlock_live_fail_closed_marker";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Hit {
@@ -16,6 +18,8 @@ struct Hit {
     symbol: bool,
     dev_string: bool,
     dev_symbol: bool,
+    live_string: bool,
+    live_symbol: bool,
 }
 
 #[test]
@@ -163,6 +167,25 @@ fn contaminated_build_fails_the_release_binary_check() {
         "a service binary with the test feature must fail the scan:\n{}",
         format_hits(&service_hits)
     );
+    let live_dir = root.join("live");
+    build(&live_dir, "softlock-service", Some("live-fail-closed"))
+        .expect("service release build with live-fail-closed");
+    let live_hits = scan(&live_dir.join("release"), "");
+    assert!(
+        live_hits
+            .iter()
+            .any(|hit| hit.live_string && hit.live_symbol),
+        "a service binary with live-fail-closed must fail the scan:\n{}",
+        format_hits(&live_hits)
+    );
+    let clean_live = scan(&clean_dir.join("release"), "");
+    assert!(
+        clean_live
+            .iter()
+            .all(|hit| !hit.live_string && !hit.live_symbol),
+        "a release build without live-fail-closed must not contain its marker:\n{}",
+        format_hits(&clean_live)
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -235,13 +258,17 @@ fn scan(root: &Path, name_filter: &str) -> Vec<Hit> {
         let symbol = contains(&bytes, MARKER_SYMBOL);
         let dev_string = contains(&bytes, DEV_STRING);
         let dev_symbol = contains(&bytes, DEV_SYMBOL);
-        if string || symbol || dev_string || dev_symbol {
+        let live_string = contains(&bytes, LIVE_STRING);
+        let live_symbol = contains(&bytes, LIVE_SYMBOL);
+        if string || symbol || dev_string || dev_symbol || live_string || live_symbol {
             hits.push(Hit {
                 path: path.display().to_string(),
                 string,
                 symbol,
                 dev_string,
                 dev_symbol,
+                live_string,
+                live_symbol,
             });
         }
     }
@@ -337,8 +364,14 @@ fn format_hits(hits: &[Hit]) -> String {
     hits.iter()
         .map(|hit| {
             format!(
-                "{} string={} symbol={} dev_string={} dev_symbol={}",
-                hit.path, hit.string, hit.symbol, hit.dev_string, hit.dev_symbol
+                "{} string={} symbol={} dev_string={} dev_symbol={} live_string={} live_symbol={}",
+                hit.path,
+                hit.string,
+                hit.symbol,
+                hit.dev_string,
+                hit.dev_symbol,
+                hit.live_string,
+                hit.live_symbol
             )
         })
         .collect::<Vec<_>>()

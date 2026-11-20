@@ -1,0 +1,4 @@
+disallowed-methods = [
+    "windows::Win32::System::RemoteDesktop::WTSConnectSessionW",
+    "windows::Win32::System::RemoteDesktop::WTSConnectSessionA",
+]

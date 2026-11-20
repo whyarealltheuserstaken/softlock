@@ -46,6 +46,7 @@ const WM_REFRESH: u32 = 0x8001;
 pub const WM_LOCK_APP: u32 = 0x8002;
 pub const CMD_LOCK: usize = 10;
 pub const CMD_QUIT: usize = 11;
+pub const CMD_HARD_LOCK: usize = 12;
 
 static VIEW: OnceLock<Mutex<OwnerView>> = OnceLock::new();
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -55,7 +56,13 @@ static AUTOSTART_CODE: AtomicU32 = AtomicU32::new(0);
 static WATCH_THREAD: AtomicU32 = AtomicU32::new(0);
 static STATUS_SEQ: AtomicU64 = AtomicU64::new(0);
 static APP: OnceLock<AppHandle> = OnceLock::new();
-static LOCK_WAKE: OnceLock<Sender<LockSource>> = OnceLock::new();
+static LOCK_WAKE: OnceLock<Sender<TrayAction>> = OnceLock::new();
+static FALLBACK_NOTICE: Mutex<String> = Mutex::new(String::new());
+
+enum TrayAction {
+    Lock(LockSource),
+    HardLock,
+}
 
 fn owner_class_name() -> String {
     format!("{}-owner", softlock_core::SERVICE_ID)
@@ -72,14 +79,26 @@ fn ui_text(key: &str) -> String {
 }
 
 fn skip_autostart() -> bool {
-    #[cfg(feature = "simulated-physical")]
+    #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
     {
-        std::env::var("SOFTLOCK_NO_AUTOSTART").ok().as_deref() == Some("1")
+        if std::env::var("SOFTLOCK_NO_AUTOSTART").ok().as_deref() == Some("1")
+            && autostart_override_allowed()
+        {
+            return true;
+        }
     }
-    #[cfg(not(feature = "simulated-physical"))]
-    {
-        false
-    }
+    false
+}
+
+#[cfg(feature = "simulated-physical")]
+fn autostart_override_allowed() -> bool {
+    true
+}
+
+#[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
+fn autostart_override_allowed() -> bool {
+    std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
+        && std::env::var("RUNNER_ENVIRONMENT").ok().as_deref() == Some("github-hosted")
 }
 
 fn status_file_path() -> Option<String> {
@@ -121,7 +140,7 @@ pub fn run(app: Option<AppHandle>) -> i32 {
     QUIT.store(true, Ordering::Release);
     cancel_watch_read();
     if let Some(sender) = LOCK_WAKE.get() {
-        let _ = sender.send(LockSource::Hotkey);
+        let _ = sender.send(TrayAction::Lock(LockSource::Hotkey));
     }
     if let Some(app) = APP.get() {
         app.exit(0);
@@ -144,24 +163,62 @@ pub fn lock_from_app() {
 }
 
 fn enqueue_lock(source: LockSource) {
+    enqueue(TrayAction::Lock(source));
+}
+
+fn enqueue_hard_lock() {
+    enqueue(TrayAction::HardLock);
+}
+
+fn enqueue(action: TrayAction) {
     if let Some(sender) = LOCK_WAKE.get() {
-        let _ = sender.send(source);
+        let _ = sender.send(action);
     } else {
-        perform_lock(source);
+        run_tray_action(action);
     }
 }
 
 fn start_lock_worker() {
-    let (sender, receiver) = mpsc::channel::<LockSource>();
+    let (sender, receiver) = mpsc::channel::<TrayAction>();
     let _ = LOCK_WAKE.set(sender);
     thread::spawn(move || {
-        while let Ok(source) = receiver.recv() {
+        while let Ok(action) = receiver.recv() {
             if QUIT.load(Ordering::Acquire) {
                 break;
             }
-            perform_lock(source);
+            run_tray_action(action);
         }
     });
+}
+
+fn run_tray_action(action: TrayAction) {
+    match action {
+        TrayAction::Lock(source) => perform_lock(source),
+        TrayAction::HardLock => perform_hard_lock(),
+    }
+}
+
+fn perform_hard_lock() {
+    let outcome = transact(actions::hard_lock_request());
+    match outcome {
+        Ok(ResponseKind::Accepted | ResponseKind::AlreadyLocked) => {
+            if let Ok(status) = transact(RequestKind::GetStatus) {
+                publish(view_from_status(&status));
+            }
+        }
+        Ok(_) => {
+            if let Ok(status) = transact(RequestKind::GetStatus) {
+                publish(view_from_status(&status));
+            } else {
+                publish(OwnerView::unknown());
+            }
+        }
+        Err(_) => publish(OwnerView::unknown()),
+    }
+}
+
+pub fn lock_for_real() {
+    enqueue_hard_lock();
 }
 
 fn perform_lock(source: LockSource) {
@@ -257,8 +314,21 @@ fn state_label(state: Option<softlock_core::StateName>) -> String {
         .unwrap_or_else(|| "Locked".to_string())
 }
 
+pub fn set_fallback_notice(notice: String) {
+    *FALLBACK_NOTICE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = notice;
+}
+
 fn notice_text() -> String {
     let mut parts = Vec::new();
+    let fallback = FALLBACK_NOTICE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if !fallback.is_empty() {
+        parts.push(fallback);
+    }
     if !HOTKEY_OK.load(Ordering::Acquire) {
         parts.push(ui_text("hotkeyUnavailable"));
     }
@@ -330,6 +400,9 @@ fn watch_states() {
                 }
             };
             let decoded = client::decode_response(&frame);
+            if let Ok(ResponseKind::FellBackToOsLock { fallback }) = &decoded {
+                set_fallback_notice(actions::fallback_notice(fallback));
+            }
             let next = client::view_after(&current_view(), &decoded);
             if decoded.is_ok() {
                 publish(next);
@@ -376,6 +449,7 @@ fn window_loop() -> i32 {
         Err(_) => return 1,
     };
     WINDOW.store(hwnd.0 as isize, Ordering::Release);
+    publish_owner_hwnd(hwnd);
     let hotkey = actions::default_hotkey();
     let registered = unsafe {
         RegisterHotKey(
@@ -435,6 +509,7 @@ unsafe extern "system" fn wndproc(
         WM_COMMAND => {
             match wparam.0 & 0xffff {
                 CMD_LOCK => enqueue_lock(LockSource::Tray),
+                CMD_HARD_LOCK => enqueue_hard_lock(),
                 CMD_QUIT => {
                     let _ = request_quit();
                 }
@@ -464,6 +539,7 @@ fn show_menu(hwnd: HWND) {
     let status = wide(&status_line(view.service_running, view.state));
     let service = wide(service_line(view.service_running));
     let lock_now = wide(&ui_text("lockNow"));
+    let lock_for_real = wide(&ui_text("lockForReal"));
     let quit = wide(&ui_text("quit"));
     let notice = wide(&notice_text());
     unsafe {
@@ -473,12 +549,34 @@ fn show_menu(hwnd: HWND) {
             let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 3, PCWSTR(notice.as_ptr()));
         }
         let _ = AppendMenuW(menu, MF_STRING, CMD_LOCK, PCWSTR(lock_now.as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            CMD_HARD_LOCK,
+            PCWSTR(lock_for_real.as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, PCWSTR(quit.as_ptr()));
         let mut point = windows::Win32::Foundation::POINT::default();
         let _ = GetCursorPos(&mut point);
         let _ = SetForegroundWindow(hwnd);
         let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, Some(0), hwnd, None);
         let _ = DestroyMenu(menu);
+    }
+}
+
+fn publish_owner_hwnd(hwnd: HWND) {
+    #[cfg(feature = "live-fail-closed")]
+    {
+        if std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
+            && std::env::var("RUNNER_ENVIRONMENT").ok().as_deref() == Some("github-hosted")
+            && let Ok(path) = std::env::var("SOFTLOCK_OWNER_HWND")
+        {
+            let _ = std::fs::write(path, (hwnd.0 as isize).to_string());
+        }
+    }
+    #[cfg(not(feature = "live-fail-closed"))]
+    {
+        let _ = hwnd;
     }
 }
 
