@@ -19,6 +19,10 @@ on:
       - 'crates/softlock-app/src-tauri/src/owner.rs'
       - 'crates/softlock-app/src-tauri/src/client.rs'
       - 'crates/softlock-service/src/authority.rs'
+      - 'crates/softlock-windows/**'
+      - 'crates/softlock-core/src/**'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/os-lock-fail-closed.yml'
 
 permissions:
