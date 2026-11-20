@@ -50,4 +50,13 @@ mod tests {
     fn both_paths_failing_is_unavailable() {
         assert_eq!(decide(false, false), RealLock::Unavailable);
     }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn live_fail_closed_stays_off_in_the_default_build() {
+        assert!(
+            !cfg!(feature = "live-fail-closed"),
+            "the default build compiled the hosted fail-closed hooks"
+        );
+    }
 }

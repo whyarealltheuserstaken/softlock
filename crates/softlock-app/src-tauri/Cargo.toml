@@ -20,6 +20,9 @@ tauri-build = { version = "2", features = [] }
 # Test-only. Release builds do not enable this. It lets a seam test point
 # the app at the service's temporary pipe. The product tree leaves it off.
 simulated-physical = []
+# Test-only. Release, universal, and product builds do not enable this.
+# The hosted tray case passes it so the owner window can use the job's pipe.
+live-fail-closed = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

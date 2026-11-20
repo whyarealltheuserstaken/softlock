@@ -7,6 +7,10 @@ fn main() {
     {
         let _ = softlock_service::marker_bytes();
     }
+    #[cfg(feature = "live-fail-closed")]
+    {
+        let _ = softlock_service::live_fail_closed_marker_bytes();
+    }
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("--print-names") => {

@@ -85,6 +85,8 @@ scan_fails_when_fat_binary_has_markers() {
   printf '%s' 'softlock_simulated_physical_marker' >> "${dest}"
   printf '%s' 'softlock-dev-launch-marker' >> "${dest}"
   printf '%s' 'softlock_dev_launch_marker' >> "${dest}"
+  printf '%s' 'softlock-live-fail-closed-marker' >> "${dest}"
+  printf '%s' 'softlock_live_fail_closed_marker' >> "${dest}"
   echo "=== negative control ${dest} ==="
   echo "appended softlock-simulated-physical-marker"
   echo "appended softlock_simulated_physical_marker"

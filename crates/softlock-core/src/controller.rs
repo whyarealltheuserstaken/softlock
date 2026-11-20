@@ -464,10 +464,21 @@ impl<P: Platform> LockController<P> {
     }
 
     /// The Windows service calls this after a lock that ran outside the
-    /// authority mutex has been confirmed.
+    /// authority mutex has been confirmed. A guarded `Locked` or `Arming`
+    /// session keeps a recorded failure: clearing it there would look like
+    /// the OS lock had already succeeded.
     pub fn note_os_lock_held(&mut self) {
-        self.os_lock_unavailable = false;
-        self.recovery_due = false;
+        if os_lock_held_clears(&self.state) {
+            self.os_lock_unavailable = false;
+            self.recovery_due = false;
+        }
+    }
+
+    /// Test setup. Marks the OS lock down without leaving the current state.
+    #[cfg(feature = "test-support")]
+    pub fn test_mark_os_lock_down(&mut self) {
+        self.os_lock_unavailable = true;
+        self.recovery_due = true;
     }
 
     fn request_os_lock(&mut self) {
@@ -883,6 +894,13 @@ fn request_name(kind: &RequestKind) -> &'static str {
         RequestKind::CheckUpdate => "CheckUpdate",
         RequestKind::InstallUpdate { .. } => "InstallUpdate",
     }
+}
+
+fn os_lock_held_clears(state: &LockState) -> bool {
+    matches!(
+        state,
+        LockState::FailingClosed { .. } | LockState::OsLocked { .. } | LockState::Unlocked
+    )
 }
 
 fn wall_unix_ms() -> i64 {

@@ -572,11 +572,59 @@ fn the_fail_closed_job_covers_each_hosted_case() {
             .expect("live test");
     assert!(test.contains("SOFTLOCK_FAIL_CLOSED_LIVE"));
     assert!(test.contains("from_secs(1)"));
-    assert!(test.contains("Unlocked"));
+    assert!(test.contains("GetStatus"));
+    assert!(test.contains("WM_COMMAND"));
+    assert!(test.contains("live-fail-closed"));
+    assert!(job.contains("live-fail-closed"));
+    assert!(job.contains("softlock-fail-closed"));
     let owner = std::fs::read_to_string(root.join("crates/softlock-app/src-tauri/src/owner.rs"))
         .expect("owner");
     assert!(owner.contains("CMD_HARD_LOCK"));
     assert!(owner.contains("enqueue_hard_lock"));
+}
+
+#[test]
+fn release_universal_and_product_builds_leave_live_fail_closed_off() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for relative in [
+        "crates/softlock-service/Cargo.toml",
+        "crates/softlock-lockhost/Cargo.toml",
+        "crates/softlock-app/src-tauri/Cargo.toml",
+    ] {
+        let text = std::fs::read_to_string(root.join(relative)).expect(relative);
+        assert!(
+            text.contains("live-fail-closed"),
+            "{relative} does not declare the feature"
+        );
+        assert!(
+            !text.contains("default = [\"live-fail-closed\"]")
+                && !text.contains("default = [\"simulated-physical\", \"live-fail-closed\"]"),
+            "{relative} enables live-fail-closed by default"
+        );
+    }
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci");
+    assert!(
+        ci.matches("live-fail-closed feature reached a product crate")
+            .count()
+            >= 3,
+        "linux, windows, and macOS product trees do not reject live-fail-closed"
+    );
+    let scan = std::fs::read_to_string(root.join(".github/universal-scan.sh")).expect("scan");
+    assert!(scan.contains("softlock-live-fail-closed-marker"));
+    assert!(scan.contains("softlock_live_fail_closed_marker"));
+    let windows = std::fs::read_to_string(root.join("crates/softlock-service/src/windows.rs"))
+        .expect("windows");
+    let authority = std::fs::read_to_string(root.join("crates/softlock-service/src/authority.rs"))
+        .expect("authority");
+    let session = std::fs::read_to_string(root.join("crates/softlock-lockhost/src/win/session.rs"))
+        .expect("session");
+    let failclosed =
+        std::fs::read_to_string(root.join("crates/softlock-lockhost/src/win/failclosed.rs"))
+            .expect("failclosed");
+    assert!(windows.contains("feature = \"live-fail-closed\""));
+    assert!(authority.contains("feature = \"live-fail-closed\""));
+    assert!(session.contains("feature = \"live-fail-closed\""));
+    assert!(failclosed.contains("feature = \"live-fail-closed\""));
 }
 
 fn collect(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {

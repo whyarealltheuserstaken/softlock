@@ -118,20 +118,39 @@ pub fn drain_os_lock(authority: &Arc<Mutex<Authority>>) {
         return;
     };
     if CHAIN_RUNNING.swap(true, Ordering::AcqRel) {
-        *DEFERRED.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(job);
+        restore_deferred(job);
         return;
     }
-    let result = run_os_lock(job.session, job.caller);
-    {
+    let _reset = ChainReset;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_os_lock(job.session, job.caller)
+    }));
+    if let Ok(Ok(())) = result {
         let mut guard = authority
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if result.is_ok() {
-            guard.note_os_lock_held();
-            guard.notify(Event::OsLockConfirmed);
-        }
+        guard.note_os_lock_held();
+        guard.notify(Event::OsLockConfirmed);
     }
-    CHAIN_RUNNING.store(false, Ordering::Release);
+}
+
+/// Clears the chain flag when the OS lock returns or panics. A panic that
+/// left the flag set would make every later host poll wait forever.
+struct ChainReset;
+
+impl Drop for ChainReset {
+    fn drop(&mut self) {
+        CHAIN_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+/// A job that arrived while the chain was busy stays. Putting the older job
+/// back would drop that newer request.
+fn restore_deferred(job: DeferredLock) {
+    let mut slot = DEFERRED.lock().unwrap_or_else(|poison| poison.into_inner());
+    if slot.is_none() {
+        *slot = Some(job);
+    }
 }
 
 fn planned_caller() -> softlock_core::Caller {
@@ -462,11 +481,14 @@ fn apply_session_events(authority: &Arc<Mutex<Authority>>, events: &Receiver<Ses
 /// Stop is accepted only from `Unlocked` or after the OS lock is confirmed.
 /// `Locked`, `Arming`, and `FailingClosed` stay up when that confirmation fails.
 fn note_stop_file() {
-    let Ok(path) = std::env::var("SOFTLOCK_STOP_FILE") else {
-        return;
-    };
-    if live_hooks_allowed() && Path::new(&path).is_file() {
-        STOP_REQUESTED.store(true, Ordering::Release);
+    #[cfg(feature = "live-fail-closed")]
+    {
+        let Ok(path) = std::env::var("SOFTLOCK_STOP_FILE") else {
+            return;
+        };
+        if live_hooks_allowed() && Path::new(&path).is_file() {
+            STOP_REQUESTED.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -1012,11 +1034,7 @@ fn environment_block(allow_panic: bool) -> Vec<u16> {
     let mut pairs: Vec<(String, String)> = std::env::vars()
         .filter(|(key, _)| host_env_allowed(key, allow_panic))
         .collect();
-    for key in [
-        "SOFTLOCK_STUB_OS_LOCK",
-        "SOFTLOCK_RUN_NONCE",
-        "SOFTLOCK_OS_LOCK_MARK",
-    ] {
+    for key in ["SOFTLOCK_STUB_OS_LOCK", "SOFTLOCK_RUN_NONCE"] {
         if let Ok(value) = std::env::var(key)
             && !pairs
                 .iter()
@@ -1024,6 +1042,14 @@ fn environment_block(allow_panic: bool) -> Vec<u16> {
         {
             pairs.push((key.to_string(), value));
         }
+    }
+    #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+    if let Ok(value) = std::env::var("SOFTLOCK_OS_LOCK_MARK")
+        && !pairs
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case("SOFTLOCK_OS_LOCK_MARK"))
+    {
+        pairs.push(("SOFTLOCK_OS_LOCK_MARK".to_string(), value));
     }
     if allow_panic
         && let Ok(value) = std::env::var("SOFTLOCK_PANIC")
@@ -1098,15 +1124,26 @@ fn host_env_allowed(key: &str, allow_panic: bool) -> bool {
         return true;
     }
     match key {
-        "SOFTLOCK_STUB_OS_LOCK"
-        | "SOFTLOCK_RUN_NONCE"
-        | "SOFTLOCK_OS_LOCK_MARK"
-        | "SOFTLOCK_FORCE_GUARD_DOWN"
-        | "GITHUB_ACTIONS"
-        | "RUNNER_ENVIRONMENT" => true,
+        "SOFTLOCK_STUB_OS_LOCK" | "SOFTLOCK_RUN_NONCE" => true,
         "SOFTLOCK_PANIC" => allow_panic,
-        _ => false,
+        _ => host_test_env(key),
     }
+}
+
+fn host_test_env(key: &str) -> bool {
+    #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+    if key.eq_ignore_ascii_case("SOFTLOCK_OS_LOCK_MARK") {
+        return true;
+    }
+    #[cfg(feature = "live-fail-closed")]
+    if key.eq_ignore_ascii_case("SOFTLOCK_FORCE_GUARD_DOWN")
+        || key.eq_ignore_ascii_case("GITHUB_ACTIONS")
+        || key.eq_ignore_ascii_case("RUNNER_ENVIRONMENT")
+    {
+        return true;
+    }
+    let _ = key;
+    false
 }
 
 fn lock_host_exe() -> std::io::Result<PathBuf> {
@@ -1521,7 +1558,15 @@ fn client_role(image: &str) -> softlock_core::Role {
 }
 
 fn dev_app_role() -> bool {
-    std::env::var("SOFTLOCK_DEV_APP").ok().as_deref() == Some("1") && dev_app_role_allowed()
+    #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+    {
+        return std::env::var("SOFTLOCK_DEV_APP").ok().as_deref() == Some("1")
+            && dev_app_role_allowed();
+    }
+    #[cfg(not(any(feature = "simulated-physical", feature = "live-fail-closed")))]
+    {
+        false
+    }
 }
 
 #[cfg(feature = "simulated-physical")]
@@ -1529,11 +1574,12 @@ fn dev_app_role_allowed() -> bool {
     true
 }
 
-#[cfg(not(feature = "simulated-physical"))]
+#[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
 fn dev_app_role_allowed() -> bool {
     live_hooks_allowed()
 }
 
+#[cfg(feature = "live-fail-closed")]
 pub fn live_hooks_allowed() -> bool {
     softlock_windows::runner_may_lock().is_ok()
 }
@@ -1815,15 +1861,27 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 fn install_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("SOFTLOCK_INSTALL_DIR")
-        && (cfg!(feature = "simulated-physical") || live_hooks_allowed())
-    {
-        return PathBuf::from(dir);
+    if let Some(dir) = install_dir_override() {
+        return dir;
     }
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn install_dir_override() -> Option<PathBuf> {
+    #[cfg(feature = "simulated-physical")]
+    if let Ok(dir) = std::env::var("SOFTLOCK_INSTALL_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    #[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
+    if live_hooks_allowed()
+        && let Ok(dir) = std::env::var("SOFTLOCK_INSTALL_DIR")
+    {
+        return Some(PathBuf::from(dir));
+    }
+    None
 }
 
 fn set_status(
@@ -1917,5 +1975,69 @@ mod session_filter {
             )
             .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, MutexGuard};
+
+    use super::{
+        CHAIN_RUNNING, ChainReset, DEFERRED, DeferredLock, chain_running, restore_deferred,
+    };
+
+    fn hold() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[test]
+    fn a_panic_in_the_os_lock_chain_clears_the_running_flag() {
+        let _hold = hold();
+        CHAIN_RUNNING.store(true, Ordering::Release);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reset = ChainReset;
+            panic!("os lock");
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            !chain_running(),
+            "a panic left the chain flag set, so host polls would stall"
+        );
+    }
+
+    #[test]
+    fn a_busy_chain_does_not_replace_a_newer_job() {
+        let _hold = hold();
+        CHAIN_RUNNING.store(false, Ordering::Release);
+        *DEFERRED.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(DeferredLock {
+            session: 9,
+            caller: softlock_core::Caller::Service,
+        });
+        restore_deferred(DeferredLock {
+            session: 4,
+            caller: softlock_core::Caller::LockHost,
+        });
+        let kept = DEFERRED
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        assert_eq!(kept.expect("job").session, 9);
+    }
+
+    #[test]
+    fn an_empty_slot_keeps_the_deferred_job() {
+        let _hold = hold();
+        *DEFERRED.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+        restore_deferred(DeferredLock {
+            session: 4,
+            caller: softlock_core::Caller::Service,
+        });
+        let kept = DEFERRED
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        assert_eq!(kept.expect("job").session, 4);
     }
 }

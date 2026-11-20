@@ -81,6 +81,7 @@ jobs:
           cargo clippy --workspace --all-targets --features softlock-core/test-support -- -D warnings
           cargo clippy --workspace --all-targets --features softlock-lockhost/simulated-physical -- -D warnings
           cargo clippy --workspace --all-targets --features softlock-lockhost/dev-launch,softlock-seam3/dev-launch -- -D warnings
+          cargo clippy --workspace --all-targets --features softlock-service/live-fail-closed,softlock-lockhost/live-fail-closed,softlock-app/live-fail-closed -- -D warnings
       - name: Core has no Windows-only dependency
         run: cargo build -p softlock-core --all-targets
       - name: Seam 1
@@ -103,6 +104,10 @@ jobs:
           fi
           if grep -F dev-launch target/product-features.txt; then
             echo "dev-launch feature reached a product crate"
+            exit 1
+          fi
+          if grep -F live-fail-closed target/product-features.txt; then
+            echo "live-fail-closed feature reached a product crate"
             exit 1
           fi
       - name: Release binaries omit test-only markers
@@ -158,6 +163,7 @@ jobs:
           cargo clippy --workspace --all-targets --features softlock-core/test-support -- -D warnings
           cargo clippy --workspace --all-targets --features softlock-lockhost/simulated-physical -- -D warnings
           cargo clippy --workspace --all-targets --features softlock-lockhost/dev-launch,softlock-seam3/dev-launch -- -D warnings
+          cargo clippy --workspace --all-targets --features softlock-service/live-fail-closed,softlock-lockhost/live-fail-closed,softlock-app/live-fail-closed -- -D warnings
       - name: Core has no Windows-only dependency
         run: cargo build -p softlock-core --all-targets
       - name: Seam 1
@@ -180,6 +186,10 @@ jobs:
           fi
           if grep -F dev-launch target/product-features.txt; then
             echo "dev-launch feature reached a product crate"
+            exit 1
+          fi
+          if grep -F live-fail-closed target/product-features.txt; then
+            echo "live-fail-closed feature reached a product crate"
             exit 1
           fi
       - name: Release binaries omit test-only markers
@@ -259,6 +269,7 @@ jobs:
           cargo clippy --workspace --all-targets --features softlock-core/test-support -- -D warnings
           cargo clippy --workspace --all-targets --features softlock-lockhost/simulated-physical -- -D warnings
           cargo clippy --workspace --all-targets --features softlock-lockhost/dev-launch,softlock-seam3/dev-launch -- -D warnings
+          cargo clippy --workspace --all-targets --features softlock-service/live-fail-closed,softlock-lockhost/live-fail-closed,softlock-app/live-fail-closed -- -D warnings
       - name: Core has no Windows-only dependency
         run: cargo build -p softlock-core --all-targets
       - name: Seam 1
@@ -281,6 +292,10 @@ jobs:
           fi
           if grep -F dev-launch target/product-features.txt; then
             echo "dev-launch feature reached a product crate"
+            exit 1
+          fi
+          if grep -F live-fail-closed target/product-features.txt; then
+            echo "live-fail-closed feature reached a product crate"
             exit 1
           fi
       - name: Release binaries omit test-only markers

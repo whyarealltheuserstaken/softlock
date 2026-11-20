@@ -4,7 +4,9 @@ name: OS lock fail-closed
 # that session. Nothing waits on these jobs. No push trigger. The test
 # refuses unless GITHUB_ACTIONS=true and RUNNER_ENVIRONMENT=github-hosted,
 # and it refuses the school workstation before any lock call. The binaries
-# are built without simulated-physical so the OS lock is real. This job
+# are built without simulated-physical so the OS lock is real. The
+# live-fail-closed feature is on for this job only. Release and product
+# builds leave it off, so the test hooks are not compiled. This job
 # never reconnects the session.
 on:
   workflow_dispatch:
@@ -14,6 +16,9 @@ on:
       - 'crates/softlock-lockhost/src/win/failclosed.rs'
       - 'crates/softlock-lockhost/src/win/session.rs'
       - 'crates/softlock-lockhost/tests/fail_closed_live.rs'
+      - 'crates/softlock-app/src-tauri/src/owner.rs'
+      - 'crates/softlock-app/src-tauri/src/client.rs'
+      - 'crates/softlock-service/src/authority.rs'
       - '.github/workflows/os-lock-fail-closed.yml'
 
 permissions:
@@ -51,16 +56,25 @@ jobs:
           if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
             throw 'refusing a runner that is not GitHub-hosted'
           }
-      - name: Build the service and the Lock Host without a stub
+      - name: Build the service and the Lock Host with the hosted hooks
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cargo build --release --locked -p softlock-service -p softlock-lockhost
+          cargo build --release --locked -p softlock-service --features live-fail-closed --target-dir target/fail-closed
+          cargo build --release --locked -p softlock-lockhost --features live-fail-closed --target-dir target/fail-closed
+      - name: Build the owner session for the tray case
+        if: matrix.case == 'tray-hard-lock'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm ci --prefix crates/softlock-app
+          cargo build --release --locked -p softlock-app --features live-fail-closed --bin softlock-app --target-dir target/fail-closed
       - name: Fail closed within one second
         shell: pwsh
         env:
           SOFTLOCK_FAIL_CLOSED_LIVE: ${{ matrix.case }}
-          SOFTLOCK_SERVICE_EXE: ${{ github.workspace }}\target\release\softlock-service.exe
+          SOFTLOCK_SERVICE_EXE: ${{ github.workspace }}\target\fail-closed\release\softlock-service.exe
+          SOFTLOCK_APP_EXE: ${{ github.workspace }}\target\fail-closed\release\softlock-app.exe
         run: |
           $ErrorActionPreference = 'Stop'
           cargo test --release --locked -p softlock-lockhost --test fail_closed_live -- --nocapture
@@ -70,6 +84,5 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: os-lock-fail-closed-${{ matrix.case }}-${{ matrix.image }}
-          path: |
-            **/result.json
-          if-no-files-found: warn
+          path: ${{ runner.temp }}/softlock-fail-closed/result.json
+          if-no-files-found: error

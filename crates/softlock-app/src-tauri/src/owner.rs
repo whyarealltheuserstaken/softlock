@@ -79,14 +79,26 @@ fn ui_text(key: &str) -> String {
 }
 
 fn skip_autostart() -> bool {
-    #[cfg(feature = "simulated-physical")]
+    #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
     {
-        std::env::var("SOFTLOCK_NO_AUTOSTART").ok().as_deref() == Some("1")
+        if std::env::var("SOFTLOCK_NO_AUTOSTART").ok().as_deref() == Some("1")
+            && autostart_override_allowed()
+        {
+            return true;
+        }
     }
-    #[cfg(not(feature = "simulated-physical"))]
-    {
-        false
-    }
+    false
+}
+
+#[cfg(feature = "simulated-physical")]
+fn autostart_override_allowed() -> bool {
+    true
+}
+
+#[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
+fn autostart_override_allowed() -> bool {
+    std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
+        && std::env::var("RUNNER_ENVIRONMENT").ok().as_deref() == Some("github-hosted")
 }
 
 fn status_file_path() -> Option<String> {
@@ -437,6 +449,7 @@ fn window_loop() -> i32 {
         Err(_) => return 1,
     };
     WINDOW.store(hwnd.0 as isize, Ordering::Release);
+    publish_owner_hwnd(hwnd);
     let hotkey = actions::default_hotkey();
     let registered = unsafe {
         RegisterHotKey(
@@ -548,6 +561,22 @@ fn show_menu(hwnd: HWND) {
         let _ = SetForegroundWindow(hwnd);
         let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, Some(0), hwnd, None);
         let _ = DestroyMenu(menu);
+    }
+}
+
+fn publish_owner_hwnd(hwnd: HWND) {
+    #[cfg(feature = "live-fail-closed")]
+    {
+        if std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
+            && std::env::var("RUNNER_ENVIRONMENT").ok().as_deref() == Some("github-hosted")
+            && let Ok(path) = std::env::var("SOFTLOCK_OWNER_HWND")
+        {
+            let _ = std::fs::write(path, (hwnd.0 as isize).to_string());
+        }
+    }
+    #[cfg(not(feature = "live-fail-closed"))]
+    {
+        let _ = hwnd;
     }
 }
 

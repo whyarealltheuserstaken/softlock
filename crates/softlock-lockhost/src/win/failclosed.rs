@@ -11,7 +11,7 @@
 //! blocking input; the overlay still shows the error and the retry still runs.
 //! Ctrl+Alt+Del is the secure attention sequence and is not swallowed.
 
-#[cfg(feature = "simulated-physical")]
+#[cfg(any(test, feature = "simulated-physical"))]
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "simulated-physical")]
 use std::sync::atomic::AtomicU8;
@@ -84,12 +84,37 @@ use softlock_core::{Caller, Method, Outcome, failed_closed_log};
 #[cfg(feature = "simulated-physical")]
 static OS_LOCK_STUB: AtomicU8 = AtomicU8::new(1);
 
+#[cfg(test)]
+static BLOCK_OS_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Holds `lock_or_disconnect` on the worker so a test can see that the
+/// window thread already returned. The held call does not touch Windows.
+#[cfg(test)]
+pub(crate) fn block_os_lock_for_test(block: bool) {
+    BLOCK_OS_LOCK.store(block, Ordering::Release);
+}
+
 pub(crate) fn lock_or_disconnect(session: u32) -> RealLock {
     let _ = session;
+    #[cfg(test)]
+    if held_for_test() {
+        return decide(false, false);
+    }
     if let Some(stubbed) = take_stub() {
         return stubbed;
     }
     finish(softlock_windows::run_lock_host(), Caller::LockHost)
+}
+
+#[cfg(test)]
+fn held_for_test() -> bool {
+    if !BLOCK_OS_LOCK.load(Ordering::Acquire) {
+        return false;
+    }
+    while BLOCK_OS_LOCK.load(Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    true
 }
 
 /// Workstation lock only. The Service confirms it and disconnects the console
@@ -142,10 +167,8 @@ fn finish(result: softlock_windows::CloseResult, caller: Caller) -> RealLock {
     for error in &result.errors {
         eprintln!("os-lock error={error}");
     }
-    if matches!(result.outcome, Outcome::Confirmed { .. })
-        && let Ok(path) = std::env::var("SOFTLOCK_OS_LOCK_MARK")
-    {
-        let _ = std::fs::write(path, b"confirmed");
+    if matches!(result.outcome, Outcome::Confirmed { .. }) {
+        write_os_lock_mark(b"confirmed");
     }
     match result.outcome {
         Outcome::Confirmed {
@@ -197,8 +220,23 @@ fn remember_os_lock_stub(stub: u8) {
 
 fn note_os_lock_attempt() {
     #[cfg(feature = "simulated-physical")]
-    if let Ok(path) = std::env::var("SOFTLOCK_OS_LOCK_MARK") {
-        let _ = std::fs::write(path, b"called");
+    write_os_lock_mark(b"called");
+}
+
+fn write_os_lock_mark(bytes: &[u8]) {
+    #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+    {
+        #[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
+        if softlock_windows::runner_may_lock().is_err() {
+            return;
+        }
+        if let Ok(path) = std::env::var("SOFTLOCK_OS_LOCK_MARK") {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+    #[cfg(not(any(feature = "simulated-physical", feature = "live-fail-closed")))]
+    {
+        let _ = bytes;
     }
 }
 

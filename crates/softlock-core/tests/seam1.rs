@@ -1765,6 +1765,49 @@ fn hard_lock_from_the_lock_host_while_locked_fails_closed() {
 }
 
 #[test]
+fn note_os_lock_held_clears_only_failing_closed_os_locked_or_unlocked() {
+    let mut locked = locked_started();
+    locked.test_mark_os_lock_down();
+    assert!(locked.os_lock_unavailable());
+    assert!(locked.recovery_due());
+    locked.note_os_lock_held();
+    assert!(
+        locked.os_lock_unavailable(),
+        "a guarded lock dropped the OS-lock failure"
+    );
+    assert!(locked.recovery_due());
+    assert!(matches!(locked.state(), LockState::Locked { .. }));
+
+    let mut platform = FakePlatform::new();
+    platform.fail_os_lock(true);
+    let mut failing = started(platform);
+    failing.handle(Event::LockRequested {
+        source: LockSource::Hotkey,
+    });
+    failing.handle(Event::HostExited);
+    assert!(matches!(failing.state(), LockState::FailingClosed { .. }));
+    assert!(failing.os_lock_unavailable());
+    assert!(failing.recovery_due());
+    failing.note_os_lock_held();
+    assert!(!failing.os_lock_unavailable());
+    assert!(!failing.recovery_due());
+    assert!(matches!(failing.state(), LockState::FailingClosed { .. }));
+
+    let mut platform = FakePlatform::new();
+    platform.fail_os_lock(true);
+    let mut unlocked = started(platform);
+    unlocked.handle(Event::Public {
+        role: Role::App,
+        kind: RequestKind::HardLock,
+    });
+    assert!(matches!(unlocked.state(), LockState::Unlocked));
+    assert!(unlocked.os_lock_unavailable());
+    unlocked.note_os_lock_held();
+    assert!(!unlocked.os_lock_unavailable());
+    assert!(matches!(unlocked.state(), LockState::Unlocked));
+}
+
+#[test]
 fn hard_lock_from_the_app_while_unlocked_calls_the_os_lock_and_stays_unlocked() {
     let mut controller = started(FakePlatform::new());
     controller.handle(Event::Public {

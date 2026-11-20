@@ -4,6 +4,8 @@
 fn main() {
     #[cfg(feature = "dev-launch")]
     let _ = softlock_lockhost::dev_launch_marker_bytes();
+    #[cfg(feature = "live-fail-closed")]
+    let _ = softlock_lockhost::live_fail_closed_marker_bytes();
     #[cfg(windows)]
     {
         let code = softlock_lockhost::run_service_host();

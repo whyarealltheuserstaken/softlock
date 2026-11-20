@@ -11,6 +11,10 @@ rust-version.workspace = true
 # Test-only. Release builds do not enable this. Injected events whose
 # extra-info matches the per-run nonce are classified as simulated-physical.
 simulated-physical = []
+# Test-only. Release, universal, and product builds do not enable this.
+# The hosted fail-closed job passes it explicitly. Guard, mark, and runner
+# hooks are not compiled without it.
+live-fail-closed = []
 # Dev-only marker. Release builds do not enable this. The lock host no longer
 # hashes a PIN or draws its own nonce.
 dev-launch = []

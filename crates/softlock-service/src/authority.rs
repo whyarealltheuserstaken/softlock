@@ -609,7 +609,11 @@ fn test_path(name: &str) -> Option<PathBuf> {
             return Some(PathBuf::from(path));
         }
     }
-    #[cfg(all(windows, not(feature = "simulated-physical")))]
+    #[cfg(all(
+        windows,
+        feature = "live-fail-closed",
+        not(feature = "simulated-physical")
+    ))]
     if crate::windows::live_hooks_allowed()
         && let Ok(path) = std::env::var(name)
     {
