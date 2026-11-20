@@ -143,7 +143,7 @@ function Test-ReparsePath([string]$path) {
     return [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }
 
-function Get-TrustIssue([string]$path) {
+function Get-TrustIssue([string]$path, [bool]$requireProtected) {
     if (Test-ReparsePath $path) { return 'reparse' }
     if (-not (Test-Path -LiteralPath $path)) { return 'missing' }
     $acl = (Get-Item -LiteralPath $path -Force).GetAccessControl()
@@ -156,7 +156,7 @@ function Get-TrustIssue([string]$path) {
     }
     $listed = $names -join ','
     if ($owner -ne 'S-1-5-18' -and $owner -ne 'S-1-5-32-544') { return "owner=$owner $protected aces=$listed" }
-    if (-not $acl.AreAccessRulesProtected) { return "owner=$owner $protected aces=$listed" }
+    if ($requireProtected -and -not $acl.AreAccessRulesProtected) { return "owner=$owner $protected aces=$listed" }
     if ($names.Count -lt 1) { return "owner=$owner no-aces" }
     foreach ($who in $names) {
         if ($who -ne 'S-1-5-18' -and $who -ne 'S-1-5-32-544') { return "owner=$owner ace=$who aces=$listed" }
@@ -165,7 +165,7 @@ function Get-TrustIssue([string]$path) {
 }
 
 function Test-OwnerTrusted([string]$path) {
-    return -not (Get-TrustIssue $path)
+    return -not (Get-TrustIssue $path $true)
 }
 
 function Test-KnownProbeName([string]$name) {
@@ -178,14 +178,18 @@ function Test-KnownProbeName([string]$name) {
 function Get-ProbeDirIssue {
     $root = 'C:\ProgramData\os-lock-probe'
     if (Test-ReparsePath 'C:\ProgramData') { return 'ProgramData reparse' }
-    $own = Get-TrustIssue $root
+    $own = Get-TrustIssue $root $true
     if ($own) { return "dir $own" }
     $item = Get-Item -LiteralPath $root -Force
     if (-not $item.PSIsContainer) { return 'dir is a file' }
     foreach ($child in @(Get-ChildItem -LiteralPath $root -Force)) {
         if (-not (Test-KnownProbeName $child.Name)) { return "child $($child.Name) unexpected" }
         if ($child.PSIsContainer) { return "child $($child.Name) directory" }
-        $issue = Get-TrustIssue $child.FullName
+        $strict = $true
+        foreach ($control in @('ready', 'service.json', 'request', 'stop', 'reconnect.on')) {
+            if ($child.Name -eq $control) { $strict = $false }
+        }
+        $issue = Get-TrustIssue $child.FullName $strict
         if ($issue) { return "child $($child.Name) $issue" }
     }
     return ''

@@ -644,7 +644,7 @@ function Add-Row([string]$id, [string]$name, [string]$status, $skip, [bool]$need
 function Invoke-Probe {
     if ($exe -like 'C:\ProgramData\os-lock-probe\*') {
         $dirIssue = Get-ProbeDirIssue
-        $fileIssue = Get-TrustIssue $exe
+        $fileIssue = Get-TrustIssue $exe $true
         if ($dirIssue -or $fileIssue) {
             throw "refusing to run a probe executable that is not owned by SYSTEM or Administrators ($dirIssue) ($fileIssue)"
         }
@@ -848,7 +848,7 @@ try {
 
     $beat = Join-Path $outDir 'heartbeat.txt'
     $dirIssue = Get-ProbeDirIssue
-    $fileIssue = Get-TrustIssue $exe
+    $fileIssue = Get-TrustIssue $exe $true
     if ($dirIssue -or $fileIssue) {
         throw "refusing to run a probe executable that is not owned by SYSTEM or Administrators ($dirIssue) ($fileIssue)"
     }
@@ -871,7 +871,8 @@ try {
         $service = Invoke-Probe 'install-service' '--watch-pid' "$PID" '--allow-local'
         $serviceUp = $service.code -eq 0
         if ($serviceUp) {
-            [System.IO.File]::WriteAllText((Join-Path $probeDir 'reconnect.on'), "on`n")
+            $utf8 = New-Object System.Text.UTF8Encoding $false
+            Write-ProbeFile (Join-Path $probeDir 'reconnect.on') $utf8.GetBytes("on`n")
             $watch.Restart()
             $fromService = Invoke-Probe 'service-disconnect' '--allow-local'
             Add-ProbeRow 'service-disconnect' 'Disconnect the console session from session 0' $fromService ([int]$watch.ElapsedMilliseconds)
