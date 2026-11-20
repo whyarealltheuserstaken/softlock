@@ -8,7 +8,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,7 +35,7 @@ use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_AC
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, CreatePipe, DisconnectNamedPipe,
     GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe,
 };
 use windows::Win32::System::RemoteDesktop::{
     WTSDisconnectSession, WTSGetActiveConsoleSessionId, WTSSESSION_NOTIFICATION,
@@ -1103,9 +1103,15 @@ fn subscribe_request(frame: &[u8]) -> Option<u64> {
     }
 }
 
+/// Live Subscribe streams. A client that has already gone away must not keep a
+/// slot until the next state change.
+const SUBSCRIBE_CAP: usize = 8;
+static SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
+
 /// After `Subscribe` is accepted, the connection stays open and the service
 /// writes `StateChanged` whenever the public state name changes. A write
-/// error ends the stream. The function returns whether it took the connection.
+/// error or a disconnected client ends the stream. The function returns
+/// whether it took the connection.
 fn stream_subscription(
     pipe: HANDLE,
     authority: &Arc<Mutex<Authority>>,
@@ -1121,8 +1127,16 @@ fn stream_subscription(
     if write_response(pipe, *id, response).is_err() {
         return true;
     }
+    let held = SUBSCRIBERS.fetch_add(1, Ordering::AcqRel);
+    if held >= SUBSCRIBE_CAP {
+        SUBSCRIBERS.fetch_sub(1, Ordering::AcqRel);
+        return true;
+    }
     let mut previous = None;
     while !STOP.load(Ordering::Acquire) {
+        if !subscriber_connected(pipe) {
+            break;
+        }
         let name = authority
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1142,7 +1156,13 @@ fn stream_subscription(
             break;
         }
     }
+    SUBSCRIBERS.fetch_sub(1, Ordering::AcqRel);
     true
+}
+
+fn subscriber_connected(pipe: HANDLE) -> bool {
+    let mut available = 0u32;
+    unsafe { PeekNamedPipe(pipe, None, 0, None, Some(&mut available), None) }.is_ok()
 }
 
 fn write_response(
