@@ -917,13 +917,13 @@ fn setup_skip(kind: LidKind) -> Option<SetupSkip> {
         0 => Some(false),
         _ => None,
     };
-    let laptop = plan::has_lid(&model, registry);
+    let lid = plan::lid_presence(&model, registry);
     match kind {
         LidKind::OnPower => {
             let batt = command_text("pmset", &["-g", "batt"]);
-            plan::lid_on_power(laptop, plan::ac_power(&batt))
+            plan::lid_on_power(lid, plan::ac_power(&batt))
         }
-        LidKind::External => plan::lid_external(laptop, ffi::display_count()),
+        LidKind::External => plan::lid_external(lid, ffi::display_count()),
         LidKind::PowerKey => plan::power_key(plan::touch_id_sensor(ffi::touch_id())),
     }
 }

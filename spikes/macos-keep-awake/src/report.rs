@@ -132,7 +132,7 @@ pub struct KitReport {
 pub fn laptop_lid_row(outcome: &str) -> Result<String, String> {
     match outcome {
         "slept" | "awake" | "skip" | "not-detected" | "not-run-on-runner" | "needs-terminal"
-        | "no-lid" | "on-battery" => Ok(outcome.to_string()),
+        | "no-lid" | "lid-unknown" | "on-battery" => Ok(outcome.to_string()),
         other => Err(format!("unknown lid outcome {other}")),
     }
 }
@@ -147,6 +147,7 @@ pub fn lid_external_row(outcome: &str) -> Result<String, String> {
         | "not-run-on-runner"
         | "needs-terminal"
         | "no-lid"
+        | "lid-unknown"
         | "on-battery"
         | "closed" => Ok(outcome.to_string()),
         other => Err(format!("unknown lid-external outcome {other}")),
@@ -259,6 +260,7 @@ pub fn hardware_row_filled(row: &HardwareRow) -> bool {
                     | "restart-panel"
                     | "nothing"
                     | "no-lid"
+                    | "lid-unknown"
                     | "on-battery"
                     | "no-touch-id"
                     | "closed"
@@ -827,9 +829,11 @@ mod tests {
     fn a_laptop_lid_row_refuses_no_lid() {
         assert!(laptop_lid_row("no lid").is_err());
         assert_eq!(laptop_lid_row("no-lid").unwrap(), "no-lid");
+        assert_eq!(laptop_lid_row("lid-unknown").unwrap(), "lid-unknown");
         assert_eq!(laptop_lid_row("slept").unwrap(), "slept");
         assert_eq!(laptop_lid_row("awake").unwrap(), "awake");
         assert_eq!(lid_external_row("no-lid").unwrap(), "no-lid");
+        assert_eq!(lid_external_row("lid-unknown").unwrap(), "lid-unknown");
         assert_eq!(
             lid_external_row("no-external-display").unwrap(),
             "no-external-display"

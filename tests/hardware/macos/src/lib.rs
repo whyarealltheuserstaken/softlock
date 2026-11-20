@@ -198,7 +198,7 @@ fn hardware_row(id: &str, name: &str, key: &str, text: &str, mode: &str) -> Row 
         "slept" | "closed" | "restart-panel" | "nothing" if method != "none" => {
             row(id, name, "pass", None, physical, detail)
         }
-        "no-external-display" | "no-lid" | "on-battery" | "no-touch-id" => {
+        "no-external-display" | "no-lid" | "lid-unknown" | "on-battery" | "no-touch-id" => {
             row(id, name, "skip", Some("not-applicable"), physical, detail)
         }
         "skip" => row(id, name, "skip", Some("operator"), physical, detail),
@@ -639,6 +639,34 @@ power-key-detection=iokit-power-notification
         assert_eq!(rows[2].id, "m07-lid-on-power");
         assert_eq!(rows[2].status, "fail");
         assert_eq!(rows[3].status, "pass");
+    }
+
+    #[test]
+    fn unknown_lid_rows_skip_not_applicable_not_no_lid() {
+        let text = "\
+mode=kit
+assertion-created=true
+assertion-released=true
+result=pass
+app-nap-verdict=napped
+lid-on-power=lid-unknown
+lid-on-power-detection=pre-prompt
+lid-external=lid-unknown
+lid-external-detection=pre-prompt
+power-key=nothing
+power-key-detection=iokit-power-notification
+";
+        let rows = keep_awake_rows(text);
+        assert_eq!(rows[2].id, "m07-lid-on-power");
+        assert_eq!(rows[2].status, "skip");
+        assert_eq!(rows[2].skip_reason.as_deref(), Some("not-applicable"));
+        assert!(rows[2].detail.contains("lid-unknown"));
+        assert!(!rows[2].detail.contains("no-lid"));
+        assert_eq!(rows[3].id, "m07-lid-external");
+        assert_eq!(rows[3].status, "skip");
+        assert_eq!(rows[3].skip_reason.as_deref(), Some("not-applicable"));
+        assert!(rows[3].detail.contains("lid-unknown"));
+        assert!(!rows[3].detail.contains("no-lid"));
     }
 
     #[test]
