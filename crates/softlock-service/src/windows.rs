@@ -377,6 +377,13 @@ fn install_journal(authority: &mut Authority) {
         Err(reason) => {
             crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
             authority.platform_mut().require_settings();
+            let mut journal = softlock_core::Journal::empty();
+            journal.mark_locked();
+            journal.flush();
+            authority.notify(Event::ServiceStarted {
+                journal,
+                session_active: true,
+            });
         }
     }
     crate::settings::register_sign_in_recovery();

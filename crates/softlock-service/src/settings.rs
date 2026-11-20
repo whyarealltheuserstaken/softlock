@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use softlock_core::PRODUCT_DISPLAY_NAME;
 use softlock_core::{
     CommitFault, HardenError, Journal, JournalEntry, JournalFault, ProductState, RepairAction,
     SERVICE_NAME, SettingValue, SettingsJournal, StartAction, TASK_MANAGER, commit_then_change,
     encode_document, executable_may_run_as_system, fault_log, parse_document, repair_action,
-    repair_entry_name, restore_action, service_start_action, task_manager_document,
+    repair_entry_name, restore_action, restore_sid, service_start_action, task_manager_document,
 };
 
 use crate::journal_store::{load_journal, save_journal};
@@ -34,21 +35,23 @@ pub struct SettingsEngine {
     stop: Arc<AtomicBool>,
     last: Instant,
     watcher: Mutex<Option<JoinHandle<()>>>,
+    /// An active lock must keep DisableTaskMgr. Revert does not clear it.
+    preserve: bool,
 }
 
 impl SettingsEngine {
     pub fn open() -> Result<Self, &'static str> {
-        let sid = console_sid()?;
         // Opening the directory refuses a user-owned or pre-created folder.
         load_journal().map_err(|_| "journal")?;
         Ok(Self {
-            sid,
+            sid: String::new(),
             pending: None,
             holding: Arc::new(AtomicBool::new(false)),
             notified: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
             last: Instant::now(),
             watcher: Mutex::new(None),
+            preserve: false,
         })
     }
 
@@ -61,9 +64,11 @@ impl SettingsEngine {
         if doc.is_empty() {
             return Ok(Boot::Idle);
         }
+        self.sid = restore_sid(&doc).map_err(fault_log)?.to_string();
         let console = match console_is_active() {
             Ok(active) => active,
             Err(_) if doc.says_locked() => {
+                self.preserve = true;
                 self.hold();
                 return Ok(Boot::FailClosed(memory_journal(&doc)));
             }
@@ -76,6 +81,7 @@ impl SettingsEngine {
                 Ok(Boot::Reverted)
             }
             StartAction::FailClosed => {
+                self.preserve = true;
                 self.hold();
                 Ok(Boot::FailClosed(memory_journal(&doc)))
             }
@@ -83,14 +89,23 @@ impl SettingsEngine {
     }
 
     pub fn stage(&mut self, journal: &mut Journal) -> Result<(), HardenError> {
+        let sid = console_sid().map_err(|reason| {
+            crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+            HardenError::Failed
+        })?;
+        self.sid = sid;
         let previous = read_task_manager(&self.sid).map_err(|reason| {
             crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
             HardenError::Failed
         })?;
-        let doc = task_manager_document(previous, journal.failures()).map_err(|_| {
-            crate::audit("settings", &[("result", "failed"), ("reason", "value")]);
-            HardenError::Failed
-        })?;
+        let doc =
+            task_manager_document(&self.sid, previous, journal.failures()).map_err(|fault| {
+                crate::audit(
+                    "settings",
+                    &[("result", "failed"), ("reason", fault_log(fault))],
+                );
+                HardenError::Failed
+            })?;
         self.pending = Some(doc);
         journal.record(JournalEntry {
             target: TASK_MANAGER.to_string(),
@@ -144,6 +159,9 @@ impl SettingsEngine {
     }
 
     pub fn revert_memory(&mut self, journal: &Journal) -> Result<(), &'static str> {
+        if self.preserve {
+            return Ok(());
+        }
         if let Some(text) = load_journal().map_err(|_| "journal")? {
             let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
             return self.revert_document(&doc);
@@ -172,6 +190,8 @@ impl SettingsEngine {
         if doc.is_empty() {
             return Ok(());
         }
+        self.sid = restore_sid(&doc).map_err(fault_log)?.to_string();
+        self.preserve = false;
         self.revert_document(&doc)
     }
 
@@ -283,7 +303,7 @@ pub fn repair_main() -> i32 {
     };
     if repair_action(state) == RepairAction::Refuse {
         crate::audit("settings", &[("result", "refused"), ("reason", "locked")]);
-        eprintln!("repair refused while SoftLock is locked");
+        eprintln!("repair refused while {PRODUCT_DISPLAY_NAME} is locked");
         return 2;
     }
     let mut engine = match SettingsEngine::open() {
@@ -326,11 +346,26 @@ pub fn register_sign_in_recovery() {
         .status()
         .map(|status| status.success())
         .unwrap_or(false);
-    if created {
-        crate::audit("settings", &[("result", "task")]);
-    } else {
-        crate::audit("settings", &[("result", "failed"), ("reason", "task")]);
+    if !created {
+        crate::audit(
+            "settings",
+            &[("result", "failed"), ("reason", "task-create")],
+        );
+        return;
     }
+    let present = Command::new(r"C:\Windows\System32\schtasks.exe")
+        .args(["/Query", "/TN", &task])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !present {
+        crate::audit(
+            "settings",
+            &[("result", "failed"), ("reason", "task-missing")],
+        );
+        return;
+    }
+    crate::audit("settings", &[("result", "task")]);
     if let Err(reason) = write_start_menu(&exe) {
         crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
     }
@@ -343,15 +378,80 @@ fn write_start_menu(exe: &Path) -> Result<(), &'static str> {
     }
     let path = programs.join(format!("{}.cmd", repair_entry_name()));
     let body = format!("@echo off\r\n\"{}\" --repair-settings\r\n", exe.display());
-    std::fs::write(&path, body).map_err(|_| "menu")
+    write_menu_new(&path, body.as_bytes())
 }
 
 fn command_path_allowed(path: &Path) -> bool {
     let text = path.to_string_lossy();
-    executable_may_run_as_system(path)
+    executable_may_run_as_system(path, path)
         && !text
             .chars()
             .any(|c| matches!(c, '&' | '|' | '>' | '<' | '%' | '!' | '\n' | '\r' | '"'))
+}
+
+#[cfg(windows)]
+fn write_menu_new(path: &Path, body: &[u8]) -> Result<(), &'static str> {
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
+    };
+    use windows::core::PCWSTR;
+    let wide = crate::secrets::wide_str(&path.display().to_string());
+    let existing = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_READ.0,
+            windows::Win32::Storage::FileSystem::FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    };
+    if let Ok(handle) = existing {
+        let trusted = crate::secrets::owner_is_trusted(handle).unwrap_or(false);
+        let reparse = crate::secrets::handle_is_reparse(handle).unwrap_or(true);
+        crate::secrets::drop_handle(handle);
+        if reparse || !trusted {
+            return Err("menu-owner");
+        }
+        return Ok(());
+    }
+    let descriptor = crate::secrets::security_descriptor_from("D:P(A;;FA;;;SY)(A;;FA;;;BA)")
+        .map_err(|_| "menu")?;
+    let sa = windows::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    let created = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+            windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
+            Some(&sa),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    };
+    crate::secrets::free_descriptor(&descriptor);
+    let handle = created.map_err(|_| "menu")?;
+    if crate::secrets::handle_is_reparse(handle).unwrap_or(true)
+        || !crate::secrets::owner_is_trusted(handle).unwrap_or(false)
+    {
+        crate::secrets::drop_handle(handle);
+        return Err("menu-owner");
+    }
+    let mut file = unsafe { std::fs::File::from_raw_handle(handle.0) };
+    std::io::Write::write_all(&mut file, body).map_err(|_| "menu")?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn write_menu_new(_path: &Path, _body: &[u8]) -> Result<(), &'static str> {
+    Err("menu")
 }
 
 #[cfg(feature = "live-fail-closed")]

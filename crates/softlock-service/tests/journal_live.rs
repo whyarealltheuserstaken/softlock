@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,10 +27,12 @@ fn live_settings_journal() {
     if installed_service_running() {
         panic!("refusing while the installed service is running");
     }
+    fs::create_dir_all(guard_dir()).expect("temp");
+    fs::create_dir_all(artifact_dir()).expect("artifact");
+    ensure_service().expect("LocalSystem service");
     let original = query_taskmgr();
     let mut guard = Guard {
         original: original.clone(),
-        child: None,
         reported: false,
     };
     let outcome = match case.as_str() {
@@ -40,10 +42,12 @@ fn live_settings_journal() {
     };
     match outcome {
         Ok(()) => {
+            capture();
             guard.reported = true;
             write_result(r#"{"ok":true}"#);
         }
         Err(reason) => {
+            capture();
             guard.reported = true;
             write_result(&format!(r#"{{"ok":false,"reason":"{reason}"}}"#));
             panic!("{reason}");
@@ -71,7 +75,7 @@ fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
     let saw = wait_until(Duration::from_secs(20), || {
         journal_ready(&journal) && query_taskmgr() == previous
     });
-    if !saw {
+    if !saw || !journal_ready(&journal) {
         return Err(format!(
             "journal was not durable before the {previous} change"
         ));
@@ -158,15 +162,11 @@ fn recover_active(guard: &mut Guard) -> Result<(), String> {
     wait_pipe()?;
     transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
     if !wait_until(Duration::from_secs(20), || {
-        query_taskmgr() == "1" && host_running()
+        query_taskmgr() == "1" && host_running() && journal_ready(&journal_file())
     }) {
         return Err("the lock host was not running with DisableTaskMgr set".to_string());
     }
-    if let Some(child) = guard.child.as_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    guard.child = None;
+    kill_service_process();
     if !host_running() {
         return Err("the lock host died with the service".to_string());
     }
@@ -180,14 +180,18 @@ fn recover_active(guard: &mut Guard) -> Result<(), String> {
             saw_unlocked = true;
         }
         last = status;
-        query_taskmgr() == "0" && state.as_deref() == Some("OsLocked")
+        let fail_closed = matches!(
+            state.as_deref(),
+            Some("FailingClosed" | "Locked" | "OsLocked")
+        );
+        query_taskmgr() == "1" && fail_closed
     });
     if saw_unlocked {
         return Err("an active lock returned to Unlocked".to_string());
     }
-    if !closed {
+    if !closed || query_taskmgr() != "1" {
         return Err(format!(
-            "an active journal did not fail closed: {last} value {}",
+            "an active journal did not keep DisableTaskMgr: {last} value {}",
             query_taskmgr()
         ));
     }
@@ -204,7 +208,6 @@ fn status_state(json: &str) -> Option<String> {
 
 struct Guard {
     original: String,
-    child: Option<Child>,
     reported: bool,
 }
 
@@ -213,63 +216,162 @@ impl Drop for Guard {
         let _ = Command::new("taskkill")
             .args(["/F", "/IM", "softlock-lockhost.exe"])
             .status();
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        let _ = Command::new("taskkill")
-            .args(["/F", "/IM", "softlock-service.exe"])
-            .status();
+        kill_service_process();
+        let _ = Command::new("sc").args(["delete", SERVICE_NAME]).status();
         let _ = set_taskmgr(&self.original);
         if !self.reported {
+            capture();
             write_result(r#"{"ok":false,"reason":"ended"}"#);
         }
     }
 }
 
-fn spawn_service(guard: &mut Guard, pause: bool, pause_file: &Path) -> Result<(), String> {
-    if let Some(child) = guard.child.as_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let root = guard_dir();
-    fs::create_dir_all(&root).map_err(|_| "temp".to_string())?;
-    let mut command = Command::new(service_exe());
-    command
-        .arg("--foreground")
-        .env("SOFTLOCK_PIN_DIR", root.join("pin"))
-        .env("SOFTLOCK_LOG", root.join("service.log"))
-        .env("SOFTLOCK_PIPE", pipe_name())
-        .env("SOFTLOCK_DEV_APP", "1")
-        .env("SOFTLOCK_STOP_FILE", root.join("stop"))
-        .env_remove("SOFTLOCK_STUB_OS_LOCK")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if pause {
-        command
-            .env("SOFTLOCK_JOURNAL_PAUSE", "1")
-            .env("SOFTLOCK_JOURNAL_PAUSE_FILE", pause_file);
+fn ensure_service() -> Result<(), String> {
+    let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
+    let _ = Command::new("sc").args(["delete", SERVICE_NAME]).status();
+    thread::sleep(Duration::from_millis(400));
+    let bin = service_exe().display().to_string();
+    let status = Command::new("sc")
+        .args([
+            "create",
+            SERVICE_NAME,
+            "binPath=",
+            &bin,
+            "start=",
+            "demand",
+            "obj=",
+            "LocalSystem",
+        ])
+        .status()
+        .map_err(|_| "sc create".to_string())?;
+    if status.success() {
+        Ok(())
     } else {
-        command.env_remove("SOFTLOCK_JOURNAL_PAUSE");
+        Err("sc create failed".to_string())
     }
-    let _ = fs::remove_file(root.join("stop"));
-    guard.child = Some(command.spawn().map_err(|_| "spawn service".to_string())?);
-    Ok(())
 }
 
-fn hard_stop(guard: &mut Guard) {
+fn spawn_service(_guard: &mut Guard, pause: bool, pause_file: &Path) -> Result<(), String> {
+    fs::create_dir_all(guard_dir()).map_err(|_| "temp".to_string())?;
+    fs::create_dir_all(guard_dir().join("pin")).map_err(|_| "temp".to_string())?;
+    kill_service_process();
+    wait_until(Duration::from_secs(15), || !service_running());
+    write_service_env(pause, pause_file)?;
+    let status = Command::new("sc")
+        .args(["start", SERVICE_NAME])
+        .status()
+        .map_err(|_| "sc start".to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("sc start failed".to_string())
+    }
+}
+
+fn write_service_env(pause: bool, pause_file: &Path) -> Result<(), String> {
+    let runner =
+        std::env::var("RUNNER_ENVIRONMENT").unwrap_or_else(|_| "github-hosted".to_string());
+    let mut pairs = vec![
+        "GITHUB_ACTIONS=true".to_string(),
+        format!("RUNNER_ENVIRONMENT={runner}"),
+        "SOFTLOCK_DEV_APP=1".to_string(),
+        format!("SOFTLOCK_PIPE={}", pipe_name()),
+        format!("SOFTLOCK_LOG={}", guard_dir().join("service.log").display()),
+        format!("SOFTLOCK_PIN_DIR={}", guard_dir().join("pin").display()),
+        format!("SOFTLOCK_STOP_FILE={}", guard_dir().join("stop").display()),
+    ];
+    if pause {
+        pairs.push("SOFTLOCK_JOURNAL_PAUSE=1".to_string());
+        pairs.push(format!(
+            "SOFTLOCK_JOURNAL_PAUSE_FILE={}",
+            pause_file.display()
+        ));
+    }
+    let data = pairs.join("\\0");
+    let key = format!(r"HKLM\SYSTEM\CurrentControlSet\Services\{SERVICE_NAME}");
+    let status = Command::new("reg")
+        .args([
+            "add",
+            &key,
+            "/v",
+            "Environment",
+            "/t",
+            "REG_MULTI_SZ",
+            "/d",
+            &data,
+            "/f",
+        ])
+        .status()
+        .map_err(|_| "env".to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("env".to_string())
+    }
+}
+
+fn hard_stop(_guard: &mut Guard) {
     let _ = Command::new("taskkill")
         .args(["/F", "/IM", "softlock-lockhost.exe"])
         .status();
-    if let Some(child) = guard.child.as_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
+    kill_service_process();
+}
+
+fn kill_service_process() {
+    if let Some(pid) = service_pid() {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
     }
-    guard.child = None;
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", "softlock-service.exe"])
-        .status();
+    let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
+}
+
+fn service_pid() -> Option<u32> {
+    let output = Command::new("sc")
+        .args(["queryex", SERVICE_NAME])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("PID")
+            .or_else(|| line.strip_prefix("PID:"))?;
+        let rest = rest.trim().trim_start_matches(':').trim();
+        if let Ok(pid) = rest.parse::<u32>()
+            && pid != 0
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+fn service_running() -> bool {
+    let Ok(output) = Command::new("sc").args(["query", SERVICE_NAME]).output() else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout).contains("RUNNING")
+}
+
+fn capture() {
+    let _ = fs::create_dir_all(artifact_dir());
+    let log = guard_dir().join("service.log");
+    let body = fs::read_to_string(&log).unwrap_or_else(|_| "missing".to_string());
+    let _ = fs::write(artifact_dir().join("service.log"), body);
+    let dir = journal_file();
+    let parent = dir.parent().unwrap_or(dir.as_path());
+    let listing = Command::new("cmd")
+        .args(["/c", "dir", "/a", &parent.display().to_string()])
+        .output();
+    let text = listing
+        .map(|output| {
+            let mut body = String::from_utf8_lossy(&output.stdout).into_owned();
+            body.push_str(&String::from_utf8_lossy(&output.stderr));
+            body
+        })
+        .unwrap_or_else(|_| "missing".to_string());
+    let _ = fs::write(artifact_dir().join("journal-dir.txt"), text);
 }
 
 fn repair_settings() -> Result<i32, String> {
@@ -296,7 +398,9 @@ fn journal_ready(path: &Path) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
         return false;
     };
-    text.contains("DisableTaskMgr") && text.contains("\"says_locked\":true")
+    text.contains("DisableTaskMgr")
+        && text.contains("\"says_locked\":true")
+        && text.contains("\"sid\":\"S-1-5-21-")
 }
 
 fn journal_file() -> PathBuf {
@@ -398,7 +502,17 @@ fn pipe_name() -> String {
 }
 
 fn guard_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("softlock-journal-{}", std::process::id()))
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    PathBuf::from(root)
+        .join("Temp")
+        .join(format!("softlock-journal-{}", std::process::id()))
+}
+
+fn artifact_dir() -> PathBuf {
+    let base = std::env::var("RUNNER_TEMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    base.join("softlock-journal")
 }
 
 fn hello() -> &'static str {
@@ -425,10 +539,7 @@ fn wait_until(limit: Duration, mut probe: impl FnMut() -> bool) -> bool {
 }
 
 fn write_result(body: &str) {
-    let base = std::env::var("RUNNER_TEMP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    let dir = base.join("softlock-journal");
+    let dir = artifact_dir();
     let _ = fs::create_dir_all(&dir);
     let _ = fs::write(dir.join("result.json"), body);
 }
