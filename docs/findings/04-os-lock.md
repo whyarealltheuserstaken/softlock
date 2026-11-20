@@ -2,10 +2,10 @@
 
 Measured on 20 November 2026 UTC by the workspace-excluded probe `spikes/os-lock`.
 
-The lines below are from [OS lock proof run 44694585404](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44694585404), commit `80094f1c9df693ac3e8e4b1f11b4443cb87e0c7c`. Both jobs passed 8 rows, restored every value, and finished `state=os-locked`. The windows-2025 check job in that run executed `run.ps1 --self-check` and printed `self-check ok`.
+The lines below are from [OS lock proof run 44705256652](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44705256652), commit `5d038b9f55729a1faf4b605a8f1eb6fcc5e5a361`. Both jobs passed 8 rows, restored every value, and finished `state=os-locked`. The windows-2025 check job in that run executed `run.ps1 --self-check` and printed `self-check ok`. That self-check creates a local standard user, has that user create the probe directory, and refuses it, then refuses a user-owned file planted in a trusted directory.
 
-- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44694585404/job/136148731450)
-- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44694585404/job/136148731274)
+- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44705256652/job/136183800170)
+- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44705256652/job/136183800270)
 
 ## Decision
 
@@ -28,7 +28,7 @@ Clearing only `DisableLockWorkstation` (the other lockdown values stay set) make
 
 `WTSDisconnectSession` from `OsLockProbe` in session 0, aimed at the console session, and `WTSDisconnectSession` from the user-session process on its own session, both report `WTS_CONSOLE_DISCONNECT`. The service's `session_locked` flag was unreadable after the disconnect (`null`). The notification is the confirmation. A heartbeat process kept writing through the lock and both disconnects.
 
-The hosted job reconnects the console between the two disconnects so both can be recorded. That reconnect is `WTSConnectSessionW` from `OsLockProbe` running as SYSTEM. The service is installed with `--ci-reconnect` only when `GITHUB_ACTIONS=true` and `RUNNER_ENVIRONMENT=github-hosted`. `--allow-local` does not turn it on, and the laptop script does not write `reconnect.on`. The service binary and its control files live in `C:\ProgramData\os-lock-probe`. The elevated script creates that directory with the owner and the access list in one call: owner Administrators, no inheritance, and full control only for SYSTEM and Administrators. An existing directory is refused unless that owner holds the directory and every file in it, and a file is deleted and created anew before it is used. The service refuses the directory unless its owner is SYSTEM or Administrators. After the HKLM values are confirmed, the restore removes the task and the whole directory. After the saved values are restored, the run confirms a lock. A successful `LockWorkStation` return is not that confirmation.
+The hosted job reconnects the console between the two disconnects so both can be recorded. That reconnect is `WTSConnectSessionW` from `OsLockProbe` running as SYSTEM. The service is installed with `--ci-reconnect` only when `GITHUB_ACTIONS=true` and `RUNNER_ENVIRONMENT=github-hosted`. `--allow-local` does not turn it on, and the laptop script does not write `reconnect.on`. The service binary and its control files live in `C:\ProgramData\os-lock-probe`. The elevated script creates that directory with the owner and the access list in one call: owner Administrators, no inheritance, and full control only for SYSTEM and Administrators. An existing directory is refused unless that owner holds the directory and every file in it, and a file is deleted and created anew before it is used. The service refuses the directory unless its owner is SYSTEM or Administrators. Files the service writes may inherit that directory access list; they are still refused unless the owner is SYSTEM or Administrators and every entry is one of those two. After the HKLM values are confirmed, the restore removes the task and the whole directory. After the saved values are restored, the run confirms a lock. A successful `LockWorkStation` return is not that confirmation.
 
 ## Rule
 
@@ -36,12 +36,12 @@ The hosted job reconnects the console between the two disconnects so both can be
 
 | Row | windows-2022 | windows-2025 |
 | --- | --- | --- |
-| `LockWorkStation` while the policy is set | api success, notified false, session unlocked, 1,001,446 µs | api success, notified false, session unlocked, 1,003,849 µs |
-| `LockWorkStation` after clearing it | lock, session locked, 70,027 µs | lock, session locked, 183,188 µs |
-| Service disconnect of the console session | console-disconnect, 79,651 µs | console-disconnect, 115,923 µs |
-| Own-session disconnect | console-disconnect, 90,825 µs | console-disconnect, 82,060 µs |
-| Background heartbeat | alive, 20 lines | alive, 21 lines |
-| Ending confirmed lock | lock, session locked, 33,758 µs | lock, session locked, 56,307 µs |
+| `LockWorkStation` while the policy is set | api success, notified false, session unlocked, 1,004,663 µs | api success, notified false, session unlocked, 1,003,661 µs |
+| `LockWorkStation` after clearing it | lock, session locked, 62,330 µs | lock, session locked, 105,741 µs |
+| Service disconnect of the console session | console-disconnect, 73,580 µs | console-disconnect, 92,179 µs |
+| Own-session disconnect | console-disconnect, 76,094 µs | console-disconnect, 52,402 µs |
+| Background heartbeat | alive, 21 lines | alive, 19 lines |
+| Ending confirmed lock | lock, session locked, 55,458 µs | lock, session locked, 53,709 µs |
 
 The three confirming paths and the ending lock are each under one second. The blocked row is the full one-second wait. The ending row is the fail-closed chain. On both images the lock confirmed, so the chain did not disconnect.
 
