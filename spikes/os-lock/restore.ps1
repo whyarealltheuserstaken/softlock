@@ -155,9 +155,9 @@ function Invoke-PendingRestore {
     $snapshot = Get-Content -LiteralPath $pending -Raw | ConvertFrom-Json
     $sid = ''
     if ($snapshot.PSObject.Properties.Name -contains 'sid' -and $snapshot.sid) { $sid = [string]$snapshot.sid }
-    $values = @()
+    $rawValues = $null
     if ($snapshot.PSObject.Properties.Name -contains 'values' -and $null -ne $snapshot.values) {
-        $values = @(Get-Items $snapshot.values)
+        $rawValues = $snapshot.values
     }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -165,7 +165,7 @@ function Invoke-PendingRestore {
     $system = $identity.User.Value -eq 'S-1-5-18'
     $held = New-Object System.Collections.Generic.List[object]
     $failed = $false
-    foreach ($entry in $values) {
+    foreach ($entry in (Get-Items $rawValues)) {
         $needsMachine = $entry.hive -eq 'HKLM'
         if ($needsMachine -and -not $elevated -and -not $system) {
             $held.Add($entry)
@@ -174,7 +174,7 @@ function Invoke-PendingRestore {
         if (Value-Matches $entry $sid) {
             try { Remove-CreatedKey $entry $sid } catch {
                 $failed = $true
-                Write-Output "$($entry.hive)\$($entry.subkey) was created by the probe and was not deleted. $($_.Exception.Message)"
+                Write-Host "$($entry.hive)\$($entry.subkey) was created by the probe and was not deleted. $($_.Exception.Message)"
                 $held.Add($entry)
             }
             continue
@@ -198,7 +198,7 @@ function Invoke-PendingRestore {
         } catch {
             $failed = $true
             $verb = if ($entry.present -eq $true) { 'was changed and was not put back' } else { 'was created by the probe and was not deleted' }
-            Write-Output "$($entry.hive)\$($entry.subkey) value $($entry.name) $verb. $($_.Exception.Message)"
+            Write-Host "$($entry.hive)\$($entry.subkey) value $($entry.name) $verb. $($_.Exception.Message)"
             $held.Add($entry)
         }
     }
@@ -216,7 +216,7 @@ function Invoke-PendingRestore {
         $utf8 = New-Object System.Text.UTF8Encoding $false
         [System.IO.File]::WriteAllText($pending, $body, $utf8)
         if (-not $elevated -and -not $system) {
-            Write-Output "HKLM was not restored. From an elevated prompt run: powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+            Write-Host "HKLM was not restored. From an elevated prompt run: powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`""
         }
         if ($failed) { return 1 }
         return 0
