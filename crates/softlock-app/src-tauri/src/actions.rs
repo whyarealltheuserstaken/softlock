@@ -46,7 +46,19 @@ pub fn hard_lock_request() -> RequestKind {
 /// the name constant. The time is the fall-back's UTC instant in local time.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn fallback_notice(fallback: &softlock_core::Fallback) -> String {
-    fallback_notice_at(fallback, local_offset_secs(fallback.at_utc_ms))
+    notice_for_offset(fallback, local_offset_secs(fallback.at_utc_ms))
+}
+
+fn notice_for_offset(fallback: &softlock_core::Fallback, offset: Option<i32>) -> String {
+    match offset {
+        Some(offset) => fallback_notice_at(fallback, offset),
+        None => format!(
+            "{} switched to the Windows lock at {} UTC because {}",
+            softlock_core::PRODUCT_DISPLAY_NAME,
+            format_local_clock(fallback.at_utc_ms, 0),
+            fallback_reason(fallback.reason)
+        ),
+    }
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -92,15 +104,15 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 /// Offset of the local zone at `utc_ms`, not the offset of the current minute.
 /// Windows asks the system to convert that UTC instant, so daylight rules stay
 /// in the operating system.
-fn local_offset_secs(utc_ms: i64) -> i32 {
+fn local_offset_secs(utc_ms: i64) -> Option<i32> {
     #[cfg(windows)]
     {
-        system_local_offset_secs(utc_ms).unwrap_or(0)
+        system_local_offset_secs(utc_ms)
     }
     #[cfg(not(windows))]
     {
         let _ = utc_ms;
-        0
+        None
     }
 }
 
@@ -446,6 +458,9 @@ mod tests {
         let local = fallback_notice_at(&fallback, 2 * 60 * 60);
         assert!(local.contains("2026-11-20 14:00:00"));
         assert!(!notice.contains("Unlocked"));
+        let unknown = notice_for_offset(&fallback, None);
+        assert!(unknown.contains("2026-11-20 12:00:00 UTC"));
+        assert!(!unknown.contains("12:00:00 because"));
     }
 
     #[test]

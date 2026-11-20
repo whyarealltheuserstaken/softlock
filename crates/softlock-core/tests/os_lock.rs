@@ -620,6 +620,13 @@ fn the_fail_closed_job_covers_each_hosted_case() {
         "result.txt",
         "--release",
         "--locked",
+        "--offline",
+        "NtResumeProcess",
+        "PSObject.Properties",
+        "finally",
+        "SoftLockAgent",
+        "Connect(200)",
+        "1000",
     ] {
         assert!(script.contains(needle), "laptop script missing {needle}");
     }
@@ -631,6 +638,10 @@ fn the_fail_closed_job_covers_each_hosted_case() {
     assert!(
         !script.contains("live-fail-closed"),
         "the laptop script enables the hosted test feature"
+    );
+    assert!(
+        !script.contains("softlock-service' -ErrorAction SilentlyContinue | Stop-Process"),
+        "the laptop script stops every service process"
     );
     let owner = std::fs::read_to_string(root.join("crates/softlock-app/src-tauri/src/owner.rs"))
         .expect("owner");

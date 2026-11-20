@@ -534,11 +534,8 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             Some(PipeCommand::Quit) => service_gone = true,
             Some(PipeCommand::Arm) | None => {}
         }
-        if service_gone && !quit_tried {
-            quit_tried = true;
-            if service_quit_locks(controller.state()) {
-                schedule_quit_os_lock();
-            }
+        if service_gone {
+            arm_quit_lock(&mut quit_tried, controller.state());
         }
         if let Some(result) = take_quit_os_lock()
             && apply_quit_os_lock(&shared, &mut controller, result)
@@ -822,6 +819,17 @@ fn service_quit_locks(state: &LockState) -> bool {
         state,
         LockState::Locked { .. } | LockState::Arming { .. } | LockState::FailingClosed { .. }
     )
+}
+
+/// `quit_tried` stays false while the session is unguarded, so a crash during
+/// unlock or recovery still locks once the session is Locked or FailingClosed.
+fn arm_quit_lock(quit_tried: &mut bool, state: &LockState) -> bool {
+    if *quit_tried || !service_quit_locks(state) {
+        return false;
+    }
+    *quit_tried = true;
+    schedule_quit_os_lock();
+    true
 }
 
 fn schedule_quit_os_lock() {
@@ -1395,6 +1403,51 @@ mod quit_guard {
             after_fail: None,
         }));
         assert!(!super::service_quit_locks(&LockState::Recovering));
+    }
+
+    #[test]
+    fn a_quit_while_unlocking_schedules_once_the_session_is_locked() {
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                super::failclosed::block_os_lock_for_test(false);
+            }
+        }
+        let _release = Release;
+        super::QUIT_OS.store(super::QUIT_IDLE, std::sync::atomic::Ordering::Release);
+        super::failclosed::block_os_lock_for_test(true);
+        let mut tried = false;
+        let unlocking = LockState::Unlocking {
+            step: DisarmStep::DisarmGuard,
+        };
+        assert!(!super::arm_quit_lock(&mut tried, &unlocking));
+        assert!(!tried);
+        assert_eq!(
+            super::QUIT_OS.load(std::sync::atomic::Ordering::Acquire),
+            super::QUIT_IDLE
+        );
+        let locked = LockState::Locked {
+            source: LockSource::Tray,
+            prompt: PromptState::Idle,
+        };
+        assert!(super::arm_quit_lock(&mut tried, &locked));
+        assert!(tried);
+        assert_eq!(
+            super::QUIT_OS.load(std::sync::atomic::Ordering::Acquire),
+            super::QUIT_RUNNING
+        );
+        assert!(!super::arm_quit_lock(&mut tried, &locked));
+        super::failclosed::block_os_lock_for_test(false);
+        let done = std::time::Instant::now();
+        loop {
+            if super::take_quit_os_lock().is_some() {
+                break;
+            }
+            if done.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("the quit lock scheduled after unlock did not finish");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
 
