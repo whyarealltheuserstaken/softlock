@@ -362,7 +362,7 @@ function Clear-ProbeDirForTest {
 
 function Invoke-PlantChecks {
     $plantUser = 'oslockplant'
-    $plantPassword = 'OsLock-Plant-9a'
+    $plantPassword = 'OsLock-Plant-9a!'
     $plantTask = 'os-lock-plant'
     $plantScript = 'C:\Users\Public\os-lock-plant.ps1'
     $previous = $ErrorActionPreference
@@ -370,9 +370,11 @@ function Invoke-PlantChecks {
         Enable-ProbePrivileges
         Clear-ProbeDirForTest
         $ErrorActionPreference = 'Continue'
-        & net.exe user $plantUser /delete 2>&1 | Out-Null
-        & net.exe user $plantUser $plantPassword /add | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'could not create the plant user' }
+        $added = @(& net.exe user $plantUser $plantPassword /add 2>&1 | ForEach-Object { "$_" })
+        if ($LASTEXITCODE -ne 0) {
+            $detail = $added -join ' '
+            throw "could not create the plant user: $detail"
+        }
         $ErrorActionPreference = 'Stop'
         $plantBody = "Set-StrictMode -Version Latest`r`n`$ErrorActionPreference = 'Stop'`r`nNew-Item -ItemType Directory -Path 'C:\ProgramData\os-lock-probe' | Out-Null`r`nSet-Content -LiteralPath 'C:\ProgramData\os-lock-probe\restore.ps1' -Value 'planted'`r`n"
         $utf8 = New-Object System.Text.UTF8Encoding $false
@@ -420,7 +422,7 @@ function Invoke-PlantChecks {
         try { Clear-ProbeDirForTest } catch { }
         if (Test-Path -LiteralPath $plantScript) { Remove-Item -LiteralPath $plantScript -Force }
         & schtasks.exe /Delete /TN $plantTask /F 2>&1 | Out-Null
-        & net.exe user $plantUser /delete 2>&1 | Out-Null
+        & cmd.exe /c "echo Y| net user $plantUser /delete" 2>&1 | Out-Null
         $ErrorActionPreference = $previous
     }
 }
