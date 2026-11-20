@@ -448,7 +448,7 @@ function Invoke-PlantChecks {
         }
         $ErrorActionPreference = 'Stop'
         Grant-PlantBatchLogon $plantUser
-        $plantBody = "Set-StrictMode -Version Latest`r`n`$ErrorActionPreference = 'Stop'`r`nNew-Item -ItemType Directory -Path 'C:\ProgramData\os-lock-probe' | Out-Null`r`nSet-Content -LiteralPath 'C:\ProgramData\os-lock-probe\restore.ps1' -Value 'planted'`r`n"
+        $plantBody = "Set-StrictMode -Version Latest`r`n`$ErrorActionPreference = 'Stop'`r`nif (-not (Test-Path -LiteralPath 'C:\ProgramData\os-lock-probe')) { New-Item -ItemType Directory -Path 'C:\ProgramData\os-lock-probe' | Out-Null }`r`nSet-Content -LiteralPath 'C:\ProgramData\os-lock-probe\restore.ps1' -Value 'planted'`r`n"
         $utf8 = New-Object System.Text.UTF8Encoding $false
         [System.IO.File]::WriteAllText($plantScript, $plantBody, $utf8)
         $ErrorActionPreference = 'Continue'
@@ -460,13 +460,16 @@ function Invoke-PlantChecks {
             $scheduled = $LASTEXITCODE -eq 0
         }
         $ErrorActionPreference = 'Stop'
-        if ($scheduled) { $scheduled = Wait-PlantDir 8 }
+        if ($scheduled) { $scheduled = Wait-PlantDir 25 }
         if (-not $scheduled) {
             $plantPasswordSecure = ConvertTo-SecureString $plantPassword -AsPlainText -Force
             $plantCred = New-Object System.Management.Automation.PSCredential(".\$plantUser", $plantPasswordSecure)
             $plantProc = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $plantScript) -Credential $plantCred -Wait -PassThru -WindowStyle Hidden
-            if ($null -eq $plantProc -or $plantProc.ExitCode -ne 0) { throw 'the standard user could not plant the probe directory' }
-            if (-not (Wait-PlantDir 15)) { throw 'the standard user did not create the probe directory' }
+            if (-not (Wait-PlantDir 15)) {
+                $code = 'none'
+                if ($null -ne $plantProc) { $code = "$($plantProc.ExitCode)" }
+                throw "the standard user could not plant the probe directory ($code)"
+            }
         }
         $refused = $false
         try { Initialize-ProbeDir } catch { $refused = $true }
