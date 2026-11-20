@@ -1,25 +1,45 @@
 # 04: Fail-closed reaches the Windows sign-in screen while the lockdown values are set
 
-The measurement is the proof job in `.github/workflows/os-lock-proof.yml` (`spikes/os-lock`). It applies `DisableLockWorkstation` and the other lockdown values from SPEC.md section 8, times the three calls in issue 4, and confirms each through a session notification (`WTS_SESSION_LOCK` or `WTS_CONSOLE_DISCONNECT`) in under one second. `verdict::pick` names the primary and the fall-back from those three results.
+Measured on 20 November 2026 UTC by the workspace-excluded probe `spikes/os-lock`.
+
+The lines below are from [OS lock proof run 44686484658](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44686484658), commit `1c33a918fe8bb67a752fb24bd17b2afc5f2f2244`. Both jobs passed 8 rows, restored every value, and finished `state=os-locked`.
+
+- [windows-2022 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44686484658/job/136122258806)
+- [windows-2025 job](https://github.com/whyarealltheuserstaken/softlock/actions/runs/44686484658/job/136122258797)
+
+## Decision
+
+Primary is `LockWorkStation`, called from the signed-in session after `DisableLockWorkstation` is cleared. Fall-back is `WTSDisconnectSession`, which does not depend on that value. The session-0 service calls it on the console session. The Lock Host calls it on its own session.
+
+`verdict::pick` printed `primary=LockWorkStation fallback=WTSDisconnectSession` on both images.
 
 Dependent tickets:
 
-- [15](https://github.com/whyarealltheuserstaken/softlock/issues/15) implements the primitive this spike picks: the real OS lock, Lock for real, and the watchdog. Its fail-closed job has to use this pair and end the runner session in its own last job.
-- [17](https://github.com/whyarealltheuserstaken/softlock/issues/17) applies the lockdown values. When the primary is `LockWorkStation`, the fail-closed and hard-lock paths clear `DisableLockWorkstation` before that call. `WTSDisconnectSession` does not depend on that value.
+- [15](https://github.com/whyarealltheuserstaken/softlock/issues/15) implements this pair: the real OS lock, Lock for real, and the watchdog. Its fail-closed job uses the same order and ends the runner session in its own last job.
+- [17](https://github.com/whyarealltheuserstaken/softlock/issues/17) applies the lockdown values. Fail-closed and hard-lock paths clear `DisableLockWorkstation` before `LockWorkStation`. They do not clear it for `WTSDisconnectSession`.
 
-## What each path is
+## What both images showed
 
-1. **Blocked.** `LockWorkStation` from the signed-in session while `DisableLockWorkstation` is 1. The call can return success. The proof passes when no lock notification arrives and the session is not reported locked. The wait is the one-second budget, so this row's elapsed time is about one second.
-2. **Primary candidate.** Clear `DisableLockWorkstation`, then `LockWorkStation` from that same user-session process. Confirmation is the lock notification, in under one second. The other lockdown values stay set.
-3. **Service fall-back.** `WTSDisconnectSession` on the console session from `OsLockProbe`, a session-0 service. This is the call the service makes when the Lock Host is gone.
-4. **Lock Host fall-back.** `WTSDisconnectSession` on the user-session process's own session. This is the call the Lock Host makes when the service is gone. It does not need `DisableLockWorkstation` cleared.
+The job is `runneradmin` in console session 2. The probe sets the SPEC.md section 8 lockdown values, including `DisableLockWorkstation=1`, and journals each original value before the write.
 
-The hosted job reconnects the console session after each disconnect so both disconnects can be timed and the job can still report. It does not call an unlock API. After the report is written it locks the desktop with `LockWorkStation`, with the saved policies already restored. The laptop script does not reconnect after the last call: it disconnects and leaves the sign-in screen up.
+`LockWorkStation` while that value is still 1 returns success (`win32=0`) and does not lock. No `WTS_SESSION_LOCK` arrives during the one-second wait, and `session_locked` is false. That row's elapsed time is the wait.
+
+Clearing only `DisableLockWorkstation` (the other lockdown values stay set) makes the same call lock the session. Confirmation is `WTS_SESSION_LOCK`, and `session_locked` is true.
+
+`WTSDisconnectSession` from `OsLockProbe` in session 0, aimed at the console session, and `WTSDisconnectSession` from the user-session process on its own session, both report `WTS_CONSOLE_DISCONNECT`. The service's `session_locked` flag was unreadable after the disconnect (`null`). The notification is the confirmation. A heartbeat process kept writing through the lock and both disconnects.
+
+The hosted job reconnects the console between the two disconnects so both can be recorded, then locks again with `LockWorkStation` after the saved values are restored. It does not call an unlock API. The laptop script does not reconnect after its last call.
+
+| Row | windows-2022 | windows-2025 |
+| --- | --- | --- |
+| `LockWorkStation` while the policy is set | api success, notified false, session unlocked, 1,003,947 µs | api success, notified false, session unlocked, 1,000,026 µs |
+| `LockWorkStation` after clearing it | lock, session locked, 40,290 µs | lock, session locked, 140,014 µs |
+| Service disconnect of the console session | console-disconnect, 67,102 µs | console-disconnect, 114,320 µs |
+| Own-session disconnect | console-disconnect, 74,075 µs | console-disconnect, 104,032 µs |
+| Background heartbeat | alive, 18 lines | alive, 20 lines |
+
+The three confirming paths are each under one second. The blocked row is the full one-second wait.
 
 ## Laptop
 
-`spikes/os-lock/run.ps1` is the manual run. It was not executed here. It refuses a school workstation, a prompt that is not elevated, a remote session, and a machine with no console session. It backs up every value before changing it, writes `%LOCALAPPDATA%\os-lock-probe\pending.json`, registers RunOnce `os-lock-restore`, and registers a one-shot SYSTEM logon task of the same name so a crash still restores HKLM. The run ends at the sign-in screen. Recovery is in `spikes/os-lock/README.md`.
-
-## Measurements
-
-Filled from the proof job log after that job is green. The lines to copy are `timing` and `pick`.
+`spikes/os-lock/run.ps1` is the client Windows run. It was not executed here. It refuses a school workstation, a prompt that is not elevated, a remote session, and a machine with no console session. It backs up every value before changing it, writes `%LOCALAPPDATA%\os-lock-probe\pending.json`, registers RunOnce `os-lock-restore`, and registers a one-shot SYSTEM logon task of the same name so a crash still restores HKLM. The run ends at the sign-in screen. Recovery is in `spikes/os-lock/README.md`.
