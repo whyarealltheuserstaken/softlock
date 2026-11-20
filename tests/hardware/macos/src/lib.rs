@@ -512,7 +512,8 @@ fn overlay_operator_row_scored(
         | "blocked"
         | "moved"
         | "measurement-unreliable"
-        | "no-hotplug-observed" => row(id, name, "fail", None, physical, detail),
+        | "no-hotplug-observed"
+        | "frontmost-not-restored" => row(id, name, "fail", None, physical, detail),
         value if value.starts_with("fail:") => row(id, name, "fail", None, physical, detail),
         "no-external-display" => row(id, name, "skip", Some("not-applicable"), physical, detail),
         "skip" => row(id, name, "skip", Some("operator"), physical, detail),

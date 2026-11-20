@@ -4,7 +4,7 @@ One window per display at the screen-saver level, with `canJoinAllSpaces` and `f
 
 Teardown paths that close every covering window and still write `result.json` / `result.txt`:
 
-- Escape, only when Accessibility is granted so the global key monitor can fire (the process is an Accessory app; a local monitor does not see Terminal keystrokes)
+- Escape, only when Accessibility is granted so the global key monitor can fire. The kit is Accessory except for the click measurement: it saves the frontmost app, becomes Regular only for that post, then closes the target, returns to Accessory, and waits until the saved app is frontmost again before any stdin prompt. A local monitor does not see Terminal keystrokes.
 - Control-C / SIGINT, SIGHUP, SIGTERM (stdin is polled every 100 ms while the run loop is pumped; Ctrl-C does not wait for Enter)
 - process panic or crash
 - the hard `--timeout-ms` watchdog (default 10 minutes), which sets a stop flag on a background thread; the main thread closes AppKit. If teardown has not happened after about five more seconds, the watchdog calls `_exit(3)`

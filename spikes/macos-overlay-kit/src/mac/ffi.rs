@@ -3,7 +3,7 @@
 use std::os::raw::c_char;
 
 use crate::claim::{SCREEN_CAPTURE_ENTRY, SCSTREAM_ENTRY};
-use crate::report::{CaptureSample, ClickFocus, OverlayWindow};
+use crate::report::{CaptureSample, ClickFocus, OverlayWindow, score_posted_click};
 use crate::text::one_line;
 use crate::wait::click_wait_finished;
 
@@ -43,6 +43,8 @@ struct ClickOut {
     key_count: i32,
     accessibility: i32,
     listen: i32,
+    frontmost_restored: i32,
+    click_route: [u8; 16],
     error: [u8; 256],
 }
 
@@ -254,6 +256,8 @@ impl TargetWindow {
             key_count: 0,
             accessibility: 0,
             listen: 0,
+            frontmost_restored: 0,
+            click_route: [0; 16],
             error: [0; 256],
         };
         unsafe {
@@ -272,6 +276,8 @@ impl TargetWindow {
             key_count: 0,
             accessibility: 0,
             listen: 0,
+            frontmost_restored: 0,
+            click_route: [0; 16],
             error: [0; 256],
         };
         unsafe {
@@ -282,15 +288,14 @@ impl TargetWindow {
         let untrusted = error.as_deref().is_some_and(|value| {
             value.contains("target never became key") || value.contains("target window missing")
         });
-        let saw_click_or_key = click_wait_finished(out.click_count, out.key_count, 0, 0, false);
-        let click = if !granted {
-            "not-applicable"
-        } else if out.click_count > 0 {
-            "fell-through"
-        } else if untrusted && !saw_click_or_key {
-            "measurement-unreliable"
+        let route = optional_text(&out.click_route).unwrap_or_else(|| "none".to_string());
+        let _ = click_wait_finished(out.click_count, out.key_count, 0, 0, false);
+        let click = score_posted_click(&route, out.click_count, granted, untrusted);
+        let restored = out.frontmost_restored != 0;
+        let outcome = if restored {
+            click
         } else {
-            "blocked"
+            "frontmost-not-restored"
         };
         let focus = if out.overlay_is_key != 0 {
             "moved"
@@ -312,8 +317,10 @@ impl TargetWindow {
             measured_focus: focus.to_string(),
             typed_click: String::new(),
             typed_focus: String::new(),
-            click_outcome: click.to_string(),
+            click_outcome: outcome.to_string(),
             focus_outcome: focus.to_string(),
+            click_route: route,
+            frontmost_restored: restored,
             note: error.unwrap_or_default(),
         }
     }

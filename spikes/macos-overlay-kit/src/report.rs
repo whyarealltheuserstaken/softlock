@@ -87,6 +87,8 @@ pub struct ClickFocus {
     pub typed_focus: String,
     pub click_outcome: String,
     pub focus_outcome: String,
+    pub click_route: String,
+    pub frontmost_restored: bool,
     pub note: String,
 }
 
@@ -285,8 +287,47 @@ pub fn row_is_failure(outcome: Option<&str>) -> bool {
                 | "moved"
                 | "measurement-unreliable"
                 | "no-hotplug-observed"
+                | "frontmost-not-restored"
         )
     )
+}
+
+/// A click that arrived only through `CGEventPostToPid` skipped hit-testing.
+pub fn score_posted_click(route: &str, count: i32, granted: bool, untrusted: bool) -> &'static str {
+    if !granted {
+        return "not-applicable";
+    }
+    if route == "pid" {
+        return "measurement-unreliable";
+    }
+    if count > 0 && route == "hid" {
+        return "fell-through";
+    }
+    if untrusted {
+        return "measurement-unreliable";
+    }
+    "blocked"
+}
+
+/// The saved app is frontmost again and this process is not active.
+pub fn frontmost_is_restored(
+    saved_pid: i32,
+    front_pid: i32,
+    self_pid: i32,
+    self_active: bool,
+) -> bool {
+    if self_active {
+        return false;
+    }
+    if saved_pid <= 0 || saved_pid == self_pid {
+        return true;
+    }
+    front_pid == saved_pid
+}
+
+/// Presentation options stay up across a prompt only while this app is inactive.
+pub fn hold_presentation_across_prompt(app_active: bool) -> bool {
+    !app_active
 }
 
 #[cfg(test)]
@@ -427,6 +468,9 @@ pub fn failure_reasons(report: &KitReport) -> Vec<String> {
     }
     if row_is_failure(Some(&report.click_focus.focus_outcome)) {
         reasons.push(format!("focus={}", report.click_focus.focus_outcome));
+    }
+    if !report.click_focus.frontmost_restored {
+        reasons.push("frontmost-not-restored".to_string());
     }
     reasons
 }
@@ -612,6 +656,14 @@ pub fn render(report: &KitReport) -> String {
         one_line(&report.click_focus.measured_click)
     ));
     out.push_str(&format!(
+        "click-route={}\n",
+        one_line(&report.click_focus.click_route)
+    ));
+    out.push_str(&format!(
+        "frontmost-restored={}\n",
+        report.click_focus.frontmost_restored
+    ));
+    out.push_str(&format!(
         "measured-focus={}\n",
         one_line(&report.click_focus.measured_focus)
     ));
@@ -743,6 +795,8 @@ fn passing_runner_fixture() -> KitReport {
             typed_focus: String::new(),
             click_outcome: "not-run-on-runner".to_string(),
             focus_outcome: "not-run-on-runner".to_string(),
+            click_route: "none".to_string(),
+            frontmost_restored: true,
             note: "runner has no Accessibility grant".to_string(),
         },
         presentation: vec![
@@ -1161,6 +1215,48 @@ mod tests {
         report.click_focus.focus_outcome = "measurement-unreliable".to_string();
         assert!(row_is_failure(Some("measurement-unreliable")));
         assert!(render(&report).contains("result=fail"));
+    }
+
+    #[test]
+    fn a_pid_posted_click_is_measurement_unreliable() {
+        assert_eq!(
+            score_posted_click("pid", 1, true, false),
+            "measurement-unreliable"
+        );
+        assert_eq!(score_posted_click("hid", 1, true, false), "fell-through");
+        assert_eq!(score_posted_click("hid", 0, true, false), "blocked");
+        assert_eq!(
+            score_posted_click("none", 0, false, false),
+            "not-applicable"
+        );
+        let mut report = passing_runner_fixture();
+        report.click_focus.click_route = "pid".to_string();
+        report.click_focus.measured_click = "measurement-unreliable".to_string();
+        report.click_focus.click_outcome = "measurement-unreliable".to_string();
+        report.click_focus.frontmost_restored = true;
+        let text = render(&report);
+        assert!(text.contains("click-route=pid"));
+        assert!(text.contains("result=fail"));
+    }
+
+    #[test]
+    fn frontmost_app_is_restored_before_a_prompt() {
+        assert!(frontmost_is_restored(40, 40, 99, false));
+        assert!(!frontmost_is_restored(40, 99, 99, true));
+        assert!(!frontmost_is_restored(40, 12, 99, false));
+        assert!(!hold_presentation_across_prompt(true));
+        assert!(hold_presentation_across_prompt(false));
+        let mut report = passing_runner_fixture();
+        report.click_focus.frontmost_restored = false;
+        report.click_focus.click_outcome = "frontmost-not-restored".to_string();
+        let text = render(&report);
+        assert!(text.contains("frontmost-restored=false"));
+        assert!(text.contains("result=fail"));
+        assert!(
+            failure_reasons(&report)
+                .iter()
+                .any(|reason| reason.contains("frontmost-not-restored"))
+        );
     }
 
     #[test]

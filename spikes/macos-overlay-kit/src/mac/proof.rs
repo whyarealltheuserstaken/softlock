@@ -16,8 +16,8 @@ use crate::claim::SHARING_APIS;
 use crate::mac::ffi::{self, OverlayGuard, TargetWindow};
 use crate::report::{
     CaptureSample, ClickFocus, KIT_ID, KitReport, OperatorRow, PRESENTATION_RECORDED_NOTE,
-    PresentationRow, claims_from_samples, exit_nonzero, operator_row, render, row_is_failure,
-    runner_operator_row, score_hotplug,
+    PresentationRow, claims_from_samples, exit_nonzero, hold_presentation_across_prompt,
+    operator_row, render, row_is_failure, runner_operator_row, score_hotplug,
 };
 use crate::scrub::{contains_serial, scrub};
 use crate::version::parse_sw_vers;
@@ -317,7 +317,7 @@ fn fill_presentation_from_args(args: &Args, rows: &mut [PresentationRow], power_
             };
             continue;
         }
-        let apply_options = !is_power;
+        let mut apply_options = !is_power;
         if apply_options {
             let bits = ffi::presentation_apply();
             row.applied_while_inactive = match row.name.as_str() {
@@ -326,6 +326,10 @@ fn fill_presentation_from_args(args: &Args, rows: &mut [PresentationRow], power_
                 _ => false,
             };
             row.app_was_active = bits.app_active;
+            if !hold_presentation_across_prompt(bits.app_active) {
+                ffi::presentation_clear();
+                apply_options = false;
+            }
         }
         if let Some(value) = values[index] {
             row.outcome = value.to_string();

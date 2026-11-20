@@ -40,6 +40,8 @@ const ACCEPTANCE_TESTS: &[&str] = &[
     "fn timeout_watchdog_sets_stop_without_an_enter_key",
     "fn measured_blocked_with_no_typed_answer_fails",
     "fn click_wait_finished_when_counts_change_or_deadline",
+    "fn frontmost_app_is_restored_before_a_prompt",
+    "fn a_pid_posted_click_is_measurement_unreliable",
 ];
 
 #[test]

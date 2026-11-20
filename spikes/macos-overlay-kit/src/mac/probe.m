@@ -53,6 +53,8 @@ typedef struct {
     int key_count;
     int accessibility;
     int listen;
+    int frontmost_restored;
+    char click_route[16];
     char error[256];
 } ClickOut;
 
@@ -115,10 +117,46 @@ static void ensure_app(void) {
     [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
 }
 
-static void activate_app(void) {
+static NSRunningApplication *g_saved_front = nil;
+
+static void activate_for_measure(void) {
+    if (g_saved_front == nil) {
+        g_saved_front = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    }
     NSApplication *app = [NSApplication sharedApplication];
     [app setActivationPolicy:NSApplicationActivationPolicyRegular];
     [app activateIgnoringOtherApps:YES];
+}
+
+static int restore_frontmost(void) {
+    if (g_target != nil) {
+        [g_target orderOut:nil];
+        [g_target close];
+        g_target = nil;
+        g_target_button = nil;
+    }
+    NSApplication *app = [NSApplication sharedApplication];
+    [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    NSRunningApplication *saved = g_saved_front;
+    pid_t want = saved != nil ? saved.processIdentifier : 0;
+    pid_t self_pid = getpid();
+    if (saved != nil && want != self_pid) {
+        [saved activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+    }
+    BOOL ok = wait_until(2, ^{
+      NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
+      pid_t front_pid = front != nil ? front.processIdentifier : 0;
+      int active = app.isActive ? 1 : 0;
+      if (active) {
+          return 0;
+      }
+      if (want <= 0 || want == self_pid) {
+          return 1;
+      }
+      return front_pid == want ? 1 : 0;
+    });
+    g_saved_front = nil;
+    return ok ? 1 : 0;
 }
 
 static BOOL wait_until(NSTimeInterval seconds, int (^pred)(void)) {
@@ -575,7 +613,7 @@ int m06_target_open(ClickOut *out) {
         window.level = NSNormalWindowLevel;
         TargetView *view = [[TargetView alloc] initWithFrame:NSMakeRect(0, 0, 280, 160)];
         window.contentView = view;
-        activate_app();
+        activate_for_measure();
         [window makeKeyAndOrderFront:nil];
         [window makeFirstResponder:view];
         g_target = window;
@@ -618,17 +656,20 @@ int m06_posted_click_focus(ClickOut *out) {
         }
         out->overlay_is_key = overlay_key ? 1 : 0;
         out->target_is_key = (g_target != nil && g_target.isKeyWindow) ? 1 : 0;
+        snprintf(out->click_route, sizeof out->click_route, "none");
         if (g_target == nil) {
             snprintf(out->error, sizeof out->error, "target window missing");
+            out->frontmost_restored = restore_frontmost();
             return 0;
         }
         if (out->accessibility == 0) {
             snprintf(out->error, sizeof out->error, "Accessibility not granted");
             out->click_count = atomic_load(&g_clicks);
             out->key_count = atomic_load(&g_keys);
+            out->frontmost_restored = restore_frontmost();
             return 0;
         }
-        activate_app();
+        activate_for_measure();
         [g_target makeKeyAndOrderFront:nil];
         [g_target makeFirstResponder:g_target.contentView];
         BOOL became_key = wait_until(2, ^{
@@ -641,6 +682,7 @@ int m06_posted_click_focus(ClickOut *out) {
             out->target_is_key = g_target.isKeyWindow ? 1 : 0;
             out->click_count = atomic_load(&g_clicks);
             out->key_count = atomic_load(&g_keys);
+            out->frontmost_restored = restore_frontmost();
             return 0;
         }
         int baseline_clicks = atomic_load(&g_clicks);
@@ -669,34 +711,12 @@ int m06_posted_click_focus(ClickOut *out) {
             }
             CFRelease(source);
         }
+        snprintf(out->click_route, sizeof out->click_route, "hid");
         wait_until(2, ^{
           return (atomic_load(&g_clicks) > baseline_clicks || atomic_load(&g_keys) > baseline_keys)
                      ? 1
                      : 0;
         });
-        if (atomic_load(&g_clicks) <= baseline_clicks) {
-            pid_t pid = getpid();
-            CGEventRef hid_down =
-                CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, point, kCGMouseButtonLeft);
-            CGEventRef hid_up =
-                CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp, point, kCGMouseButtonLeft);
-            if (hid_down != NULL && hid_up != NULL) {
-                CGEventPostToPid(pid, hid_down);
-                CGEventPostToPid(pid, hid_up);
-            }
-            if (hid_down != NULL) {
-                CFRelease(hid_down);
-            }
-            if (hid_up != NULL) {
-                CFRelease(hid_up);
-            }
-            wait_until(2, ^{
-              return (atomic_load(&g_clicks) > baseline_clicks ||
-                      atomic_load(&g_keys) > baseline_keys)
-                         ? 1
-                         : 0;
-            });
-        }
         overlay_key = NO;
         for (NSWindow *window in g_overlay) {
             if (window.isKeyWindow) {
@@ -707,6 +727,7 @@ int m06_posted_click_focus(ClickOut *out) {
         out->target_is_key = g_target.isKeyWindow ? 1 : 0;
         out->click_count = atomic_load(&g_clicks);
         out->key_count = atomic_load(&g_keys);
+        out->frontmost_restored = restore_frontmost();
     }
     return 0;
 }
