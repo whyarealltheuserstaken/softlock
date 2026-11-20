@@ -121,7 +121,7 @@ static void activate_app(void) {
     [app activateIgnoringOtherApps:YES];
 }
 
-static BOOL wait_until(NSTimeInterval seconds, BOOL (^pred)(void)) {
+static BOOL wait_until(NSTimeInterval seconds, int (^pred)(void)) {
     NSDate *until = [NSDate dateWithTimeIntervalSinceNow:seconds];
     while ([until timeIntervalSinceNow] > 0) {
         if (pred()) {
@@ -129,7 +129,7 @@ static BOOL wait_until(NSTimeInterval seconds, BOOL (^pred)(void)) {
         }
         pump(0.02);
     }
-    return pred();
+    return pred() ? YES : NO;
 }
 
 static CGPoint quartz_point_in_view(NSView *view) {
@@ -546,7 +546,9 @@ int m06_control_open(void) {
         g_control = window;
         [window orderFrontRegardless];
         wait_until(2, ^{
-          return window.isVisible && (window.occlusionState & NSWindowOcclusionStateVisible) != 0;
+          return (window.isVisible && (window.occlusionState & NSWindowOcclusionStateVisible) != 0)
+                     ? 1
+                     : 0;
         });
     }
     return 0;
@@ -579,7 +581,7 @@ int m06_target_open(ClickOut *out) {
         g_target = window;
         wait_until(2, ^{
           [window makeKeyAndOrderFront:nil];
-          return window.isKeyWindow;
+          return window.isKeyWindow ? 1 : 0;
         });
         out->target_is_key = window.isKeyWindow ? 1 : 0;
         out->accessibility = AXIsProcessTrusted() ? 1 : 0;
@@ -631,7 +633,7 @@ int m06_posted_click_focus(ClickOut *out) {
         [g_target makeFirstResponder:g_target.contentView];
         BOOL became_key = wait_until(2, ^{
           [g_target makeKeyAndOrderFront:nil];
-          return g_target.isKeyWindow;
+          return g_target.isKeyWindow ? 1 : 0;
         });
         if (!became_key) {
             snprintf(out->error, sizeof out->error, "target never became key");
@@ -668,7 +670,9 @@ int m06_posted_click_focus(ClickOut *out) {
             CFRelease(source);
         }
         wait_until(2, ^{
-          return atomic_load(&g_clicks) > baseline_clicks || atomic_load(&g_keys) > baseline_keys;
+          return (atomic_load(&g_clicks) > baseline_clicks || atomic_load(&g_keys) > baseline_keys)
+                     ? 1
+                     : 0;
         });
         if (atomic_load(&g_clicks) <= baseline_clicks) {
             pid_t pid = getpid();
@@ -687,7 +691,10 @@ int m06_posted_click_focus(ClickOut *out) {
                 CFRelease(hid_up);
             }
             wait_until(2, ^{
-              return atomic_load(&g_clicks) > baseline_clicks || atomic_load(&g_keys) > baseline_keys;
+              return (atomic_load(&g_clicks) > baseline_clicks ||
+                      atomic_load(&g_keys) > baseline_keys)
+                         ? 1
+                         : 0;
             });
         }
         overlay_key = NO;
