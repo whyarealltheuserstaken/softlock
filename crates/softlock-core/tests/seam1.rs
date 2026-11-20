@@ -9,8 +9,8 @@ use softlock_core::{
     ARM_STEP_TIMEOUT, ArmStep, Event, FailReason, FakePlatform, Fallback, GuardHealth,
     HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BEFORE_FAILURE, HardeningPlan, HeartbeatReport, IpcError,
     Journal, JournalEntry, LaunchNonce, LockController, LockSource, LockState, MAX_FRAME, MethodId,
-    OverlayHealth, PlannedChange, PolicySetting, PromptState, RequestKind, ResponseKind, Role,
-    SERVICE_SILENCE_LIMIT, Secret, SessionEvent, SessionId, StateName,
+    OverlayHealth, PlannedChange, PolicySetting, PolicySettings, PromptState, RequestKind,
+    ResponseKind, Role, SERVICE_SILENCE_LIMIT, Secret, SessionEvent, SessionId, StateName,
     UNSUPPORTED_PLATFORM_MESSAGE, UnsupportedPlatform, Verdict, checked_body_len,
     journal_is_durable_before_apply,
 };
@@ -1946,6 +1946,107 @@ fn recovering_with_no_active_lock_reverts_the_journal_and_unlocks() {
         controller.platform().setting(PolicySetting::DisableTaskMgr),
         Some("0")
     );
+}
+
+#[test]
+fn a_registry_change_reasserts_without_waiting() {
+    let mut controller = locked_started();
+    controller
+        .platform_mut()
+        .clear_policy(PolicySetting::DisableTaskMgr);
+    controller.handle(Event::PolicyChanged);
+    assert_eq!(
+        controller.platform().setting(PolicySetting::DisableTaskMgr),
+        Some("1")
+    );
+    assert!(matches!(controller.state(), LockState::Locked { .. }));
+}
+
+#[test]
+fn repair_while_locked_does_not_revert_or_unlock() {
+    let mut controller = locked_started();
+    let locked = controller
+        .platform()
+        .setting(PolicySetting::DisableTaskMgr)
+        .map(str::to_string);
+    controller.handle(Event::Repair);
+    assert!(matches!(controller.state(), LockState::Locked { .. }));
+    assert_eq!(
+        controller
+            .platform()
+            .setting(PolicySetting::DisableTaskMgr)
+            .map(str::to_string),
+        locked
+    );
+    assert!(!controller.journal().is_empty());
+    assert!(!controller.returned_to_unlocked());
+}
+
+#[test]
+fn a_reassert_failure_is_not_unlocked() {
+    let mut controller = locked_started();
+    controller.platform_mut().fail_reassert(true);
+    controller.handle(Event::ReassertFailed);
+    assert!(!controller.returned_to_unlocked());
+    assert!(matches!(
+        controller.state(),
+        LockState::OsLocked { .. } | LockState::FailingClosed { .. }
+    ));
+}
+
+#[test]
+fn unlock_restores_absent_zero_and_administrator_one() {
+    for previous in [None, Some("0"), Some("1")] {
+        let mut platform = FakePlatform::new();
+        if let Some(value) = previous {
+            platform.set_setting(PolicySetting::DisableTaskMgr, value);
+        }
+        let mut controller = started(platform);
+        controller.handle(Event::LockRequested {
+            source: LockSource::App,
+        });
+        assert_eq!(
+            controller.platform().setting(PolicySetting::DisableTaskMgr),
+            Some("1")
+        );
+        let nonce = LaunchNonce::from_bytes([7; 32]);
+        controller.handle(Event::AdoptLaunchNonce {
+            nonce: nonce.clone(),
+        });
+        controller.handle(Event::Verified { nonce });
+        assert!(matches!(controller.state(), LockState::Unlocked));
+        assert_eq!(
+            controller.platform().setting(PolicySetting::DisableTaskMgr),
+            previous
+        );
+        assert!(controller.journal().is_empty());
+        controller.handle(Event::Repair);
+        assert_eq!(
+            controller.platform().setting(PolicySetting::DisableTaskMgr),
+            previous
+        );
+    }
+}
+
+#[test]
+fn an_external_clear_is_reasserted_at_five_seconds_and_not_before() {
+    let mut controller = locked_started();
+    controller
+        .platform_mut()
+        .clear_policy(PolicySetting::DisableTaskMgr);
+    advance_while_locked(&mut controller, Duration::from_millis(4_999));
+    assert_eq!(
+        controller.platform().setting(PolicySetting::DisableTaskMgr),
+        None,
+        "Task Manager must stay cleared until 5 s"
+    );
+    advance_while_locked(&mut controller, Duration::from_millis(1));
+    assert_eq!(
+        controller.platform().setting(PolicySetting::DisableTaskMgr),
+        Some("1"),
+        "Task Manager must be re-asserted at 5 s"
+    );
+    assert!(matches!(controller.state(), LockState::Locked { .. }));
 }
 
 #[test]

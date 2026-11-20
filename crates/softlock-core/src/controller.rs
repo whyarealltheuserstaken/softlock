@@ -72,6 +72,12 @@ pub enum Event {
         session_active: bool,
     },
     ServiceStopRequested,
+    /// A watched policy changed under us. Re-assert while locked.
+    PolicyChanged,
+    /// Administrator repair. Reverts a leftover journal and refuses while locked.
+    Repair,
+    /// The platform could not put a locked setting back.
+    ReassertFailed,
 }
 
 pub struct LockController<P> {
@@ -88,6 +94,7 @@ pub struct LockController<P> {
     now: MonotonicInstant,
     last_heartbeat: Option<MonotonicInstant>,
     last_heartbeat_seq: Option<u64>,
+    last_reassert: Option<MonotonicInstant>,
     step_started: Option<MonotonicInstant>,
     session_os_locked: bool,
     broker_launched: bool,
@@ -122,6 +129,7 @@ impl<P: Platform> LockController<P> {
             now: MonotonicInstant::zero(),
             last_heartbeat: None,
             last_heartbeat_seq: None,
+            last_reassert: None,
             step_started: None,
             session_os_locked: false,
             broker_launched: false,
@@ -167,6 +175,13 @@ impl<P: Platform> LockController<P> {
                 self.on_service_started(journal, session_active);
             }
             Event::ServiceStopRequested => self.on_stop(),
+            Event::PolicyChanged => self.on_policy_changed(),
+            Event::Repair => self.on_repair(),
+            Event::ReassertFailed => {
+                if matches!(self.state, LockState::Locked { .. }) {
+                    self.fail_closed(FailReason::RevertFailed);
+                }
+            }
         }
     }
 
@@ -376,6 +391,7 @@ impl<P: Platform> LockController<P> {
                     self.awake = Some(guard);
                     self.journal.set_failures(0);
                     self.journal.flush();
+                    self.last_reassert = Some(self.now);
                     self.last_heartbeat = Some(self.now);
                     self.last_heartbeat_seq = None;
                     self.broker_nonce = None;
@@ -672,6 +688,50 @@ impl<P: Platform> LockController<P> {
             && self.now.saturating_duration_since(started) >= ARM_STEP_TIMEOUT
         {
             self.fail_closed(FailReason::ArmTimeout);
+            return;
+        }
+        self.reassert_locked();
+    }
+
+    fn reassert_locked(&mut self) {
+        if !matches!(self.state, LockState::Locked { .. }) {
+            return;
+        }
+        let Some(last) = self.last_reassert else {
+            return;
+        };
+        if self.now.saturating_duration_since(last) < Duration::from_secs(5) {
+            return;
+        }
+        self.force_reassert();
+    }
+
+    fn force_reassert(&mut self) {
+        if Hardening::reassert(&mut self.platform, &self.journal).is_err() {
+            self.fail_closed(FailReason::RevertFailed);
+            return;
+        }
+        self.last_reassert = Some(self.now);
+    }
+
+    fn on_policy_changed(&mut self) {
+        if !matches!(self.state, LockState::Locked { .. }) {
+            self.reject("PolicyChanged");
+            return;
+        }
+        self.force_reassert();
+    }
+
+    fn on_repair(&mut self) {
+        if !matches!(self.state, LockState::Unlocked) {
+            self.reject("Repair");
+            return;
+        }
+        if self.journal.is_empty() {
+            return;
+        }
+        if !self.teardown() {
+            self.fail_closed(FailReason::RevertFailed);
         }
     }
 

@@ -67,6 +67,7 @@ pub struct FakePlatform {
     last_os_lock: Option<SessionId>,
     secret_verdict: Verdict,
     revert_failed: bool,
+    reassert_failed: bool,
     guard_armed: bool,
     overlay_shown: bool,
     power_held: bool,
@@ -92,6 +93,7 @@ impl FakePlatform {
             last_os_lock: None,
             secret_verdict: Verdict::Rejected,
             revert_failed: false,
+            reassert_failed: false,
             guard_armed: false,
             overlay_shown: false,
             power_held: false,
@@ -150,6 +152,10 @@ impl FakePlatform {
 
     pub fn fail_revert(&mut self, fail: bool) {
         self.revert_failed = fail;
+    }
+
+    pub fn fail_reassert(&mut self, fail: bool) {
+        self.reassert_failed = fail;
     }
 
     pub fn apply_events(&self) -> &[ApplyEvent] {
@@ -334,6 +340,22 @@ impl Hardening for FakePlatform {
                         self.extras.remove(&entry.target);
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn reassert(&mut self, journal: &Journal) -> Result<(), HardenError> {
+        if self.reassert_failed {
+            return Err(HardenError::Failed);
+        }
+        for entry in journal.entries() {
+            let Some(setting) = PolicySetting::from_id(&entry.target) else {
+                continue;
+            };
+            if self.policy(setting).as_deref() != Some(entry.new_value.as_str()) {
+                let value = entry.new_value.clone();
+                self.write_policy(setting, &value);
             }
         }
         Ok(())

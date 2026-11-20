@@ -351,6 +351,86 @@ fn session_event(
     }
 }
 
+fn install_journal(authority: &mut Authority) {
+    match crate::settings::SettingsEngine::open() {
+        Ok(mut engine) => match engine.boot() {
+            Ok(crate::settings::Boot::FailClosed(journal)) => {
+                authority.platform_mut().install_engine(engine);
+                authority.notify(Event::ServiceStarted {
+                    journal,
+                    session_active: true,
+                });
+            }
+            Ok(_) => authority.platform_mut().install_engine(engine),
+            Err(reason) => {
+                crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+                authority.platform_mut().require_settings();
+                let mut journal = softlock_core::Journal::empty();
+                journal.mark_locked();
+                journal.flush();
+                authority.notify(Event::ServiceStarted {
+                    journal,
+                    session_active: true,
+                });
+            }
+        },
+        Err(reason) => {
+            crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+            authority.platform_mut().require_settings();
+            let mut journal = softlock_core::Journal::empty();
+            journal.mark_locked();
+            journal.flush();
+            authority.notify(Event::ServiceStarted {
+                journal,
+                session_active: true,
+            });
+        }
+    }
+    crate::settings::register_sign_in_recovery();
+}
+
+fn poll_journal(authority: &Arc<Mutex<Authority>>) {
+    let mut guard = authority
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if guard.platform_mut().poll_settings().is_err() {
+        guard.notify(Event::ReassertFailed);
+    }
+}
+
+pub(crate) fn running_product_state() -> Option<softlock_core::ProductState> {
+    let name = pipe_path();
+    let mut file = open_client_pipe(&name).ok()?;
+    let body = br#"{"v":1,"id":2,"kind":"GetStatus"}"#;
+    let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(body);
+    write_prefixed_frame(&mut file, &frame).ok()?;
+    let response = read_prefixed_frame(&mut file).ok()?;
+    if response.len() < 4 {
+        return Some(softlock_core::ProductState::Locked);
+    }
+    let text = String::from_utf8_lossy(&response[4..]);
+    Some(product_state_from_status(&text))
+}
+
+fn product_state_from_status(text: &str) -> softlock_core::ProductState {
+    use softlock_core::ProductState;
+    for (needle, state) in [
+        ("\"state\":\"FailingClosed\"", ProductState::FailingClosed),
+        ("\"state\":\"Unlocking\"", ProductState::Unlocking),
+        ("\"state\":\"Recovering\"", ProductState::Recovering),
+        ("\"state\":\"OsLocked\"", ProductState::OsLocked),
+        ("\"state\":\"Unlocked\"", ProductState::Unlocked),
+        ("\"state\":\"Arming\"", ProductState::Arming),
+        ("\"state\":\"Locked\"", ProductState::Locked),
+    ] {
+        if text.contains(needle) {
+            return state;
+        }
+    }
+    ProductState::Locked
+}
+
 fn serve(probe: Option<PathBuf>) -> i32 {
     let data_dir = crate::service_data_directory();
     let store = crate::secrets::verify_service_directory(&data_dir);
@@ -397,6 +477,7 @@ fn serve(probe: Option<PathBuf>) -> i32 {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = loaded;
     remember_pin_status();
+    install_journal(&mut authority);
     let arm = ArmWait::new();
     authority.platform_mut().set_arm_wait(arm.clone());
     let authority = Arc::new(Mutex::new(authority));
@@ -433,6 +514,7 @@ fn serve(probe: Option<PathBuf>) -> i32 {
     while !STOP.load(Ordering::Acquire) {
         apply_session_events(&authority, &session_rx);
         note_stop_file();
+        poll_journal(&authority);
         poll_stop(&authority);
         thread::sleep(Duration::from_millis(20));
     }

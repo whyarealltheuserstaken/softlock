@@ -346,7 +346,7 @@ fn load_verified(path: &Path) -> io::Result<Option<String>> {
 #[cfg(windows)]
 fn write_hash_in_directory(dir: windows::Win32::Foundation::HANDLE, hash: &str) -> io::Result<()> {
     let name = random_temp_name()?;
-    let file = create_relative(&name, dir)?;
+    let file = create_relative(&name, dir, SYSTEM_ONLY_SDDL)?;
     if let Err(error) = finish_created_handle(file) {
         let _ = delete_by_handle(file);
         drop_handle(file);
@@ -388,7 +388,7 @@ fn open_log_in_directory(
             file_at_end(handle)
         }
         Err(error) if not_found(&error) => {
-            let handle = create_relative(name, dir)?;
+            let handle = create_relative(name, dir, SYSTEM_ONLY_SDDL)?;
             if let Err(error) = finish_created_handle(handle) {
                 let _ = delete_by_handle(handle);
                 drop_handle(handle);
@@ -450,7 +450,10 @@ fn write_handle(handle: windows::Win32::Foundation::HANDLE, bytes: &[u8]) -> io:
 }
 
 #[cfg(windows)]
-fn write_all_handle(handle: windows::Win32::Foundation::HANDLE, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_all_handle(
+    handle: windows::Win32::Foundation::HANDLE,
+    bytes: &[u8],
+) -> io::Result<()> {
     use windows::Win32::Storage::FileSystem::{FlushFileBuffers, WriteFile};
     let mut offset = 0;
     while offset < bytes.len() {
@@ -470,7 +473,7 @@ fn write_all_handle(handle: windows::Win32::Foundation::HANDLE, bytes: &[u8]) ->
 }
 
 #[cfg(windows)]
-fn read_handle_text(handle: windows::Win32::Foundation::HANDLE) -> io::Result<String> {
+pub(crate) fn read_handle_text(handle: windows::Win32::Foundation::HANDLE) -> io::Result<String> {
     use std::io::Read;
     use std::os::windows::io::FromRawHandle;
     let mut file = unsafe { fs::File::from_raw_handle(handle.0) };
@@ -519,7 +522,7 @@ fn create_directory_default(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn create_directory_with(path: &Path, sddl: Option<&str>) -> io::Result<()> {
+pub(crate) fn create_directory_with(path: &Path, sddl: Option<&str>) -> io::Result<()> {
     use windows::Win32::Security::SECURITY_ATTRIBUTES;
     use windows::Win32::Storage::FileSystem::CreateDirectoryW;
     use windows::core::PCWSTR;
@@ -586,13 +589,13 @@ fn already_exists(error: &windows::core::Error) -> bool {
 }
 
 #[cfg(windows)]
-fn already_exists_io(error: &io::Error) -> bool {
+pub(crate) fn already_exists_io(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::AlreadyExists
         || matches!(error.raw_os_error(), Some(80) | Some(183))
 }
 
 #[cfg(windows)]
-fn not_found(error: &io::Error) -> bool {
+pub(crate) fn not_found(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || matches!(error.raw_os_error(), Some(2) | Some(3))
 }
 
@@ -600,7 +603,7 @@ fn not_found(error: &io::Error) -> bool {
 /// as `0x80070002`, which `from_raw_os_error` does not treat as not-found,
 /// so a missing directory was never created.
 #[cfg(windows)]
-fn os_error(error: windows::core::Error) -> io::Error {
+pub(crate) fn os_error(error: windows::core::Error) -> io::Error {
     let code = error.code().0 as u32;
     let win32 = if code & 0xFFFF_0000 == 0x8007_0000 {
         (code & 0xFFFF) as i32
@@ -616,7 +619,7 @@ fn security_descriptor() -> io::Result<windows::Win32::Security::PSECURITY_DESCR
 }
 
 #[cfg(windows)]
-fn security_descriptor_from(
+pub(crate) fn security_descriptor_from(
     sddl: &str,
 ) -> io::Result<windows::Win32::Security::PSECURITY_DESCRIPTOR> {
     use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
@@ -637,7 +640,7 @@ fn security_descriptor_from(
 }
 
 #[cfg(windows)]
-fn free_descriptor(descriptor: &windows::Win32::Security::PSECURITY_DESCRIPTOR) {
+pub(crate) fn free_descriptor(descriptor: &windows::Win32::Security::PSECURITY_DESCRIPTOR) {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
     if !descriptor.0.is_null() {
         unsafe {
@@ -671,7 +674,7 @@ pub(crate) fn running_as_system() -> bool {
 }
 
 #[cfg(windows)]
-struct PrivilegeGuard {
+pub(crate) struct PrivilegeGuard {
     token: windows::Win32::Foundation::HANDLE,
     previous: windows::Win32::Security::TOKEN_PRIVILEGES,
 }
@@ -697,7 +700,7 @@ impl Drop for PrivilegeGuard {
 /// state back when the guard drops. Callers hold the guard across the single
 /// call that needs it.
 #[cfg(windows)]
-fn enable_privilege_scoped(name: windows::core::PCWSTR) -> io::Result<PrivilegeGuard> {
+pub(crate) fn enable_privilege_scoped(name: windows::core::PCWSTR) -> io::Result<PrivilegeGuard> {
     use windows::Win32::Foundation::{ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE};
     use windows::Win32::Security::{
         AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
@@ -758,7 +761,7 @@ pub fn is_reparse_point(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-fn handle_is_reparse(handle: windows::Win32::Foundation::HANDLE) -> io::Result<bool> {
+pub(crate) fn handle_is_reparse(handle: windows::Win32::Foundation::HANDLE) -> io::Result<bool> {
     use windows::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo,
         GetFileInformationByHandleEx,
@@ -861,7 +864,10 @@ fn remove_pin_without_system(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn open_directory(path: &Path, control: bool) -> io::Result<windows::Win32::Foundation::HANDLE> {
+pub(crate) fn open_directory(
+    path: &Path,
+    control: bool,
+) -> io::Result<windows::Win32::Foundation::HANDLE> {
     use windows::Win32::Storage::FileSystem::{
         FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
         FILE_TRAVERSE, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
@@ -921,7 +927,7 @@ fn open_reparse(
 }
 
 #[cfg(windows)]
-fn drop_handle(handle: windows::Win32::Foundation::HANDLE) {
+pub(crate) fn drop_handle(handle: windows::Win32::Foundation::HANDLE) {
     if !handle.0.is_null() {
         unsafe {
             let _ = windows::Win32::Foundation::CloseHandle(handle);
@@ -977,7 +983,7 @@ pub fn dacl_sddl(path: &Path) -> io::Result<String> {
 }
 
 #[cfg(windows)]
-fn dacl_sddl_handle(handle: windows::Win32::Foundation::HANDLE) -> io::Result<String> {
+pub(crate) fn dacl_sddl_handle(handle: windows::Win32::Foundation::HANDLE) -> io::Result<String> {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT,
@@ -1108,7 +1114,7 @@ fn random_temp_name() -> io::Result<String> {
 }
 
 #[cfg(windows)]
-fn wide(path: &Path) -> Vec<u16> {
+pub(crate) fn wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     path.as_os_str()
         .encode_wide()
@@ -1117,7 +1123,7 @@ fn wide(path: &Path) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-fn wide_str(text: &str) -> Vec<u16> {
+pub(crate) fn wide_str(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -1127,6 +1133,8 @@ const FILE_CREATE: u32 = 2;
 const FILE_OPEN: u32 = 1;
 #[cfg(windows)]
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+#[cfg(windows)]
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 #[cfg(windows)]
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 #[cfg(windows)]
@@ -1193,10 +1201,24 @@ unsafe extern "system" {
     ) -> i32;
 
     fn RtlNtStatusToDosError(status: i32) -> u32;
+
+    fn NtQueryDirectoryFile(
+        file_handle: *mut core::ffi::c_void,
+        event: *mut core::ffi::c_void,
+        apc_routine: *mut core::ffi::c_void,
+        apc_context: *mut core::ffi::c_void,
+        io_status_block: *mut IoStatusBlock,
+        file_information: *mut core::ffi::c_void,
+        length: u32,
+        file_information_class: u32,
+        return_single_entry: u8,
+        file_name: *mut UnicodeString,
+        restart_scan: u8,
+    ) -> i32;
 }
 
 #[cfg(windows)]
-fn nt_result(status: i32) -> io::Result<()> {
+pub(crate) fn nt_result(status: i32) -> io::Result<()> {
     if status >= 0 {
         return Ok(());
     }
@@ -1205,13 +1227,14 @@ fn nt_result(status: i32) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn create_relative(
+pub(crate) fn create_relative(
     name: &str,
     directory: windows::Win32::Foundation::HANDLE,
+    sddl: &str,
 ) -> io::Result<windows::Win32::Foundation::HANDLE> {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
-    let descriptor = security_descriptor_from(SYSTEM_ONLY_SDDL)?;
+    let descriptor = security_descriptor_from(sddl)?;
     let mut wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let mut unicode = UnicodeString {
         length: ((wide_name.len() - 1) * 2) as u16,
@@ -1265,7 +1288,63 @@ fn create_relative(
 }
 
 #[cfg(windows)]
-fn open_relative(
+pub(crate) fn create_directory_relative(
+    name: &str,
+    directory: windows::Win32::Foundation::HANDLE,
+    sddl: &str,
+) -> io::Result<()> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    let descriptor = security_descriptor_from(sddl)?;
+    let mut wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut unicode = UnicodeString {
+        length: ((wide_name.len() - 1) * 2) as u16,
+        maximum_length: (wide_name.len() * 2) as u16,
+        buffer: wide_name.as_mut_ptr(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: directory.0,
+        object_name: &mut unicode,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: descriptor.0,
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut iosb = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut raw = std::ptr::null_mut();
+    let access = FILE_READ_ACCESS | FILE_WRITE_ACCESS | 0x0002_0000 | 0x0010_0000 | 0x0001_0000;
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw,
+            access,
+            &mut attributes,
+            &mut iosb,
+            std::ptr::null_mut(),
+            FILE_ATTRIBUTE_NORMAL.0,
+            0,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT_OPTION,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    free_descriptor(&descriptor);
+    nt_result(status).map_err(|error| {
+        if already_exists_io(&error) {
+            io::Error::new(io::ErrorKind::AlreadyExists, "directory exists")
+        } else {
+            error
+        }
+    })?;
+    drop_handle(HANDLE(raw));
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn open_relative(
     directory: windows::Win32::Foundation::HANDLE,
     name: &str,
 ) -> io::Result<windows::Win32::Foundation::HANDLE> {
@@ -1310,7 +1389,7 @@ fn open_relative(
 }
 
 #[cfg(windows)]
-fn rename_relative(
+pub(crate) fn rename_relative(
     file: windows::Win32::Foundation::HANDLE,
     directory: windows::Win32::Foundation::HANDLE,
     name: &str,
@@ -1345,7 +1424,7 @@ fn rename_relative(
 }
 
 #[cfg(windows)]
-fn delete_by_handle(file: windows::Win32::Foundation::HANDLE) -> io::Result<()> {
+pub(crate) fn delete_by_handle(file: windows::Win32::Foundation::HANDLE) -> io::Result<()> {
     let mut info = [1u8];
     let mut iosb = IoStatusBlock {
         status: 0,
@@ -1362,3 +1441,145 @@ fn delete_by_handle(file: windows::Win32::Foundation::HANDLE) -> io::Result<()> 
     };
     nt_result(status)
 }
+
+#[cfg(windows)]
+pub(crate) fn owner_is_trusted(handle: windows::Win32::Foundation::HANDLE) -> io::Result<bool> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    if status.0 != 0 {
+        return Err(io::Error::from_raw_os_error(status.0 as i32));
+    }
+    let system = well_known_sid(windows::Win32::Security::WinLocalSystemSid)?;
+    let admins = well_known_sid(windows::Win32::Security::WinBuiltinAdministratorsSid)?;
+    let trusted = unsafe {
+        EqualSid(owner, PSID(system.as_ptr() as *mut _)).is_ok()
+            || EqualSid(owner, PSID(admins.as_ptr() as *mut _)).is_ok()
+    };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    Ok(trusted)
+}
+
+#[cfg(windows)]
+fn well_known_sid(kind: windows::Win32::Security::WELL_KNOWN_SID_TYPE) -> io::Result<Vec<u8>> {
+    use windows::Win32::Security::{CreateWellKnownSid, PSID};
+    let mut sid_buf = vec![0u8; 68];
+    let mut len = sid_buf.len() as u32;
+    unsafe {
+        CreateWellKnownSid(
+            kind,
+            None,
+            Some(PSID(sid_buf.as_mut_ptr().cast())),
+            &mut len,
+        )
+        .map_err(os_error)?;
+    }
+    Ok(sid_buf)
+}
+
+#[cfg(windows)]
+pub(crate) fn link_count(handle: windows::Win32::Foundation::HANDLE) -> io::Result<u32> {
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(os_error)?;
+    Ok(info.nNumberOfLinks)
+}
+
+/// Names in a directory opened with `FILE_FLAG_OPEN_REPARSE_POINT`. `.` and `..` are omitted.
+#[cfg(windows)]
+pub(crate) fn list_directory_names(
+    directory: windows::Win32::Foundation::HANDLE,
+) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    let mut restart = 1u8;
+    loop {
+        let mut buffer = vec![0u8; 16 * 1024];
+        let mut iosb = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                directory.0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut iosb,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                12,
+                0,
+                std::ptr::null_mut(),
+                restart,
+            )
+        };
+        restart = 0;
+        if status == STATUS_NO_MORE_FILES || status == STATUS_NO_SUCH_FILE {
+            break;
+        }
+        nt_result(status)?;
+        let mut offset = 0usize;
+        loop {
+            if offset + 12 > buffer.len() {
+                break;
+            }
+            let next = u32::from_le_bytes([
+                buffer[offset],
+                buffer[offset + 1],
+                buffer[offset + 2],
+                buffer[offset + 3],
+            ]);
+            let name_len = u32::from_le_bytes([
+                buffer[offset + 8],
+                buffer[offset + 9],
+                buffer[offset + 10],
+                buffer[offset + 11],
+            ]);
+            let start = offset + 12;
+            let end = start + name_len as usize;
+            if end > buffer.len() || !name_len.is_multiple_of(2) {
+                return Err(io::Error::other("directory entry was truncated"));
+            }
+            let units: Vec<u16> = buffer[start..end]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .collect();
+            let name = String::from_utf16(&units).unwrap_or_default();
+            if name != "." && name != ".." {
+                names.push(name);
+            }
+            if next == 0 {
+                break;
+            }
+            offset += next as usize;
+        }
+    }
+    Ok(names)
+}
+
+#[cfg(windows)]
+const STATUS_NO_MORE_FILES: i32 = 0x8000_0006_u32 as i32;
+#[cfg(windows)]
+const STATUS_NO_SUCH_FILE: i32 = 0xC000_000F_u32 as i32;
