@@ -1130,6 +1130,11 @@ fn stream_subscription(
     let held = SUBSCRIBERS.fetch_add(1, Ordering::AcqRel);
     if held >= SUBSCRIBE_CAP {
         SUBSCRIBERS.fetch_sub(1, Ordering::AcqRel);
+        // DisconnectNamedPipe drops unread bytes. Wait until the client has
+        // the rejection frame so it can tell a full stream from a broken pipe.
+        unsafe {
+            let _ = windows::Win32::Storage::FileSystem::FlushFileBuffers(pipe);
+        }
         return true;
     }
     let mut previous = None;
