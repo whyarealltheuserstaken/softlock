@@ -86,6 +86,7 @@ fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
     if query_taskmgr() != previous {
         return Err(format!("kill changed DisableTaskMgr from {previous}"));
     }
+    let _ = wait_until(Duration::from_secs(5), || !host_running());
     spawn_service(guard, None, &pause)?;
     let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == previous);
     hard_stop(guard);
@@ -101,14 +102,19 @@ fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
 fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
     set_taskmgr("absent")?;
     let pause = guard_dir().join("pause-after");
-    spawn_service(guard, None, &pause)?;
+    let _ = fs::remove_file(&pause);
+    // Hold the service after the registry write, before it can OS-lock the
+    // session or revert. The value is 1; killing both processes leaves the
+    // journal durable for the restart to restore.
+    spawn_service(guard, Some("after"), &pause)?;
     wait_pipe()?;
-    transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+    lock_in_background();
     let applied = wait_until(Duration::from_secs(20), || query_taskmgr() == "1");
     if !applied {
         return Err("DisableTaskMgr was not set to 1".to_string());
     }
     hard_stop(guard);
+    let _ = wait_until(Duration::from_secs(5), || !host_running());
     spawn_service(guard, None, &pause)?;
     let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == "absent");
     hard_stop(guard);
@@ -378,10 +384,67 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
 }
 
 fn hard_stop(_guard: &mut Guard) {
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", "softlock-lockhost.exe"])
-        .status();
+    // A live host OS-locks the console when its service pipe closes, and the
+    // service OS-locks when it sees the host die. Freeze the host first so
+    // neither side can lock the session, then kill the service and the host.
+    // The next boot must see the host gone and revert.
+    let _ = suspend_host();
     kill_service_process();
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "softlock-service.exe"])
+        .status();
+    for _ in 0..10 {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "softlock-lockhost.exe"])
+            .status();
+        if !host_running() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn suspend_host() -> Result<(), String> {
+    let pid = host_pid().ok_or_else(|| "lock host pid".to_string())?;
+    unsafe {
+        let process = windows::Win32::System::Threading::OpenProcess(
+            windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS(0x0800),
+            false,
+            pid,
+        )
+        .map_err(|_| "open host".to_string())?;
+        let status = NtSuspendProcess(process.0);
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!("suspend host returned {status}"))
+        }
+    }
+}
+
+fn host_pid() -> Option<u32> {
+    let output = Command::new("tasklist")
+        .args([
+            "/FI",
+            "IMAGENAME eq softlock-lockhost.exe",
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find(|line| line.to_ascii_lowercase().contains("softlock-lockhost.exe"))?;
+    let pid = line.split(',').nth(1)?.trim().trim_matches('"');
+    pid.parse().ok()
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtSuspendProcess(process: *mut core::ffi::c_void) -> i32;
 }
 
 fn kill_service_process() {
