@@ -372,6 +372,11 @@ fn kill_service_process() {
             .args(["/F", "/PID", &pid.to_string()])
             .status();
     }
+    // Stop is refused while the service is still starting. The test binary
+    // is not this image, so killing it is the stop.
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "softlock-service.exe"])
+        .status();
     let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
 }
 
@@ -383,9 +388,9 @@ fn service_pid() -> Option<u32> {
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines() {
         let line = line.trim();
-        let rest = line
-            .strip_prefix("PID")
-            .or_else(|| line.strip_prefix("PID:"))?;
+        let Some(rest) = line.strip_prefix("PID") else {
+            continue;
+        };
         let rest = rest.trim().trim_start_matches(':').trim();
         if let Ok(pid) = rest.parse::<u32>()
             && pid != 0
