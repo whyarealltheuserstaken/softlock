@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -166,21 +166,29 @@ fn recover_active(guard: &mut Guard) -> Result<(), String> {
     }) {
         return Err("the lock host was not running with DisableTaskMgr set".to_string());
     }
-    // The host exits when the service dies. Suspending it first keeps the
-    // process, path, session, and token so the restart still sees a live lock.
-    suspend_host()?;
-    kill_service_process();
-    if !host_running() {
-        return Err(format!(
-            "the lock host died with the service: {}",
-            service_state()
-        ));
-    }
-    spawn_service(guard, None, &pause)?;
+    // Killing the service makes the host exit. A second process boots the
+    // same journal while this service is still paused and the host is alive.
+    let boot_pipe = format!(r"\\.\pipe\softlock-journal-boot-{}", std::process::id());
+    let runner =
+        std::env::var("RUNNER_ENVIRONMENT").unwrap_or_else(|_| "github-hosted".to_string());
+    let mut boot = Command::new(service_exe())
+        .arg("--foreground")
+        .env("SOFTLOCK_PIPE", &boot_pipe)
+        .env("SOFTLOCK_LOG", guard_dir().join("boot.log"))
+        .env("SOFTLOCK_PIN_DIR", guard_dir().join("pin-boot"))
+        .env("SOFTLOCK_DEV_APP", "1")
+        .env("SOFTLOCK_STOP_FILE", guard_dir().join("stop-boot"))
+        .env("GITHUB_ACTIONS", "true")
+        .env("RUNNER_ENVIRONMENT", runner)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "boot spawn".to_string())?;
     let mut last = String::new();
     let mut saw_unlocked = false;
     let closed = wait_until(Duration::from_secs(25), || {
-        let status = transact(&pipe_name(), status_body()).unwrap_or_default();
+        let status = transact(&boot_pipe, status_body()).unwrap_or_default();
         let state = status_state(&status);
         if state.as_deref() == Some("Unlocked") {
             saw_unlocked = true;
@@ -195,6 +203,8 @@ fn recover_active(guard: &mut Guard) -> Result<(), String> {
     if saw_unlocked {
         return Err("an active lock returned to Unlocked".to_string());
     }
+    let _ = boot.kill();
+    let _ = boot.wait();
     if !closed || query_taskmgr() != "1" {
         return Err(format!(
             "an active journal did not keep DisableTaskMgr: {last} value {}",
@@ -414,7 +424,11 @@ fn service_running() -> bool {
 fn capture() {
     let _ = fs::create_dir_all(artifact_dir());
     let log = guard_dir().join("service.log");
-    let body = fs::read_to_string(&log).unwrap_or_else(|_| "missing".to_string());
+    let mut body = fs::read_to_string(&log).unwrap_or_else(|_| "missing".to_string());
+    if let Ok(boot) = fs::read_to_string(guard_dir().join("boot.log")) {
+        body.push_str("\n-- boot --\n");
+        body.push_str(&boot);
+    }
     let _ = fs::write(artifact_dir().join("service.log"), body);
     let dir = journal_file();
     let parent = dir.parent().unwrap_or(dir.as_path());
@@ -528,49 +542,6 @@ fn installed_service_running() -> bool {
         return false;
     };
     String::from_utf8_lossy(&output.stdout).contains("RUNNING")
-}
-
-fn suspend_host() -> Result<(), String> {
-    let pid = host_pid().ok_or_else(|| "lock host pid".to_string())?;
-    unsafe {
-        let process = windows::Win32::System::Threading::OpenProcess(
-            windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS(0x0800),
-            false,
-            pid,
-        )
-        .map_err(|_| "open host".to_string())?;
-        let status = NtSuspendProcess(process.0);
-        let _ = windows::Win32::Foundation::CloseHandle(process);
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(format!("suspend host returned {status}"))
-        }
-    }
-}
-
-fn host_pid() -> Option<u32> {
-    let output = Command::new("tasklist")
-        .args([
-            "/FI",
-            "IMAGENAME eq softlock-lockhost.exe",
-            "/FO",
-            "CSV",
-            "/NH",
-        ])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let line = text
-        .lines()
-        .find(|line| line.to_ascii_lowercase().contains("softlock-lockhost.exe"))?;
-    let pid = line.split(',').nth(1)?.trim().trim_matches('"');
-    pid.parse().ok()
-}
-
-#[link(name = "ntdll")]
-unsafe extern "system" {
-    fn NtSuspendProcess(process: *mut core::ffi::c_void) -> i32;
 }
 
 fn host_running() -> bool {
