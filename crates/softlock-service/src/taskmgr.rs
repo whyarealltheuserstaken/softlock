@@ -7,8 +7,8 @@ use std::thread;
 use std::time::Duration;
 
 use softlock_core::{
-    HostPresence, SettingValue, expand_profile_image, hive_target_allowed, same_exe_path,
-    sid_is_safe,
+    HostPresence, SettingValue, console_user_from, expand_profile_image, hive_target_allowed,
+    same_exe_path, sid_is_safe,
 };
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE};
 use windows::Win32::System::Registry::{
@@ -392,11 +392,28 @@ pub fn console_sid() -> Result<String, &'static str> {
     if session == 0xFFFF_FFFF {
         return Err("sid");
     }
-    unsafe {
+    let queried = unsafe {
         let mut token = HANDLE::default();
         if windows::Win32::System::RemoteDesktop::WTSQueryUserToken(session, &mut token).is_err() {
-            return Err("sid");
+            None
+        } else {
+            let sid = token_sid(token).ok();
+            let _ = windows::Win32::Foundation::CloseHandle(token);
+            sid
         }
+    };
+    let process = current_process_sid().ok();
+    console_user_from(queried.as_deref(), process.as_deref())
+        .map(str::to_string)
+        .map_err(|_| "sid")
+}
+
+fn current_process_sid() -> Result<String, &'static str> {
+    use windows::Win32::Security::TOKEN_QUERY;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(|_| "sid")?;
         let sid = token_sid(token);
         let _ = windows::Win32::Foundation::CloseHandle(token);
         sid

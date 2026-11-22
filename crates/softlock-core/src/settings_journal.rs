@@ -381,6 +381,26 @@ fn component_prefix(body: &[&str], prefix: &[&str]) -> bool {
 }
 
 /// A locked user is a domain account (`S-1-5-21-` plus a rid). Service accounts are not.
+/// The console user is the SID from `WTSQueryUserToken` when that call
+/// works. When it fails, an interactive process is already that user, so its
+/// token is the console user. A service account is never substituted.
+pub fn console_user_from<'a>(
+    queried: Option<&'a str>,
+    process: Option<&'a str>,
+) -> Result<&'a str, JournalFault> {
+    if let Some(sid) = queried {
+        return if sid_is_safe(sid) {
+            Ok(sid)
+        } else {
+            Err(JournalFault::Sid)
+        };
+    }
+    match process {
+        Some(sid) if sid_is_safe(sid) => Ok(sid),
+        _ => Err(JournalFault::Sid),
+    }
+}
+
 pub fn sid_is_safe(sid: &str) -> bool {
     let Some(rest) = sid.strip_prefix("S-1-5-21-") else {
         return false;
@@ -844,6 +864,21 @@ mod tests {
         bob.sid = BOB.to_string();
         assert_eq!(restore_sid(&bob).expect("bob"), BOB);
         assert_ne!(restore_sid(&bob).expect("bob"), ALICE);
+    }
+
+    #[test]
+    fn a_service_account_is_not_the_console_user() {
+        assert_eq!(console_user_from(Some(ALICE), Some("S-1-5-18")), Ok(ALICE));
+        assert_eq!(console_user_from(None, Some(ALICE)), Ok(ALICE));
+        assert_eq!(
+            console_user_from(None, Some("S-1-5-18")),
+            Err(JournalFault::Sid)
+        );
+        assert_eq!(
+            console_user_from(Some("S-1-5-18"), Some(ALICE)),
+            Err(JournalFault::Sid)
+        );
+        assert_eq!(console_user_from(None, None), Err(JournalFault::Sid));
     }
 
     #[test]

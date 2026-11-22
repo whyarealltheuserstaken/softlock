@@ -68,8 +68,8 @@ pub use platform::{
 pub use settings_journal::{
     CommitFault, DirFacts, DirFault, DirOwner, HostPresence, JournalFault, ProductState,
     REASSERT_AFTER, RepairAction, SettingEntry, SettingValue, SettingsJournal, StartAction,
-    TASK_MANAGER, admit_directory, allowed_previous, commit_then_change, dir_fault_log,
-    encode_document, executable_may_run_as_system, expand_profile_image, fault_log,
+    TASK_MANAGER, admit_directory, allowed_previous, commit_then_change, console_user_from,
+    dir_fault_log, encode_document, executable_may_run_as_system, expand_profile_image, fault_log,
     hive_target_allowed, journal_dacl_exact, parent_dacl_trusted, parse_document, reassert_due,
     repair_action, repair_entry_name, restore_action, restore_sid, same_exe_path,
     service_start_action, sid_is_safe, task_manager_document,

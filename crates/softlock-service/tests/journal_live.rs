@@ -68,9 +68,9 @@ fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
     set_taskmgr(previous)?;
     let pause = guard_dir().join(format!("pause-{previous}"));
     let _ = fs::remove_file(&pause);
-    spawn_service(guard, true, &pause)?;
+    spawn_service(guard, Some("before"), &pause)?;
     wait_pipe()?;
-    transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+    lock_in_background();
     let journal = journal_file();
     let saw = wait_until(Duration::from_secs(20), || {
         journal_ready(&journal) && query_taskmgr() == previous
@@ -86,7 +86,7 @@ fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
     if query_taskmgr() != previous {
         return Err(format!("kill changed DisableTaskMgr from {previous}"));
     }
-    spawn_service(guard, false, &pause)?;
+    spawn_service(guard, None, &pause)?;
     let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == previous);
     hard_stop(guard);
     if !restored {
@@ -101,8 +101,7 @@ fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
 fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
     set_taskmgr("absent")?;
     let pause = guard_dir().join("pause-after");
-    fs::write(&pause, b"go").map_err(|_| "pause file".to_string())?;
-    spawn_service(guard, true, &pause)?;
+    spawn_service(guard, None, &pause)?;
     wait_pipe()?;
     transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
     let applied = wait_until(Duration::from_secs(20), || query_taskmgr() == "1");
@@ -110,7 +109,7 @@ fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
         return Err("DisableTaskMgr was not set to 1".to_string());
     }
     hard_stop(guard);
-    spawn_service(guard, false, &pause)?;
+    spawn_service(guard, None, &pause)?;
     let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == "absent");
     hard_stop(guard);
     if !restored {
@@ -122,8 +121,7 @@ fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
 fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     set_taskmgr("absent")?;
     let pause = guard_dir().join("pause-reassert");
-    fs::write(&pause, b"go").map_err(|_| "pause file".to_string())?;
-    spawn_service(guard, true, &pause)?;
+    spawn_service(guard, None, &pause)?;
     wait_pipe()?;
     transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
     if !wait_until(Duration::from_secs(20), || query_taskmgr() == "1") {
@@ -157,10 +155,10 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
 fn recover_active(guard: &mut Guard) -> Result<(), String> {
     set_taskmgr("0")?;
     let pause = guard_dir().join("pause-active");
-    fs::write(&pause, b"go").map_err(|_| "pause file".to_string())?;
-    spawn_service(guard, true, &pause)?;
+    let _ = fs::remove_file(&pause);
+    spawn_service(guard, Some("after"), &pause)?;
     wait_pipe()?;
-    transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+    lock_in_background();
     if !wait_until(Duration::from_secs(20), || {
         query_taskmgr() == "1" && host_running() && journal_ready(&journal_file())
     }) {
@@ -170,7 +168,7 @@ fn recover_active(guard: &mut Guard) -> Result<(), String> {
     if !host_running() {
         return Err("the lock host died with the service".to_string());
     }
-    spawn_service(guard, false, &pause)?;
+    spawn_service(guard, None, &pause)?;
     let mut last = String::new();
     let mut saw_unlocked = false;
     let closed = wait_until(Duration::from_secs(25), || {
@@ -251,24 +249,40 @@ fn ensure_service() -> Result<(), String> {
     }
 }
 
-fn spawn_service(_guard: &mut Guard, pause: bool, pause_file: &Path) -> Result<(), String> {
+fn spawn_service(_guard: &mut Guard, pause: Option<&str>, pause_file: &Path) -> Result<(), String> {
     fs::create_dir_all(guard_dir()).map_err(|_| "temp".to_string())?;
     fs::create_dir_all(guard_dir().join("pin")).map_err(|_| "temp".to_string())?;
-    kill_service_process();
-    wait_until(Duration::from_secs(15), || !service_running());
+    // The environment is read when the service starts. Stop anything that
+    // came up before those values were written, then start once.
     write_service_env(pause, pause_file)?;
-    let status = Command::new("sc")
+    kill_service_process();
+    wait_until(Duration::from_secs(20), || !service_running());
+    let output = Command::new("sc")
         .args(["start", SERVICE_NAME])
-        .status()
+        .output()
         .map_err(|_| "sc start".to_string())?;
-    if status.success() {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported = output.status.success() || text.contains("1056");
+    let running = wait_until(Duration::from_secs(20), service_running);
+    if reported && running {
         Ok(())
     } else {
-        Err("sc start failed".to_string())
+        Err(format!("sc start failed: {}", text.trim()))
     }
 }
 
-fn write_service_env(pause: bool, pause_file: &Path) -> Result<(), String> {
+fn lock_in_background() {
+    let pipe = pipe_name();
+    thread::spawn(move || {
+        let _ = transact(&pipe, lock_now());
+    });
+}
+
+fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), String> {
     let runner =
         std::env::var("RUNNER_ENVIRONMENT").unwrap_or_else(|_| "github-hosted".to_string());
     let mut pairs = vec![
@@ -280,8 +294,8 @@ fn write_service_env(pause: bool, pause_file: &Path) -> Result<(), String> {
         format!("SOFTLOCK_PIN_DIR={}", guard_dir().join("pin").display()),
         format!("SOFTLOCK_STOP_FILE={}", guard_dir().join("stop").display()),
     ];
-    if pause {
-        pairs.push("SOFTLOCK_JOURNAL_PAUSE=1".to_string());
+    if let Some(phase) = pause {
+        pairs.push(format!("SOFTLOCK_JOURNAL_PAUSE={phase}"));
         pairs.push(format!(
             "SOFTLOCK_JOURNAL_PAUSE_FILE={}",
             pause_file.display()

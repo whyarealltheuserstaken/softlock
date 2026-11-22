@@ -131,8 +131,14 @@ impl SettingsEngine {
         let saved = commit_then_change(
             || save_journal(&bytes).map_err(|_| JournalFault::NotDurable),
             || {
-                pause_after_flush();
-                write_task_manager(&sid, SettingValue::Dword { value: 1 })
+                // The lock call is still inside the authority mutex here, so
+                // an OS-lock confirmation cannot revert this value until the
+                // pause ends. Killing the service in either pause leaves the
+                // journal durable.
+                pause_for("before");
+                let written = write_task_manager(&sid, SettingValue::Dword { value: 1 });
+                pause_for("after");
+                written
             },
         );
         match saved {
@@ -455,17 +461,21 @@ fn write_menu_new(_path: &Path, _body: &[u8]) -> Result<(), &'static str> {
 }
 
 #[cfg(feature = "live-fail-closed")]
-fn pause_after_flush() {
+fn pause_for(phase: &str) {
     if !crate::windows::live_hooks_allowed() {
         return;
     }
-    if std::env::var("SOFTLOCK_JOURNAL_PAUSE").ok().as_deref() != Some("1") {
+    if std::env::var("SOFTLOCK_JOURNAL_PAUSE").ok().as_deref() != Some(phase) {
         return;
     }
     let path = std::env::var("SOFTLOCK_JOURNAL_PAUSE_FILE").unwrap_or_default();
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
-        if !path.is_empty() && Path::new(&path).is_file() {
+        if !path.is_empty()
+            && std::fs::read_to_string(&path)
+                .ok()
+                .is_some_and(|text| text.contains("go"))
+        {
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -473,4 +483,4 @@ fn pause_after_flush() {
 }
 
 #[cfg(not(feature = "live-fail-closed"))]
-fn pause_after_flush() {}
+fn pause_for(_phase: &str) {}
