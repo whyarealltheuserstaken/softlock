@@ -38,6 +38,7 @@ softlock-linux = { path = "../../softlock-linux" }
 softlock-macos = { path = "../../softlock-macos" }
 
 [target.'cfg(windows)'.dependencies]
+softlock-windows = { path = "../../softlock-windows" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",

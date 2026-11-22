@@ -534,9 +534,8 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             Some(PipeCommand::Quit) => service_gone = true,
             Some(PipeCommand::Arm) | None => {}
         }
-        if service_gone && !quit_tried {
-            quit_tried = true;
-            schedule_quit_os_lock();
+        if service_gone {
+            arm_quit_lock(&mut quit_tried, controller.state());
         }
         if let Some(result) = take_quit_os_lock()
             && apply_quit_os_lock(&shared, &mut controller, result)
@@ -810,9 +809,33 @@ const QUIT_DONE: u8 = 5;
 /// The quit path's OS lock. The window thread only reads the result.
 static QUIT_OS: AtomicU8 = AtomicU8::new(QUIT_IDLE);
 
+/// The quit tests share `QUIT_OS` and the held OS-lock flag.
+#[cfg(test)]
+static QUIT_TEST: Mutex<()> = Mutex::new(());
+
 /// Quit is the service pipe closing. The OS lock can take the whole
 /// confirmation budget, so it runs off the window thread. The hooks stay
 /// until the result says the session is locked, or another host has armed.
+/// A service crash locks the workstation only while the session is guarded.
+/// Unlocked, unlocking, recovering, and an already OS-locked session stay as they are.
+fn service_quit_locks(state: &LockState) -> bool {
+    matches!(
+        state,
+        LockState::Locked { .. } | LockState::Arming { .. } | LockState::FailingClosed { .. }
+    )
+}
+
+/// `quit_tried` stays false while the session is unguarded, so a crash during
+/// unlock or recovery still locks once the session is Locked or FailingClosed.
+fn arm_quit_lock(quit_tried: &mut bool, state: &LockState) -> bool {
+    if *quit_tried || !service_quit_locks(state) {
+        return false;
+    }
+    *quit_tried = true;
+    schedule_quit_os_lock();
+    true
+}
+
 fn schedule_quit_os_lock() {
     if QUIT_OS
         .compare_exchange(QUIT_IDLE, QUIT_RUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -1353,6 +1376,97 @@ fn host_write_loop(
 }
 
 #[cfg(test)]
+mod quit_guard {
+    use softlock_core::{ArmStep, DisarmStep, FailReason, LockSource, LockState, PromptState};
+
+    #[test]
+    fn a_guarded_session_still_locks_when_the_service_quits() {
+        let locked = LockState::Locked {
+            source: LockSource::Tray,
+            prompt: PromptState::Idle,
+        };
+        let arming = LockState::Arming {
+            source: LockSource::App,
+            step: ArmStep::Guard,
+        };
+        let failing = LockState::FailingClosed {
+            reason: FailReason::HostExited,
+        };
+        assert!(super::service_quit_locks(&locked));
+        assert!(super::service_quit_locks(&arming));
+        assert!(super::service_quit_locks(&failing));
+    }
+
+    #[test]
+    fn an_unguarded_session_does_not_lock_when_the_service_quits() {
+        assert!(!super::service_quit_locks(&LockState::Unlocked));
+        assert!(!super::service_quit_locks(&LockState::Unlocking {
+            step: DisarmStep::DisarmGuard,
+        }));
+        assert!(!super::service_quit_locks(&LockState::OsLocked {
+            after_fail: None,
+        }));
+        assert!(!super::service_quit_locks(&LockState::Recovering));
+    }
+
+    #[test]
+    fn a_quit_while_unlocking_schedules_once_the_session_is_locked() {
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                super::failclosed::block_os_lock_for_test(false);
+            }
+        }
+        let _release = Release;
+        let _order = super::QUIT_TEST
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        super::QUIT_OS.store(super::QUIT_IDLE, std::sync::atomic::Ordering::Release);
+        super::failclosed::block_os_lock_for_test(true);
+        let mut tried = false;
+        let unlocking = LockState::Unlocking {
+            step: DisarmStep::DisarmGuard,
+        };
+        assert!(!super::arm_quit_lock(&mut tried, &unlocking));
+        assert!(!tried);
+        assert_eq!(
+            super::QUIT_OS.load(std::sync::atomic::Ordering::Acquire),
+            super::QUIT_IDLE
+        );
+        let locked = LockState::Locked {
+            source: LockSource::Tray,
+            prompt: PromptState::Idle,
+        };
+        let held = super::failclosed::os_lock_held_count();
+        assert!(super::arm_quit_lock(&mut tried, &locked));
+        assert!(tried);
+        assert_eq!(
+            super::QUIT_OS.load(std::sync::atomic::Ordering::Acquire),
+            super::QUIT_RUNNING
+        );
+        assert!(!super::arm_quit_lock(&mut tried, &locked));
+        let entered = std::time::Instant::now();
+        while super::failclosed::os_lock_held_count() == held {
+            if entered.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("the quit lock reached Windows instead of the test hold");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        super::failclosed::block_os_lock_for_test(false);
+        let done = std::time::Instant::now();
+        loop {
+            if super::take_quit_os_lock().is_some() {
+                break;
+            }
+            if done.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("the quit lock scheduled after unlock did not finish");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+#[cfg(test)]
 mod quit_thread {
     use super::{QUIT_IDLE, QUIT_OS, QUIT_RUNNING, schedule_quit_os_lock, take_quit_os_lock};
     use crate::real_lock::RealLock;
@@ -1368,8 +1482,12 @@ mod quit_thread {
             }
         }
         let _release = Release;
+        let _order = super::QUIT_TEST
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         QUIT_OS.store(QUIT_IDLE, Ordering::Release);
         super::failclosed::block_os_lock_for_test(true);
+        let held = super::failclosed::os_lock_held_count();
         let started = Instant::now();
         schedule_quit_os_lock();
         let queued = started.elapsed();
@@ -1379,6 +1497,12 @@ mod quit_thread {
             queued.as_millis()
         );
         assert_eq!(QUIT_OS.load(Ordering::Acquire), QUIT_RUNNING);
+        while super::failclosed::os_lock_held_count() == held {
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!("the quit lock reached Windows instead of the test hold");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         std::thread::sleep(Duration::from_millis(40));
         assert_eq!(
             QUIT_OS.load(Ordering::Acquire),
