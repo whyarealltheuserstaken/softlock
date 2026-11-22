@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use softlock_core::{
     HostPresence, SettingValue, console_user_from, expand_profile_image, hive_target_allowed,
-    same_exe_path, sid_is_safe,
+    host_identity, same_exe_path, sid_is_safe,
 };
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE};
 use windows::Win32::System::Registry::{
@@ -619,19 +619,12 @@ fn host_matches(
     unsafe {
         let _ = windows::Win32::Foundation::CloseHandle(process);
     }
-    let path_ok = same_exe_path(Path::new(&image), expected);
-    let token_failed = token.is_err();
-    let token_ok = token
-        .ok()
-        .zip(console_user)
-        .is_some_and(|(sid, expected_sid)| sid == expected_sid);
-    if path_ok && session_ok && session == console && token_ok {
-        HostPresence::Alive
-    } else if path_ok && (token_failed || !session_ok || console_user.is_none()) {
-        HostPresence::Unknown
-    } else {
-        HostPresence::Dead
-    }
+    host_identity(
+        same_exe_path(Path::new(&image), expected),
+        session_ok && session == console,
+        token.ok().as_deref(),
+        console_user,
+    )
 }
 
 fn process_user_sid(process: HANDLE) -> Result<String, &'static str> {

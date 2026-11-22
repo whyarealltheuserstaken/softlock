@@ -171,7 +171,10 @@ fn recover_active(guard: &mut Guard) -> Result<(), String> {
     suspend_host()?;
     kill_service_process();
     if !host_running() {
-        return Err("the lock host died with the service".to_string());
+        return Err(format!(
+            "the lock host died with the service: {}",
+            service_state()
+        ));
     }
     spawn_service(guard, None, &pause)?;
     let mut last = String::new();
@@ -377,11 +380,6 @@ fn kill_service_process() {
             .args(["/F", "/PID", &pid.to_string()])
             .status();
     }
-    // Stop is refused while the service is still starting. The test binary
-    // is not this image, so killing it is the stop.
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", "softlock-service.exe"])
-        .status();
     let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
 }
 

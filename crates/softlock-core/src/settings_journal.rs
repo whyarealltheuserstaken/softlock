@@ -384,6 +384,30 @@ fn component_prefix(body: &[&str], prefix: &[&str]) -> bool {
 /// The console user is the SID from `WTSQueryUserToken` when that call
 /// works. When it fails, an interactive process is already that user, so its
 /// token is the console user. A service account is never substituted.
+/// The Lock Host is this install when the image and console session match
+/// and its token is the console user or LocalSystem. The service launches
+/// the host as LocalSystem in the console session. Any other token is a
+/// different process that happens to share the executable name.
+pub fn host_identity(
+    path_matches: bool,
+    session_matches: bool,
+    host_sid: Option<&str>,
+    console_sid: Option<&str>,
+) -> HostPresence {
+    if !path_matches {
+        return HostPresence::Dead;
+    }
+    match (host_sid, console_sid) {
+        (Some(host), Some(console))
+            if session_matches && (host == console || host == "S-1-5-18") =>
+        {
+            HostPresence::Alive
+        }
+        (Some(_), Some(_)) => HostPresence::Dead,
+        _ => HostPresence::Unknown,
+    }
+}
+
 pub fn console_user_from<'a>(
     queried: Option<&'a str>,
     process: Option<&'a str>,
@@ -879,6 +903,26 @@ mod tests {
             Err(JournalFault::Sid)
         );
         assert_eq!(console_user_from(None, None), Err(JournalFault::Sid));
+        assert_eq!(
+            host_identity(true, true, Some("S-1-5-18"), Some(ALICE)),
+            HostPresence::Alive
+        );
+        assert_eq!(
+            host_identity(true, true, Some(ALICE), Some(ALICE)),
+            HostPresence::Alive
+        );
+        assert_eq!(
+            host_identity(true, true, Some(BOB), Some(ALICE)),
+            HostPresence::Dead
+        );
+        assert_eq!(
+            host_identity(false, true, Some("S-1-5-18"), Some(ALICE)),
+            HostPresence::Dead
+        );
+        assert_eq!(
+            host_identity(true, true, None, Some(ALICE)),
+            HostPresence::Unknown
+        );
     }
 
     #[test]
