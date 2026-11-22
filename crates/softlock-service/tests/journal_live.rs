@@ -256,7 +256,23 @@ fn spawn_service(_guard: &mut Guard, pause: Option<&str>, pause_file: &Path) -> 
     // came up before those values were written, then start once.
     write_service_env(pause, pause_file)?;
     kill_service_process();
-    wait_until(Duration::from_secs(20), || !service_running());
+    if !wait_until(Duration::from_secs(20), service_stopped) {
+        return Err(format!("service did not stop: {}", service_state()));
+    }
+    match start_service() {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            // 1056 while STOP_PENDING. Wait until it is actually stopped.
+            kill_service_process();
+            if !wait_until(Duration::from_secs(20), service_stopped) {
+                return Err(first);
+            }
+            start_service()
+        }
+    }
+}
+
+fn start_service() -> Result<(), String> {
     let output = Command::new("sc")
         .args(["start", SERVICE_NAME])
         .output()
@@ -266,13 +282,32 @@ fn spawn_service(_guard: &mut Guard, pause: Option<&str>, pause_file: &Path) -> 
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let reported = output.status.success() || text.contains("1056");
-    let running = wait_until(Duration::from_secs(20), service_running);
-    if reported && running {
+    if wait_until(Duration::from_secs(20), service_running) {
         Ok(())
     } else {
-        Err(format!("sc start failed: {}", text.trim()))
+        Err(format!(
+            "sc start failed: {} state {}",
+            text.trim(),
+            service_state()
+        ))
     }
+}
+
+fn service_state() -> String {
+    let Ok(output) = Command::new("sc").args(["query", SERVICE_NAME]).output() else {
+        return "unreadable".to_string();
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn service_stopped() -> bool {
+    let state = service_state();
+    state.contains("STOPPED") || state.contains("1060")
 }
 
 fn lock_in_background() {
