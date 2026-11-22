@@ -626,9 +626,24 @@ fn the_fail_closed_job_covers_each_hosted_case() {
         "finally",
         "Connect(200)",
         "1000",
+        "Status -ne 'Stopped'",
+        "already-locked",
+        "CancelKeyPress",
+        "HostsAtStart",
+        "Start-Service",
     ] {
         assert!(script.contains(needle), "laptop script missing {needle}");
     }
+    assert!(
+        script.contains(
+            "($null -ne $installed -and $installed.Status -ne 'Stopped') -or $running.Count -gt 0"
+        ),
+        "a stopped installed service still refuses the laptop check"
+    );
+    assert!(
+        !script.contains("if (Test-OsConfirmed) { }"),
+        "the tray case still has an empty lock poll"
+    );
     let reconnect = format!("{}{}", "WTSConnect", "Session");
     assert!(
         !script.contains(&reconnect),

@@ -25,8 +25,10 @@ $script:Reason = 'interrupted'
 $script:ExitCode = 1
 $script:Started = New-Object System.Collections.Generic.List[int]
 $script:Suspended = New-Object System.Collections.Generic.List[uint32]
+$script:HostsAtStart = New-Object System.Collections.Generic.List[int]
 $script:Service = $null
 $script:SkipPipe = $false
+$script:Cleaned = $false
 
 function Write-Result([string]$status, [string]$reason) {
     $lines = New-Object System.Collections.Generic.List[string]
@@ -214,14 +216,36 @@ function Stop-Started {
     }
 }
 
+function Stop-AppearedHosts {
+    $hosts = @(Get-Process -Name 'softlock-lockhost' -ErrorAction SilentlyContinue)
+    foreach ($proc in $hosts) {
+        if ($script:HostsAtStart -notcontains $proc.Id) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Complete-Check {
+    if ($script:Cleaned) { return }
+    $script:Cleaned = $true
+    Resume-Suspended
+    Stop-AppearedHosts
+    Stop-Started
+    Write-Result $script:Outcome $script:Reason
+    Write-Host "Wrote $resultJson"
+}
+
 function Invoke-LaptopCheck {
     $installed = Get-Service -Name 'SoftLockAgent' -ErrorAction SilentlyContinue
     $running = @(Get-Process -Name 'softlock-service' -ErrorAction SilentlyContinue)
-    if ($null -ne $installed -or $running.Count -gt 0) {
+    if (($null -ne $installed -and $installed.Status -ne 'Stopped') -or $running.Count -gt 0) {
         $script:Outcome = 'refused'
-        $script:Reason = 'installed-service: run Stop-Service SoftLockAgent from an elevated prompt, then run this script again. This script does not stop an installed service.'
+        $script:Reason = 'installed-service: run Stop-Service SoftLockAgent from an elevated prompt, then run this script again. This script does not stop an installed service. After the check, run Start-Service SoftLockAgent.'
         $script:ExitCode = 2
         return
+    }
+    foreach ($proc in @(Get-Process -Name 'softlock-lockhost' -ErrorAction SilentlyContinue)) {
+        $script:HostsAtStart.Add($proc.Id)
     }
 
     $serviceExe = Join-Path $root 'target\release\softlock-service.exe'
@@ -239,25 +263,40 @@ function Invoke-LaptopCheck {
         return
     }
 
-    $window = [Diagnostics.Stopwatch]::StartNew()
-    if (Test-OsConfirmed) { }
+    if (Test-OsConfirmed) {
+        $script:Outcome = 'refused'
+        $script:Reason = 'already-locked'
+        $script:ExitCode = 2
+        return
+    }
     Write-Host "Press Enter, then choose Lock for real within 15 s."
-    $entered = $false
+    $poll = [Diagnostics.Stopwatch]::StartNew()
+    $enteredAt = $null
     $firstLock = $null
-    while ($window.Elapsed.TotalSeconds -lt 15) {
-        if (-not $entered -and [Console]::KeyAvailable) {
+    while ($true) {
+        if ($null -eq $enteredAt -and [Console]::KeyAvailable) {
             $key = [Console]::ReadKey($true)
-            if ($key.Key -eq 'Enter') { $entered = $true }
+            if ($key.Key -eq 'Enter') { $enteredAt = $poll.Elapsed }
         }
         if ($null -eq $firstLock -and (Test-OsConfirmed)) {
-            $firstLock = [int]$window.Elapsed.TotalMilliseconds
+            $firstLock = $poll.Elapsed
         }
-        if ($null -ne $firstLock) { break }
+        if ($null -ne $enteredAt) {
+            if ($null -ne $firstLock) { break }
+            if (($poll.Elapsed - $enteredAt).TotalSeconds -ge 15) { break }
+        }
         Start-Sleep -Milliseconds 50
+    }
+    $elapsed = 0
+    if ($null -ne $firstLock -and $null -ne $enteredAt) {
+        $delta = [int]($firstLock - $enteredAt).TotalMilliseconds
+        if ($delta -gt 0) { $elapsed = $delta }
+    } elseif ($null -eq $firstLock -and $null -ne $enteredAt) {
+        $elapsed = [int]($poll.Elapsed - $enteredAt).TotalMilliseconds
     }
     $script:Rows.Add([pscustomobject]@{
         name = 'tray-hard-lock'
-        elapsed_ms = $(if ($null -eq $firstLock) { [int]$window.Elapsed.TotalMilliseconds } else { $firstLock })
+        elapsed_ms = $elapsed
         confirmed = ($null -ne $firstLock)
         unlocked = $false
         detail = $(if ($null -ne $firstLock) { 'first locked reading' } else { 'no lock within 15 s' })
@@ -343,6 +382,29 @@ function Invoke-LaptopCheck {
     $script:ExitCode = 0
 }
 
+trap {
+    if ($script:Outcome -eq 'fail' -and $script:Reason -eq 'interrupted') {
+        $script:Reason = 'interrupted'
+    }
+    if ($script:ExitCode -eq 0) { $script:ExitCode = 1 }
+    Complete-Check
+    break
+}
+
+try {
+    [Console]::CancelKeyPress.Add({
+        param($sender, $eventArgs)
+        $eventArgs.Cancel = $true
+        if ($script:Outcome -eq 'fail' -and $script:Reason -eq 'interrupted') {
+            $script:Reason = 'interrupted'
+        }
+        if ($script:ExitCode -eq 0) { $script:ExitCode = 1 }
+        Complete-Check
+        [Environment]::Exit($script:ExitCode)
+    })
+} catch {
+}
+
 try {
     Invoke-LaptopCheck
 } catch {
@@ -351,10 +413,7 @@ try {
     }
     if ($script:ExitCode -eq 0) { $script:ExitCode = 1 }
 } finally {
-    Resume-Suspended
-    Stop-Started
-    Write-Result $script:Outcome $script:Reason
-    Write-Host "Wrote $resultJson"
+    Complete-Check
 }
 
 exit $script:ExitCode
