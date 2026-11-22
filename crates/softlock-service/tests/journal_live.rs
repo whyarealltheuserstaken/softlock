@@ -127,7 +127,9 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     if !wait_until(Duration::from_secs(20), || query_taskmgr() == "1") {
         return Err("lock did not set DisableTaskMgr".to_string());
     }
-    set_taskmgr("absent")?;
+    let _ = Command::new("reg")
+        .args(["delete", KEY, "/v", "DisableTaskMgr", "/f"])
+        .status();
     if !wait_until(Duration::from_secs(8), || query_taskmgr() == "1") {
         return Err("cleared DisableTaskMgr was not re-asserted within 5 s".to_string());
     }
@@ -164,6 +166,9 @@ fn recover_active(guard: &mut Guard) -> Result<(), String> {
     }) {
         return Err("the lock host was not running with DisableTaskMgr set".to_string());
     }
+    // The host exits when the service dies. Suspending it first keeps the
+    // process, path, session, and token so the restart still sees a live lock.
+    suspend_host()?;
     kill_service_process();
     if !host_running() {
         return Err("the lock host died with the service".to_string());
@@ -525,6 +530,49 @@ fn installed_service_running() -> bool {
         return false;
     };
     String::from_utf8_lossy(&output.stdout).contains("RUNNING")
+}
+
+fn suspend_host() -> Result<(), String> {
+    let pid = host_pid().ok_or_else(|| "lock host pid".to_string())?;
+    unsafe {
+        let process = windows::Win32::System::Threading::OpenProcess(
+            windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS(0x0800),
+            false,
+            pid,
+        )
+        .map_err(|_| "open host".to_string())?;
+        let status = NtSuspendProcess(process.0);
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!("suspend host returned {status}"))
+        }
+    }
+}
+
+fn host_pid() -> Option<u32> {
+    let output = Command::new("tasklist")
+        .args([
+            "/FI",
+            "IMAGENAME eq softlock-lockhost.exe",
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find(|line| line.to_ascii_lowercase().contains("softlock-lockhost.exe"))?;
+    let pid = line.split(',').nth(1)?.trim().trim_matches('"');
+    pid.parse().ok()
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtSuspendProcess(process: *mut core::ffi::c_void) -> i32;
 }
 
 fn host_running() -> bool {
