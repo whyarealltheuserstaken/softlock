@@ -155,6 +155,16 @@ pub struct SettingsJournal {
     #[serde(default)]
     pub os_confirmed: bool,
     pub failures: u32,
+    /// Monotonic millisecond clock when this backoff ends. Zero means none.
+    #[serde(default)]
+    pub backoff_until_tick: u64,
+    /// Monotonic millisecond clock when the deadline was written.
+    #[serde(default)]
+    pub written_tick: u64,
+    /// Unix milliseconds when the deadline was written. An earlier reading
+    /// later is a clock rollback and restarts the delay.
+    #[serde(default)]
+    pub written_wall_ms: u64,
     pub entries: Vec<SettingEntry>,
     /// Boot time and the logon that was locked. Absent on a journal written
     /// before this field existed, which startup treats as unknown.
@@ -352,6 +362,9 @@ impl SettingsJournal {
             says_locked: false,
             os_confirmed: false,
             failures: 0,
+            backoff_until_tick: 0,
+            written_tick: 0,
+            written_wall_ms: 0,
             entries: Vec::new(),
             lock: None,
         }
@@ -400,6 +413,9 @@ pub fn task_manager_document(
         says_locked: true,
         os_confirmed: false,
         failures,
+        backoff_until_tick: 0,
+        written_tick: 0,
+        written_wall_ms: 0,
         entries: vec![SettingEntry {
             target: TASK_MANAGER.to_string(),
             path: String::new(),
@@ -483,6 +499,9 @@ pub fn lockdown_document(
         says_locked: true,
         os_confirmed: false,
         failures,
+        backoff_until_tick: 0,
+        written_tick: 0,
+        written_wall_ms: 0,
         entries,
         lock: None,
     })
@@ -1652,6 +1671,9 @@ mod tests {
         let parsed = parse_document(legacy).expect("ticket 16 journal");
         assert!(!parsed.workstation_clear);
         assert_eq!(parsed.entries().len(), 1);
+        assert_eq!(parsed.backoff_until_tick, 0);
+        assert_eq!(parsed.written_tick, 0);
+        assert_eq!(parsed.written_wall_ms, 0);
         assert!(parse_document(br#"{"v":1,"says_locked":true,"failures":0,"entries":[{"target":"DisableTaskMgr","previous":{"kind":"sz","value":"1"},"new_value":{"kind":"dword","value":1}}]}"#).is_err());
         assert!(
             parse_document(br#"{"v":2,"says_locked":false,"failures":0,"entries":[]}"#).is_err()

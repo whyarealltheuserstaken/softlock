@@ -1209,6 +1209,11 @@ fn flush_persists_failure_count_and_locked_flag_and_recovery_restores_backoff() 
     });
     assert_eq!(controller.failure_count(), 4);
     assert_eq!(controller.journal().failures(), 4);
+    assert_eq!(
+        controller.backoff_delay(),
+        Duration::from_secs(30),
+        "a saved count of 4 is still the 30 s backoff after a restart"
+    );
     let mut again = FakePlatform::new();
     again.fail_os_lock(true);
     let mut restarted = started(again);
@@ -1221,6 +1226,10 @@ fn flush_persists_failure_count_and_locked_flag_and_recovery_restores_backoff() 
         4,
         "restarting from the saved journal must keep the backoff count"
     );
+    assert_eq!(restarted.backoff_delay(), Duration::from_secs(30));
+    restarted.handle(Event::BackoffElapsed);
+    assert_eq!(restarted.backoff_delay(), Duration::ZERO);
+    assert_eq!(restarted.failure_count(), 4);
     assert!(matches!(
         controller.state(),
         LockState::FailingClosed { .. }
@@ -1244,6 +1253,53 @@ fn a_confirmed_os_lock_stays_locked_across_a_service_restart() {
     });
     assert!(matches!(controller.state(), LockState::OsLocked { .. }));
     assert!(!controller.returned_to_unlocked());
+}
+
+#[test]
+fn pin_and_password_failures_share_one_lock_session_counter() {
+    let mut controller = locked_started();
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::softlock_pin(),
+        secret: Secret::new("nope"),
+    });
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::os_password(),
+        secret: Secret::new("nope"),
+    });
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::softlock_pin(),
+        secret: Secret::new("nope"),
+    });
+    controller.handle(Event::SubmitSecret {
+        method: MethodId::os_password(),
+        secret: Secret::new("nope"),
+    });
+    assert_eq!(controller.failure_count(), 4);
+    assert_eq!(controller.backoff_delay(), Duration::from_secs(30));
+    let leaked = format!("{:?}", controller.rejection_log());
+    assert!(!leaked.contains("nope"));
+}
+
+#[test]
+fn a_stamped_wait_is_what_a_restart_enforces() {
+    let mut journal = Journal::empty();
+    journal.mark_locked();
+    journal.set_failures(4);
+    journal.set_wait_ms(5_000);
+    journal.flush();
+    let mut platform = FakePlatform::new();
+    platform.fail_os_lock(true);
+    let mut controller = started(platform);
+    controller.handle(Event::ServiceStarted {
+        journal: journal.persisted(),
+        session_active: true,
+    });
+    assert_eq!(controller.backoff_delay(), Duration::from_secs(5));
+    assert_eq!(controller.failure_count(), 4);
+    assert!(matches!(
+        controller.state(),
+        LockState::FailingClosed { .. }
+    ));
 }
 
 #[test]
