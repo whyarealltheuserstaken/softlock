@@ -477,7 +477,13 @@ fn owner_sid_handle(handle: HANDLE) -> io::Result<String> {
             let _ = LocalFree(Some(windows::Win32::Foundation::HLOCAL(descriptor.0)));
         }
     }
-    if rendered.is_empty() || !softlock_core::sid_is_safe(&rendered) {
+    if rendered.is_empty()
+        || !rendered.starts_with("S-1-")
+        || rendered.len() >= 96
+        || !rendered
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
         Err(io::Error::other("owner"))
     } else {
         Ok(rendered)
