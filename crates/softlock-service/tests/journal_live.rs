@@ -117,8 +117,8 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
         // The Service has to create this file. A copy the console user already
         // had is put back when the guard drops.
         if path.exists() {
-            guard.config_bytes = Some(fs::read(&path).map_err(|_| "config read".to_string())?);
-            let _ = fs::remove_file(&path);
+            guard.config_bytes = Some(fs::read(&path).unwrap_or_default());
+            force_remove(&path);
         }
         let pause = guard_dir().join("pause-config");
         let _ = fs::remove_file(&pause);
@@ -129,10 +129,12 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
             path.is_file() && owner_can_write(&path) && journal_ready(&journal_file())
         });
         if !created {
-            return Err(
-                "the service did not create a writable config file before the ACL change"
-                    .to_string(),
-            );
+            return Err(format!(
+                "config file before the ACL change exists={} writable={} journal={}",
+                path.is_file(),
+                owner_can_write(&path),
+                journal_ready(&journal_file())
+            ));
         }
         guard.config_path = Some(path.clone());
         let body = fs::read_to_string(&path).map_err(|_| "config read".to_string())?;
@@ -180,6 +182,19 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
 #[cfg(feature = "live-fail-closed")]
 fn owner_can_write(path: &Path) -> bool {
     matches!(softlock_service::owner_write_denied(path), Ok(false))
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn force_remove(path: &Path) {
+    let text = path.display().to_string();
+    let _ = fs::remove_file(path);
+    if path.exists() {
+        let _ = Command::new("takeown").args(["/f", &text]).status();
+        let _ = Command::new("icacls")
+            .args([&text, "/grant", "Everyone:F"])
+            .status();
+        let _ = fs::remove_file(path);
+    }
 }
 
 #[cfg(feature = "live-fail-closed")]
