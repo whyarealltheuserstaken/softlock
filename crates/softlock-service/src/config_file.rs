@@ -135,60 +135,323 @@ pub fn reassert_entry(entry: &SettingEntry) -> Result<(), &'static str> {
     let SettingValue::Sddl { value: locked } = &entry.new_value else {
         return Err("value");
     };
-    // The locked DACL grants read and denies WRITE_DAC, including to the
-    // owner. Opening with WRITE_DAC fails, the error fail-closes the lock,
-    // and the correct PIN is rejected. Read the descriptor first. A
-    // canonical reprint of the same lock is held.
+    if !locked.starts_with("D:") {
+        return Err("value");
+    }
+    // The poll thread is the service. A leaked impersonation would make the
+    // token the client, and WRITE_DAC would then be the client's right.
+    let impersonating = thread_is_impersonating();
+    if impersonating {
+        unsafe {
+            let _ = windows::Win32::Security::RevertToSelf();
+        }
+    }
     let directory = entry.target == CONFIG_DIR;
     let path = Path::new(&entry.path);
-    if let Ok(handle) = open_dacl_read(path, directory) {
-        let current = dacl_sddl_handle(handle).ok();
-        drop_handle(handle);
-        if let Some(current) = current
-            && (current == *locked || dacl_is_held(&current))
-        {
-            return Ok(());
-        }
-    }
-    // The seam service is the console user. The locked DACL denies that user
-    // write, including WRITE_DAC, so opening for the rewrite fails. That
-    // denial is the lock holding. LocalSystem still has full control and
-    // falls through to put the journaled descriptor back.
-    if owner_change_denied(path, directory) {
+    let (owner, dacl) = read_security(path, directory);
+    let held = security_is_held(owner.as_deref(), dacl.as_deref());
+    note_acl("acl-check", &owner, &dacl, held, impersonating);
+    if held {
         return Ok(());
     }
-    let handle = open_entry(entry).map_err(|_| "acl")?;
-    let result = set_dacl_handle(handle, locked);
-    drop_handle(handle);
-    result
+    // Not held. Rewrite as SYSTEM. Access denied is not a reason to stop:
+    // SeTakeOwnershipPrivilege and SeRestorePrivilege, with backup semantics,
+    // put the owner back and write the DACL. Only a failed rewrite fail-closes.
+    let (owner, dacl) = reclaim_security(path, directory, locked)?;
+    let held = security_is_held(Some(&owner), Some(&dacl));
+    note_acl("acl-reclaimed", &Some(owner), &Some(dacl), held, false);
+    if !held {
+        return Err("acl");
+    }
+    // A later READ_CONTROL open is the same check without the backup
+    // privilege. If that open fails, the descriptor just read stands.
+    let (again_owner, again_dacl) = read_security(path, directory);
+    if again_owner.is_some() && again_dacl.is_some() {
+        let again = security_is_held(again_owner.as_deref(), again_dacl.as_deref());
+        note_acl("acl-read", &again_owner, &again_dacl, again, false);
+        if !again {
+            return Err("acl");
+        }
+    }
+    Ok(())
 }
 
-fn owner_change_denied(path: &Path, directory: bool) -> bool {
-    if directory {
-        let access = FILE_ADD_FILE
-            | FILE_ADD_SUBDIRECTORY
-            | DELETE
-            | WRITE_DAC
-            | FILE_READ_ATTRIBUTES
-            | SYNCHRONIZE;
-        match open_with_access_kind(path, access, true) {
-            Ok(handle) => {
-                drop_handle(handle);
-                false
-            }
-            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) => true,
-            Err(_) => false,
+fn security_is_held(owner: Option<&str>, dacl: Option<&str>) -> bool {
+    let (Some(owner), Some(dacl)) = (owner, dacl) else {
+        return false;
+    };
+    softlock_core::config_lock_held(dacl, owner) && console_granted_write(dacl) != Some(true)
+}
+
+/// `Some(true)` when the console user's token is granted write. No token
+/// (the foreground seam process is not LocalSystem) leaves the SDDL parse
+/// as the authority.
+fn console_granted_write(dacl: &str) -> Option<bool> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows::Win32::Security::{
+        AccessCheck, DuplicateTokenEx, GENERIC_MAPPING, PSECURITY_DESCRIPTOR,
+        SecurityImpersonation, TOKEN_QUERY, TokenImpersonation,
+    };
+    use windows::core::{BOOL, PCWSTR};
+    let session = crate::windows::console_session();
+    if session == 0xFFFF_FFFF {
+        return None;
+    }
+    let mut primary = HANDLE::default();
+    unsafe {
+        if windows::Win32::System::RemoteDesktop::WTSQueryUserToken(session, &mut primary).is_err()
+        {
+            return None;
         }
-    } else {
-        owner_write_denied(path).unwrap_or(false)
+    }
+    let mut impersonation = HANDLE::default();
+    let duplicated = unsafe {
+        DuplicateTokenEx(
+            primary,
+            TOKEN_QUERY,
+            None,
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut impersonation,
+        )
+    };
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(primary);
+    }
+    if duplicated.is_err() {
+        return None;
+    }
+    let wide = dacl
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(wide.as_ptr()),
+            1,
+            &mut descriptor,
+            None,
+        )
+    };
+    if converted.is_err() {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(impersonation);
+        }
+        return None;
+    }
+    let mapping = GENERIC_MAPPING {
+        GenericRead: 0x120089,
+        GenericWrite: 0x120116,
+        GenericExecute: 0x1200A0,
+        GenericAll: 0x1F01FF,
+    };
+    let desired = FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | 0x40
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER;
+    let mut privileges = vec![0u64; 32];
+    let mut length = (privileges.len() * std::mem::size_of::<u64>()) as u32;
+    let mut granted = 0u32;
+    let mut status = BOOL::default();
+    let checked = unsafe {
+        AccessCheck(
+            descriptor,
+            impersonation,
+            desired,
+            &mapping,
+            Some(privileges.as_mut_ptr().cast()),
+            &mut length,
+            &mut granted,
+            &mut status,
+        )
+    };
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(impersonation);
+        if !descriptor.0.is_null() {
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        }
+    }
+    checked.ok()?;
+    Some(status.as_bool())
+}
+
+fn read_security(path: &Path, directory: bool) -> (Option<String>, Option<String>) {
+    let Ok(handle) = open_dacl_read(path, directory) else {
+        return (None, None);
+    };
+    let owner = owner_sid_handle(handle).ok();
+    let dacl = dacl_sddl_handle(handle).ok();
+    drop_handle(handle);
+    (owner, dacl)
+}
+
+fn reclaim_security(
+    path: &Path,
+    directory: bool,
+    locked: &str,
+) -> Result<(String, String), &'static str> {
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        SE_BACKUP_NAME, SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME,
+    };
+    let _take = crate::secrets::enable_privilege_scoped(SE_TAKE_OWNERSHIP_NAME).map_err(|_| {
+        crate::audit(
+            "settings",
+            &[("result", "acl-privilege"), ("name", "take-ownership")],
+        );
+        "privilege"
+    })?;
+    let _restore = crate::secrets::enable_privilege_scoped(SE_RESTORE_NAME).map_err(|_| {
+        crate::audit(
+            "settings",
+            &[("result", "acl-privilege"), ("name", "restore")],
+        );
+        "privilege"
+    })?;
+    let _backup = crate::secrets::enable_privilege_scoped(SE_BACKUP_NAME).map_err(|_| {
+        crate::audit(
+            "settings",
+            &[("result", "acl-privilege"), ("name", "backup")],
+        );
+        "privilege"
+    })?;
+    let handle = open_backup(path, directory).map_err(|_| "acl")?;
+    if refuse_reparse(handle).map_err(|_| "reparse")? {
+        drop_handle(handle);
+        return Err("reparse");
+    }
+    let descriptor = format!("O:SY{locked}");
+    let result = set_security_handle(
+        handle,
+        &descriptor,
+        OWNER_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION
+            | PROTECTED_DACL_SECURITY_INFORMATION,
+    );
+    if let Err(error) = result {
+        drop_handle(handle);
+        return Err(error);
+    }
+    let owner = owner_sid_handle(handle).map_err(|_| "acl");
+    let dacl = dacl_sddl_handle(handle).map_err(|_| "acl");
+    drop_handle(handle);
+    match (owner, dacl) {
+        (Ok(owner), Ok(dacl)) if security_is_held(Some(&owner), Some(&dacl)) => Ok((owner, dacl)),
+        (Ok(owner), Ok(dacl)) => {
+            note_acl("acl-reclaimed", &Some(owner), &Some(dacl), false, false);
+            Err("acl")
+        }
+        _ => Err("acl"),
     }
 }
 
-fn dacl_is_held(current: &str) -> bool {
-    let Ok(sid) = crate::taskmgr::console_sid() else {
-        return false;
+fn note_acl(
+    phase: &'static str,
+    owner: &Option<String>,
+    dacl: &Option<String>,
+    held: bool,
+    impersonating: bool,
+) {
+    let owner = owner.clone().unwrap_or_else(|| "unread".to_string());
+    let dacl = dacl.clone().unwrap_or_else(|| "unread".to_string());
+    let user_write = match console_granted_write(&dacl) {
+        Some(true) => "1",
+        Some(false) => "0",
+        None => "unknown",
     };
-    softlock_core::locked_dacl_holds(current, &sid)
+    let dacl: String = dacl
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(360)
+        .collect();
+    let token = process_token_sid();
+    crate::audit(
+        "settings",
+        &[
+            ("result", phase),
+            ("owner", &owner),
+            ("dacl", &dacl),
+            ("token", &token),
+            ("impersonating", if impersonating { "1" } else { "0" }),
+            ("user_write", user_write),
+            ("held", if held { "1" } else { "0" }),
+        ],
+    );
+}
+
+fn process_token_sid() -> String {
+    use windows::Win32::Security::TOKEN_QUERY;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return "unknown".to_string();
+        }
+        let sid = token_user_sid(token).unwrap_or_else(|_| "unknown".to_string());
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+        sid
+    }
+}
+
+fn token_user_sid(token: windows::Win32::Foundation::HANDLE) -> io::Result<String> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
+    use windows::core::PWSTR;
+    unsafe {
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        if needed == 0 {
+            return Err(io::Error::other("sid"));
+        }
+        let mut buffer = vec![0u8; needed as usize];
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )
+        .map_err(crate::secrets::os_error)?;
+        let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
+        let mut text = PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut text).map_err(crate::secrets::os_error)?;
+        let sid = text.to_string().unwrap_or_default();
+        if !text.is_null() {
+            let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        }
+        if sid.starts_with("S-1-")
+            && sid.len() < 96
+            && sid
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            Ok(sid)
+        } else {
+            Err(io::Error::other("sid"))
+        }
+    }
+}
+
+fn thread_is_impersonating() -> bool {
+    use windows::Win32::Security::TOKEN_QUERY;
+    use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        let opened = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut token);
+        if opened.is_ok() {
+            let _ = windows::Win32::Foundation::CloseHandle(token);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn open_dacl_read(path: &Path, directory: bool) -> io::Result<HANDLE> {
@@ -197,7 +460,37 @@ fn open_dacl_read(path: &Path, directory: bool) -> io::Result<HANDLE> {
     } else {
         FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE
     };
-    open_with_access_kind(path, access, directory)
+    // Parents are opened without FILE_TRAVERSE. FR does not grant that bit,
+    // and the locked directory is the parent of the config file.
+    open_with_access_kind(path, access, directory, false)
+}
+
+fn open_backup(path: &Path, _directory: bool) -> io::Result<HANDLE> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::core::PCWSTR;
+    let access = READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    let wide = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+    unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            flags,
+            None,
+        )
+        .map_err(crate::secrets::os_error)
+    }
 }
 
 pub fn write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -506,7 +799,7 @@ fn open_acl(path: &Path, directory: bool) -> io::Result<HANDLE> {
     } else {
         READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES | SYNCHRONIZE
     };
-    match open_with_access_kind(path, access, directory) {
+    match open_with_access_kind(path, access, directory, true) {
         Ok(handle) => Ok(handle),
         Err(_) if !directory => open_config(path, false),
         Err(error) => Err(error),
@@ -518,10 +811,15 @@ fn open_for_owner_write(path: &Path) -> io::Result<HANDLE> {
 }
 
 fn open_with_access(path: &Path, access: u32) -> io::Result<HANDLE> {
-    open_with_access_kind(path, access, false)
+    open_with_access_kind(path, access, false, true)
 }
 
-fn open_with_access_kind(path: &Path, access: u32, as_directory: bool) -> io::Result<HANDLE> {
+fn open_with_access_kind(
+    path: &Path,
+    access: u32,
+    as_directory: bool,
+    traverse: bool,
+) -> io::Result<HANDLE> {
     let (drive, parts) = components(path)?;
     if parts.is_empty() {
         return Err(io::Error::other("config"));
@@ -531,9 +829,14 @@ fn open_with_access_kind(path: &Path, access: u32, as_directory: bool) -> io::Re
         drop_handle(directory);
         return Err(io::Error::other("reparse"));
     }
+    let parent_access = if traverse {
+        DIR_OPEN
+    } else {
+        DIR_OPEN & !FILE_TRAVERSE
+    };
     let last = parts.len() - 1;
     for name in &parts[..last] {
-        let next = open_child(directory, name, DIR_OPEN, true, false)?;
+        let next = open_child(directory, name, parent_access, true, false)?;
         drop_handle(directory);
         if refuse_reparse(next)? {
             drop_handle(next);
@@ -607,7 +910,6 @@ fn write_handle(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "live-fail-closed")]
 fn owner_sid_handle(handle: HANDLE) -> io::Result<String> {
     use windows::Win32::Foundation::LocalFree;
     use windows::Win32::Security::Authorization::{

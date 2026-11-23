@@ -206,6 +206,28 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
                 owner_rights(&path)
             ));
         }
+        // Deny SYSTEM WRITE_DAC and allow the console user write. Access
+        // denied must not count as held. The service puts the locked DACL
+        // back, or the user would be able to edit the file while locked.
+        let hostile = format!("D:P(D;;WD;;;SY)(A;;FA;;;{mine})(A;;FR;;;OW)");
+        restore_dacl_as_system(&path, &hostile)?;
+        if !wait_until(Duration::from_secs(15), || owner_rights_denied(&path)) {
+            let dacl = softlock_service::testing_dacl(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
+            let owner = softlock_service::testing_owner(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
+            let log = fs::read_to_string(guard_dir().join("service.log")).unwrap_or_default();
+            let start = log.len().saturating_sub(700);
+            let start = (start..=log.len())
+                .find(|index| log.is_char_boundary(*index))
+                .unwrap_or(log.len());
+            return Err(format!(
+                "a DACL that denies SYSTEM WRITE_DAC left the console user able to write (owner {owner} dacl {dacl} log {})",
+                &log[start..]
+            ));
+        }
         hard_stop(guard)?;
         let _ = wait_until(Duration::from_secs(5), || !host_running());
         spawn_service(guard, None, &pause, true)?;

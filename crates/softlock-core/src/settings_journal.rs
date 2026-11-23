@@ -663,18 +663,9 @@ pub fn with_config_acl(
     Ok(doc)
 }
 
-const GROUP_WRITE_SIDS: &[&str] = &[
-    "S-1-1-0",
-    "S-1-5-11",
-    "S-1-5-32-545",
-    // The console user on a hosted runner is a member of Administrators.
-    // That group's allow ACE is `FILE_DELETE_CHILD` on the parent directory.
-    "S-1-5-32-544",
-];
-
-/// Remove write for `console_sid` and for Users, Everyone, and Authenticated
-/// Users, including inherited allow ACEs. The result is a protected DACL so
-/// the parent cannot grant that write back. The caller journals the original.
+/// Remove write for everyone except SYSTEM, including inherited allow ACEs.
+/// The result is a protected DACL so the parent cannot grant that write back.
+/// The caller journals the original.
 pub fn dacl_without_owner_write(dacl: &str, console_sid: &str) -> Result<String, JournalFault> {
     if !sddl_allowed(dacl) || !sid_is_safe(console_sid) {
         return Err(JournalFault::Value);
@@ -716,18 +707,20 @@ pub fn dacl_without_owner_write(dacl: &str, console_sid: &str) -> Result<String,
     Ok(protected)
 }
 
-/// The file still has the lock from [`dacl_without_owner_write`].
+/// The descriptor is the locked config, judged from the bytes that were read.
 ///
-/// Windows reprints the same descriptor with SID aliases expanded and
-/// `FR` turned into a hex mask, so the journal string and the on-disk
-/// string are not equal. The locked DACL also denies `WRITE_DAC`, including
-/// to the owner. Reassert has to treat this form as held. A failed rewrite
-/// fail-closes the lock, and a correct PIN does not unlock `FailingClosed`.
-pub fn locked_dacl_holds(dacl: &str, console_sid: &str) -> bool {
-    if !sddl_allowed(dacl) || !sid_is_safe(console_sid) || !dacl_is_protected(dacl) {
+/// Access denied is not evidence. Held means the DACL is protected, Owner
+/// Rights is present and limited to read, nobody but SYSTEM or Administrators
+/// is granted write, `WRITE_DAC`, `WRITE_OWNER`, or `DELETE`, a deny does not
+/// take those rights away from SYSTEM or Administrators, and the owner is
+/// SYSTEM or Administrators. Windows may print `FR` as a hex mask and `SY`
+/// as `S-1-5-18`; both forms count.
+pub fn config_lock_held(dacl: &str, owner: &str) -> bool {
+    if !sddl_allowed(dacl) || !dacl_is_protected(dacl) || !privileged_trustee(owner) {
         return false;
     }
-    let mut system_can_restore = false;
+    let mut privileged_can_repair = false;
+    let mut owner_rights_limited = false;
     let mut rest = dacl;
     while let Some(start) = rest.find('(') {
         let Some(end) = rest[start..].find(')') else {
@@ -738,17 +731,27 @@ pub fn locked_dacl_holds(dacl: &str, console_sid: &str) -> bool {
             return false;
         };
         let allow = parts[0] == "A";
+        let deny = parts[0] == "D";
         let trustee = parts[5];
         let write = ace_grants_write(parts[2]);
-        if allow && is_system_trustee(trustee) && write {
-            system_can_restore = true;
-        }
-        if allow && write && locked_principal(trustee, console_sid) {
+        if is_owner_rights(trustee) {
+            if !allow || write {
+                return false;
+            }
+            owner_rights_limited = true;
+        } else if privileged_trustee(trustee) {
+            if deny && write {
+                return false;
+            }
+            if allow && write {
+                privileged_can_repair = true;
+            }
+        } else if allow && write {
             return false;
         }
         rest = &rest[start + end + 1..];
     }
-    system_can_restore
+    owner_rights_limited && privileged_can_repair
 }
 
 fn dacl_is_protected(dacl: &str) -> bool {
@@ -764,17 +767,15 @@ fn ace_parts(ace: &str) -> Option<Vec<&str>> {
     if parts.len() == 6 { Some(parts) } else { None }
 }
 
-fn locked_principal(trustee: &str, console_sid: &str) -> bool {
-    trustee_matches(trustee, console_sid)
-        || trustee.eq_ignore_ascii_case("OW")
-        || trustee.eq_ignore_ascii_case("S-1-3-4")
-        || GROUP_WRITE_SIDS
-            .iter()
-            .any(|sid| trustee_matches(trustee, sid))
+fn is_owner_rights(trustee: &str) -> bool {
+    trustee.eq_ignore_ascii_case("OW") || trustee.eq_ignore_ascii_case("S-1-3-4")
 }
 
-fn is_system_trustee(trustee: &str) -> bool {
-    trustee.eq_ignore_ascii_case("SY") || trustee.eq_ignore_ascii_case("S-1-5-18")
+fn privileged_trustee(trustee: &str) -> bool {
+    trustee.eq_ignore_ascii_case("SY")
+        || trustee.eq_ignore_ascii_case("S-1-5-18")
+        || trustee.eq_ignore_ascii_case("BA")
+        || trustee.eq_ignore_ascii_case("S-1-5-32-544")
 }
 
 /// Bytes appended after `baseline`. A log that was replaced, or a snapshot
@@ -829,7 +830,7 @@ fn explicit_ace(ace: &str) -> String {
     )
 }
 
-fn rewrite_owner_ace(ace: &str, owner: &str) -> Result<(String, bool), JournalFault> {
+fn rewrite_owner_ace(ace: &str, _owner: &str) -> Result<(String, bool), JournalFault> {
     let inner = ace
         .strip_prefix('(')
         .and_then(|text| text.strip_suffix(')'))
@@ -838,30 +839,23 @@ fn rewrite_owner_ace(ace: &str, owner: &str) -> Result<(String, bool), JournalFa
     if parts.len() != 6 {
         return Err(JournalFault::Value);
     }
-    let owner_rights =
-        parts[5].eq_ignore_ascii_case("OW") || parts[5].eq_ignore_ascii_case("S-1-3-4");
-    let console_write =
-        parts[0] == "A" && trustee_matches(parts[5], owner) && ace_grants_write(parts[2]);
-    let group_write = parts[0] == "A"
-        && GROUP_WRITE_SIDS
-            .iter()
-            .any(|sid| trustee_matches(parts[5], sid))
-        && ace_grants_write(parts[2]);
-    if console_write || (owner_rights && ace_grants_write(parts[2])) {
-        // Read only. SYSTEM keeps full control and puts the original
-        // descriptor back. DC is FILE_WRITE_DATA, and WRITE_DAC is WD.
-        Ok((
-            format!("(A;{};FR;{};{};{})", parts[1], parts[3], parts[4], parts[5]),
-            true,
-        ))
-    } else if group_write {
-        Ok((
-            format!("(A;{};FR;{};{};{})", parts[1], parts[3], parts[4], parts[5]),
-            true,
-        ))
-    } else {
-        Ok((ace.to_string(), false))
+    let write = ace_grants_write(parts[2]);
+    let system = parts[5].eq_ignore_ascii_case("SY") || parts[5].eq_ignore_ascii_case("S-1-5-18");
+    // A deny of write for SYSTEM or Administrators cannot be the locked
+    // descriptor: reassert would read it and refuse to call it held.
+    if parts[0] == "D" && write && privileged_trustee(parts[5]) {
+        return Ok((String::new(), true));
     }
+    // Everyone except SYSTEM loses write. That includes the console user,
+    // Administrators (the console user is a member), Owner Rights, and
+    // Creator Owner. SYSTEM keeps full control and puts the original back.
+    if parts[0] == "A" && write && !system {
+        return Ok((
+            format!("(A;{};FR;{};{};{})", parts[1], parts[3], parts[4], parts[5]),
+            true,
+        ));
+    }
+    Ok((ace.to_string(), false))
 }
 
 fn ace_grants_write(rights: &str) -> bool {
@@ -891,53 +885,6 @@ fn ace_grants_write(rights: &str) -> bool {
         || upper.contains("WO")
         || upper.contains("SD")
         || upper.contains("DT")
-}
-
-fn sid_eq(left: &str, right: &str) -> bool {
-    left.eq_ignore_ascii_case(right)
-}
-
-/// Windows prints a well-known SID as a two-letter alias. `LA` is the local
-/// administrator, the account whose RID is 500.
-fn trustee_matches(ace_sid: &str, wanted: &str) -> bool {
-    if sid_eq(ace_sid, wanted) {
-        return true;
-    }
-    match (sddl_alias(ace_sid), sddl_alias(wanted)) {
-        (Some(left), Some(right)) => left == right,
-        _ => false,
-    }
-}
-
-fn sddl_alias(sid: &str) -> Option<&'static str> {
-    if sid.eq_ignore_ascii_case("LA") || local_administrator(sid) {
-        return Some("LA");
-    }
-    if sid.eq_ignore_ascii_case("WD") || sid.eq_ignore_ascii_case("S-1-1-0") {
-        return Some("WD");
-    }
-    if sid.eq_ignore_ascii_case("AU") || sid.eq_ignore_ascii_case("S-1-5-11") {
-        return Some("AU");
-    }
-    if sid.eq_ignore_ascii_case("BU") || sid.eq_ignore_ascii_case("S-1-5-32-545") {
-        return Some("BU");
-    }
-    if sid.eq_ignore_ascii_case("BA") || sid.eq_ignore_ascii_case("S-1-5-32-544") {
-        return Some("BA");
-    }
-    None
-}
-
-fn local_administrator(sid: &str) -> bool {
-    let Some(rest) = sid.strip_prefix("S-1-5-21-") else {
-        return false;
-    };
-    let mut parts = rest.split('-');
-    let domain = parts
-        .by_ref()
-        .take(3)
-        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
-    domain && parts.next() == Some("500") && parts.next().is_none()
 }
 
 pub fn sddl_allowed(text: &str) -> bool {
@@ -2260,25 +2207,37 @@ mod tests {
     }
 
     #[test]
-    fn a_canonical_locked_dacl_still_holds() {
+    fn a_lock_is_held_only_when_the_descriptor_says_so() {
         let owner = "S-1-5-21-1-2-3-1001";
         let dacl =
             format!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{owner})(A;;FA;;;WD)(A;;FA;;;S-1-3-0)");
         let locked = dacl_without_owner_write(&dacl, owner).expect("rewrite");
-        assert!(locked_dacl_holds(&locked, owner), "{locked}");
+        assert!(
+            !config_lock_held(&locked, owner),
+            "the console user owning the file is not held: {locked}"
+        );
+        assert!(config_lock_held(&locked, "S-1-5-18"), "{locked}");
+        assert!(config_lock_held(&locked, "S-1-5-32-544"), "{locked}");
         let canonical = locked
             .replace("SY", "S-1-5-18")
             .replace("BA", "S-1-5-32-544")
             .replace("WD", "S-1-1-0")
             .replace("OW", "S-1-3-4")
             .replace("FR", "0x120089");
-        assert!(locked_dacl_holds(&canonical, owner), "{canonical}");
+        assert!(config_lock_held(&canonical, "S-1-5-18"), "{canonical}");
         let weakened = format!("{canonical}(A;;FA;;;{owner})");
-        assert!(!locked_dacl_holds(&weakened, owner), "{weakened}");
+        assert!(!config_lock_held(&weakened, "S-1-5-18"), "{weakened}");
+        let hostile = format!("D:P(D;;WD;;;SY)(A;;FA;;;{owner})(A;;FR;;;OW)");
+        assert!(
+            !config_lock_held(&hostile, "S-1-5-18"),
+            "a deny of WRITE_DAC for SYSTEM is not held: {hostile}"
+        );
+        assert!(!config_lock_held("D:P(A;;FA;;;SY)(A;;FA;;;OW)", "S-1-5-18"));
+        assert!(!config_lock_held("D:P(A;;FA;;;SY)", "S-1-5-18"));
         let unprotected = locked.replacen("D:P", "D:", 1);
-        assert!(!locked_dacl_holds(&unprotected, owner), "{unprotected}");
+        assert!(!config_lock_held(&unprotected, "S-1-5-18"), "{unprotected}");
         let no_system = locked.replace("(A;;FA;;;SY)", "");
-        assert!(!locked_dacl_holds(&no_system, owner), "{no_system}");
+        assert!(!config_lock_held(&no_system, "S-1-5-18"), "{no_system}");
     }
 
     #[test]
