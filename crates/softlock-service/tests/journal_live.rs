@@ -1551,16 +1551,24 @@ fn suspend_pid(image: &str, pid: u32) -> Result<(), String> {
         // Suspending a process that is still inside the loader returns
         // STATUS_DLL_INIT_FAILED. The host is alive; the call can succeed
         // once that init finishes.
+        // STATUS_DLL_INIT_FAILED: still inside the loader.
+        // STATUS_PROCESS_IS_TERMINATING: already leaving, so there is
+        // nothing left to freeze.
+        const DLL_INIT_FAILED: i32 = 0xC000_0142_u32 as i32;
+        const PROCESS_IS_TERMINATING: i32 = 0xC000_010A_u32 as i32;
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut status = NtSuspendProcess(process.0);
         let mut tries = 1u32;
-        while status == 0xC000_0142_u32 as i32 && tries < 40 && Instant::now() < deadline {
+        while status == DLL_INIT_FAILED && tries < 40 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));
             status = NtSuspendProcess(process.0);
             tries += 1;
         }
         let _ = windows::Win32::Foundation::CloseHandle(process);
-        if status == 0 || image_pid(image) != Some(pid) {
+        if status == 0
+            || image_pid(image) != Some(pid)
+            || (status == PROCESS_IS_TERMINATING && image_pid(image) != Some(pid))
+        {
             Ok(())
         } else {
             Err(format!("suspend {image} returned {status}"))
