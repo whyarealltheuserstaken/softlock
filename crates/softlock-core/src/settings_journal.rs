@@ -2095,8 +2095,8 @@ mod tests {
             r"C:\Windows\System32"
         ));
         assert!(!configured_file_matches(
-            r"C:\Program Files\SoftLock\config.toml",
-            r"C:\Program Files\SoftLock"
+            r"C:\Program Files\Vendor\config.toml",
+            r"C:\Program Files\Vendor"
         ));
         assert!(!configured_file_matches(&file, r"C:\Temp"));
         assert!(!configured_file_matches(&file, r"C:\Users\owner\..\Temp"));

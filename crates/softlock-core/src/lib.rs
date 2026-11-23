@@ -78,11 +78,11 @@ pub use settings_journal::{
     dir_fault_log, encode_document, executable_may_run_as_system, expand_profile_image,
     fact_after_boot, fact_for_session, fault_log, held_start, hive_target_allowed, host_identity,
     journal_dacl_exact, lockdown_document, lockdown_policy, lockdown_target,
-    mark_workstation_clear, original_previous, parent_dacl_trusted, parse_document, reassert_due,
-    reassert_write, recovery_action, release_os_hold, repair_action, repair_entry_name,
-    restore_action, restore_action_for, restore_sid, same_exe_path, sddl_allowed,
-    service_start_action, sid_is_safe, startup_steps, task_manager_document, with_config_acl,
-    workstation_value_after_attempt,
+    mark_workstation_clear, original_previous, owner_reconnected, parent_dacl_trusted,
+    parse_document, reassert_due, reassert_write, recovery_action, release_os_hold, repair_action,
+    repair_entry_name, restore_action, restore_action_for, restore_sid, same_exe_path,
+    sddl_allowed, service_start_action, sid_is_safe, sign_in_release, startup_steps,
+    task_manager_document, with_config_acl, workstation_value_after_attempt,
 };
 pub use state::{
     ArmStep, DisarmStep, FailReason, Fallback, HeartbeatReport, LaunchNonce, LockSource, LockState,
