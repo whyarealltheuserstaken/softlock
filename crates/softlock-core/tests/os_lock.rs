@@ -590,6 +590,8 @@ fn the_fail_closed_job_covers_each_hosted_case() {
         "stop-while-locked",
         "unhealthy-guard",
         "tray-hard-lock",
+        "hold-ready",
+        "exit-before-ready",
     ] {
         assert!(job.contains(case), "missing {case}");
     }

@@ -668,6 +668,9 @@ fn supervise(
             .unwrap_or(HostAction::Hold);
         drain_os_lock(&authority);
         if let HostAction::Respawn { arm: arm_again } = action {
+            // The previous wait must not stay Waiting across this process.
+            arm.failed();
+            arm_sent = false;
             if let Some(child) = host
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
@@ -682,6 +685,7 @@ fn supervise(
                     next_id = next_id.saturating_add(1);
                     if let Ok(frame) = encode_service(next_id, &ServiceToHost::Arm) {
                         let _ = child.writer.send(frame);
+                        arm_sent = true;
                     }
                 }
                 *host.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(child);
@@ -1248,6 +1252,7 @@ fn host_test_env(key: &str) -> bool {
     }
     #[cfg(feature = "live-fail-closed")]
     if key.eq_ignore_ascii_case("SOFTLOCK_FORCE_GUARD_DOWN")
+        || key.eq_ignore_ascii_case("SOFTLOCK_HOST_READY")
         || key.eq_ignore_ascii_case("GITHUB_ACTIONS")
         || key.eq_ignore_ascii_case("RUNNER_ENVIRONMENT")
     {
@@ -1358,18 +1363,34 @@ fn serve_client(pipe: HANDLE, authority: &Arc<Mutex<Authority>>) {
             break;
         }
         // Lock has marked the arm slot. Wait only after the authority mutex
-        // is released, and only once HostReady has been accepted.
+        // is released. A timeout or a failed slot fails closed: the host is
+        // replaced by the supervisor, and the public name leaves Arming.
         if matches!(response, softlock_core::ResponseKind::Accepted) {
             let arm = authority
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .arm_wait();
-            if let Some(arm) = arm.filter(|arm| arm.is_waiting())
-                && !arm.wait_ready()
-            {
-                response = softlock_core::ResponseKind::NeedsConfirmation {
-                    fields: vec!["guard".to_string()],
+            if let Some(arm) = arm {
+                let confirmed = if arm.is_ready() {
+                    true
+                } else if arm.is_waiting() {
+                    arm.wait_ready()
+                } else {
+                    false
                 };
+                if !confirmed {
+                    arm.failed();
+                    {
+                        let mut guard = authority
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        guard.expire_arm_wait();
+                    }
+                    drain_os_lock(authority);
+                    response = softlock_core::ResponseKind::NeedsConfirmation {
+                        fields: vec!["guard".to_string()],
+                    };
+                }
             }
         }
         if write_response(pipe, 0, &response).is_err() {

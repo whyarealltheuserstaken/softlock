@@ -47,6 +47,8 @@ jobs:
           - stop-while-locked
           - unhealthy-guard
           - tray-hard-lock
+          - hold-ready
+          - exit-before-ready
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15

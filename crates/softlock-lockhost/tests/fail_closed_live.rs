@@ -47,6 +47,15 @@ fn live_fail_closed() {
         .env("SOFTLOCK_OS_LOCK_MARK", &mark)
         .env("SOFTLOCK_FORCE_GUARD_DOWN", &guard_file)
         .env_remove("SOFTLOCK_STUB_OS_LOCK")
+        .env_remove("SOFTLOCK_HOST_READY");
+    let before_ready = matches!(case.as_str(), "hold-ready" | "exit-before-ready");
+    if case == "hold-ready" {
+        command.env("SOFTLOCK_HOST_READY", "hold");
+    }
+    if case == "exit-before-ready" {
+        command.env("SOFTLOCK_HOST_READY", "exit");
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -60,24 +69,35 @@ fn live_fail_closed() {
     let mut saw_locked = false;
     if case != "tray-hard-lock" {
         let response = transact(&pipe, lock_now()).expect("lock");
-        assert!(
-            response.contains("Accepted"),
-            "{case} was not accepted: {response}"
-        );
-        let locked = wait_until(Duration::from_secs(15), || {
-            let state = status_state(&transact(&pipe, status()).unwrap_or_default());
-            if state.as_deref() == Some("Unlocked") {
-                saw_unlocked = true;
+        if before_ready {
+            assert!(
+                response.contains("Accepted") || response.contains("NeedsConfirmation"),
+                "{case} lock response: {response}"
+            );
+            assert!(
+                !response.contains("\"Unlocked\""),
+                "{case} lock response was Unlocked: {response}"
+            );
+        } else {
+            assert!(
+                response.contains("Accepted"),
+                "{case} was not accepted: {response}"
+            );
+            let locked = wait_until(Duration::from_secs(15), || {
+                let state = status_state(&transact(&pipe, status()).unwrap_or_default());
+                if state.as_deref() == Some("Unlocked") {
+                    saw_unlocked = true;
+                }
+                if state.as_deref() == Some("Locked") {
+                    saw_locked = true;
+                }
+                saw_locked
+            });
+            assert!(locked, "{case} did not reach Locked");
+            assert!(!saw_unlocked, "{case} read Unlocked before the fault");
+            if matches!(case.as_str(), "kill-host" | "suspend-host" | "kill-service") {
+                wait_until(Duration::from_secs(10), || host_pid().is_some());
             }
-            if state.as_deref() == Some("Locked") {
-                saw_locked = true;
-            }
-            saw_locked
-        });
-        assert!(locked, "{case} did not reach Locked");
-        assert!(!saw_unlocked, "{case} read Unlocked before the fault");
-        if matches!(case.as_str(), "kill-host" | "suspend-host" | "kill-service") {
-            wait_until(Duration::from_secs(10), || host_pid().is_some());
         }
     }
     let host_before = host_pid();
@@ -88,9 +108,13 @@ fn live_fail_closed() {
         let ready = wait_until(Duration::from_secs(15), || hwnd_file.is_file());
         assert!(ready, "the owner window did not publish its handle");
     }
-    let log_at = fs::metadata(&log)
-        .map(|meta| meta.len() as usize)
-        .unwrap_or(0);
+    let log_at = if before_ready {
+        0
+    } else {
+        fs::metadata(&log)
+            .map(|meta| meta.len() as usize)
+            .unwrap_or(0)
+    };
     let _ = fs::remove_file(&mark);
     let started = Instant::now();
     match case.as_str() {
@@ -113,6 +137,7 @@ fn live_fail_closed() {
             fs::write(&guard_file, b"down").expect("guard file");
         }
         "tray-hard-lock" => post_tray_hard_lock(&hwnd_file),
+        "hold-ready" | "exit-before-ready" => {}
         other => panic!("unknown case {other}"),
     }
     let mut confirmed_at = None;
@@ -192,10 +217,19 @@ fn live_fail_closed() {
         );
     } else {
         assert!(
-            saw_locked || case == "kill-service",
+            saw_locked || case == "kill-service" || before_ready,
             "{case} never read Locked"
         );
         assert!(!saw_unlocked, "{case} read Unlocked: {fresh}");
+        if before_ready {
+            assert!(
+                fresh.contains("LockWorkStation") || fresh.contains("WTSDisconnectSession"),
+                "{case} did not lock or disconnect: {fresh}"
+            );
+            let state = status_state(&transact(&pipe, status()).unwrap_or_default());
+            assert_ne!(state.as_deref(), Some("Unlocked"), "{case} ended Unlocked");
+            assert_ne!(state.as_deref(), Some("Arming"), "{case} stayed Arming");
+        }
     }
 }
 

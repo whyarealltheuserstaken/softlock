@@ -104,6 +104,17 @@ impl ServicePlatform {
     }
 }
 
+/// How long a desktop lock may wait for `HostReady`.
+///
+/// Fail-closed detection is one second: three missed 250 ms heartbeats, and
+/// once that decision is made the OS lock has to confirm inside the same
+/// second. A healthy Lock Host reports ready inside that second. Hosted
+/// runs arm in tens of milliseconds, and the slow samples stayed under
+/// 600 ms, so a shorter cutoff would fail a lock that did arm. One second
+/// is that budget. It replaces the old 8 s wait, which left the desktop
+/// unguarded for the whole timeout.
+pub const ARM_READY_LIMIT: Duration = Duration::from_secs(1);
+
 /// The request thread waits here while another thread watches the Lock Host.
 #[derive(Clone)]
 pub struct ArmWait {
@@ -153,7 +164,7 @@ impl ArmWait {
             .slot
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + ARM_READY_LIMIT;
         while matches!(*slot, ArmSlot::Waiting) {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -199,6 +210,15 @@ impl ArmWait {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         matches!(*slot, ArmSlot::Waiting)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        let slot = self
+            .inner
+            .slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        matches!(*slot, ArmSlot::Ready)
     }
 
     pub fn ready(&self) {
