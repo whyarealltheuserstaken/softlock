@@ -91,6 +91,21 @@ impl ServicePlatform {
             .and_then(crate::settings::SettingsEngine::os_confirmed_marker)
     }
 
+    /// The repair `--repair-settings` runs. Refuses unless this logon is the
+    /// console again.
+    #[cfg(windows)]
+    pub fn repair_leftover(&mut self) -> Result<(), &'static str> {
+        self.settings.as_mut().ok_or("settings")?.repair_leftover()
+    }
+
+    /// This logon is the active console again. Does not write the journal.
+    #[cfg(windows)]
+    pub fn owner_back(&mut self) -> bool {
+        self.settings
+            .as_mut()
+            .is_some_and(crate::settings::SettingsEngine::owner_back)
+    }
+
     pub fn set_arm_wait(&mut self, arm: ArmWait) {
         self.arm = Some(arm);
     }

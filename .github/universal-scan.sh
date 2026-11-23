@@ -87,6 +87,7 @@ scan_fails_when_fat_binary_has_markers() {
   printf '%s' 'softlock_dev_launch_marker' >> "${dest}"
   printf '%s' 'softlock-live-fail-closed-marker' >> "${dest}"
   printf '%s' 'softlock_live_fail_closed_marker' >> "${dest}"
+  printf '%s' 'softlock-present-physical-pin' >> "${dest}"
   echo "=== negative control ${dest} ==="
   echo "appended softlock-simulated-physical-marker"
   echo "appended softlock_simulated_physical_marker"
@@ -106,5 +107,6 @@ scan_fails_when_fat_binary_has_markers() {
   fi
   grep -F "test-only markers in release binaries" "${log}"
   grep -F "string=true symbol=true dev_string=true dev_symbol=true" "${log}"
+  grep -F "pin_string=true" "${log}"
   echo "negative control: scan failed on a fat Mach-O with release markers"
 }

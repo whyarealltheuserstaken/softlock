@@ -25,6 +25,8 @@ Cancel on the Ctrl+Alt+Del screen returns to the desktop, where SoftLock is stil
 
 Windows Hello and the account password at the real Windows lock screen keep working. SoftLock does not change sign-in policy, credential providers, or smart-card enforcement. The UAC values above apply to elevation prompts, not to the lock screen. Clearing `DisableLockWorkstation` is what lets the real lock appear. Restoring it afterward does not sign the owner out and does not block the password or Hello prompt that is already up.
 
+When the lock had to disconnect the session, SoftLock stays at the Windows sign-in until this same account is the console again. Signing in, or unlocking that session, clears that on its own. There is no repair command to run. On a machine with auto-logon enabled, a disconnect fallback is not a real lock: Windows signs that same account back in without a password, and SoftLock treats that as the owner returning. A disconnect is a lock only when reconnecting asks for credentials.
+
 ## What policy does not close
 
 These stay available. They are limitations, not a second lock.

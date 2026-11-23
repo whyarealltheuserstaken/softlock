@@ -55,7 +55,9 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, STARTUPINFOW,
     THREAD_QUERY_LIMITED_INFORMATION, TerminateProcess, WaitForSingleObject,
 };
-use windows::Win32::UI::WindowsAndMessaging::{WTS_SESSION_LOCK, WTS_SESSION_UNLOCK};
+use windows::Win32::UI::WindowsAndMessaging::{
+    WTS_SESSION_LOCK, WTS_SESSION_LOGON, WTS_SESSION_UNLOCK,
+};
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::authority::{Authority, HostAction, HostLoss};
@@ -75,7 +77,8 @@ static PIN_STATUS: Mutex<String> = Mutex::new(String::new());
 static PIN_LOADED: Mutex<String> = Mutex::new(String::new());
 static SESSION_TX: Mutex<Option<Sender<SessionEvent>>> = Mutex::new(None);
 /// Set when the confirmed OS lock was a disconnect. The unlock notification
-/// that follows is not the owner signing back in. SPEC section 7.
+/// that follows is not the owner signing back in until this logon is the
+/// console again. SPEC section 7.
 static DISCONNECT_HELD: AtomicBool = AtomicBool::new(false);
 
 const ACCEPT_CONTROLS: u32 = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SESSIONCHANGE;
@@ -387,6 +390,7 @@ fn session_event(
     match event_type {
         WTS_SESSION_LOCK => Some(SessionEvent::OsLocked),
         WTS_SESSION_UNLOCK => Some(SessionEvent::OsUnlocked),
+        WTS_SESSION_LOGON => Some(SessionEvent::Logon),
         _ => None,
     }
 }
@@ -614,12 +618,21 @@ fn remember_pin_status() {
 
 fn apply_session_events(authority: &Arc<Mutex<Authority>>, events: &Receiver<SessionEvent>) {
     while let Ok(event) = events.try_recv() {
+        let sign_in = matches!(event, SessionEvent::OsUnlocked | SessionEvent::Logon);
+        if sign_in {
+            let mut guard = authority
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if owner_authenticated(&mut guard, event) {
+                continue;
+            }
+        }
+        // The disconnect's own unlock, including when some other console
+        // session is already active, is not the owner signing back in.
         if matches!(event, SessionEvent::OsUnlocked) && DISCONNECT_HELD.load(Ordering::Acquire) {
-            // Windows raises an unlock notice for the disconnect itself,
-            // including when some other console session is already active.
-            // That notice is not the owner signing back in. The supervisor
-            // leaves OsLocked until `--repair-settings` removes the marker,
-            // which it does only when this logon is the console. SPEC section 7.
+            continue;
+        }
+        if matches!(event, SessionEvent::Logon) {
             continue;
         }
         let mut guard = authority
@@ -627,6 +640,37 @@ fn apply_session_events(authority: &Arc<Mutex<Authority>>, events: &Receiver<Ses
             .unwrap_or_else(|poison| poison.into_inner());
         guard.notify(Event::Session(event));
     }
+}
+
+/// A console unlock after this process saw the owner leave, or a logon onto
+/// the console, when the journal still says this same logon. The service
+/// runs the repair itself. The owner does not.
+fn owner_authenticated(guard: &mut Authority, event: SessionEvent) -> bool {
+    if !matches!(guard.state(), LockState::OsLocked { .. }) {
+        return false;
+    }
+    // The disconnect's own unlock is the proof this logon left. A later
+    // return is the sign-in. An unlock while this logon is still the console
+    // is not that proof.
+    if matches!(event, SessionEvent::OsUnlocked)
+        && DISCONNECT_HELD.load(Ordering::Acquire)
+        && !guard.platform_mut().owner_back()
+    {
+        OWNER_WAS_AWAY.store(true, Ordering::Release);
+        return false;
+    }
+    let unlock_after_away = matches!(event, SessionEvent::OsUnlocked)
+        && DISCONNECT_HELD.load(Ordering::Acquire)
+        && OWNER_WAS_AWAY.load(Ordering::Acquire);
+    let logon = matches!(event, SessionEvent::Logon);
+    if !unlock_after_away && !logon {
+        return false;
+    }
+    if guard.platform_mut().repair_leftover().is_err() {
+        return false;
+    }
+    finish_sign_in(guard);
+    true
 }
 
 /// Stop is accepted only from `Unlocked` or after the OS lock is confirmed.
@@ -706,7 +750,8 @@ fn supervise(
             .try_lock()
             .map(|mut guard| guard.poll_host(Instant::now(), alive))
             .unwrap_or(HostAction::Hold);
-        let signed_in = release_returned_owner(&authority);
+        let signed_in =
+            release_returned_owner(&authority) || REPLACE_HOST.swap(false, Ordering::AcqRel);
         if signed_in {
             // The host that was spawned for the disconnected session is not
             // the next lock's host. The following iteration starts a new one.
@@ -754,32 +799,55 @@ fn supervise(
 /// A later empty journal is the repair task, not a journal that was never
 /// written.
 static MARKER_SEEN: AtomicBool = AtomicBool::new(false);
+/// This process saw the console leave after its own confirmed disconnect.
+static OWNER_WAS_AWAY: AtomicBool = AtomicBool::new(false);
+/// The session handler already repaired. The supervisor drops the host
+/// that was started in the disconnected session.
+static REPLACE_HOST: AtomicBool = AtomicBool::new(false);
 
 fn release_returned_owner(authority: &Arc<Mutex<Authority>>) -> bool {
-    if !DISCONNECT_HELD.load(Ordering::Acquire) {
-        return false;
-    }
     let mut guard = authority
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    if !matches!(guard.state(), softlock_core::LockState::OsLocked { .. }) {
+    if !matches!(guard.state(), LockState::OsLocked { .. }) {
         return false;
     }
     match guard.platform_mut().os_confirmed_marker() {
-        Some(true) => {
-            MARKER_SEEN.store(true, Ordering::Release);
-            false
-        }
+        Some(true) => MARKER_SEEN.store(true, Ordering::Release),
+        // The ONLOGON task removed a marker this process had seen.
         Some(false) if MARKER_SEEN.load(Ordering::Acquire) => {
-            // `--repair-settings` removed the marker. That is the ONLOGON
-            // route, and it only does so when this logon is the console.
-            MARKER_SEEN.store(false, Ordering::Release);
-            DISCONNECT_HELD.store(false, Ordering::Release);
-            guard.release_after_repair();
-            true
+            finish_sign_in(&mut guard);
+            return true;
         }
-        _ => false,
+        _ => return false,
     }
+    // A process that booted into OsLocked stays there until a logon or the
+    // sign-in task. Watching the console from the first poll would open the
+    // lock on a restart whose session never left.
+    if !DISCONNECT_HELD.load(Ordering::Acquire) || !MARKER_SEEN.load(Ordering::Acquire) {
+        return false;
+    }
+    if !guard.platform_mut().owner_back() {
+        OWNER_WAS_AWAY.store(true, Ordering::Release);
+        return false;
+    }
+    if !OWNER_WAS_AWAY.load(Ordering::Acquire) {
+        return false;
+    }
+    if guard.platform_mut().repair_leftover().is_err() {
+        return false;
+    }
+    finish_sign_in(&mut guard);
+    true
+}
+
+fn finish_sign_in(guard: &mut Authority) {
+    MARKER_SEEN.store(false, Ordering::Release);
+    OWNER_WAS_AWAY.store(false, Ordering::Release);
+    DISCONNECT_HELD.store(false, Ordering::Release);
+    guard.release_after_repair();
+    REPLACE_HOST.store(true, Ordering::Release);
+    crate::audit("settings", &[("result", "restored"), ("reason", "sign-in")]);
 }
 
 fn arm_frame(authority: &Arc<Mutex<Authority>>, id: u64) -> Option<Vec<u8>> {
@@ -2178,7 +2246,9 @@ mod session_filter {
     use softlock_core::SessionEvent;
     use windows::Win32::System::RemoteDesktop::WTSSESSION_NOTIFICATION;
     use windows::Win32::System::Services::SERVICE_CONTROL_SESSIONCHANGE;
-    use windows::Win32::UI::WindowsAndMessaging::{WTS_SESSION_LOCK, WTS_SESSION_UNLOCK};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WTS_SESSION_LOCK, WTS_SESSION_LOGON, WTS_SESSION_UNLOCK,
+    };
 
     #[test]
     fn another_sessions_lock_does_not_move_the_console() {
@@ -2228,6 +2298,15 @@ mod session_filter {
                 console
             ),
             Some(SessionEvent::OsUnlocked)
+        );
+        assert_eq!(
+            session_event(
+                SERVICE_CONTROL_SESSIONCHANGE,
+                WTS_SESSION_LOGON,
+                same_ptr,
+                console
+            ),
+            Some(SessionEvent::Logon)
         );
         assert!(session_event(SERVICE_CONTROL_SESSIONCHANGE, 1, same_ptr, console).is_none());
         assert!(

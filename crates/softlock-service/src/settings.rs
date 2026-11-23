@@ -320,6 +320,19 @@ impl SettingsEngine {
         Some(doc.os_confirmed)
     }
 
+    /// The confirmed disconnect's logon is the console again, and that
+    /// console is active. This is the read [`Self::repair_leftover`] uses
+    /// before it writes.
+    pub fn owner_back(&mut self) -> bool {
+        let Some(text) = load_journal().ok().flatten() else {
+            return false;
+        };
+        let Ok(doc) = parse_document(text.as_bytes()) else {
+            return false;
+        };
+        doc.os_confirmed && doc.lock.is_some_and(crate::taskmgr::owner_session_returned)
+    }
+
     pub fn repair_leftover(&mut self) -> Result<(), &'static str> {
         let Some(text) = load_journal().map_err(|_| "journal")? else {
             return Ok(());
@@ -329,8 +342,10 @@ impl SettingsEngine {
             return Ok(());
         }
         // A confirmed disconnect is cleared only when this same logon is the
-        // console again. That is the ONLOGON repair route. A session that
-        // merely looks active after the disconnect is not a sign-in.
+        // console again. The running service calls this on the logon or
+        // unlock that brings the owner back, and the ONLOGON task calls it
+        // when the service is not the process that sees the event. A session
+        // that merely looks active before it has left is not a sign-in.
         if doc.os_confirmed {
             let returned = doc
                 .lock

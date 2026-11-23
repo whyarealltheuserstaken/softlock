@@ -15,6 +15,8 @@ mod log;
 #[cfg(feature = "simulated-physical")]
 mod pincheck;
 mod platform;
+#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+mod present_physical;
 mod secrets;
 #[cfg(windows)]
 mod settings;
@@ -37,6 +39,8 @@ pub use pincheck::PinChecker;
 #[cfg(feature = "simulated-physical")]
 pub use pincheck::marker_bytes;
 pub use platform::{ArmWait, OsLock, ServicePlatform};
+#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+pub use present_physical::marker_bytes as present_physical_marker_bytes;
 pub use secrets::PinStore;
 
 #[cfg(windows)]

@@ -771,6 +771,8 @@ Run on one Windows 11 laptop (Modern Standby, touchscreen if available) and one 
 10. Pausing: pick one app in Efficiency mode and one in Suspend (for example a chat app and a music app), lock for 10 minutes, then unlock, and both work normally. Repeat, holding the power button while locked, and check that nothing is stuck after the restart.
 Each item is a one-line pass or fail in the release notes.
 
+On a machine with auto-logon enabled, a disconnect fallback is not a real lock. Windows signs that same logon back in without a password, and SoftLock leaves OsLocked because that sign-in is the owner returning. A disconnect is a lock only when reconnecting asks for credentials.
+
 ---
 
 ## Out of Scope

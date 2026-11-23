@@ -10,6 +10,7 @@ const DEV_STRING: &[u8] = b"softlock-dev-launch-marker";
 const DEV_SYMBOL: &[u8] = b"softlock_dev_launch_marker";
 const LIVE_STRING: &[u8] = b"softlock-live-fail-closed-marker";
 const LIVE_SYMBOL: &[u8] = b"softlock_live_fail_closed_marker";
+const PIN_STRING: &[u8] = b"softlock-present-physical-pin";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Hit {
@@ -20,6 +21,7 @@ struct Hit {
     dev_symbol: bool,
     live_string: bool,
     live_symbol: bool,
+    pin_string: bool,
 }
 
 #[test]
@@ -174,9 +176,14 @@ fn contaminated_build_fails_the_release_binary_check() {
     assert!(
         live_hits
             .iter()
-            .any(|hit| hit.live_string && hit.live_symbol),
+            .any(|hit| hit.live_string && hit.live_symbol && hit.pin_string),
         "a service binary with live-fail-closed must fail the scan:\n{}",
         format_hits(&live_hits)
+    );
+    assert!(
+        service_hits.iter().any(|hit| hit.pin_string),
+        "presenting a PIN as physical input must fail the scan:\n{}",
+        format_hits(&service_hits)
     );
     let clean_live = scan(&clean_dir.join("release"), "");
     assert!(
@@ -260,7 +267,9 @@ fn scan(root: &Path, name_filter: &str) -> Vec<Hit> {
         let dev_symbol = contains(&bytes, DEV_SYMBOL);
         let live_string = contains(&bytes, LIVE_STRING);
         let live_symbol = contains(&bytes, LIVE_SYMBOL);
-        if string || symbol || dev_string || dev_symbol || live_string || live_symbol {
+        let pin_string = contains(&bytes, PIN_STRING);
+        if string || symbol || dev_string || dev_symbol || live_string || live_symbol || pin_string
+        {
             hits.push(Hit {
                 path: path.display().to_string(),
                 string,
@@ -269,6 +278,7 @@ fn scan(root: &Path, name_filter: &str) -> Vec<Hit> {
                 dev_symbol,
                 live_string,
                 live_symbol,
+                pin_string,
             });
         }
     }
@@ -364,14 +374,15 @@ fn format_hits(hits: &[Hit]) -> String {
     hits.iter()
         .map(|hit| {
             format!(
-                "{} string={} symbol={} dev_string={} dev_symbol={} live_string={} live_symbol={}",
+                "{} string={} symbol={} dev_string={} dev_symbol={} live_string={} live_symbol={} pin_string={}",
                 hit.path,
                 hit.string,
                 hit.symbol,
                 hit.dev_string,
                 hit.dev_symbol,
                 hit.live_string,
-                hit.live_symbol
+                hit.live_symbol,
+                hit.pin_string
             )
         })
         .collect::<Vec<_>>()

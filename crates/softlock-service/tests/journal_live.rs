@@ -611,15 +611,28 @@ fn kill_after_apply(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
 fn wait_os_held(expected: &str, label: &str) -> Result<(), String> {
     let mut ended_unlocked = false;
     let mut last_state = String::new();
+    let log_at = fs::read_to_string(guard_dir().join("service.log"))
+        .map(|text| text.len())
+        .unwrap_or(0);
     let held = wait_until(Duration::from_secs(25), || {
         let status = transact(&pipe_name(), status_body()).unwrap_or_default();
         let state = status_state(&status).unwrap_or_default();
         last_state = state.clone();
         let os_held = session_os_held();
-        // Unlocked on an active session is a fail-open. A confirmed OS lock
-        // whose session is disconnected or locked is session_os_held, and the
-        // originals have to be back. SPEC section 7.
+        // Unlocked with no confirmed OS lock is a fail-open. Unlocked after
+        // `os-lock result=confirmed`, with the original value back, is the
+        // owner (or the runner's auto-logon) returning to this logon. The
+        // service clears OsLocked itself. A reconnect on a real machine asks
+        // for credentials unless auto-logon is on.
         if state == "Unlocked" && !os_held {
+            let log = fs::read_to_string(guard_dir().join("service.log")).unwrap_or_default();
+            let fresh = log.get(log_at..).unwrap_or("");
+            if fresh.contains("os-lock result=confirmed")
+                && query_taskmgr() == expected
+                && !journal_ready(&journal_file())
+            {
+                return true;
+            }
             ended_unlocked = true;
             return true;
         }
@@ -808,14 +821,10 @@ fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
             "the host death did not disconnect the console: {state}"
         ));
     }
-    // Same logon, same session, back on the console. The repair task is the
-    // sign-in route. Reconnecting alone does not clear the marker.
+    // Same logon, same session, back on the console. The service clears
+    // OsLocked itself once that sign-in is the console. No repair command.
     align_console()?;
-    let (code, note) = repair_as_system()?;
-    if code != 0 {
-        return Err(format!("sign-in repair failed ({code} {note})"));
-    }
-    if !wait_until(Duration::from_secs(20), || {
+    if !wait_until(Duration::from_secs(25), || {
         status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
             == Some("Unlocked")
     }) {
@@ -956,8 +965,12 @@ fn run_system_task(name: &str, script: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "live-fail-closed")]
+#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+#[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
 fn type_pin_keys() -> Result<(), String> {
+    // Keeps the release-scan marker on the only build that can compile this
+    // hook. A product binary does not enable either feature.
+    let _ = softlock_service::present_physical_marker_bytes();
     use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
@@ -1007,7 +1020,8 @@ fn type_pin_keys() -> Result<(), String> {
     failed.map_or(Ok(()), Err)
 }
 
-#[cfg(feature = "live-fail-closed")]
+#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+#[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
 fn pin_key(virtual_key: u16, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
