@@ -540,7 +540,8 @@ fn serve(probe: Option<PathBuf>) -> i32 {
     };
     *PIN_LOADED
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner()) = loaded;
+        .unwrap_or_else(|poison| poison.into_inner()) = loaded.clone();
+    crate::log::audit("pin", &[("result", &loaded)]);
     remember_pin_status();
     install_journal(&mut authority);
     let arm = ArmWait::new();

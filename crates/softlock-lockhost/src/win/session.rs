@@ -1057,6 +1057,8 @@ fn on_key(
 }
 
 fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: &mut PinEntry) {
+    #[cfg(feature = "live-fail-closed")]
+    note_test_pin(entry.bytes.len());
     let secret = Secret::new(&entry.bytes);
     // `Zeroize` for `Vec` clears the length and keeps the allocation, so the
     // next PIN reuses this buffer instead of abandoning a copy.
@@ -1227,6 +1229,22 @@ fn owner_layout() -> windows::Win32::UI::Input::KeyboardAndMouse::HKL {
             layout
         }
     }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn note_test_pin(len: usize) {
+    // The journal sign-in case sets this path. The length is not the secret.
+    // A release build does not compile this.
+    let Ok(path) = std::env::var("SOFTLOCK_TYPE_PIN") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let _ = std::fs::write(
+        std::path::PathBuf::from(path).with_extension("result"),
+        len.to_string(),
+    );
 }
 
 fn publish(shared: &Shared, report: PipeReport) {

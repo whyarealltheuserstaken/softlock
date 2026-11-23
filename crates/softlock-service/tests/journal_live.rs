@@ -915,7 +915,8 @@ fn seed_system_pin(dir: &Path) -> Result<(), String> {
 $log = '{log}'
 try {{
   $hash = [IO.File]::ReadAllText('{staged}')
-  [IO.File]::WriteAllText('{pin}', $hash)
+  $utf8 = New-Object System.Text.UTF8Encoding $false
+  [IO.File]::WriteAllText('{pin}', $hash, $utf8)
   Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -1033,10 +1034,19 @@ fn type_pin_keys() -> Result<(), String> {
     let path = guard_dir().join("type-pin.request");
     let _ = fs::remove_file(&path);
     fs::write(&path, b"1").map_err(|_| "pin request".to_string())?;
-    if wait_until(Duration::from_secs(10), || !path.exists()) {
+    if !wait_until(Duration::from_secs(10), || !path.exists()) {
+        return Err("the lock host did not type the pin".to_string());
+    }
+    let result = path.with_extension("result");
+    if !wait_until(Duration::from_secs(10), || result.is_file()) {
+        return Err("the lock host typed but did not submit a pin".to_string());
+    }
+    let count = fs::read_to_string(&result).unwrap_or_default();
+    let count = count.trim();
+    if count == "6" {
         Ok(())
     } else {
-        Err("the lock host did not type the pin".to_string())
+        Err(format!("the submitted pin was {count} bytes"))
     }
 }
 
