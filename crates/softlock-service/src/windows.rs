@@ -614,17 +614,13 @@ fn remember_pin_status() {
 
 fn apply_session_events(authority: &Arc<Mutex<Authority>>, events: &Receiver<SessionEvent>) {
     while let Ok(event) = events.try_recv() {
-        if matches!(event, SessionEvent::OsUnlocked)
-            && DISCONNECT_HELD.load(Ordering::Acquire)
-            && crate::taskmgr::console_is_active() != Ok(true)
-        {
-            // The unlock notice that Windows raises for the disconnect
-            // itself arrives while the console is gone. That is not the
-            // owner signing back in. SPEC section 7.
+        if matches!(event, SessionEvent::OsUnlocked) && DISCONNECT_HELD.load(Ordering::Acquire) {
+            // Windows raises an unlock notice for the disconnect itself,
+            // including when some other console session is already active.
+            // That notice is not the owner signing back in. A lock-screen
+            // confirmation clears this flag, so a later real unlock still
+            // counts. SPEC section 7.
             continue;
-        }
-        if matches!(event, SessionEvent::OsUnlocked) {
-            DISCONNECT_HELD.store(false, Ordering::Release);
         }
         let mut guard = authority
             .lock()
