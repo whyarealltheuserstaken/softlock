@@ -28,8 +28,13 @@ const WRITE_DAC: u32 = 0x0004_0000;
 const WRITE_OWNER: u32 = 0x0008_0000;
 const DELETE: u32 = 0x0001_0000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
-const GENERIC_READ: u32 = 0x8000_0000;
-const GENERIC_WRITE: u32 = 0x4000_0000;
+const FILE_READ_DATA: u32 = 0x0001;
+const FILE_WRITE_DATA: u32 = 0x0002;
+const FILE_APPEND_DATA: u32 = 0x0004;
+const FILE_READ_EA: u32 = 0x0008;
+const FILE_WRITE_EA: u32 = 0x0010;
+const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
 
 const DIR_ACCESS: u32 = FILE_LIST_DIRECTORY
     | FILE_ADD_FILE
@@ -37,8 +42,19 @@ const DIR_ACCESS: u32 = FILE_LIST_DIRECTORY
     | FILE_TRAVERSE
     | READ_CONTROL
     | SYNCHRONIZE;
-const FILE_ACCESS: u32 =
-    GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER | DELETE | SYNCHRONIZE;
+const FILE_ACCESS: u32 = FILE_READ_DATA
+    | FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_READ_EA
+    | FILE_WRITE_EA
+    | FILE_READ_ATTRIBUTES
+    | FILE_WRITE_ATTRIBUTES
+    | READ_CONTROL
+    | WRITE_DAC
+    | WRITE_OWNER
+    | DELETE
+    | SYNCHRONIZE;
+const OWNER_WRITE: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES;
 
 pub fn configured_path() -> Result<PathBuf, &'static str> {
     let path = if let Some(dir) = test_config_dir() {
@@ -314,7 +330,7 @@ fn open_for_owner_write(path: &Path) -> io::Result<HANDLE> {
         }
         directory = next;
     }
-    let file = open_child(directory, &parts[last], GENERIC_WRITE, false, false);
+    let file = open_child(directory, &parts[last], OWNER_WRITE, false, false);
     drop_handle(directory);
     let file = file?;
     if refuse_reparse(file)? {
