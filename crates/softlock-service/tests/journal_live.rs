@@ -604,8 +604,18 @@ fn clock_shift_stays_locked(guard: &mut Guard) -> Result<(), String> {
         original: original.clone(),
     };
     // A large forward jump. BootTime moves with the wall clock. Unbiased
-    // uptime does not, so the restart must not end Unlocked.
+    // uptime does not. The live service has to stay locked across the jump.
+    // The restart, not the kill, is the recovery under test.
     powershell("[void](Set-Date -Date (Get-Date).AddDays(3))")?;
+    thread::sleep(Duration::from_secs(2));
+    let live = transact(&pipe_name(), status_body()).unwrap_or_default();
+    let live_state = status_state(&live).unwrap_or_default();
+    if live_state == "Unlocked" || query_taskmgr() != "1" {
+        return Err(format!(
+            "a clock change moved the live lock (state {live_state}, value {})",
+            query_taskmgr()
+        ));
+    }
     hard_stop(guard)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
     spawn_service(guard, None, &pause)?;
@@ -1018,20 +1028,36 @@ fn hard_stop(_guard: &mut Guard) -> Result<(), String> {
     // between the snapshot and the open is already stopped. A host that is
     // still listed and cannot be suspended fails the test.
     settle_host()?;
-    kill_service_process();
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", "softlock-service.exe"])
-        .status();
-    for _ in 0..10 {
+    // The service OS-locks when it observes the host die. The service has to
+    // be gone before the host is killed, or that recovery finishes during
+    // the kill and the next start finds a reverted journal.
+    let service_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "softlock-service.exe"])
+            .status();
+        if !image_running("softlock-service.exe") {
+            break;
+        }
+        if Instant::now() >= service_deadline {
+            return Err("service did not exit before the host".to_string());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
+    let host_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
         let _ = Command::new("taskkill")
             .args(["/F", "/IM", "softlock-lockhost.exe"])
             .status();
         if !host_running() {
-            break;
+            return Ok(());
         }
-        thread::sleep(Duration::from_millis(100));
+        if Instant::now() >= host_deadline {
+            return Err("lock host did not exit".to_string());
+        }
+        thread::sleep(Duration::from_millis(50));
     }
-    Ok(())
 }
 
 fn settle_host() -> Result<(), String> {
@@ -1079,6 +1105,18 @@ fn suspend_pid(pid: u32) -> Result<(), String> {
             Err(format!("suspend host returned {status}"))
         }
     }
+}
+
+fn image_running(image: &str) -> bool {
+    let Ok(output) = Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .to_ascii_lowercase()
+        .contains(&image.to_ascii_lowercase())
 }
 
 fn host_pid() -> Option<u32> {
