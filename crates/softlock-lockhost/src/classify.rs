@@ -39,11 +39,29 @@ pub fn classify(input: HookInput) -> InputClass {
             return InputClass::SimulatedPhysical;
         }
     }
+    // The journal test cannot strip `LLKHF_INJECTED` from another process.
+    // Windows hands each hook the original flags. This tag is honored only
+    // in a `live-fail-closed` binary, which the release scan rejects.
+    #[cfg(feature = "live-fail-closed")]
+    if input.extra_info == PRESENT_PHYSICAL_EXTRA {
+        let _ = present_physical_marker();
+        return InputClass::Physical;
+    }
     if input.injected {
         InputClass::Injected
     } else {
         InputClass::Physical
     }
+}
+
+/// `dwExtraInfo` the journal test writes. Same literal as `journal_live`.
+#[cfg(feature = "live-fail-closed")]
+const PRESENT_PHYSICAL_EXTRA: u64 = 0x5048_5953_5049_4E31;
+
+#[cfg(feature = "live-fail-closed")]
+#[inline(never)]
+fn present_physical_marker() -> &'static [u8] {
+    std::hint::black_box(b"softlock-present-physical-pin")
 }
 
 /// Per-run nonce written into `dwExtraInfo` by seam tests.
@@ -119,6 +137,21 @@ mod tests {
             extra_info: 0xA5A5_5A5A_1234_5678,
         });
         assert_eq!(hardware, InputClass::Physical);
+    }
+
+    #[cfg(feature = "live-fail-closed")]
+    #[test]
+    fn a_tagged_injected_pin_is_physical() {
+        let tagged = classify(HookInput {
+            injected: true,
+            extra_info: super::PRESENT_PHYSICAL_EXTRA,
+        });
+        assert_eq!(tagged, InputClass::Physical);
+        let other = classify(HookInput {
+            injected: true,
+            extra_info: 1,
+        });
+        assert_eq!(other, InputClass::Injected);
     }
 
     #[cfg(feature = "simulated-physical")]

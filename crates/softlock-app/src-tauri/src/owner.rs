@@ -549,9 +549,16 @@ fn same_hotkey(left: &actions::Hotkey, right: &actions::Hotkey) -> bool {
 
 #[cfg(any(test, feature = "simulated-physical", feature = "live-fail-closed"))]
 pub fn poll_config_once() {
-    static SEEN: Mutex<String> = Mutex::new(String::new());
+    static SEEN: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
     let mut seen = SEEN.lock().unwrap_or_else(|poison| poison.into_inner());
-    observe_config(&mut seen);
+    let path = profile_config_path()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if seen.0 != path {
+        seen.0 = path;
+        seen.1.clear();
+    }
+    observe_config(&mut seen.1);
 }
 
 #[cfg(any(test, feature = "simulated-physical", feature = "live-fail-closed"))]

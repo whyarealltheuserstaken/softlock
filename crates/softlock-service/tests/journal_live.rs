@@ -1026,22 +1026,14 @@ fn confirmed_since(baseline: &str, expected: &str) -> bool {
 #[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
 fn type_pin_keys() -> Result<(), String> {
     // Keeps the release-scan marker on the only build that can compile this
-    // hook. A product binary does not enable either feature.
+    // path. A product binary does not enable either feature. The lock host
+    // honors `PRESENT_PHYSICAL_EXTRA` only when it was built with
+    // `live-fail-closed`. Clearing `LLKHF_INJECTED` from this process does
+    // not change the flags Windows delivers to the host's hook.
     let _ = softlock_service::present_physical_marker_bytes();
-    // The low-level hook runs on the thread that installed it, and only
-    // while that thread pumps messages. SendInput from this thread would
-    // otherwise stay marked injected, and the guard would drop it.
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-    let hook = thread::spawn(move || pump_physical_pin_hook(ready_tx, stop_rx));
-    ready_rx
-        .recv_timeout(Duration::from_secs(5))
-        .map_err(|_| "pin hook".to_string())?
-        .map_err(|_| "pin hook".to_string())?;
     let mut keys = vec![0x7Cu16];
     keys.extend(b"135742".iter().copied().map(u16::from));
     keys.push(0x0D);
-    let mut failed = None;
     for vk in keys {
         let input = [pin_key(vk, false), pin_key(vk, true)];
         let sent = unsafe {
@@ -1051,75 +1043,10 @@ fn type_pin_keys() -> Result<(), String> {
             )
         };
         if sent != 2 {
-            failed = Some("the pin key was not delivered".to_string());
-            break;
+            return Err("the pin key was not delivered".to_string());
         }
         thread::sleep(Duration::from_millis(80));
     }
-    let _ = stop_tx.send(());
-    let _ = hook.join();
-    failed.map_or(Ok(()), Err)
-}
-
-#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
-#[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
-fn pump_physical_pin_hook(
-    ready: std::sync::mpsc::Sender<Result<(), ()>>,
-    stop: std::sync::mpsc::Receiver<()>,
-) -> Result<(), ()> {
-    use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, DispatchMessageW, KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, LLKHF_INJECTED,
-        MSG, PM_REMOVE, PeekMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-        WH_KEYBOARD_LL,
-    };
-    use windows::core::PCWSTR;
-    unsafe extern "system" fn present_physical(
-        code: i32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        if code >= 0 {
-            unsafe {
-                let info = &mut *(lparam.0 as *mut KBDLLHOOKSTRUCT);
-                info.flags = KBDLLHOOKSTRUCT_FLAGS(info.flags.0 & !LLKHF_INJECTED.0);
-            }
-        }
-        unsafe { CallNextHookEx(None, code, wparam, lparam) }
-    }
-    let module = unsafe { GetModuleHandleW(PCWSTR::null()) }.unwrap_or_default();
-    let hook = unsafe {
-        SetWindowsHookExW(
-            WH_KEYBOARD_LL,
-            Some(present_physical),
-            Some(HINSTANCE(module.0)),
-            0,
-        )
-    };
-    let Ok(hook) = hook else {
-        let _ = ready.send(Err(()));
-        return Err(());
-    };
-    let mut message = unsafe { std::mem::zeroed::<MSG>() };
-    // The hook is delivered on this thread's queue. The queue does not
-    // exist until the first peek. SendInput before that times the hook
-    // out and Windows removes it, so the guard still sees the key as
-    // injected.
-    let _ = unsafe { PeekMessageW(std::ptr::addr_of_mut!(message), None, 0, 0, PM_REMOVE) };
-    let _ = ready.send(Ok(()));
-    while stop.try_recv().is_err() {
-        while unsafe { PeekMessageW(std::ptr::addr_of_mut!(message), None, 0, 0, PM_REMOVE) }
-            .as_bool()
-        {
-            unsafe {
-                let _ = TranslateMessage(std::ptr::addr_of!(message));
-                DispatchMessageW(std::ptr::addr_of!(message));
-            }
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    let _ = unsafe { UnhookWindowsHookEx(hook) };
     Ok(())
 }
 
@@ -1141,7 +1068,8 @@ fn pin_key(virtual_key: u16, up: bool) -> windows::Win32::UI::Input::KeyboardAnd
                     Default::default()
                 },
                 time: 0,
-                dwExtraInfo: 0,
+                // "PHYSPIN1". Must match `PRESENT_PHYSICAL_EXTRA` in the lock host.
+                dwExtraInfo: 0x5048_5953_5049_4E31usize,
             },
         },
     }

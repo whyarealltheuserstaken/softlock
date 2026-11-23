@@ -2488,9 +2488,10 @@ fn a_locked_file_edit_is_offered_and_applied_on_accept() {
     });
     assert!(
         offered,
-        "the locked edit did not raise the offer\nstatus {}\nconfig {}\nlog {}",
+        "the locked edit did not raise the offer\nstatus {}\nconfig {}\ndisk {}\nlog {}",
         session.status().unwrap_or_default(),
         session.config().unwrap_or_default(),
+        fs::read_to_string(&path).unwrap_or_default(),
         log_tail(&session.log)
     );
     let during = session.config().expect("config");
@@ -2571,15 +2572,17 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
     );
     assert!(softlock_app_lib::refresh_from_service());
     fs::write(&path, &edited).expect("write after unlock");
+    // An unlocked edit is saved, not offered. Decline writes the effective
+    // document back over the disk. Polling first would PutConfig the new
+    // bytes and there would be nothing left to restore.
     assert!(
-        wait_for(Duration::from_secs(10), || {
-            softlock_app_lib::poll_config_once();
-            softlock_app_lib::config_offer()
-        }),
-        "the edit after unlock did not raise the offer"
+        softlock_app_lib::decline_offered_config(),
+        "decline did not restore the file after unlock"
     );
-    assert!(softlock_app_lib::decline_offered_config());
-    assert!(!softlock_app_lib::config_offer());
+    assert!(
+        !softlock_app_lib::config_offer(),
+        "an unlocked edit raised the locked-edit offer"
+    );
     let disk = fs::read_to_string(&path).expect("restored file");
     assert!(
         disk.contains("Ctrl+Alt+Shift+L") && !disk.contains("Ctrl+Alt+Shift+K"),
