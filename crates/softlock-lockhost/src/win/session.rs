@@ -342,6 +342,9 @@ pub(crate) struct Shared {
     pub offer_pin: AtomicBool,
     pub offer_password: AtomicBool,
     pub shift_down: AtomicBool,
+    pub ctrl_down: AtomicBool,
+    pub alt_down: AtomicBool,
+    pub caps_lock: AtomicBool,
     pub backoff_until: AtomicU64,
     pub password_exhausted: AtomicBool,
     pub locked: AtomicBool,
@@ -415,6 +418,9 @@ impl Shared {
             offer_pin: AtomicBool::new(true),
             offer_password: AtomicBool::new(true),
             shift_down: AtomicBool::new(false),
+            ctrl_down: AtomicBool::new(false),
+            alt_down: AtomicBool::new(false),
+            caps_lock: AtomicBool::new(false),
             backoff_until: AtomicU64::new(0),
             password_exhausted: AtomicBool::new(false),
             locked: AtomicBool::new(false),
@@ -1003,6 +1009,10 @@ struct PinEntry {
     bytes: Vec<u8>,
     chars: u32,
     layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+    /// A password key produced no character. Submitting would guess.
+    untranslated: bool,
+    /// `ToUnicodeEx` is waiting for the next key to compose this one.
+    dead_pending: bool,
 }
 
 impl Default for PinEntry {
@@ -1013,6 +1023,8 @@ impl Default for PinEntry {
             bytes: Vec::with_capacity(PIN_CHAR_LIMIT as usize * 4),
             chars: 0,
             layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL(std::ptr::null_mut()),
+            untranslated: false,
+            dead_pending: false,
         }
     }
 }
@@ -1049,6 +1061,8 @@ fn open_prompt(
         return;
     }
     entry.layout = owner_layout();
+    let caps = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x14) } & 1 != 0;
+    shared.caps_lock.store(caps, Ordering::Release);
     controller.handle(Event::PromptOpened {
         method: current_method(shared),
     });
@@ -1093,17 +1107,37 @@ fn on_key(
     if entry.chars >= limit {
         return;
     }
-    let honor_shift = shared.prompt_method.load(Ordering::Acquire) == METHOD_PASSWORD;
-    if let Some(mut encoded) = translate(entry.layout, event, honor_shift) {
-        entry.bytes.extend_from_slice(&encoded);
-        encoded.zeroize();
-        entry.chars = entry.chars.saturating_add(1);
-        shared.pin_chars.store(entry.chars, Ordering::Release);
-        overlay::invalidate(shared);
+    let password = shared.prompt_method.load(Ordering::Acquire) == METHOD_PASSWORD;
+    match translate(entry.layout, event, password) {
+        crate::key_decode::DecodedKey::Text(mut encoded) => {
+            entry.dead_pending = false;
+            entry.bytes.extend_from_slice(&encoded);
+            encoded.zeroize();
+            entry.chars = entry.chars.saturating_add(1);
+            shared.pin_chars.store(entry.chars, Ordering::Release);
+            overlay::invalidate(shared);
+        }
+        crate::key_decode::DecodedKey::Dead => {
+            entry.dead_pending = true;
+        }
+        crate::key_decode::DecodedKey::Untranslated if password => {
+            entry.untranslated = true;
+        }
+        crate::key_decode::DecodedKey::Untranslated => {}
     }
 }
 
 fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: &mut PinEntry) {
+    let password = current_method(shared).as_str() == MethodId::os_password().as_str();
+    if password && !crate::key_decode::password_may_submit(entry.untranslated, entry.dead_pending) {
+        entry.bytes.zeroize();
+        entry.chars = 0;
+        entry.untranslated = false;
+        entry.dead_pending = false;
+        shared.pin_chars.store(0, Ordering::Release);
+        overlay::invalidate(shared);
+        return;
+    }
     #[cfg(feature = "live-fail-closed")]
     note_test_pin(entry.bytes.len());
     let secret = Secret::new(&entry.bytes);
@@ -1222,21 +1256,33 @@ fn pop_char(entry: &mut PinEntry) {
 fn translate(
     layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
     event: RawEvent,
-    honor_shift: bool,
-) -> Option<Vec<u8>> {
+    password: bool,
+) -> crate::key_decode::DecodedKey {
     let mut state = [0u8; 256];
     unsafe {
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardState(&mut state);
     }
-    // Ambient Shift or Alt would turn a digit into a symbol. The forwarded
-    // key is the one the hook stored, without whatever else is latched.
-    // Password entry is the exception: Shift captured with that key is set.
-    for modifier in [0x10usize, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5] {
+    // Ambient Shift, Ctrl, or Alt would change the character. The hook stored
+    // the modifiers that were down with this key. Caps Lock is a toggle.
+    // AltGr is Ctrl+Alt. A password key that still produces no text is
+    // untranslated and is not submitted.
+    for modifier in [
+        0x10usize, 0x11, 0x12, 0x14, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+    ] {
         state[modifier] = 0;
     }
-    if honor_shift && event.mods & 1 != 0 {
+    if password && event.mods & 1 != 0 {
         state[0x10] = 0x80;
         state[0xA0] = 0x80;
+    }
+    if password && event.mods & 2 != 0 && event.mods & 4 != 0 {
+        state[0x11] = 0x80;
+        state[0xA2] = 0x80;
+        state[0x12] = 0x80;
+        state[0xA5] = 0x80;
+    }
+    if password && event.mods & 8 != 0 {
+        state[0x14] = 0x01;
     }
     let index = event.vk as usize;
     if index < state.len() {
@@ -1267,11 +1313,13 @@ fn translate(
         }
     }
     buffer.fill(0);
-    if produced.is_empty() {
-        fallback_digit(event.vk).map(|byte| vec![byte])
-    } else {
-        Some(produced)
+    if !password && produced.is_empty() {
+        return match fallback_digit(event.vk) {
+            Some(byte) => crate::key_decode::DecodedKey::Text(vec![byte]),
+            None => crate::key_decode::DecodedKey::Untranslated,
+        };
     }
+    crate::key_decode::classify_translation(written, &produced)
 }
 
 fn fallback_digit(vk: u16) -> Option<u8> {
@@ -1358,6 +1406,8 @@ fn switch_method(shared: &Shared, entry: &mut PinEntry) {
     };
     entry.bytes.zeroize();
     entry.chars = 0;
+    entry.untranslated = false;
+    entry.dead_pending = false;
     shared.prompt_method.store(next, Ordering::Release);
     shared.pin_chars.store(0, Ordering::Release);
     overlay::invalidate(shared);

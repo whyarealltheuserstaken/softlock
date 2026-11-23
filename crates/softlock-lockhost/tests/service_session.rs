@@ -761,6 +761,7 @@ impl PasswordAccount {
     }
 
     fn named(suffix: &str) -> Self {
+        require_hosted_runner();
         // Short names and a known-good password. `net user` on the runner
         // rejects a password that contains three consecutive characters of
         // the account name, and a long random password was rejected outright.
@@ -1173,7 +1174,6 @@ unsafe extern "system" fn enum_window_title(
     windows::core::BOOL(1)
 }
 
-#[test]
 #[test]
 fn outside_failures_stop_the_password_path_before_the_threshold() {
     let _guard = gate();

@@ -13,7 +13,9 @@
 //!
 //! A local-account rejection does increment the bad-password count. The
 //! password budget therefore stays at `threshold - 2` attempts per observation
-//! window. PIN failures are a separate counter and never call this function.
+//! window, and at zero when the threshold is 1 or 2. PIN failures are a
+//! separate counter and never call this function. For a Microsoft account or
+//! a domain account the local bad-password count may not be authoritative.
 //! Spike 9 still has to show whether an offline Microsoft account counts the
 //! same way, and whether this logon works offline for that account.
 //! The UTF-16 copy is wiped with `zeroize` before return. This module does
@@ -21,8 +23,8 @@
 
 use std::sync::Mutex;
 
-use softlock_core::{LockoutPolicy, Secret, Verdict, unreadable_lockout_policy};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+use softlock_core::{LockoutPolicy, Secret, unreadable_lockout_policy};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::NetworkManagement::NetManagement::{
     NetApiBufferFree, NetUserGetInfo, NetUserModalsGet, USER_INFO_3, USER_MODALS_INFO_3,
 };
@@ -36,7 +38,7 @@ use windows::Win32::Security::{
 use windows::core::{PCWSTR, PWSTR};
 use zeroize::Zeroize;
 
-use crate::password_shape::password_accepted_shape;
+use crate::password_shape::{PasswordLogon, password_accepted_shape};
 
 /// One password check at a time. Parallel attempts cannot race the counter.
 static ATTEMPTS: Mutex<()> = Mutex::new(());
@@ -52,8 +54,9 @@ struct Wide(Vec<u16>);
 
 impl Wide {
     fn from_str(text: &str) -> Self {
-        let mut units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        units.reserve(1);
+        let mut units = Vec::with_capacity(text.encode_utf16().count() + 1);
+        units.extend(text.encode_utf16());
+        units.push(0);
         Self(units)
     }
 
@@ -73,28 +76,47 @@ impl Drop for Wide {
     }
 }
 
-pub fn verify_session_password(secret: &Secret) -> Verdict {
+pub fn verify_session_password(secret: &Secret) -> PasswordLogon {
     let _gate = ATTEMPTS.lock().unwrap_or_else(|poison| poison.into_inner());
     if !password_accepted_shape(secret.expose()) {
-        return Verdict::Rejected;
+        return PasswordLogon::Failed(1326);
     }
     let Some(password) = Wide::from_bytes(secret.expose()) else {
-        return Verdict::Rejected;
+        return PasswordLogon::Failed(1326);
     };
     match session_identity() {
         Ok(identity) => {
-            if network_logon_matches(&identity.user, &identity.domain, &password, &identity.sid) {
-                Verdict::Verified
-            } else {
-                Verdict::Rejected
-            }
+            network_logon_matches(&identity.user, &identity.domain, &password, &identity.sid)
         }
-        Err(()) => Verdict::Rejected,
+        Err(()) => PasswordLogon::Failed(1311),
     }
 }
 
-/// Network logon for a named account. The seam 3 measurement uses this on a
-/// local test account. It closes the token immediately and does not unlock.
+/// Read the session user's bad-password count before calling `LogonUser`.
+/// A locked account, a count that would reach `threshold - 1` on the next
+/// failure, or a failed read refuses the attempt.
+pub(crate) fn account_allows_logon(policy: LockoutPolicy) -> bool {
+    let Ok(identity) = session_identity() else {
+        return false;
+    };
+    let user = wide_as_string(&identity.user);
+    let Ok(info) = read_account_lockout(&user) else {
+        return false;
+    };
+    if info.locked_out {
+        return false;
+    }
+    if policy.threshold == 0 {
+        return true;
+    }
+    let stop_at = policy.threshold.saturating_sub(1);
+    info.bad_password_count.saturating_add(1) < stop_at
+}
+
+/// Network logon for a named account. Seam 3 uses this on a local test
+/// account. It closes the token immediately and does not unlock. It is not
+/// in a default build.
+#[cfg(feature = "simulated-physical")]
 pub fn network_logon(user: &str, domain: &str, secret: &Secret) -> bool {
     let _gate = ATTEMPTS.lock().unwrap_or_else(|poison| poison.into_inner());
     if !password_accepted_shape(secret.expose()) {
@@ -124,7 +146,12 @@ pub fn network_logon(user: &str, domain: &str, secret: &Secret) -> bool {
     }
 }
 
+#[cfg(feature = "simulated-physical")]
 pub fn account_lockout(user: &str) -> Result<AccountLockout, &'static str> {
+    read_account_lockout(user)
+}
+
+fn read_account_lockout(user: &str) -> Result<AccountLockout, &'static str> {
     let wide = Wide::from_str(user);
     let mut buffer: *mut u8 = std::ptr::null_mut();
     let status = unsafe { NetUserGetInfo(PCWSTR::null(), wide.as_pcwstr(), 3, &mut buffer) };
@@ -187,7 +214,12 @@ fn overridden_account() -> Option<Result<Identity, ()>> {
     }))
 }
 
-fn network_logon_matches(user: &Wide, domain: &Wide, password: &Wide, expected_sid: &str) -> bool {
+fn network_logon_matches(
+    user: &Wide,
+    domain: &Wide,
+    password: &Wide,
+    expected_sid: &str,
+) -> PasswordLogon {
     let mut token = HANDLE::default();
     let opened = unsafe {
         LogonUserW(
@@ -200,11 +232,27 @@ fn network_logon_matches(user: &Wide, domain: &Wide, password: &Wide, expected_s
         )
     };
     if opened.is_err() {
-        return false;
+        // Read the code before any other call replaces it.
+        let code = unsafe { GetLastError() }.0;
+        return PasswordLogon::Failed(code);
     }
     let matched = token_sid(token).ok().is_some_and(|sid| sid == expected_sid);
     let _ = unsafe { CloseHandle(token) };
-    matched
+    if matched {
+        PasswordLogon::Verified
+    } else {
+        PasswordLogon::Mismatch
+    }
+}
+
+fn wide_as_string(wide: &Wide) -> String {
+    let units = wide
+        .0
+        .iter()
+        .copied()
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+    String::from_utf16_lossy(&units)
 }
 
 fn names_for_sid(sid: &str) -> Result<(Wide, Wide), ()> {
@@ -315,8 +363,8 @@ struct ModalRead {
     duration_minutes: u32,
 }
 
-/// The machine lockout policy. A failed read fails closed: threshold 3 and a
-/// long observation window, so the password path allows one attempt.
+/// The machine lockout policy. A failed read fails closed: threshold 2, so
+/// the password path allows no attempt, and a long observation window.
 pub fn read_lockout_policy() -> LockoutPolicy {
     match read_modals() {
         Some(read) => {
@@ -335,7 +383,7 @@ pub fn read_lockout_policy() -> LockoutPolicy {
             read.policy
         }
         None => {
-            crate::audit("lockout", &[("result", "unreadable"), ("threshold", "3")]);
+            crate::audit("lockout", &[("result", "unreadable"), ("threshold", "2")]);
             unreadable_lockout_policy()
         }
     }

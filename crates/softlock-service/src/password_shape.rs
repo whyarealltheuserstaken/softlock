@@ -9,6 +9,17 @@ pub const PASSWORD_MAX_CHARS: usize = 127;
 /// UTF-8 bound. 127 non-BMP characters are four bytes each.
 pub const PASSWORD_MAX_BYTES: usize = PASSWORD_MAX_CHARS * 4;
 
+/// Result of one account-password check. `Failed` carries the Win32 code
+/// from `GetLastError` after `LogonUserW`, never the password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordLogon {
+    Verified,
+    /// `LogonUserW` failed. The value is the Win32 code.
+    Failed(u32),
+    /// The logon succeeded for a different account than the locked session.
+    Mismatch,
+}
+
 pub fn password_accepted_shape(bytes: &[u8]) -> bool {
     if bytes.len() > PASSWORD_MAX_BYTES || bytes.contains(&0) {
         return false;

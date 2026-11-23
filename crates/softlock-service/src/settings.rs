@@ -87,8 +87,8 @@ impl SettingsEngine {
         self.password_attempts.clone()
     }
 
-    /// Rewrite the password-attempt list. Lockdown rows stay. A missing file
-    /// keeps the list in memory for the document the next lock writes.
+    /// Rewrite the password-attempt list. Lockdown rows stay. A missing
+    /// journal file is a failure: the caller must not call `LogonUser`.
     pub fn store_password_attempts(
         &mut self,
         attempts: &[softlock_core::PasswordStamp],
@@ -98,7 +98,7 @@ impl SettingsEngine {
             pending.password_attempts = self.password_attempts.clone();
         }
         let Some(text) = load_journal().map_err(|_| "unreadable")? else {
-            return Ok(());
+            return Err("missing");
         };
         let mut doc = parse_document(text.as_bytes()).map_err(|_| "malformed")?;
         doc.password_attempts = self.password_attempts.clone();

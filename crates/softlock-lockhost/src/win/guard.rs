@@ -460,8 +460,33 @@ unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 .store(down, std::sync::atomic::Ordering::Release);
             return LRESULT(1);
         }
+        if vk == 0x11 || vk == 0xA2 || vk == 0xA3 {
+            shared
+                .ctrl_down
+                .store(down, std::sync::atomic::Ordering::Release);
+            return LRESULT(1);
+        }
+        if vk == 0x12 || vk == 0xA4 || vk == 0xA5 {
+            shared
+                .alt_down
+                .store(down, std::sync::atomic::Ordering::Release);
+            return LRESULT(1);
+        }
+        if vk == 0x14 {
+            if down {
+                let caps = shared.caps_lock.load(std::sync::atomic::Ordering::Acquire);
+                shared
+                    .caps_lock
+                    .store(!caps, std::sync::atomic::Ordering::Release);
+            }
+            return LRESULT(1);
+        }
         if down {
-            let mods = u8::from(shared.shift_down.load(std::sync::atomic::Ordering::Acquire));
+            let shift = u8::from(shared.shift_down.load(std::sync::atomic::Ordering::Acquire));
+            let ctrl = u8::from(shared.ctrl_down.load(std::sync::atomic::Ordering::Acquire));
+            let alt = u8::from(shared.alt_down.load(std::sync::atomic::Ordering::Acquire));
+            let caps = u8::from(shared.caps_lock.load(std::sync::atomic::Ordering::Acquire));
+            let mods = shift | (ctrl << 1) | (alt << 2) | (caps << 3);
             shared
                 .wake
                 .fetch_add(1, std::sync::atomic::Ordering::Release);

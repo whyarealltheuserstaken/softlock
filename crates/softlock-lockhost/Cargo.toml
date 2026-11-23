@@ -24,7 +24,7 @@ getrandom = "0.2.16"
 
 [dev-dependencies]
 softlock-seam3 = { path = "../softlock-seam3" }
-softlock-service = { path = "../softlock-service" }
+softlock-service = { path = "../softlock-service", features = ["simulated-physical"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 softlock-windows = { path = "../softlock-windows" }

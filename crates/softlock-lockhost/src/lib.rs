@@ -7,6 +7,8 @@
 //! strings or symbols.
 
 mod classify;
+#[cfg(any(windows, test))]
+mod key_decode;
 mod real_lock;
 
 pub use real_lock::{RealLock, decide};

@@ -87,10 +87,12 @@ fn duration_ms(duration: Duration) -> u64 {
 /// lockout is enabled). The two counters do not share a count or a wait.
 ///
 /// The password wait is the stricter of a monotonic clock and the wall clock.
-/// A failure stays inside the observation window until both clocks say it has
-/// aged out. A rollback of either clock keeps it inside. Threshold `0` means
-/// Windows lockout is disabled, and the password path then uses only the
-/// escalating wait.
+/// Windows clears the bad-password count only after the observation window
+/// has passed since the latest failure, and then it clears every failure at
+/// once. A rollback of either clock keeps that latest failure inside the
+/// window. Threshold `0` means Windows lockout is disabled, and the password
+/// path then uses only the escalating wait. Threshold `1` or `2` allows no
+/// password attempt: there is no margin under the threshold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PasswordStamp {
     pub tick: u64,
@@ -118,22 +120,23 @@ pub struct PasswordGate {
     pub allow: bool,
 }
 
-/// A policy read that failed. The threshold is small, and the window is long
-/// enough that a second password attempt is not offered while an unknown
-/// window might still be counting.
+/// A policy read that failed. The threshold is low enough that the password
+/// path allows nothing, and the window stays open so a later read is what
+/// would have to reopen it.
 pub fn unreadable_lockout_policy() -> LockoutPolicy {
     LockoutPolicy {
-        threshold: 3,
+        threshold: 2,
         window: Duration::from_secs(99_999 * 60),
     }
 }
 
-/// `None` when lockout is disabled. Otherwise `threshold - 2`, and at least 1.
+/// `None` when lockout is disabled. `Some(0)` when the threshold is 1 or 2,
+/// because one attempt can lock the account. Otherwise `threshold - 2`.
 pub fn password_attempt_limit(threshold: u32) -> Option<u32> {
-    if threshold == 0 {
-        None
-    } else {
-        Some(threshold.saturating_sub(2).max(1))
+    match threshold {
+        0 => None,
+        1 | 2 => Some(0),
+        _ => Some(threshold - 2),
     }
 }
 
@@ -158,21 +161,28 @@ pub fn password_gate(
     } else {
         duration_ms(policy.window)
     };
-    let mut active: Vec<PasswordStamp> = stamps
-        .iter()
-        .copied()
-        .filter(|stamp| stamp_counts(*stamp, now, window_ms))
-        .collect();
-    if stamps.len() > 1_000 {
-        // A journal that cannot be bounded is treated as already full.
-        active = stamps.iter().copied().take(1_000).collect();
-    }
-    let count = u32::try_from(active.len()).unwrap_or(u32::MAX);
+    // While the latest failure is still inside the window, every recorded
+    // failure counts. Once that latest failure has aged out on both clocks,
+    // Windows has reset the counter, so the count is zero.
+    let open = if policy.threshold == 0 {
+        !stamps.is_empty()
+    } else {
+        latest(stamps).is_some_and(|stamp| stamp_counts(stamp, now, window_ms))
+    };
+    let over_bound = stamps.len() > 1_000;
+    let count = if over_bound {
+        1_000
+    } else if open {
+        u32::try_from(stamps.len()).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
     let limit = password_attempt_limit(policy.threshold);
-    let exhausted = limit.is_some_and(|cap| count >= cap) || stamps.len() > 1_000;
-    let escalation = stricter_remaining(latest(&active), password_escalation(count), now);
-    let window_left = if exhausted {
-        soonest_expiry(&active, policy.window, now)
+    let exhausted = limit.is_some_and(|cap| count >= cap) || over_bound;
+    let basis = if open { latest(stamps) } else { None };
+    let escalation = stricter_remaining(basis, password_escalation(count), now);
+    let window_left = if exhausted && open && policy.threshold > 0 {
+        stricter_remaining(basis, policy.window, now)
     } else {
         Duration::ZERO
     };
@@ -205,13 +215,10 @@ fn latest(stamps: &[PasswordStamp]) -> Option<PasswordStamp> {
         .max_by_key(|stamp| (stamp.tick, stamp.wall_ms))
 }
 
-fn soonest_expiry(stamps: &[PasswordStamp], window: Duration, now: ClockSample) -> Duration {
-    stamps
-        .iter()
-        .copied()
-        .map(|stamp| stricter_remaining(Some(stamp), window, now))
-        .min()
-        .unwrap_or(window)
+/// True while `stamp` has not aged out of `window` on both clocks. A zero
+/// window never ages out: there is no observation interval to trust.
+pub fn stamp_inside_window(stamp: PasswordStamp, window: Duration, now: ClockSample) -> bool {
+    stamp_counts(stamp, now, duration_ms(window))
 }
 
 fn stricter_remaining(stamp: Option<PasswordStamp>, delay: Duration, now: ClockSample) -> Duration {

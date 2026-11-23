@@ -25,7 +25,7 @@ mod state;
 pub use backoff::{
     BackoffRecord, BackoffRestore, ClockSample, LockoutPolicy, PasswordGate, PasswordStamp,
     delay_after_failure, password_attempt_limit, password_escalation, password_gate,
-    restore_backoff, unreadable_lockout_policy,
+    restore_backoff, stamp_inside_window, unreadable_lockout_policy,
 };
 pub use config::{
     CONFIG_ERRORS_NAME, CONFIG_FILE_NAME, Config, HotkeyChord, MAX_CONFIG_BYTES, UserConfig,

@@ -6,11 +6,9 @@ Issue 21. The Service checks the locked session's password with `LogonUserW` and
 
 Seam 3 test `network_logon_lockout_count` runs on the GitHub-hosted `windows-2022` and `windows-2025` images. It is behind `runner_may_lock`, so it does not run on the school workstation.
 
-The test creates a local account, sets the lockout threshold to 3 (duration 1, window 1), and calls the same network logon four times with a password that is not the account's. It prints one line and does not fail the build when the count stays at zero:
+The test creates a local account, sets the lockout threshold to 3 (duration 1, window 1), and calls the same network logon four times with a password that is not the account's. It asserts `before_bad=0`, `after_bad=3`, the account locks, and none of the wrong logons were accepted.
 
-`lockout-measure threshold=3 before_bad=… after_bad=… before_locked=… after_locked=… wrong_logons_accepted=…`
-
-Run `45135643553` printed the same line on both images:
+Run `45135643553` printed this line on both images before the assert was added:
 
 `lockout-measure threshold=3 before_bad=0 after_bad=3 before_locked=false after_locked=true wrong_logons_accepted=0`
 
@@ -25,9 +23,15 @@ A rejected `LOGON32_LOGON_NETWORK` counts, so a flat wait after five failures is
 
 ## What the password path does with that
 
-On each password attempt the Service reads the policy with `NetUserModalsGet` level 3 (threshold, observation window, and duration). The cap uses the threshold and the observation window. Duration is read and not used for the cap. A failed read fails closed: threshold 3 and an observation window of 99999 minutes, which allows one password attempt.
+On each password attempt the Service reads the policy with `NetUserModalsGet` level 3 (threshold, observation window, and duration). The cap uses the threshold and the observation window. Duration is read and not used for the cap. A failed read fails closed: threshold 2 and an observation window of 99999 minutes, which allows no password attempt.
 
-The password budget is `threshold - 2` attempts per observation window, and at least one when the threshold is not 0. Threshold 0 means lockout is disabled, and the path then uses only the escalating wait. A failure stays inside the window until both the monotonic clock and the wall clock say it has aged out. The wait is the stricter of those two clocks, so a wait does not end while the failures still count. The waits escalate: 30 seconds, 1 minute, 2 minutes, 5 minutes, 10 minutes, then 15 minutes.
+The password budget is `threshold - 2` attempts per observation window. Threshold 1 or 2 allows none: one attempt can lock the account. Threshold 0 means lockout is disabled, and the path then uses only the escalating wait. Windows resets the bad-password count to zero only after the observation window has passed since the latest failure. SoftLock therefore counts every recorded failure while that latest stamp is still inside the window on either clock, and counts zero once it has aged out on both. Aging failures out one by one handed attempts back and could lock the account. The waits escalate: 30 seconds, 1 minute, 2 minutes, 5 minutes, 10 minutes, then 15 minutes.
+
+Before `LogonUser`, the Service reads `usri3_bad_pw_count` and `UF_LOCKOUT` with `NetUserGetInfo` level 3 for the session user. It refuses when the account is locked, when one more failure would reach `threshold - 1`, or when the read fails. Failures from the sign-in screen, RDP, shares, or another program count in that number. For a Microsoft account or a domain account the local count may not be the count Windows enforces. That remains spike 9.
+
+The failure stamp is saved to the journal before `LogonUser`. If that save fails, `LogonUser` is not called. Only `ERROR_LOGON_FAILURE` (1326) keeps the stamp. 1909, 1330, 1907, 1385, 1327, and 1311 turn the password path off for this lock and are logged as the result code, never the password. A successful check clears the stamps.
+
+Stamps from a previous boot stay in force. Dropping them on startup would need a boot identity that does not move when the clock does. PR 105 is adding `LockIdentity`. Until that survives a clock change, a reboot does not clear the password budget.
 
 PIN failures are a separate counter. They use the existing PIN backoff, they never call `LogonUser`, and they do not spend the password budget. Password failures do not move the PIN counter. When the password budget is used up, the prompt says the password path is unavailable and, when a PIN is stored, offers the PIN.
 

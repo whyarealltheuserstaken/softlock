@@ -38,7 +38,9 @@ pub use authority::{
 #[cfg(feature = "live-fail-closed")]
 pub use live_marker::marker_bytes as live_fail_closed_marker_bytes;
 pub use log::{Capture, FileLog, allowed_field, audit};
-pub use password_shape::{PASSWORD_MAX_BYTES, PASSWORD_MAX_CHARS, password_accepted_shape};
+pub use password_shape::{
+    PASSWORD_MAX_BYTES, PASSWORD_MAX_CHARS, PasswordLogon, password_accepted_shape,
+};
 #[cfg(feature = "simulated-physical")]
 pub use pincheck::PinChecker;
 #[cfg(feature = "simulated-physical")]
@@ -63,7 +65,7 @@ pub use settings::{
     clear_disable_lock_workstation_for_os_lock, reapply_disable_lock_workstation, repair_main,
 };
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "simulated-physical"))]
 pub use password::{AccountLockout, account_lockout, network_logon};
 #[cfg(windows)]
 pub use windows::{
