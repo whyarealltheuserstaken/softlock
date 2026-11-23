@@ -141,17 +141,47 @@ pub fn reassert_entry(entry: &SettingEntry) -> Result<(), &'static str> {
     // canonical reprint of the same lock is held.
     let directory = entry.target == CONFIG_DIR;
     let path = Path::new(&entry.path);
-    let handle = open_dacl_read(path, directory).map_err(|_| "acl")?;
-    let current = dacl_sddl_handle(handle).map_err(|_| "acl");
-    drop_handle(handle);
-    let current = current?;
-    if current == *locked || dacl_is_held(&current) {
+    if let Ok(handle) = open_dacl_read(path, directory) {
+        let current = dacl_sddl_handle(handle).ok();
+        drop_handle(handle);
+        if let Some(current) = current
+            && (current == *locked || dacl_is_held(&current))
+        {
+            return Ok(());
+        }
+    }
+    // The seam service is the console user. The locked DACL denies that user
+    // write, including WRITE_DAC, so opening for the rewrite fails. That
+    // denial is the lock holding. LocalSystem still has full control and
+    // falls through to put the journaled descriptor back.
+    if owner_change_denied(path, directory) {
         return Ok(());
     }
     let handle = open_entry(entry).map_err(|_| "acl")?;
     let result = set_dacl_handle(handle, locked);
     drop_handle(handle);
     result
+}
+
+fn owner_change_denied(path: &Path, directory: bool) -> bool {
+    if directory {
+        let access = FILE_ADD_FILE
+            | FILE_ADD_SUBDIRECTORY
+            | DELETE
+            | WRITE_DAC
+            | FILE_READ_ATTRIBUTES
+            | SYNCHRONIZE;
+        match open_with_access_kind(path, access, true) {
+            Ok(handle) => {
+                drop_handle(handle);
+                false
+            }
+            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) => true,
+            Err(_) => false,
+        }
+    } else {
+        owner_write_denied(path).unwrap_or(false)
+    }
 }
 
 fn dacl_is_held(current: &str) -> bool {

@@ -1056,8 +1056,10 @@ fn pump_physical_pin_hook(
         lparam: LPARAM,
     ) -> LRESULT {
         if code >= 0 {
-            let info = &mut *(lparam.0 as *mut KBDLLHOOKSTRUCT);
-            info.flags = KBDLLHOOKSTRUCT_FLAGS(info.flags.0 & !LLKHF_INJECTED.0);
+            unsafe {
+                let info = &mut *(lparam.0 as *mut KBDLLHOOKSTRUCT);
+                info.flags = KBDLLHOOKSTRUCT_FLAGS(info.flags.0 & !LLKHF_INJECTED.0);
+            }
         }
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }

@@ -2482,12 +2482,16 @@ fn a_locked_file_edit_is_offered_and_applied_on_accept() {
     let edited = original.replace("Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+K");
     assert_ne!(edited, original, "the default hotkey was not in the file");
     fs::write(&path, &edited).expect("write");
+    let offered = wait_for(Duration::from_secs(10), || {
+        softlock_app_lib::poll_config_once();
+        softlock_app_lib::config_offer()
+    });
     assert!(
-        wait_for(Duration::from_secs(10), || {
-            softlock_app_lib::poll_config_once();
-            softlock_app_lib::config_offer()
-        }),
-        "the locked edit did not raise the offer"
+        offered,
+        "the locked edit did not raise the offer\nstatus {}\nconfig {}\nlog {}",
+        session.status().unwrap_or_default(),
+        session.config().unwrap_or_default(),
+        log_tail(&session.log)
     );
     let during = session.config().expect("config");
     assert!(
@@ -2562,7 +2566,8 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
     let status = session.status().unwrap_or_default();
     assert!(
         unlocked && status.contains("\"state\":\"Unlocked\""),
-        "the pin did not unlock after the declined locked edit: {status}"
+        "the pin did not unlock after the declined locked edit: {status}\nlog {}",
+        log_tail(&session.log)
     );
     assert!(softlock_app_lib::refresh_from_service());
     fs::write(&path, &edited).expect("write after unlock");
@@ -2585,6 +2590,15 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
         after.contains("Ctrl+Alt+Shift+L") && !after.contains("Ctrl+Alt+Shift+K"),
         "decline changed the effective config: {after}"
     );
+}
+
+fn log_tail(path: &Path) -> String {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let start = text.len().saturating_sub(800);
+    let start = (start..=text.len())
+        .find(|index| text.is_char_boundary(*index))
+        .unwrap_or(text.len());
+    text[start..].to_string()
 }
 
 fn arm_owner(session: &Session) {
