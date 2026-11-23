@@ -25,7 +25,6 @@ const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
 const FILE_TRAVERSE: u32 = 0x0020;
 const READ_CONTROL: u32 = 0x0002_0000;
 const WRITE_DAC: u32 = 0x0004_0000;
-const WRITE_OWNER: u32 = 0x0008_0000;
 const DELETE: u32 = 0x0001_0000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const FILE_READ_DATA: u32 = 0x0001;
@@ -36,12 +35,8 @@ const FILE_WRITE_EA: u32 = 0x0010;
 const FILE_READ_ATTRIBUTES: u32 = 0x0080;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
 
-const DIR_ACCESS: u32 = FILE_LIST_DIRECTORY
-    | FILE_ADD_FILE
-    | FILE_ADD_SUBDIRECTORY
-    | FILE_TRAVERSE
-    | READ_CONTROL
-    | SYNCHRONIZE;
+const DIR_OPEN: u32 = FILE_LIST_DIRECTORY | FILE_TRAVERSE | READ_CONTROL | SYNCHRONIZE;
+const DIR_CREATE: u32 = DIR_OPEN | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY;
 const FILE_ACCESS: u32 = FILE_READ_DATA
     | FILE_WRITE_DATA
     | FILE_APPEND_DATA
@@ -51,7 +46,6 @@ const FILE_ACCESS: u32 = FILE_READ_DATA
     | FILE_WRITE_ATTRIBUTES
     | READ_CONTROL
     | WRITE_DAC
-    | WRITE_OWNER
     | DELETE
     | SYNCHRONIZE;
 const OWNER_WRITE: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES;
@@ -71,6 +65,7 @@ fn config_reason(error: io::Error) -> &'static str {
         Some(2) => "config-2",
         Some(3) => "config-3",
         Some(5) => "config-5",
+        Some(50) => "config-50",
         Some(32) => "config-32",
         Some(87) => "config-87",
         Some(123) => "config-123",
@@ -86,6 +81,19 @@ fn config_reason(error: io::Error) -> &'static str {
                 "config" => "config-path",
                 "acl" => "config-acl",
                 "privilege missing" => "config-privilege",
+                "open-5" => "open-5",
+                "open-2" => "open-2",
+                "open-3" => "open-3",
+                "create-5" => "create-5",
+                "create-3" => "create-3",
+                "claim-5" => "claim-5",
+                "claim-87" => "claim-87",
+                "claim-1307" => "claim-1307",
+                "write-5" => "write-5",
+                "open" => "open",
+                "create" => "create",
+                "claim" => "claim",
+                "write" => "write",
                 _ => "config",
             }
         }
@@ -240,7 +248,7 @@ fn create_for_console_user(path: &Path) -> io::Result<()> {
         return Err(error);
     }
     let body = softlock_core::Config::initial().document().to_string();
-    let written = write_handle(handle, body.as_bytes());
+    let written = write_handle(handle, body.as_bytes()).map_err(|error| annotate("write", error));
     drop_handle(handle);
     written
 }
@@ -269,7 +277,24 @@ fn claim_for_console_user(handle: HANDLE, sid: &str) -> io::Result<()> {
         &dacl,
         DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
     )
-    .map_err(io::Error::other)
+    .map_err(|reason| annotate("claim", io::Error::other(reason)))
+}
+
+fn annotate(step: &'static str, error: io::Error) -> io::Error {
+    let code = error.raw_os_error().unwrap_or(0);
+    let label = match (step, code) {
+        ("open", 5) => "open-5",
+        ("open", 2) => "open-2",
+        ("open", 3) => "open-3",
+        ("create", 5) => "create-5",
+        ("create", 3) => "create-3",
+        ("claim", 5) => "claim-5",
+        ("claim", 87) => "claim-87",
+        ("claim", 1307) => "claim-1307",
+        ("write", 5) => "write-5",
+        _ => step,
+    };
+    io::Error::other(label)
 }
 
 fn fault(fault: JournalFault) -> &'static str {
@@ -290,7 +315,7 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
     if parts.is_empty() {
         return Err(io::Error::other("config"));
     }
-    let mut directory = open_root(&drive)?;
+    let mut directory = open_root(&drive).map_err(|error| annotate("open", error))?;
     if refuse_reparse(directory)? {
         drop_handle(directory);
         return Err(io::Error::other("reparse"));
@@ -300,14 +325,15 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
         if index == last {
             break;
         }
-        let next = match open_child(directory, name, DIR_ACCESS, true, false) {
+        let next = match open_child(directory, name, DIR_OPEN, true, false) {
             Ok(handle) => handle,
             Err(error) if create && not_found(&error) => {
-                open_child_at(directory, name, DIR_ACCESS, true, true, false)?
+                open_child_at(directory, name, DIR_CREATE, true, true, false)
+                    .map_err(|error| annotate("create", error))?
             }
             Err(error) => {
                 drop_handle(directory);
-                return Err(error);
+                return Err(annotate("open", error));
             }
         };
         drop_handle(directory);
@@ -321,11 +347,12 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
     let file = match open_child(directory, name, FILE_ACCESS, false, false) {
         Ok(handle) => handle,
         Err(error) if create && not_found(&error) => {
-            open_child_at(directory, name, FILE_ACCESS, false, true, false)?
+            open_child_at(directory, name, FILE_ACCESS, false, true, false)
+                .map_err(|error| annotate("create", error))?
         }
         Err(error) => {
             drop_handle(directory);
-            return Err(error);
+            return Err(annotate("open", error));
         }
     };
     drop_handle(directory);
@@ -348,7 +375,7 @@ fn open_for_owner_write(path: &Path) -> io::Result<HANDLE> {
     }
     let last = parts.len() - 1;
     for name in &parts[..last] {
-        let next = open_child(directory, name, DIR_ACCESS, true, false)?;
+        let next = open_child(directory, name, DIR_OPEN, true, false)?;
         drop_handle(directory);
         if refuse_reparse(next)? {
             drop_handle(next);
