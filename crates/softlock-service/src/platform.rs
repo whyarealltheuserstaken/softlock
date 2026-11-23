@@ -370,6 +370,17 @@ impl Hardening for ServicePlatform {
         Ok(())
     }
 
+    fn keep_os_lock_after_revert(&mut self, keep: bool) {
+        #[cfg(windows)]
+        if let Some(engine) = self.settings.as_mut() {
+            engine.keep_os_lock_after_revert(keep);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = keep;
+        }
+    }
+
     fn revert(&mut self, journal: &Journal) -> Result<(), HardenError> {
         #[cfg(windows)]
         if let Some(engine) = self.settings.as_mut() {

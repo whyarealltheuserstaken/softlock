@@ -728,7 +728,8 @@ fn an_absent_value_is_deleted_after_a_restart_mid_lock() {
         startup_steps(),
         [StartupStep::RecoverJournal, StartupStep::LoadConfig]
     );
-    let previous = original_previous(Some(&doc.entries()[0].previous), &live).clone();
+    let locked = SettingValue::Dword { value: 1 };
+    let previous = original_previous(Some(&doc.entries()[0].previous), &live, &locked).clone();
     assert_eq!(previous, SettingValue::Absent);
     assert_eq!(
         restore_action(&previous, &live).expect("restore"),

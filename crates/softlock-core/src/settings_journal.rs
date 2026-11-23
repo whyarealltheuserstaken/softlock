@@ -144,6 +144,12 @@ pub struct SettingsJournal {
     #[serde(default)]
     pub workstation_clear: bool,
     pub says_locked: bool,
+    /// Policies were restored after a confirmed OS lock. Startup stays
+    /// `OsLocked` until the console is active again. SPEC section 7: the
+    /// state is `OsLocked` until the owner signs back in, and that recovery
+    /// never reports `Unlocked`.
+    #[serde(default)]
+    pub os_confirmed: bool,
     pub failures: u32,
     pub entries: Vec<SettingEntry>,
     /// Boot time and the logon that was locked. Absent on a journal written
@@ -190,6 +196,52 @@ pub enum StartAction {
     Idle,
     Revert,
     FailClosed,
+    /// Policies are already restored and the console is not active.
+    /// Stay `OsLocked`. Do not revert again and do not report `Unlocked`.
+    StayOsLocked,
+}
+
+/// What a missing session means. A disconnect drops the console and can drop
+/// the session id without a new logon. That is not proof the lock ended.
+/// SPEC section 7 and Decision 5: recovery never reports `Unlocked`.
+/// `listed == None` is a failed query. `same_logon == None` is a failed
+/// LUID read. The console being active while the old session is gone is a
+/// new logon.
+pub fn fact_for_session(
+    listed: Option<bool>,
+    console_active: bool,
+    same_logon: Option<bool>,
+) -> SessionFact {
+    match listed {
+        None => SessionFact::Unknown,
+        Some(true) => match same_logon {
+            None => SessionFact::Unknown,
+            Some(true) => SessionFact::SameLogon,
+            Some(false) => SessionFact::DifferentLogon,
+        },
+        Some(false) if console_active => SessionFact::SessionGone,
+        Some(false) => SessionFact::Unknown,
+    }
+}
+
+/// A journal whose policies were restored after a confirmed OS lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldStart {
+    /// The console is active. The owner is back.
+    OwnerReturned,
+    /// The console is not active. Stay `OsLocked`.
+    StayOsLocked,
+}
+
+pub fn held_start(doc: &SettingsJournal, console_active: bool) -> Option<HeldStart> {
+    if !doc.os_confirmed || doc.says_locked() || !doc.entries.is_empty() {
+        return None;
+    }
+    Some(if console_active {
+        HeldStart::OwnerReturned
+    } else {
+        HeldStart::StayOsLocked
+    })
 }
 
 /// Whether the Lock Host from this install is still the locked session.
@@ -252,6 +304,7 @@ impl SettingsJournal {
             sid: String::new(),
             workstation_clear: false,
             says_locked: false,
+            os_confirmed: false,
             failures: 0,
             entries: Vec::new(),
             lock: None,
@@ -259,7 +312,7 @@ impl SettingsJournal {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && !self.says_locked && self.failures == 0
+        self.entries.is_empty() && !self.says_locked && !self.os_confirmed && self.failures == 0
     }
 
     pub fn entries(&self) -> &[SettingEntry] {
@@ -299,6 +352,7 @@ pub fn task_manager_document(
         sid: sid.to_string(),
         workstation_clear: false,
         says_locked: true,
+        os_confirmed: false,
         failures,
         entries: vec![SettingEntry {
             target: TASK_MANAGER.to_string(),
@@ -379,6 +433,7 @@ pub fn lockdown_document(
         sid: sid.to_string(),
         workstation_clear: false,
         says_locked: true,
+        os_confirmed: false,
         failures,
         entries,
         lock: None,
@@ -816,6 +871,25 @@ fn account_component(name: &str) -> bool {
         })
 }
 
+/// The value a restart writes back.
+///
+/// A live value equal to the lockdown dword is the lock itself. The journaled
+/// previous wins, so that dword is not stored as the original. Any other live
+/// value is the user's value, including a value written after a stale journal
+/// still said the original was absent. Reverting that stale absent would
+/// delete the user's value.
+pub fn original_previous<'a>(
+    journaled: Option<&'a SettingValue>,
+    current: &'a SettingValue,
+    locked: &SettingValue,
+) -> &'a SettingValue {
+    if current == locked {
+        journaled.unwrap_or(current)
+    } else {
+        current
+    }
+}
+
 /// `Ok(None)` means the current value already matches and the write is skipped.
 pub fn restore_action_for(
     target: &str,
@@ -975,16 +1049,6 @@ pub fn recovery_action(
         }
         SessionFact::SameLogon | SessionFact::Unknown => StartAction::FailClosed,
     }
-}
-
-/// The value a restart writes back. The journaled previous wins, so a
-/// mid-lock read of the locked dword cannot replace an absent original,
-/// and the restore deletes the value instead of writing zero.
-pub fn original_previous<'a>(
-    journaled: Option<&'a SettingValue>,
-    current: &'a SettingValue,
-) -> &'a SettingValue {
-    journaled.unwrap_or(current)
 }
 
 /// Service startup order. Journal recovery runs before the config file is
@@ -1451,7 +1515,8 @@ mod tests {
         );
         assert_eq!(startup_steps()[0], StartupStep::RecoverJournal);
         assert_eq!(startup_steps()[1], StartupStep::LoadConfig);
-        let previous = original_previous(Some(&doc.entries()[0].previous), &live).clone();
+        let locked = SettingValue::Dword { value: 1 };
+        let previous = original_previous(Some(&doc.entries()[0].previous), &live, &locked).clone();
         assert_eq!(previous, SettingValue::Absent);
         assert_eq!(
             restore_action(&previous, &live).expect("restore"),
@@ -1459,6 +1524,63 @@ mod tests {
         );
         assert_ne!(previous, SettingValue::Dword { value: 0 });
         assert_ne!(previous, live);
+    }
+
+    #[test]
+    fn a_disconnect_does_not_count_as_a_new_logon() {
+        let doc = task_manager_document(ALICE, SettingValue::Absent, 0).expect("journal");
+        // The session id dropped and the console is not active. That is a
+        // disconnect, not proof the lock ended.
+        let fact = fact_for_session(Some(false), false, None);
+        assert_eq!(fact, SessionFact::Unknown);
+        assert_eq!(
+            recovery_action(&doc, fact, false, HostPresence::Dead),
+            StartAction::FailClosed
+        );
+        // The console is active and the old session is gone. That logon ended.
+        let gone = fact_for_session(Some(false), true, None);
+        assert_eq!(gone, SessionFact::SessionGone);
+        assert_eq!(
+            recovery_action(&doc, gone, true, HostPresence::Dead),
+            StartAction::Revert
+        );
+        assert_eq!(
+            fact_for_session(None, true, Some(true)),
+            SessionFact::Unknown
+        );
+        assert_eq!(
+            fact_for_session(Some(true), true, None),
+            SessionFact::Unknown
+        );
+    }
+
+    #[test]
+    fn a_stale_absent_original_does_not_delete_a_newer_value() {
+        let doc = task_manager_document(ALICE, SettingValue::Absent, 0).expect("journal");
+        let locked = SettingValue::Dword { value: 1 };
+        let live = SettingValue::Dword { value: 0 };
+        // Live 0 is not the lockdown dword. It is the user's value. A stale
+        // journal that still says absent must not delete it.
+        assert_eq!(
+            original_previous(Some(&doc.entries()[0].previous), &live, &locked),
+            &live
+        );
+        let applied = SettingValue::Dword { value: 1 };
+        assert_eq!(
+            original_previous(Some(&doc.entries()[0].previous), &applied, &locked),
+            &SettingValue::Absent
+        );
+    }
+
+    #[test]
+    fn an_os_lock_that_already_restored_stays_locked_until_the_console_returns() {
+        let mut doc = SettingsJournal::empty();
+        doc.sid = ALICE.to_string();
+        doc.os_confirmed = true;
+        assert_eq!(held_start(&doc, false), Some(HeldStart::StayOsLocked));
+        assert_eq!(held_start(&doc, true), Some(HeldStart::OwnerReturned));
+        doc.says_locked = true;
+        assert_eq!(held_start(&doc, false), None);
     }
 
     #[test]

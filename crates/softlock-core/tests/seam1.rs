@@ -1234,6 +1234,19 @@ fn flush_persists_failure_count_and_locked_flag_and_recovery_restores_backoff() 
 }
 
 #[test]
+fn a_confirmed_os_lock_stays_locked_across_a_service_restart() {
+    let mut journal = Journal::empty();
+    journal.mark_os_held();
+    let mut controller = started(FakePlatform::new());
+    controller.handle(Event::ServiceStarted {
+        journal,
+        session_active: false,
+    });
+    assert!(matches!(controller.state(), LockState::OsLocked { .. }));
+    assert!(!controller.returned_to_unlocked());
+}
+
+#[test]
 fn pin_and_confirmation_token_are_redacted_and_unsupported() {
     let pin = "1234";
     let token = "confirm-token";

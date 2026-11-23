@@ -538,7 +538,12 @@ impl<P: Platform> LockController<P> {
             self.reject("OsLockConfirmed");
             return;
         };
-        if !self.teardown() {
+        // Revert the policies, and keep a durable OsLocked marker. A restart
+        // before the owner returns must not come back Unlocked.
+        self.platform.keep_os_lock_after_revert(true);
+        let reverted = self.teardown();
+        self.platform.keep_os_lock_after_revert(false);
+        if !reverted {
             self.reject("Revert");
         }
         self.enter(LockState::OsLocked {
@@ -796,6 +801,23 @@ impl<P: Platform> LockController<P> {
                             self.enter(LockState::OsLocked { after_fail });
                             return;
                         }
+                        // The in-memory journal is clear. Drop the durable
+                        // OsLocked marker too, so a restart does not lock again
+                        // after the owner has signed back in. A failed clear
+                        // stays OsLocked.
+                        if Hardening::revert(&mut self.platform, &self.journal).is_err() {
+                            self.release_guard_and_overlay();
+                            push_bounded(
+                                &mut self.notifications,
+                                Fallback {
+                                    reason: FailReason::Repair,
+                                    at_ms: self.now.as_millis(),
+                                    at_utc_ms: wall_unix_ms(),
+                                },
+                            );
+                            self.enter(LockState::OsLocked { after_fail });
+                            return;
+                        }
                         if let Some(reason) = after_fail {
                             push_bounded(
                                 &mut self.notifications,
@@ -827,6 +849,14 @@ impl<P: Platform> LockController<P> {
     }
 
     fn on_service_started(&mut self, journal: Journal, session_active: bool) {
+        if journal.os_held() {
+            // Policies are already restored. The console is not active.
+            // SPEC section 7: stay OsLocked until the owner signs back in.
+            self.enter(LockState::OsLocked {
+                after_fail: Some(FailReason::SessionActive),
+            });
+            return;
+        }
         if journal.is_empty() {
             return;
         }

@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 
 use softlock_core::PRODUCT_DISPLAY_NAME;
 use softlock_core::{
-    CONFIG_DIR, CONFIG_FILE, CommitFault, HardenError, Journal, JournalEntry, JournalFault,
-    LOCKDOWN, ProductState, RepairAction, SERVICE_NAME, SettingValue, SettingsJournal, StartAction,
-    allowed_previous_for, commit_then_change, encode_document, executable_may_run_as_system,
-    fault_log, lockdown_document, lockdown_policy, mark_workstation_clear, original_previous,
-    parse_document, reassert_write, recovery_action, repair_action, repair_entry_name,
-    restore_action_for, restore_sid, with_config_acl, workstation_value_after_attempt,
+    CONFIG_DIR, CONFIG_FILE, CommitFault, HardenError, HeldStart, Journal, JournalEntry,
+    JournalFault, LOCKDOWN, ProductState, RepairAction, SERVICE_NAME, SettingValue,
+    SettingsJournal, StartAction, allowed_previous_for, commit_then_change, encode_document,
+    executable_may_run_as_system, fault_log, held_start, lockdown_document, lockdown_policy,
+    mark_workstation_clear, original_previous, parse_document, reassert_write, recovery_action,
+    repair_action, repair_entry_name, restore_action_for, restore_sid, with_config_acl,
+    workstation_value_after_attempt,
 };
 
 use crate::journal_store::{load_journal, save_journal};
@@ -30,6 +31,8 @@ pub enum Boot {
     Idle,
     Reverted,
     FailClosed(Journal),
+    /// Policies are already restored and the console is not active.
+    StayOsLocked,
 }
 
 #[cfg(test)]
@@ -48,6 +51,7 @@ pub struct SettingsEngine {
     stop: Arc<AtomicBool>,
     last: Instant,
     watcher: Mutex<Option<JoinHandle<()>>>,
+    keep_os_lock: bool,
 }
 
 impl SettingsEngine {
@@ -66,7 +70,12 @@ impl SettingsEngine {
             stop: Arc::new(AtomicBool::new(false)),
             last: Instant::now(),
             watcher: Mutex::new(None),
+            keep_os_lock: false,
         })
+    }
+
+    pub fn keep_os_lock_after_revert(&mut self, keep: bool) {
+        self.keep_os_lock = keep;
     }
 
     pub fn boot(&mut self) -> Result<Boot, &'static str> {
@@ -78,12 +87,23 @@ impl SettingsEngine {
         if doc.is_empty() {
             return Ok(Boot::Idle);
         }
+        let console = console_is_active();
+        let console_active = console.unwrap_or(false);
+        if let Some(held) = held_start(&doc, console_active) {
+            return match held {
+                HeldStart::OwnerReturned => {
+                    let empty = encode_document(&SettingsJournal::empty()).map_err(fault_log)?;
+                    save_journal(&empty).map_err(|_| "not-durable")?;
+                    Ok(Boot::Idle)
+                }
+                HeldStart::StayOsLocked => Ok(Boot::StayOsLocked),
+            };
+        }
         self.sid = restore_sid(&doc).map_err(fault_log)?.to_string();
         // A failed WTS query comes back as SessionFact::Unknown and fails
         // closed. A proven different boot, a missing session, or a different
         // logon is the only revert. SPEC Decision 5 and section 7.
-        let console = console_is_active();
-        let mut fact = observe_lock(doc.lock);
+        let mut fact = observe_lock(doc.lock, console_active);
         if console.is_err() && fact == softlock_core::SessionFact::SameLogon {
             fact = softlock_core::SessionFact::Unknown;
         }
@@ -102,6 +122,7 @@ impl SettingsEngine {
                 }
                 Ok(Boot::FailClosed(memory_journal(&doc)))
             }
+            StartAction::StayOsLocked => Ok(Boot::StayOsLocked),
         }
     }
 
@@ -111,9 +132,8 @@ impl SettingsEngine {
             HardenError::Failed
         })?;
         self.sid = sid;
-        // A journal that already says locked has the originals. The live
-        // dword is the lockdown itself. Re-reading it would store that dword
-        // as the value to restore, and an absent value would never be deleted.
+        // A live lockdown dword keeps the journaled previous. Any other live
+        // value is the user's, so a stale absent original cannot delete it.
         let durable = load_journal().ok().flatten().and_then(|text| {
             parse_document(text.as_bytes())
                 .ok()
@@ -131,7 +151,13 @@ impl SettingsEngine {
                     .find(|entry| entry.target == policy.target)
                     .map(|entry| &entry.previous)
             });
-            previous.push((policy.target, original_previous(journaled, &live).clone()));
+            let locked = SettingValue::Dword {
+                value: policy.locked,
+            };
+            previous.push((
+                policy.target,
+                original_previous(journaled, &live, &locked).clone(),
+            ));
         }
         let mut doc =
             lockdown_document(&self.sid, &previous, journal.failures()).map_err(|fault| {
@@ -252,6 +278,7 @@ impl SettingsEngine {
     pub fn revert_memory(&mut self, journal: &Journal) -> Result<(), &'static str> {
         // Called when the OS lock is confirmed, or when the owner unlocks.
         // SPEC section 7 reverts the journal at confirmation, not before.
+        // Confirmation keeps an OsLocked marker. An owner unlock clears it.
         if let Some(text) = load_journal().map_err(|_| "journal")? {
             let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
             return self.revert_document(&doc);
@@ -358,7 +385,16 @@ impl SettingsEngine {
             }
             self.write_previous(&entry.target, entry.previous.clone())?;
         }
-        let empty = encode_document(&SettingsJournal::empty()).map_err(|_| "malformed")?;
+        let next = if self.keep_os_lock {
+            let mut held = SettingsJournal::empty();
+            held.sid = doc.sid.clone();
+            held.os_confirmed = true;
+            held.lock = doc.lock;
+            held
+        } else {
+            SettingsJournal::empty()
+        };
+        let empty = encode_document(&next).map_err(|_| "malformed")?;
         save_journal(&empty).map_err(|_| "not-durable")?;
         SKIP_WORKSTATION.store(false, Ordering::Release);
         self.release();

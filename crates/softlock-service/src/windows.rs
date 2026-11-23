@@ -393,6 +393,15 @@ fn install_journal(authority: &mut Authority) {
                     session_active: true,
                 });
             }
+            Ok(crate::settings::Boot::StayOsLocked) => {
+                authority.platform_mut().install_engine(engine);
+                let mut journal = softlock_core::Journal::empty();
+                journal.mark_os_held();
+                authority.notify(Event::ServiceStarted {
+                    journal,
+                    session_active: false,
+                });
+            }
             Ok(_) => authority.platform_mut().install_engine(engine),
             Err(reason) => {
                 crate::audit("settings", &[("result", "failed"), ("reason", reason)]);

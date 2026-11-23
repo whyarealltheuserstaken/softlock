@@ -94,13 +94,36 @@ fn restore(guard: &mut Guard) -> Result<(), String> {
     // active. A later hard stop of an unpaused lock can fail closed and
     // reject the next lock.
     every_row_restores(guard)?;
-    for previous in ["absent", "0", "1"] {
-        kill_before_apply(guard, previous)?;
+    for order in KILL_ORDERS {
+        for previous in ["absent", "0", "1"] {
+            kill_before_apply(guard, previous, order)?;
+        }
+        kill_after_apply(guard, order)?;
     }
-    kill_after_apply(guard)?;
     reassert_and_repair(guard)?;
     config_acl_round_trip(guard)?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum KillOrder {
+    ServiceFirst,
+    HostFirst,
+    Both,
+}
+
+const KILL_ORDERS: [KillOrder; 3] = [
+    KillOrder::ServiceFirst,
+    KillOrder::HostFirst,
+    KillOrder::Both,
+];
+
+fn order_name(order: KillOrder) -> &'static str {
+    match order {
+        KillOrder::ServiceFirst => "service-first",
+        KillOrder::HostFirst => "host-first",
+        KillOrder::Both => "both",
+    }
 }
 
 fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
@@ -129,7 +152,7 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
         }
         let pause = guard_dir().join("pause-config");
         let _ = fs::remove_file(&pause);
-        spawn_service(guard, Some("before"), &pause)?;
+        spawn_service(guard, Some("before"), &pause, true)?;
         wait_pipe()?;
         let created = wait_for_config(&path);
         if !created {
@@ -181,7 +204,7 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
         }
         hard_stop(guard)?;
         let _ = wait_until(Duration::from_secs(5), || !host_running());
-        spawn_service(guard, None, &pause)?;
+        spawn_service(guard, None, &pause, true)?;
         let restored = wait_until(Duration::from_secs(20), || {
             softlock_service::testing_dacl(&path)
                 .ok()
@@ -492,87 +515,77 @@ fn console_user_sid() -> Result<String, String> {
     }
 }
 
-fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
+fn kill_before_apply(guard: &mut Guard, previous: &str, order: KillOrder) -> Result<(), String> {
     realign()?;
     set_taskmgr(previous)?;
-    let pause = guard_dir().join(format!("pause-{previous}"));
+    let pause = guard_dir().join(format!("pause-{}-{previous}", order_name(order)));
     let _ = fs::remove_file(&pause);
-    spawn_service(guard, Some("before"), &pause)?;
+    let before = journal_text();
+    spawn_service(guard, Some("before"), &pause, true)?;
     wait_pipe()?;
     lock_in_background();
     let journal = journal_file();
     let saw = wait_until(Duration::from_secs(20), || {
-        journal_ready(&journal) && query_taskmgr() == previous
+        journal_ready(&journal) && journal_text() != before && query_taskmgr() == previous
     });
     if !saw || !journal_ready(&journal) {
         return Err(format!(
-            "journal was not durable before the {previous} change"
+            "journal was not durable before the {previous} change ({})",
+            order_name(order)
         ));
     }
     // The service is blocked after the flush. A stop file is not read until
     // that pause ends, which would apply the value. Kill it.
-    hard_stop(guard)?;
+    stop_in_order(guard, order)?;
     if query_taskmgr() != previous {
-        return Err(format!("kill changed DisableTaskMgr from {previous}"));
+        return Err(format!(
+            "kill changed DisableTaskMgr from {previous} ({})",
+            order_name(order)
+        ));
     }
     let _ = wait_until(Duration::from_secs(5), || !host_running());
-    spawn_service(guard, None, &pause)?;
-    let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == previous);
+    // Leave the console where the kill left it. Attaching here would turn a
+    // confirmed disconnect back into an active desktop before recovery runs.
+    spawn_service(guard, None, &pause, false)?;
+    wait_os_held(
+        previous,
+        &format!("before {previous} {}", order_name(order)),
+    )?;
     hard_stop(guard)?;
     realign()?;
-    if !restored {
-        return Err(format!("restart did not restore {previous}"));
-    }
     if query_taskmgr() != previous {
-        return Err(format!("restored value was not {previous}"));
+        return Err(format!(
+            "restored value was not {previous} ({})",
+            order_name(order)
+        ));
     }
     Ok(())
 }
 
-fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
+fn kill_after_apply(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
     realign()?;
     set_taskmgr("absent")?;
-    let pause = guard_dir().join("pause-after");
+    let pause = guard_dir().join(format!("pause-after-{}", order_name(order)));
     let _ = fs::remove_file(&pause);
-    // Hold the service after the registry write, before it can OS-lock the
-    // session or revert. The value is 1; killing both processes leaves the
-    // journal durable. The restart is the same boot and the same logon, so
-    // it must OS-lock or disconnect and must not end Unlocked. Settings are
-    // restored once that lock is confirmed (SPEC section 7).
-    spawn_service(guard, Some("after"), &pause)?;
+    // Hold the service after the registry write. Killing both processes
+    // leaves the journal durable. The restart is the same boot. It must
+    // OS-lock or leave the session OS-held, and must not end Unlocked while
+    // the session is active. Settings are restored once that lock is
+    // confirmed (SPEC section 7).
+    spawn_service(guard, Some("after"), &pause, true)?;
     wait_pipe()?;
     lock_in_background();
     let applied = wait_until(Duration::from_secs(20), || query_taskmgr() == "1");
     if !applied {
-        return Err("DisableTaskMgr was not set to 1".to_string());
-    }
-    hard_stop(guard)?;
-    let _ = wait_until(Duration::from_secs(5), || !host_running());
-    spawn_service(guard, None, &pause)?;
-    let mut ended_unlocked = false;
-    let mut last_state = String::new();
-    let held = wait_until(Duration::from_secs(25), || {
-        let status = transact(&pipe_name(), status_body()).unwrap_or_default();
-        let state = status_state(&status).unwrap_or_default();
-        last_state = state.clone();
-        if state == "Unlocked" {
-            ended_unlocked = true;
-            return true;
-        }
-        let os_held = state == "OsLocked" || session_os_held();
-        os_held && query_taskmgr() == "absent"
-    });
-    if ended_unlocked {
-        hard_stop(guard)?;
-        return Err("restart ended Unlocked with no OS lock".to_string());
-    }
-    if !held {
-        hard_stop(guard)?;
         return Err(format!(
-            "restart did not OS-lock or disconnect and restore (state {last_state}, value {})",
-            query_taskmgr()
+            "DisableTaskMgr was not set to 1 ({})",
+            order_name(order)
         ));
     }
+    stop_in_order(guard, order)?;
+    let _ = wait_until(Duration::from_secs(5), || !host_running());
+    spawn_service(guard, None, &pause, false)?;
+    wait_os_held("absent", &format!("after {}", order_name(order)))?;
     // The owner coming back attaches the console again. The product never
     // reconnects a session. The restored value has to still be absent.
     realign()?;
@@ -582,27 +595,71 @@ fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
     hard_stop(guard)?;
     if !still || query_taskmgr() != "absent" {
         return Err(format!(
-            "settings were not the absent original after the owner returned (state {state})"
+            "settings were not the absent original after the owner returned (state {state}, {})",
+            order_name(order)
+        ));
+    }
+    Ok(())
+}
+
+fn wait_os_held(expected: &str, label: &str) -> Result<(), String> {
+    let mut ended_unlocked = false;
+    let mut last_state = String::new();
+    let held = wait_until(Duration::from_secs(25), || {
+        let status = transact(&pipe_name(), status_body()).unwrap_or_default();
+        let state = status_state(&status).unwrap_or_default();
+        last_state = state.clone();
+        let os_held = session_os_held();
+        // Unlocked on an active session is a fail-open. A confirmed OS lock
+        // whose session is disconnected or locked is session_os_held, and the
+        // originals have to be back. SPEC section 7.
+        if state == "Unlocked" && !os_held {
+            ended_unlocked = true;
+            return true;
+        }
+        let reported = state == "OsLocked" || os_held;
+        reported && query_taskmgr() == expected && !journal_ready(&journal_file())
+    });
+    if ended_unlocked {
+        return Err(format!(
+            "{label} ended Unlocked with no OS lock (value {})",
+            query_taskmgr()
+        ));
+    }
+    if !held {
+        return Err(format!(
+            "{label} did not OS-lock or disconnect and restore (state {last_state}, value {})",
+            query_taskmgr()
         ));
     }
     Ok(())
 }
 
 fn clock_shift_stays_locked(guard: &mut Guard) -> Result<(), String> {
-    realign()?;
-    set_taskmgr("absent")?;
-    let pause = guard_dir().join("pause-clock");
-    let _ = fs::remove_file(&pause);
-    spawn_service(guard, None, &pause)?;
-    wait_pipe()?;
-    lock_in_background();
-    if !wait_until(Duration::from_secs(20), || query_taskmgr() == "1") {
-        return Err("the clock case did not set DisableTaskMgr".to_string());
-    }
     let original = powershell("(Get-Date).ToString('o')")?;
     let _restore = ClockRestore {
         original: original.clone(),
     };
+    for order in KILL_ORDERS {
+        clock_one_order(guard, order)?;
+    }
+    Ok(())
+}
+
+fn clock_one_order(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
+    realign()?;
+    set_taskmgr("absent")?;
+    let pause = guard_dir().join(format!("pause-clock-{}", order_name(order)));
+    let _ = fs::remove_file(&pause);
+    spawn_service(guard, None, &pause, true)?;
+    wait_pipe()?;
+    lock_in_background();
+    if !wait_until(Duration::from_secs(20), || query_taskmgr() == "1") {
+        return Err(format!(
+            "the clock case did not set DisableTaskMgr ({})",
+            order_name(order)
+        ));
+    }
     // A large forward jump. BootTime moves with the wall clock. Unbiased
     // uptime does not. The live service has to stay locked across the jump.
     // The restart, not the kill, is the recovery under test.
@@ -612,36 +669,16 @@ fn clock_shift_stays_locked(guard: &mut Guard) -> Result<(), String> {
     let live_state = status_state(&live).unwrap_or_default();
     if live_state == "Unlocked" || query_taskmgr() != "1" {
         return Err(format!(
-            "a clock change moved the live lock (state {live_state}, value {})",
-            query_taskmgr()
+            "a clock change moved the live lock (state {live_state}, value {}, {})",
+            query_taskmgr(),
+            order_name(order)
         ));
     }
-    hard_stop_service_first(guard)?;
+    stop_in_order(guard, order)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
-    spawn_service(guard, None, &pause)?;
-    let mut ended_unlocked = false;
-    let mut last_state = String::new();
-    let held = wait_until(Duration::from_secs(25), || {
-        let status = transact(&pipe_name(), status_body()).unwrap_or_default();
-        let state = status_state(&status).unwrap_or_default();
-        last_state = state.clone();
-        if state == "Unlocked" {
-            ended_unlocked = true;
-            return true;
-        }
-        let os_held = state == "OsLocked" || session_os_held();
-        os_held && query_taskmgr() == "absent"
-    });
+    spawn_service(guard, None, &pause, false)?;
+    wait_os_held("absent", &format!("clock {}", order_name(order)))?;
     hard_stop(guard)?;
-    if ended_unlocked {
-        return Err("a clock change ended Unlocked with no OS lock".to_string());
-    }
-    if !held || query_taskmgr() != "absent" {
-        return Err(format!(
-            "a clock change did not keep the lock and restore (state {last_state}, value {})",
-            query_taskmgr()
-        ));
-    }
     Ok(())
 }
 
@@ -677,7 +714,7 @@ fn powershell(script: &str) -> Result<String, String> {
 fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     set_taskmgr("absent")?;
     let pause = guard_dir().join("pause-reassert");
-    spawn_service(guard, None, &pause)?;
+    spawn_service(guard, None, &pause, true)?;
     wait_pipe()?;
     transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
     if !wait_until(Duration::from_secs(20), || query_taskmgr() == "1") {
@@ -738,7 +775,7 @@ fn recover_active(guard: &mut Guard) -> Result<(), String> {
     set_taskmgr("0")?;
     let pause = guard_dir().join("pause-active");
     let _ = fs::remove_file(&pause);
-    spawn_service(guard, Some("after"), &pause)?;
+    spawn_service(guard, Some("after"), &pause, true)?;
     wait_pipe()?;
     lock_in_background();
     if !wait_until(Duration::from_secs(20), || {
@@ -906,7 +943,12 @@ fn ensure_service() -> Result<(), String> {
     }
 }
 
-fn spawn_service(_guard: &mut Guard, pause: Option<&str>, pause_file: &Path) -> Result<(), String> {
+fn spawn_service(
+    _guard: &mut Guard,
+    pause: Option<&str>,
+    pause_file: &Path,
+    attach: bool,
+) -> Result<(), String> {
     fs::create_dir_all(guard_dir()).map_err(|_| "temp".to_string())?;
     fs::create_dir_all(guard_dir().join("pin")).map_err(|_| "temp".to_string())?;
     // The environment is read when the service starts. Stop anything that
@@ -916,10 +958,17 @@ fn spawn_service(_guard: &mut Guard, pause: Option<&str>, pause_file: &Path) -> 
     if !wait_until(Duration::from_secs(20), service_stopped) {
         return Err(format!("service did not stop: {}", service_state()));
     }
-    // A disconnect leaves no console session. Startup then fail-closes a
-    // durable journal instead of restoring it. Attach this session first.
+    // A recovery start leaves the console where the kill left it. Attaching
+    // first would turn a confirmed disconnect back into an active desktop,
+    // and an empty journal would then report Unlocked. SPEC section 7.
     #[cfg(feature = "live-fail-closed")]
-    align_console()?;
+    if attach {
+        align_console()?;
+    }
+    #[cfg(not(feature = "live-fail-closed"))]
+    {
+        let _ = attach;
+    }
     match start_service() {
         Ok(()) => Ok(()),
         Err(first) => {
@@ -1021,52 +1070,64 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
 }
 
 fn hard_stop(guard: &mut Guard) -> Result<(), String> {
-    // Freeze the host, then kill the service before the host. The restore
-    // cases are inside the journal pause. Freezing the service there let the
-    // kill change the registry value and left the restart Unlocked.
-    stop_processes(guard, false)
+    stop_in_order(guard, KillOrder::Both)
 }
 
-fn hard_stop_service_first(guard: &mut Guard) -> Result<(), String> {
-    // The service OS-locks when the host goes silent. Freeze the service
-    // before the host so that silence cannot finish the OS lock.
-    stop_processes(guard, true)
-}
-
-fn stop_processes(_guard: &mut Guard, freeze_service: bool) -> Result<(), String> {
-    // A live host OS-locks the console when its service pipe closes, and the
-    // service OS-locks when it sees the host die. A process that exits between
-    // the snapshot and the open is already stopped. One that is still listed
-    // and cannot be suspended fails the test.
-    if freeze_service {
-        freeze("softlock-service.exe")?;
-    }
+fn stop_in_order(_guard: &mut Guard, order: KillOrder) -> Result<(), String> {
+    // Freeze both, then kill in the order under test. A process that exits
+    // between the snapshot and the open is already stopped. One that is still
+    // listed and cannot be suspended fails the test. The product has to end
+    // OsLocked or session-held for every order.
+    freeze("softlock-service.exe")?;
     freeze("softlock-lockhost.exe")?;
-    // The service has to be gone before the host is killed.
-    let service_deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let _ = Command::new("taskkill")
-            .args(["/F", "/IM", "softlock-service.exe"])
-            .status();
-        if !image_running("softlock-service.exe") {
-            break;
+    match order {
+        KillOrder::ServiceFirst => {
+            kill_image("softlock-service.exe", "service did not exit")?;
+            let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
+            kill_image("softlock-lockhost.exe", "lock host did not exit")?;
         }
-        if Instant::now() >= service_deadline {
-            return Err("service did not exit before the host".to_string());
+        KillOrder::HostFirst => {
+            kill_image("softlock-lockhost.exe", "lock host did not exit")?;
+            kill_image("softlock-service.exe", "service did not exit")?;
+            let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
         }
-        thread::sleep(Duration::from_millis(50));
+        KillOrder::Both => {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/IM", "softlock-service.exe"])
+                    .status();
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/IM", "softlock-lockhost.exe"])
+                    .status();
+                if !image_running("softlock-service.exe") && !host_running() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err("service and host did not exit together".to_string());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
+        }
     }
-    let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
-    let host_deadline = Instant::now() + Duration::from_secs(3);
+    Ok(())
+}
+
+fn kill_image(image: &str, error: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let _ = Command::new("taskkill")
-            .args(["/F", "/IM", "softlock-lockhost.exe"])
-            .status();
-        if !host_running() {
+        let _ = Command::new("taskkill").args(["/F", "/IM", image]).status();
+        let gone = if image == "softlock-lockhost.exe" {
+            !host_running()
+        } else {
+            !image_running(image)
+        };
+        if gone {
             return Ok(());
         }
-        if Instant::now() >= host_deadline {
-            return Err("lock host did not exit".to_string());
+        if Instant::now() >= deadline {
+            return Err(error.to_string());
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -1323,6 +1384,10 @@ fn wait_pipe() -> Result<(), String> {
     }
 }
 
+fn journal_text() -> String {
+    fs::read_to_string(journal_file()).unwrap_or_default()
+}
+
 fn journal_ready(path: &Path) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
         return false;
@@ -1419,7 +1484,7 @@ fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
         set_value(key, name, previous)?;
     }
     let pause = guard_dir().join("pause-rows");
-    spawn_service(guard, None, &pause)?;
+    spawn_service(guard, None, &pause, true)?;
     wait_pipe()?;
     transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
     if !wait_until(Duration::from_secs(20), || {
@@ -1434,7 +1499,7 @@ fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
     }
     hard_stop(guard)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
-    spawn_service(guard, None, &pause)?;
+    spawn_service(guard, None, &pause, true)?;
     let restored = wait_until(Duration::from_secs(25), || {
         chosen
             .iter()

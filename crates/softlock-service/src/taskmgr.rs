@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use softlock_core::{
     HostPresence, LockIdentity, LockdownPolicy, PolicyHive, SessionFact, SettingValue,
-    console_user_from, expand_profile_image, fact_after_boot, hive_target_allowed, host_identity,
-    same_exe_path, sid_is_safe,
+    console_user_from, expand_profile_image, fact_after_boot, fact_for_session,
+    hive_target_allowed, host_identity, same_exe_path, sid_is_safe,
 };
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE};
 use windows::Win32::System::Registry::{
@@ -582,19 +582,23 @@ pub fn current_lock_identity() -> Option<LockIdentity> {
 /// Compare the journaled uptime and logon with this boot. A failed query is
 /// [`SessionFact::Unknown`], which startup fails closed on. A wall-clock
 /// change is not a different boot: only a smaller unbiased uptime is.
-pub fn observe_lock(saved: Option<LockIdentity>) -> SessionFact {
+///
+/// A session id that is merely absent while the console is not active is a
+/// disconnect, not a new logon. SPEC section 7: that recovery never reports
+/// `Unlocked`.
+pub fn observe_lock(saved: Option<LockIdentity>, console_active: bool) -> SessionFact {
     let Some(saved) = saved else {
         return SessionFact::Unknown;
     };
-    let session = match session_listed(saved.session) {
-        Err(()) => SessionFact::Unknown,
-        Ok(false) => SessionFact::SessionGone,
-        Ok(true) => match logon_luid(saved.session) {
-            Err(()) => SessionFact::Unknown,
-            Ok(logon) if logon != saved.logon => SessionFact::DifferentLogon,
-            Ok(_) => SessionFact::SameLogon,
+    let listed = session_listed(saved.session).ok();
+    let same_logon = match listed {
+        Some(true) => match logon_luid(saved.session) {
+            Err(()) => None,
+            Ok(logon) => Some(logon == saved.logon),
         },
+        _ => None,
     };
+    let session = fact_for_session(listed, console_active, same_logon);
     fact_after_boot(saved.boot, unbiased_uptime().ok(), session)
 }
 
