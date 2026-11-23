@@ -281,8 +281,16 @@ pub trait OsLockOps {
 pub fn fail_closed(caller: Caller, ops: &mut impl OsLockOps) -> Outcome {
     let mut attempts = Vec::new();
     for method in caller.steps() {
-        if *method == Method::LockWorkStation {
-            let _ = catch_step(StepFault::Panic, || ops.before_lock_workstation());
+        if *method == Method::LockWorkStation
+            && let Err(StepFault::Skipped) =
+                catch_step(StepFault::Panic, || ops.before_lock_workstation())
+        {
+            attempts.push(Attempt {
+                method: *method,
+                confirmed: false,
+                fault: Some(StepFault::Skipped),
+            });
+            continue;
         }
         let started = Instant::now();
         let call = catch_step(StepFault::Panic, || ops.call(*method));

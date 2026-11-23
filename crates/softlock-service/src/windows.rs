@@ -194,10 +194,10 @@ fn run_os_lock(session: u32, caller: softlock_core::Caller) -> Result<(), OsLock
     }
     match result.outcome {
         softlock_core::Outcome::Confirmed { method } => {
-            // The other rows stay at their locked values until unlock. Only
-            // DisableLockWorkstation was cleared, and only so this call could
-            // lock. Put that locked value back before reporting confirmation.
-            if clears && let Err(reason) = crate::settings::reapply_disable_lock_workstation() {
+            // A disconnect after the host died still has to put
+            // DisableLockWorkstation back. The flag is cleared here, before
+            // the confirmation is reported.
+            if let Err(reason) = crate::settings::reapply_disable_lock_workstation() {
                 crate::audit(
                     "os-lock",
                     &[("result", "reapply-failed"), ("reason", reason)],
@@ -217,7 +217,7 @@ fn run_os_lock(session: u32, caller: softlock_core::Caller) -> Result<(), OsLock
             Ok(())
         }
         softlock_core::Outcome::FailedClosed { attempts } => {
-            if clears && let Err(reason) = crate::settings::reapply_disable_lock_workstation() {
+            if let Err(reason) = crate::settings::reapply_disable_lock_workstation() {
                 crate::audit(
                     "os-lock",
                     &[("policy", "reapply-failed"), ("reason", reason)],

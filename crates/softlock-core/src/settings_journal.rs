@@ -470,6 +470,33 @@ pub fn reassert_due(elapsed: Duration) -> bool {
     elapsed >= REASSERT_AFTER
 }
 
+/// Put `DisableLockWorkstation` back after an OS-lock attempt. The temporary
+/// clear flag does not survive, including when a later disconnect is what
+/// confirmed the lock.
+pub fn workstation_value_after_attempt(
+    doc: &SettingsJournal,
+) -> Result<Option<(SettingsJournal, SettingValue)>, JournalFault> {
+    validate(doc)?;
+    let Some(policy) = lockdown_policy("DisableLockWorkstation") else {
+        return Ok(None);
+    };
+    if !doc
+        .entries
+        .iter()
+        .any(|entry| entry.target == policy.target)
+    {
+        return Ok(None);
+    }
+    let mut next = doc.clone();
+    next.workstation_clear = false;
+    Ok(Some((
+        next,
+        SettingValue::Dword {
+            value: policy.locked,
+        },
+    )))
+}
+
 /// Save first. A failed save does not run `change`.
 pub fn commit_then_change<E>(
     save: impl FnOnce() -> Result<(), JournalFault>,

@@ -43,7 +43,6 @@ pub use secrets::{SYSTEM_ONLY_SDDL, dacl_sddl, is_reparse_point, user_read_denie
 #[cfg(windows)]
 pub use settings::{
     clear_disable_lock_workstation_for_os_lock, reapply_disable_lock_workstation, repair_main,
-    revert_durable_journal,
 };
 
 #[cfg(windows)]

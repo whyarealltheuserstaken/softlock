@@ -75,6 +75,7 @@ pub use settings_journal::{
     lockdown_target, mark_workstation_clear, parent_dacl_trusted, parse_document, reassert_due,
     reassert_write, repair_action, repair_entry_name, restore_action, restore_action_for,
     restore_sid, same_exe_path, service_start_action, sid_is_safe, task_manager_document,
+    workstation_value_after_attempt,
 };
 pub use state::{
     ArmStep, DisarmStep, FailReason, Fallback, HeartbeatReport, LaunchNonce, LockSource, LockState,

@@ -14,6 +14,7 @@ use softlock_core::{
     commit_then_change, encode_document, executable_may_run_as_system, fault_log,
     lockdown_document, lockdown_policy, mark_workstation_clear, parse_document, reassert_write,
     repair_action, repair_entry_name, restore_action_for, restore_sid, service_start_action,
+    workstation_value_after_attempt,
 };
 
 use crate::journal_store::{load_journal, save_journal};
@@ -394,67 +395,23 @@ pub fn clear_disable_lock_workstation_for_os_lock() -> Result<bool, &'static str
     Ok(true)
 }
 
-/// Put every journaled value back, then drop the document. Runs before a
-/// confirmed OS lock is reported, so a crash after the report is already restored.
-pub fn revert_durable_journal() -> Result<(), &'static str> {
-    RESTORED.store(true, Ordering::Release);
-    let Some(text) = load_journal().map_err(|_| "journal")? else {
-        SKIP_WORKSTATION.store(false, Ordering::Release);
-        return Ok(());
-    };
-    let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
-    if doc.is_empty() {
-        SKIP_WORKSTATION.store(false, Ordering::Release);
-        return Ok(());
-    }
-    let sid = restore_sid(&doc).map_err(fault_log)?.to_string();
-    for entry in doc.entries() {
-        let policy = lockdown_policy(&entry.target).ok_or("target")?;
-        let current = read_lockdown(&sid, policy)?;
-        if let Some(next) =
-            restore_action_for(&entry.target, entry.previous, current).map_err(|_| "value")?
-        {
-            write_lockdown(&sid, policy, next)?;
-        }
-    }
-    let empty = encode_document(&SettingsJournal::empty()).map_err(|_| "malformed")?;
-    save_journal(&empty).map_err(|_| "not-durable")?;
-    SKIP_WORKSTATION.store(false, Ordering::Release);
-    Ok(())
-}
-
 /// Put `DisableLockWorkstation` back to its locked value and clear the
-/// temporary-clear flag. The owner's previous value stays in the journal.
+/// temporary-clear flag before the registry write, so a crash cannot leave
+/// re-assert skipping an absent value. The owner's previous value stays.
 pub fn reapply_disable_lock_workstation() -> Result<(), &'static str> {
     SKIP_WORKSTATION.store(false, Ordering::Release);
     let Some(text) = load_journal().map_err(|_| "journal")? else {
         return Ok(());
     };
-    let mut doc = parse_document(text.as_bytes()).map_err(fault_log)?;
-    if doc.sid.is_empty() {
+    let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
+    let Some((settled, value)) = workstation_value_after_attempt(&doc).map_err(fault_log)? else {
         return Ok(());
-    }
-    let sid = restore_sid(&doc).map_err(fault_log)?.to_string();
-    if let Some(policy) = lockdown_policy("DisableLockWorkstation")
-        && doc
-            .entries()
-            .iter()
-            .any(|entry| entry.target == policy.target)
-    {
-        write_lockdown(
-            &sid,
-            policy,
-            SettingValue::Dword {
-                value: policy.locked,
-            },
-        )?;
-    }
-    if doc.workstation_clear {
-        doc.workstation_clear = false;
-        let bytes = encode_document(&doc).map_err(fault_log)?;
-        save_journal(&bytes).map_err(|_| "not-durable")?;
-    }
-    Ok(())
+    };
+    let bytes = encode_document(&settled).map_err(fault_log)?;
+    save_journal(&bytes).map_err(|_| "not-durable")?;
+    let sid = restore_sid(&settled).map_err(fault_log)?.to_string();
+    let policy = lockdown_policy("DisableLockWorkstation").ok_or("target")?;
+    write_lockdown(&sid, policy, value)
 }
 
 pub fn repair_main() -> i32 {

@@ -3,14 +3,15 @@
 //! Finding 04: `LockWorkStation` returns success while `DisableLockWorkstation`
 //! is set and the session stays open. This path never trusts that return. A
 //! lock counts only after a console-session notification or the session state
-//! says so, within one second. The fall-back is `WTSDisconnectSession` on this
-//! process's session, confirmed the same way. `DisableLockWorkstation` is
-//! cleared through the settings journal before `LockWorkStation`, and put
-//! back when that call does not confirm. The disconnect does not clear it.
-//! If both fail, the guard and the overlay stay up. The PIN is the only
-//! release, and the OS lock is retried. A hook that has already died is not
-//! blocking input; the overlay still shows the error and the retry still runs.
-//! Ctrl+Alt+Del is the secure attention sequence and is not swallowed.
+//! says so, within one second. When the service is already gone this process
+//! cannot update the settings journal, so it disconnects its own session and
+//! does not call `LockWorkStation`. The service clears `DisableLockWorkstation`
+//! only before the workstation call it asks for, and puts that value back
+//! after the attempt, including a disconnect. If both fail, the guard and the
+//! overlay stay up. The PIN is the only release, and the OS lock is retried.
+//! A hook that has already died is not blocking input; the overlay still
+//! shows the error and the retry still runs. Ctrl+Alt+Del is the secure
+//! attention sequence and is not swallowed.
 
 #[cfg(any(test, feature = "simulated-physical"))]
 use std::sync::atomic::AtomicBool;
@@ -113,9 +114,9 @@ pub(crate) fn lock_or_disconnect(session: u32) -> RealLock {
     if let Some(stubbed) = take_stub() {
         return stubbed;
     }
-    let _ = softlock_service::clear_disable_lock_workstation_for_os_lock();
-    let result = softlock_windows::run_lock_host();
-    finish_policy(&result);
+    // The service is gone, so this process cannot record a clear in the
+    // SYSTEM journal. Disconnect without calling LockWorkStation.
+    let result = softlock_windows::run_lock_host_service_dead();
     finish(result, Caller::LockHost)
 }
 
@@ -150,9 +151,8 @@ pub(crate) fn lock_workstation_only() -> RealLock {
     if let Some(stubbed) = take_stub() {
         return stubbed;
     }
-    let _ = softlock_service::clear_disable_lock_workstation_for_os_lock();
+    // The service already cleared DisableLockWorkstation and puts it back.
     let result = softlock_windows::run_lock_host_primary();
-    finish_policy(&result);
     finish(result, Caller::LockHostPrimary)
 }
 
@@ -175,12 +175,6 @@ fn take_stub() -> Option<RealLock> {
         // The Windows calls are not made. Neither path confirmed.
         _ => Some(decide(false, false)),
     }
-}
-
-fn finish_policy(_result: &softlock_windows::CloseResult) {
-    // Confirmed or not, the locked value goes back. Unlock restores the
-    // owner's previous value. A disconnect never reaches this after a clear.
-    let _ = softlock_service::reapply_disable_lock_workstation();
 }
 
 fn finish(result: softlock_windows::CloseResult, caller: Caller) -> RealLock {

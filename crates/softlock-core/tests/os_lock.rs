@@ -63,6 +63,8 @@ struct Script {
     panic_call: Option<Method>,
     panic_observe: Option<Expect>,
     skip_lock: bool,
+    /// The journal cannot be updated, so the workstation call must not run.
+    prepare_skipped: bool,
     plug_in_clear: bool,
     cleared_disable_lock_workstation: bool,
 }
@@ -81,6 +83,7 @@ impl Script {
             panic_call: None,
             panic_observe: None,
             skip_lock: false,
+            prepare_skipped: false,
             plug_in_clear: false,
             cleared_disable_lock_workstation: false,
         }
@@ -95,6 +98,9 @@ impl OsLockOps for Script {
         }
         if self.panic_prepare {
             panic!("prepare");
+        }
+        if self.prepare_skipped {
+            return Err(StepFault::Skipped);
         }
         Ok(())
     }
@@ -128,6 +134,26 @@ impl OsLockOps for Script {
         }
         Ok(observation)
     }
+}
+
+#[test]
+fn a_service_dead_host_does_not_spend_the_budget_on_a_blocked_workstation_lock() {
+    let mut script = Script::new();
+    script.prepare_skipped = true;
+    // DisableLockWorkstation is still 1, so this observation is the full
+    // second the call would burn before the disconnect fall-back.
+    script.lock_obs = obs(None, Some(false), Some(false), Duration::from_secs(1));
+    let outcome = fail_closed(Caller::LockHost, &mut script);
+    assert_eq!(
+        outcome,
+        Outcome::Confirmed {
+            method: Method::DisconnectOwnSession
+        }
+    );
+    assert_eq!(script.calls, vec![Method::DisconnectOwnSession]);
+    assert_eq!(script.observes, vec![Expect::DisconnectOwn]);
+    assert!(within_budget(script.own_obs.elapsed));
+    assert!(!within_budget(Duration::from_secs(1)));
 }
 
 #[test]

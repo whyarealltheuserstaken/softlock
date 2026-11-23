@@ -86,12 +86,15 @@ fn live_settings_journal() {
 }
 
 fn restore(guard: &mut Guard) -> Result<(), String> {
+    // The all-rows lock has to run while this console session is still
+    // active. A later hard stop of an unpaused lock can fail closed and
+    // reject the next lock.
+    every_row_restores(guard)?;
     for previous in ["absent", "0", "1"] {
         kill_before_apply(guard, previous)?;
     }
     kill_after_apply(guard)?;
     reassert_and_repair(guard)?;
-    every_row_restores(guard)?;
     Ok(())
 }
 
@@ -678,9 +681,12 @@ fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
             .iter()
             .all(|(key, name, _, locked)| query_value(key, name) == *locked)
     }) {
-        return Err("lock did not set every Ctrl+Alt+Del and UAC row".to_string());
+        return Err(format!(
+            "lock did not set every Ctrl+Alt+Del and UAC row: {}",
+            row_report(&chosen)
+        ));
     }
-    hard_stop(guard);
+    hard_stop(guard)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
     spawn_service(guard, None, &pause)?;
     let restored = wait_until(Duration::from_secs(20), || {
@@ -688,11 +694,27 @@ fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
             .iter()
             .all(|(key, name, previous, _)| query_value(key, name) == *previous)
     });
-    hard_stop(guard);
+    hard_stop(guard)?;
     if !restored {
-        return Err("restart did not restore every row".to_string());
+        return Err(format!(
+            "restart did not restore every row: {}",
+            row_report(&chosen)
+        ));
     }
     Ok(())
+}
+
+fn row_report(chosen: &[(&str, &str, &str, &str)]) -> String {
+    chosen
+        .iter()
+        .map(|(key, name, previous, locked)| {
+            format!(
+                "{name}={} (wanted {locked}, previous {previous})",
+                query_value(key, name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn installed_service_running() -> bool {

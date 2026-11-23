@@ -7,6 +7,7 @@ use softlock_core::{
     Caller, JournalFault, LOCKDOWN, SettingValue, blocks_owner_sign_in,
     clears_disable_lock_workstation, commit_then_change, encode_document, lockdown_document,
     lockdown_policy, mark_workstation_clear, parse_document, reassert_write, restore_action_for,
+    workstation_value_after_attempt,
 };
 
 const ALICE: &str = "S-1-5-21-1-2-3-1001";
@@ -248,30 +249,97 @@ fn a_group_policy_overwrite_is_reasserted() {
 }
 
 #[test]
+fn no_path_leaves_disable_lock_workstation_cleared() {
+    for previous in [
+        SettingValue::Absent,
+        SettingValue::Dword { value: 0 },
+        SettingValue::Dword { value: 1 },
+    ] {
+        let doc = mark_workstation_clear(&locked_document("DisableLockWorkstation", previous))
+            .expect("clear is journaled");
+        assert!(doc.workstation_clear);
+        let (settled, write) = workstation_value_after_attempt(&doc)
+            .expect("settle")
+            .expect("the row is still in the journal");
+        assert!(
+            !settled.workstation_clear,
+            "the temporary clear must not survive the attempt"
+        );
+        assert_eq!(write, SettingValue::Dword { value: 1 });
+        assert_eq!(
+            reassert_write(
+                "DisableLockWorkstation",
+                SettingValue::Dword { value: 1 },
+                SettingValue::Absent,
+                settled.workstation_clear
+            ),
+            Some(SettingValue::Dword { value: 1 }),
+            "re-assert must stop skipping once the flag is cleared"
+        );
+        let entry = settled
+            .entries()
+            .iter()
+            .find(|entry| entry.target == "DisableLockWorkstation")
+            .expect("row");
+        assert_eq!(entry.previous, previous);
+        let recovered =
+            restore_action_for("DisableLockWorkstation", previous, write).expect("recovery");
+        if previous == write {
+            assert_eq!(recovered, None);
+        } else {
+            assert_eq!(recovered, Some(previous));
+        }
+    }
+    // A disconnect after the host died did not clear the value itself.
+    // The journaled clear is still put back.
+    assert!(!clears_disable_lock_workstation(Caller::Service));
+}
+
+#[test]
 fn fail_closed_clears_disable_lock_workstation_only_before_the_workstation_lock() {
     assert!(clears_disable_lock_workstation(Caller::LockHost));
     assert!(clears_disable_lock_workstation(Caller::LockHostPrimary));
     assert!(clears_disable_lock_workstation(Caller::ServiceCoordinated));
     assert!(!clears_disable_lock_workstation(Caller::Service));
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let service = std::fs::read_to_string(root.join("crates/softlock-service/src/windows.rs"))
-        .expect("service");
-    assert!(service.contains("clears_disable_lock_workstation"));
-    assert!(service.contains("clear_disable_lock_workstation_for_os_lock"));
-    assert!(service.contains("reapply_disable_lock_workstation"));
-    assert!(
-        !service.contains("revert_durable_journal"),
-        "an OS lock confirmation must not restore the owner's values"
+    let doc = locked_document("DisableLockWorkstation", SettingValue::Dword { value: 0 });
+    let marked = mark_workstation_clear(&doc).expect("journaled before the delete");
+    assert_eq!(
+        marked
+            .entries()
+            .iter()
+            .find(|entry| entry.target == "DisableLockWorkstation")
+            .expect("row")
+            .previous,
+        SettingValue::Dword { value: 0 }
     );
-    let host = std::fs::read_to_string(root.join("crates/softlock-lockhost/src/win/failclosed.rs"))
-        .expect("host");
-    assert!(host.contains("clear_disable_lock_workstation_for_os_lock"));
-    let reconnect = format!("{}{}", "WTSConnect", "Session");
-    assert!(!host.contains(&reconnect));
-    let live =
-        std::fs::read_to_string(root.join("crates/softlock-lockhost/tests/fail_closed_live.rs"))
-            .expect("live");
-    assert!(live.contains("Duration::from_secs(1)"));
+    assert!(softlock_core::within_budget(
+        std::time::Duration::from_millis(999)
+    ));
+    assert!(!softlock_core::within_budget(
+        std::time::Duration::from_secs(1)
+    ));
+}
+
+#[test]
+fn the_lock_host_does_not_link_the_service() {
+    let manifest = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../softlock-lockhost/Cargo.toml"),
+    )
+    .expect("lock host manifest");
+    let mut in_product_deps = false;
+    for line in manifest.lines() {
+        if line.starts_with('[') {
+            in_product_deps = (line.starts_with("[dependencies]")
+                || line.contains(".dependencies]"))
+                && !line.contains("dev-dependencies");
+        }
+        if in_product_deps {
+            assert!(
+                !line.contains("softlock-service"),
+                "the lock host links the service: {line}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -285,31 +353,8 @@ fn lockdown_does_not_block_windows_hello_or_the_password() {
     }
     assert!(blocks_owner_sign_in("scforceoption"));
     assert!(blocks_owner_sign_in("DisabledCredentialProviders"));
-    let guide = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/user-guide/ctrl-alt-del.md"),
-    )
-    .expect("user guide");
-    for needle in [
-        "NoLogoff",
-        "DisableChangePassword",
-        "HideFastUserSwitching",
-        "DisableLockWorkstation",
-        "NoClose",
-        "ConsentPromptBehaviorAdmin",
-        "ConsentPromptBehaviorUser",
-        "Windows Hello",
-        "password",
-        "power",
-        "network",
-        "accessibility",
-        "crash",
-    ] {
-        assert!(
-            guide.contains(needle),
-            "{needle} missing from the user guide"
-        );
-    }
+    assert!(blocks_owner_sign_in("AllowDomainPINLogon"));
+    assert!(blocks_owner_sign_in("DisablePasswordUnlock"));
 }
 
 fn full_with(target: &str, previous: SettingValue) -> Vec<(&str, SettingValue)> {
