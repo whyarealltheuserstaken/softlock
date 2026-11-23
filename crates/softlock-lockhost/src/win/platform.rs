@@ -1,8 +1,8 @@
 //! Windows platform for the dev-launch controller.
 //!
-//! Lockdown policies are not applied. Ticket 15 writes them, after the journal
-//! from ticket 16. A no-op here lets the state machine reach Locked without
-//! changing the machine.
+//! Lockdown policies are not applied here. The service writes DisableTaskMgr
+//! after its journal. A no-op here lets the state machine reach Locked without
+//! this process changing the machine.
 
 use std::sync::Arc;
 

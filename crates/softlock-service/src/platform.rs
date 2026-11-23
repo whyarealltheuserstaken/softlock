@@ -33,6 +33,10 @@ pub struct ServicePlatform {
     guard: GuardHealth,
     overlay: OverlayHealth,
     arm: Option<ArmWait>,
+    #[cfg(windows)]
+    settings: Option<crate::settings::SettingsEngine>,
+    #[cfg(windows)]
+    settings_required: bool,
 }
 
 impl ServicePlatform {
@@ -49,7 +53,29 @@ impl ServicePlatform {
                 topmost: false,
             },
             arm: None,
+            #[cfg(windows)]
+            settings: None,
+            #[cfg(windows)]
+            settings_required: false,
         }
+    }
+
+    #[cfg(windows)]
+    pub fn install_engine(&mut self, engine: crate::settings::SettingsEngine) {
+        self.settings = Some(engine);
+    }
+
+    #[cfg(windows)]
+    pub fn require_settings(&mut self) {
+        self.settings_required = true;
+    }
+
+    #[cfg(windows)]
+    pub fn poll_settings(&mut self) -> Result<(), &'static str> {
+        let Some(engine) = self.settings.as_mut() else {
+            return Ok(());
+        };
+        engine.reassert_if_due()
     }
 
     pub fn set_arm_wait(&mut self, arm: ArmWait) {
@@ -284,7 +310,20 @@ impl SessionControl for ServicePlatform {
 
 impl Hardening for ServicePlatform {
     fn apply(&mut self, plan: &HardeningPlan, journal: &mut Journal) -> Result<(), HardenError> {
+        #[cfg(windows)]
+        if self.settings_required && self.settings.is_none() {
+            crate::audit("settings", &[("result", "failed"), ("reason", "journal")]);
+            return Err(HardenError::Failed);
+        }
+        #[cfg(windows)]
+        if let Some(engine) = self.settings.as_mut() {
+            engine.stage(journal)?;
+        }
         for change in &plan.changes {
+            #[cfg(windows)]
+            if change.target == softlock_core::TASK_MANAGER && self.settings.is_some() {
+                continue;
+            }
             journal.record(JournalEntry {
                 target: change.target.clone(),
                 previous: None,
@@ -292,10 +331,36 @@ impl Hardening for ServicePlatform {
             });
         }
         journal.flush();
+        #[cfg(windows)]
+        if let Some(engine) = self.settings.as_mut() {
+            engine.persist_and_apply()?;
+        }
         Ok(())
     }
 
-    fn revert(&mut self, _journal: &Journal) -> Result<(), HardenError> {
+    fn revert(&mut self, journal: &Journal) -> Result<(), HardenError> {
+        #[cfg(windows)]
+        if let Some(engine) = self.settings.as_mut() {
+            return engine.revert_memory(journal).map_err(|reason| {
+                crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+                HardenError::Failed
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = journal;
+        }
+        Ok(())
+    }
+
+    fn reassert(&mut self, _journal: &Journal) -> Result<(), HardenError> {
+        #[cfg(windows)]
+        if let Some(engine) = self.settings.as_mut() {
+            engine.reassert_now().map_err(|reason| {
+                crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+                HardenError::Failed
+            })?;
+        }
         Ok(())
     }
 }

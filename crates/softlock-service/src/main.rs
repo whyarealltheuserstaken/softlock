@@ -22,6 +22,18 @@ fn main() {
             let code = softlock_service::run_foreground();
             std::process::exit(code);
         }
+        Some("--repair-settings") => {
+            #[cfg(windows)]
+            {
+                let code = softlock_service::repair_main();
+                std::process::exit(code);
+            }
+            #[cfg(not(windows))]
+            {
+                eprintln!("the service runs on Windows");
+                std::process::exit(1);
+            }
+        }
         Some("--session-probe") => {
             let path = args.next().unwrap_or_default();
             let code = softlock_service::run_session_probe(&path);
