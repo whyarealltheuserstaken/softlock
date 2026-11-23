@@ -35,7 +35,8 @@ const FILE_WRITE_EA: u32 = 0x0010;
 const FILE_READ_ATTRIBUTES: u32 = 0x0080;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
 
-const DIR_OPEN: u32 = FILE_LIST_DIRECTORY | FILE_TRAVERSE | READ_CONTROL | SYNCHRONIZE;
+const DIR_OPEN: u32 =
+    FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
 const DIR_CREATE: u32 = DIR_OPEN | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY;
 const FILE_ACCESS: u32 = FILE_READ_DATA
     | FILE_WRITE_DATA
@@ -263,6 +264,7 @@ fn annotate(step: &'static str, error: io::Error) -> io::Error {
         ("claim", 87) => "claim-87",
         ("claim", 1307) => "claim-1307",
         ("write", 5) => "write-5",
+        ("attr", 5) => "attr-5",
         _ => step,
     };
     io::Error::other(label)
@@ -287,7 +289,7 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
         return Err(io::Error::other("config"));
     }
     let mut directory = open_root(&drive).map_err(|error| annotate("open", error))?;
-    if refuse_reparse(directory)? {
+    if refuse_reparse(directory).map_err(|error| annotate("attr", error))? {
         drop_handle(directory);
         return Err(io::Error::other("reparse"));
     }
@@ -308,7 +310,7 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
             }
         };
         drop_handle(directory);
-        if refuse_reparse(next)? {
+        if refuse_reparse(next).map_err(|error| annotate("attr", error))? {
             drop_handle(next);
             return Err(io::Error::other("reparse"));
         }
