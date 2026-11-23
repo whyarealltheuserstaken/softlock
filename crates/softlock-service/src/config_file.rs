@@ -194,17 +194,23 @@ pub fn testing_restore_dacl(path: &Path, sddl: &str) -> io::Result<()> {
 }
 
 fn ensure_file(path: &Path) -> io::Result<()> {
-    if let Ok(handle) = open_config(path, false) {
-        drop_handle(handle);
-        return Ok(());
-    }
-    let _user = crate::taskmgr::impersonate_console_user().map_err(io::Error::other)?;
     match open_config(path, false) {
         Ok(handle) => {
             drop_handle(handle);
             Ok(())
         }
         Err(error) if not_found(&error) => create_for_console_user(path),
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) => {
+            let _user = crate::taskmgr::impersonate_console_user().map_err(io::Error::other)?;
+            match open_config(path, false) {
+                Ok(handle) => {
+                    drop_handle(handle);
+                    Ok(())
+                }
+                Err(error) if not_found(&error) => create_for_console_user(path),
+                Err(error) => Err(error),
+            }
+        }
         Err(error) => Err(error),
     }
 }
