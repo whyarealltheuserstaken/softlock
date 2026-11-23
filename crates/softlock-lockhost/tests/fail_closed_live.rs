@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_TERMINATE, SYNCHRONIZE,
+    GetExitCodeProcess, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     TerminateProcess,
 };
 
@@ -124,7 +124,7 @@ fn live_fail_closed() {
         "kill-host" => {
             let pid = host_before.expect("lock host");
             let process = unsafe {
-                OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, false, pid).expect("open host")
+                OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid).expect("open host")
             };
             started = Instant::now();
             unsafe {
