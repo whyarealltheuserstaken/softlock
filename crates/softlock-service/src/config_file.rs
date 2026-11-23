@@ -65,7 +65,7 @@ fn config_reason(error: io::Error) -> &'static str {
     Box::leak(format!("cfg_{code}_{text}").into_boxed_str())
 }
 
-fn test_config_dir() -> Option<PathBuf> {
+pub(crate) fn test_config_dir() -> Option<PathBuf> {
     crate::authority::test_path("SOFTLOCK_CONFIG_DIR")
 }
 

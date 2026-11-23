@@ -443,11 +443,6 @@ impl Authority {
     /// Respawns when the host is gone. Retries the OS lock while it is down.
     /// Neither result is Unlocked.
     pub fn poll_host(&mut self, now: Instant, process_alive: bool) -> HostAction {
-        // A live host waits out the OS-lock chain. A dead one still fails closed.
-        #[cfg(windows)]
-        if process_alive && crate::windows::chain_running() {
-            return HostAction::Hold;
-        }
         let stale = self
             .last_beat
             .is_some_and(|last| now.saturating_duration_since(last) >= SILENCE);
@@ -474,6 +469,12 @@ impl Authority {
         {
             self.arm_replace = true;
             self.note_host_lost(HostLoss::Silent);
+        }
+        // A live host waits out the OS-lock chain. A dead host, and a host that
+        // missed HostReady, still fail closed.
+        #[cfg(windows)]
+        if process_alive && !self.arm_replace && crate::windows::chain_running() {
+            return HostAction::Hold;
         }
         // A dead Lock Host is replaced. While the session is still locked this
         // is the emergency recovery. After a normal unlock the replacement

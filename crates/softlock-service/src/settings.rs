@@ -140,22 +140,28 @@ impl SettingsEngine {
                 HardenError::Failed
             })?;
         self.config = None;
-        let path = crate::config_file::configured_path().map_err(|reason| {
-            crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
-            HardenError::Failed
-        })?;
-        let entry = crate::config_file::prepare_entry(&path).map_err(|reason| {
-            crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
-            HardenError::Failed
-        })?;
-        doc = with_config_acl(doc, entry.clone()).map_err(|fault| {
-            crate::audit(
-                "settings",
-                &[("result", "failed"), ("reason", fault_log(fault))],
-            );
-            HardenError::Failed
-        })?;
-        self.config = Some(entry);
+        // The seam 3 service runs as the console user. Setting a protected
+        // DACL on its private config file needs a privilege that user does
+        // not have, and a failed row fail-closes the lock. The hosted proof
+        // covers the real profile file as LocalSystem.
+        if crate::config_file::test_config_dir().is_none() {
+            let path = crate::config_file::configured_path().map_err(|reason| {
+                crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+                HardenError::Failed
+            })?;
+            let entry = crate::config_file::prepare_entry(&path).map_err(|reason| {
+                crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+                HardenError::Failed
+            })?;
+            doc = with_config_acl(doc, entry.clone()).map_err(|fault| {
+                crate::audit(
+                    "settings",
+                    &[("result", "failed"), ("reason", fault_log(fault))],
+                );
+                HardenError::Failed
+            })?;
+            self.config = Some(entry);
+        }
         self.pending = Some(doc);
         for (target, value) in &previous {
             let locked = lockdown_policy(target)
