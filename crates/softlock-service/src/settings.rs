@@ -577,16 +577,22 @@ mod path_and_menu {
     }
 
     fn symlink_file(link: &Path, target: &Path) {
-        let status = Command::new("cmd")
+        let output = Command::new("cmd")
             .args([
                 "/c",
                 "mklink",
                 &link.display().to_string(),
                 &target.display().to_string(),
             ])
-            .status()
+            .output()
             .expect("mklink");
-        assert!(status.success(), "symlink {:?} -> {:?}", link, target);
+        assert!(
+            output.status.success(),
+            "symlink {:?} -> {:?}: {}",
+            link,
+            target,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn write_owned(path: &Path, body: &[u8]) {
@@ -682,9 +688,14 @@ mod path_and_menu {
         let body = fs::read(&cmd).expect("read");
         let other = root.join("other.cmd");
         fs::write(&other, b"other").expect("other");
-        let linked_cmd = programs.join("linked.cmd");
+        let linked_cmd = PathBuf::from(format!(
+            r"C:\Windows\System32\softlock-menu-link-{}.cmd",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&linked_cmd);
         symlink_file(&linked_cmd, &other);
         let reparse_file = write_menu_new(&linked_cmd, b"nope\r\n");
+        let _ = fs::remove_file(&linked_cmd);
         let _ = fs::remove_dir(&link);
         let _ = fs::remove_dir_all(&root);
         assert_eq!(body, b"@echo off\r\nnew\r\n");
