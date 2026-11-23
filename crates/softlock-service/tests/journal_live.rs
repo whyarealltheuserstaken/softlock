@@ -1027,72 +1027,15 @@ fn confirmed_since(baseline: &str, expected: &str) -> bool {
 fn type_pin_keys() -> Result<(), String> {
     // Keeps the release-scan marker on the only build that can compile this
     // path. A product binary does not enable either feature. After the
-    // disconnect this thread is not on the input desktop, so SendInput from
-    // here returns success and the console hook never sees the keys.
-    // `last_physical_input_ms` stayed null on 3d6d754 for that reason. An
-    // interactive task runs on the console desktop, which is where the lock
-    // host installed its hook.
+    // disconnect this thread is not on the input desktop. The interactive
+    // task runs the lock host's `--type-pin` path, which uses the same
+    // `INPUT` layout as the product, on the console desktop.
     let _ = softlock_service::present_physical_marker_bytes();
-    let script = guard_dir().join("type-pin.ps1");
     let log = guard_dir().join("type-pin.txt");
     let _ = fs::remove_file(&log);
-    let body = format!(
-        r#"$ErrorActionPreference = 'Stop'
-$log = '{log}'
-try {{
-  Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class SoftlockPinKeys {{
-  [StructLayout(LayoutKind.Explicit, Size = 40)]
-  public struct INPUT {{
-    [FieldOffset(0)] public uint type;
-    [FieldOffset(8)] public ushort wVk;
-    [FieldOffset(10)] public ushort wScan;
-    [FieldOffset(12)] public uint dwFlags;
-    [FieldOffset(16)] public uint time;
-    [FieldOffset(24)] public ulong extra;
-  }}
-  [DllImport("user32.dll", SetLastError=true)]
-  public static extern uint SendInput(uint n, INPUT[] inputs, int cb);
-  [DllImport("user32.dll", SetLastError=true)]
-  public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
-  [DllImport("user32.dll", SetLastError=true)]
-  public static extern bool SetThreadDesktop(IntPtr desktop);
-}}
-'@
-  $desk = [SoftlockPinKeys]::OpenInputDesktop(0, $false, 0x1FF)
-  $switched = $false
-  if ($desk -ne [IntPtr]::Zero) {{
-    $switched = [SoftlockPinKeys]::SetThreadDesktop($desk)
-  }}
-  $extra = [Convert]::ToUInt64('5048595350494E31', 16)
-  foreach ($vk in 0x7C,0x31,0x33,0x35,0x37,0x34,0x32,0x0D) {{
-    $down = New-Object SoftlockPinKeys+INPUT
-    $down.type = 1
-    $down.wVk = [uint16]$vk
-    $down.extra = $extra
-    $up = New-Object SoftlockPinKeys+INPUT
-    $up.type = 1
-    $up.wVk = [uint16]$vk
-    $up.dwFlags = 2
-    $up.extra = $extra
-    $n = [SoftlockPinKeys]::SendInput(2, @($down, $up), 40)
-    if ($n -ne 2) {{
-      throw "send $vk n=$n err=$([Runtime.InteropServices.Marshal]::GetLastWin32Error()) desk=$desk switched=$switched"
-    }}
-    Start-Sleep -Milliseconds 80
-  }}
-  "ok desk=$desk switched=$switched" | Set-Content -LiteralPath $log
-}} catch {{
-  $_ | Out-String | Set-Content -LiteralPath $log
-  exit 1
-}}
-"#,
-        log = log.display(),
-    );
-    fs::write(&script, body).map_err(|_| "pin script".to_string())?;
-    run_interactive_task("sl-type-pin", &script)?;
+    let host = service_exe().with_file_name("softlock-lockhost.exe");
+    let bin = format!("\"{}\" --type-pin \"{}\"", host.display(), log.display());
+    run_interactive_task("sl-type-pin", &bin)?;
     let delivered = wait_until(Duration::from_secs(20), || log.is_file());
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "sl-type-pin", "/F"])
@@ -1110,7 +1053,7 @@ public static class SoftlockPinKeys {{
 
 #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
 #[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
-fn run_interactive_task(name: &str, script: &Path) -> Result<(), String> {
+fn run_interactive_task(name: &str, bin: &str) -> Result<(), String> {
     let user = Command::new("whoami")
         .output()
         .map_err(|_| "whoami".to_string())?;
@@ -1118,25 +1061,13 @@ fn run_interactive_task(name: &str, script: &Path) -> Result<(), String> {
     if user.is_empty() {
         return Err("whoami returned no user".to_string());
     }
-    let powershell = std::env::var("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
-        .join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
-    let bin = format!(
-        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
-        powershell.display(),
-        script.display()
-    );
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", name, "/F"])
         .status();
     let created = Command::new("schtasks")
         .args([
-            "/Create", "/TN", name, "/TR", &bin, "/SC", "ONCE", "/ST", "00:00", "/RU", &user,
-            "/IT", "/RL", "LIMITED", "/F",
+            "/Create", "/TN", name, "/TR", bin, "/SC", "ONCE", "/ST", "00:00", "/RU", &user, "/IT",
+            "/RL", "LIMITED", "/F",
         ])
         .output()
         .map_err(|_| "pin task".to_string())?;
@@ -1673,67 +1604,69 @@ fn capture() {
 }
 
 #[cfg(feature = "live-fail-closed")]
+fn repair_service_name() -> String {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    format!(
+        "slr{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+#[cfg(feature = "live-fail-closed")]
 fn repair_as_system() -> Result<(i32, String), String> {
-    let script = guard_dir().join("repair.ps1");
+    // A jumped clock stalls the task scheduler: `schtasks /Run` returns and
+    // the script never starts. A demand service does not consult that clock.
+    let script = guard_dir().join("repair.cmd");
     let code_path = guard_dir().join("repair-code.txt");
     let log_path = guard_dir().join("repair-out.txt");
     let out_path = guard_dir().join("repair-stdout.txt");
     let _ = fs::remove_file(&code_path);
     let body = format!(
-        "$ErrorActionPreference = 'Stop'\ntry {{\n  $p = Start-Process -FilePath '{exe}' -ArgumentList '--repair-settings' -Wait -PassThru -WindowStyle Hidden -RedirectStandardError '{log}' -RedirectStandardOutput '{out}'\n  Set-Content -LiteralPath '{code}' -Value $p.ExitCode -NoNewline\n}} catch {{\n  Set-Content -LiteralPath '{log}' -Value $_.Exception.Message\n  Set-Content -LiteralPath '{code}' -Value '1' -NoNewline\n}}\n",
+        "@echo off\r\n\"{exe}\" --repair-settings > \"{out}\" 2> \"{log}\"\r\necho %ERRORLEVEL%>\"{code}\"\r\n",
         exe = service_exe().display(),
         log = log_path.display(),
         out = out_path.display(),
         code = code_path.display(),
     );
     fs::write(&script, body).map_err(|_| "repair script".to_string())?;
-    let powershell = std::env::var("SystemRoot")
+    let cmd = std::env::var("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
         .join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
-    let bin = format!(
-        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
-        powershell.display(),
-        script.display()
-    );
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", "sl-repair", "/F"])
-        .status();
-    let created = Command::new("schtasks")
+        .join("cmd.exe");
+    let bin = format!("{} /c {}", cmd.display(), script.display());
+    // A second repair can start while `sc start` is still waiting on the
+    // first service, which refuses to leave the database. Each call gets
+    // its own name.
+    let name = repair_service_name();
+    let created = Command::new("sc")
         .args([
-            "/Create",
-            "/TN",
-            "sl-repair",
-            "/TR",
+            "create",
+            &name,
+            "binPath=",
             &bin,
-            "/SC",
-            "ONCE",
-            "/ST",
-            "00:00",
-            "/RU",
-            "SYSTEM",
-            "/RL",
-            "HIGHEST",
-            "/F",
+            "start=",
+            "demand",
+            "obj=",
+            "LocalSystem",
         ])
-        .status()
-        .map_err(|_| "repair task".to_string())?;
-    if !created.success() {
-        return Err("repair task was not created".to_string());
+        .output()
+        .map_err(|_| "repair service".to_string())?;
+    if !created.status.success() {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&created.stdout),
+            String::from_utf8_lossy(&created.stderr)
+        );
+        return Err(format!("repair service was not created ({text})"));
     }
-    let started = Command::new("schtasks")
-        .args(["/Run", "/TN", "sl-repair"])
-        .status()
-        .map_err(|_| "repair task".to_string())?;
-    let ready = started.success() && wait_until(Duration::from_secs(20), || code_path.is_file());
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", "sl-repair", "/F"])
-        .status();
+    // `sc start` waits for a service that never calls the service control
+    // manager. The script writes the exit code as soon as repair returns.
+    let _ = Command::new("sc").args(["start", &name]).spawn();
+    let ready = wait_until(Duration::from_secs(20), || code_path.is_file());
+    let _ = Command::new("sc").args(["delete", &name]).status();
     if !ready {
-        return Err("repair task did not finish".to_string());
+        return Err("repair service did not finish".to_string());
     }
     let code = fs::read_to_string(&code_path).unwrap_or_default();
     let code = code.trim().parse::<i32>().unwrap_or(1);
