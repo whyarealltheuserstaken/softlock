@@ -564,13 +564,18 @@ pub fn dacl_without_owner_write(dacl: &str, console_sid: &str) -> Result<String,
         };
         let ace = &rest[start..=start + end];
         let (rewritten, _) = rewrite_owner_ace(ace, console_sid)?;
-        out.push_str(&rewritten);
+        out.push_str(&explicit_ace(&rewritten));
         rest = &rest[start + end + 1..];
     }
     out.push_str(rest);
     // Without an Owner Rights ACE, Windows still grants the owner WRITE_DAC.
     if !out.contains(";;;OW)") && !out.to_ascii_uppercase().contains(";;;S-1-3-4)") {
         out.push_str("(A;;FR;;;OW)");
+    }
+    // A protected DACL must still name SYSTEM. An inherited-only copy is not
+    // enough once the parent can no longer grant it.
+    if !out.contains(";;;SY)") && !out.to_ascii_uppercase().contains(";;;S-1-5-18)") {
+        out.push_str("(A;;FA;;;SY)");
     }
     let protected = if let Some(rest) = out.strip_prefix("D:") {
         if rest.starts_with('P') {
@@ -585,6 +590,31 @@ pub fn dacl_without_owner_write(dacl: &str, console_sid: &str) -> Result<String,
         return Err(JournalFault::Value);
     }
     Ok(protected)
+}
+
+/// Drop the inherited-ACE flag. A protected DACL still evaluates an ACE
+/// marked inherited, but the copy must stand on its own after the parent
+/// stops granting the same access.
+fn explicit_ace(ace: &str) -> String {
+    let Some(inner) = ace
+        .strip_prefix('(')
+        .and_then(|text| text.strip_suffix(')'))
+    else {
+        return ace.to_string();
+    };
+    let parts: Vec<&str> = inner.split(';').collect();
+    if parts.len() != 6 {
+        return ace.to_string();
+    }
+    format!(
+        "({};{};{};{};{};{})",
+        parts[0],
+        parts[1].replace("ID", ""),
+        parts[2],
+        parts[3],
+        parts[4],
+        parts[5]
+    )
 }
 
 fn rewrite_owner_ace(ace: &str, owner: &str) -> Result<(String, bool), JournalFault> {
@@ -1656,11 +1686,12 @@ mod tests {
         );
         let locked = dacl_without_owner_write(&dacl, owner).expect("rewrite");
         assert!(locked.starts_with("D:P"), "{locked}");
-        assert!(locked.contains("(A;OICIID;FR;;;S-1-1-0)"), "{locked}");
-        assert!(locked.contains("(A;ID;FR;;;S-1-5-32-545)"), "{locked}");
-        assert!(locked.contains("(A;ID;FR;;;S-1-5-11)"), "{locked}");
+        assert!(locked.contains("(A;OICI;FR;;;S-1-1-0)"), "{locked}");
+        assert!(locked.contains("(A;;FR;;;S-1-5-32-545)"), "{locked}");
+        assert!(locked.contains("(A;;FR;;;S-1-5-11)"), "{locked}");
         assert!(locked.contains(&format!("(A;;FR;;;{owner})")), "{locked}");
-        assert!(!locked.contains("FA"), "{locked}");
+        assert!(locked.contains("(A;;FA;;;SY)"), "{locked}");
+        assert!(!locked.contains("ID"), "{locked}");
     }
 
     #[test]
@@ -1670,7 +1701,7 @@ mod tests {
         let locked = dacl_without_owner_write(&dacl, user).expect("rewrite");
         assert!(locked.starts_with("D:P"), "{locked}");
         assert!(locked.contains("(A;;FA;;;SY)"), "{locked}");
-        assert!(locked.contains(&format!("(A;ID;FR;;;{user})")), "{locked}");
+        assert!(locked.contains(&format!("(A;;FR;;;{user})")), "{locked}");
         assert!(!locked.contains(&format!("FA;;;{user}")), "{locked}");
     }
 

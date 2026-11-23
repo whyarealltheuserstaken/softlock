@@ -278,9 +278,45 @@ fn align_console() -> Result<(), String> {
 #[cfg(feature = "live-fail-closed")]
 fn restore_dacl_as_system(path: &Path, sddl: &str) -> Result<(), String> {
     let script = guard_dir().join("restore-dacl.ps1");
+    let log = guard_dir().join("restore-dacl.log");
+    let sddl = sddl.replace('\'', "''");
+    let path_text = path.display().to_string().replace('\'', "''");
     let body = format!(
-        "$sd = New-Object System.Security.AccessControl.FileSecurity\n$sd.SetSecurityDescriptorSddlForm('{sddl}')\nSet-Acl -LiteralPath '{path}' -AclObject $sd\n",
-        path = path.display(),
+        r#"$ErrorActionPreference = 'Stop'
+$log = '{log}'
+try {{
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class SoftlockAcl {{
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern int SetNamedSecurityInfo(string name, int type, int security, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string sddl, int revision, out IntPtr sd, out uint length);
+  [DllImport("advapi32.dll", SetLastError=true)]
+  public static extern bool GetSecurityDescriptorDacl(IntPtr sd, out bool present, out IntPtr dacl, out bool defaulted);
+}}
+'@
+  $sd = [IntPtr]::Zero
+  $length = [uint32]0
+  $converted = [SoftlockAcl]::ConvertStringSecurityDescriptorToSecurityDescriptor('{sddl}', 1, [ref]$sd, [ref]$length)
+  if (-not $converted) {{ throw "convert $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }}
+  $present = $false
+  $dacl = [IntPtr]::Zero
+  $defaulted = $false
+  [void][SoftlockAcl]::GetSecurityDescriptorDacl($sd, [ref]$present, [ref]$dacl, [ref]$defaulted)
+  if (-not $present) {{ throw 'no dacl' }}
+  $status = [SoftlockAcl]::SetNamedSecurityInfo('{path_text}', 1, 0x80000004, [IntPtr]::Zero, [IntPtr]::Zero, $dacl, [IntPtr]::Zero)
+  if ($status -ne 0) {{ throw "set $status" }}
+  'ok' | Set-Content -LiteralPath $log
+}} catch {{
+  $_ | Out-String | Set-Content -LiteralPath $log
+  exit 1
+}}
+"#,
+        log = log.display(),
+        sddl = sddl,
+        path_text = path_text,
     );
     fs::write(&script, body).map_err(|_| "dacl script".to_string())?;
     let powershell = std::env::var("SystemRoot")
@@ -323,7 +359,10 @@ fn restore_dacl_as_system(path: &Path, sddl: &str) -> Result<(), String> {
         let current = softlock_service::testing_dacl(path)
             .map_err(|error| error.to_string())
             .unwrap_or_else(|error| error);
-        Err(format!("dacl task did not restore write ({current})"))
+        let note = fs::read_to_string(&log).unwrap_or_default();
+        Err(format!(
+            "dacl task did not restore write ({current}) {note}"
+        ))
     }
 }
 
