@@ -112,13 +112,25 @@ pub fn apply_entry(entry: &SettingEntry) -> Result<(), &'static str> {
 }
 
 pub fn restore_entry(entry: &SettingEntry) -> Result<(), &'static str> {
+    let ordinary = restore_entry_ordinary(entry);
+    if ordinary.is_ok() {
+        return Ok(());
+    }
+    // The locked DACL, or one that denies SYSTEM WRITE_DAC, refuses the
+    // ordinary open. Take ownership and write the journaled previous with
+    // backup semantics. A failed restore still fail-closes.
+    let SettingValue::Sddl { value } = &entry.previous else {
+        return ordinary;
+    };
+    write_dacl_privileged(Path::new(&entry.path), entry.target == CONFIG_DIR, value)
+}
+
+fn restore_entry_ordinary(entry: &SettingEntry) -> Result<(), &'static str> {
     let handle = open_entry(entry).map_err(|_| "acl")?;
     let current = dacl_sddl_handle(handle).map_err(|_| "acl");
     let result = match current {
         Ok(current) => {
-            let current_value = SettingValue::Sddl {
-                value: current.clone(),
-            };
+            let current_value = SettingValue::Sddl { value: current };
             match restore_action(&entry.previous, &current_value).map_err(|_| "value")? {
                 Some(SettingValue::Sddl { value }) => set_dacl_handle(handle, &value),
                 Some(_) => Err("value"),
@@ -127,6 +139,24 @@ pub fn restore_entry(entry: &SettingEntry) -> Result<(), &'static str> {
         }
         Err(reason) => Err(reason),
     };
+    drop_handle(handle);
+    result
+}
+
+fn write_dacl_privileged(path: &Path, directory: bool, sddl: &str) -> Result<(), &'static str> {
+    use windows::Win32::Security::{SE_BACKUP_NAME, SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME};
+    let _take =
+        crate::secrets::enable_privilege_scoped(SE_TAKE_OWNERSHIP_NAME).map_err(|_| "privilege")?;
+    let _restore =
+        crate::secrets::enable_privilege_scoped(SE_RESTORE_NAME).map_err(|_| "privilege")?;
+    let _backup =
+        crate::secrets::enable_privilege_scoped(SE_BACKUP_NAME).map_err(|_| "privilege")?;
+    let handle = open_backup(path, directory).map_err(|_| "acl")?;
+    if refuse_reparse(handle).map_err(|_| "reparse")? {
+        drop_handle(handle);
+        return Err("reparse");
+    }
+    let result = set_dacl_handle(handle, sddl);
     drop_handle(handle);
     result
 }
@@ -327,16 +357,20 @@ fn reclaim_security(
         return Err("reparse");
     }
     let descriptor = format!("O:SY{locked}");
-    let result = set_security_handle(
+    let wrote = set_security_handle(
         handle,
         &descriptor,
         OWNER_SECURITY_INFORMATION
             | DACL_SECURITY_INFORMATION
             | PROTECTED_DACL_SECURITY_INFORMATION,
     );
-    if let Err(error) = result {
-        drop_handle(handle);
-        return Err(error);
+    if wrote.is_err() {
+        // SeTakeOwnershipPrivilege can name Administrators as the owner
+        // when naming SYSTEM is refused. Owner Rights still blocks a
+        // later WRITE_DAC, so the DACL write above has to have succeeded
+        // for a hostile descriptor. An owner change alone is enough when
+        // the ACEs are already the lock.
+        let _ = set_security_handle(handle, "O:BA", OWNER_SECURITY_INFORMATION);
     }
     let owner = owner_sid_handle(handle).map_err(|_| "acl");
     let dacl = dacl_sddl_handle(handle).map_err(|_| "acl");
@@ -345,9 +379,9 @@ fn reclaim_security(
         (Ok(owner), Ok(dacl)) if security_is_held(Some(&owner), Some(&dacl)) => Ok((owner, dacl)),
         (Ok(owner), Ok(dacl)) => {
             note_acl("acl-reclaimed", &Some(owner), &Some(dacl), false, false);
-            Err("acl")
+            Err(wrote.err().unwrap_or("acl"))
         }
-        _ => Err("acl"),
+        _ => Err(wrote.err().unwrap_or("acl")),
     }
 }
 
@@ -1031,6 +1065,18 @@ fn set_security_handle(
             GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut dacl_defaulted)
                 .map_err(|_| "acl")?;
         }
+    }
+    // Windows reads a protected DACL back as `D:PAI`. Putting that string
+    // through SetSecurityInfo with the protected bit set fails while the
+    // auto-inherit control bit is also set. The ACEs stay. The protected
+    // bit is the information flag below, not this control bit.
+    unsafe {
+        let _ = windows::Win32::Security::SetSecurityDescriptorControl(
+            descriptor,
+            windows::Win32::Security::SE_DACL_AUTO_INHERIT_REQ
+                | windows::Win32::Security::SE_DACL_AUTO_INHERITED,
+            windows::Win32::Security::SECURITY_DESCRIPTOR_CONTROL(0),
+        );
     }
     let status = unsafe {
         SetSecurityInfo(

@@ -562,6 +562,7 @@ fn kill_before_apply(guard: &mut Guard, previous: &str, order: KillOrder) -> Res
     }
     // The service is blocked after the flush. A stop file is not read until
     // that pause ends, which would apply the value. Kill it.
+    let baseline = log_baseline();
     stop_in_order(guard, order)?;
     if query_taskmgr() != previous {
         return Err(format!(
@@ -576,6 +577,7 @@ fn kill_before_apply(guard: &mut Guard, previous: &str, order: KillOrder) -> Res
     wait_os_held(
         previous,
         &format!("before {previous} {}", order_name(order)),
+        &baseline,
     )?;
     hard_stop(guard)?;
     clear_os_hold()?;
@@ -609,10 +611,11 @@ fn kill_after_apply(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
             order_name(order)
         ));
     }
+    let baseline = log_baseline();
     stop_in_order(guard, order)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
     spawn_service(guard, None, &pause, false)?;
-    wait_os_held("absent", &format!("after {}", order_name(order)))?;
+    wait_os_held("absent", &format!("after {}", order_name(order)), &baseline)?;
     // The owner coming back attaches the console again. The product never
     // reconnects a session. The restored value has to still be absent.
     realign()?;
@@ -630,10 +633,9 @@ fn kill_after_apply(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
     Ok(())
 }
 
-fn wait_os_held(expected: &str, label: &str) -> Result<(), String> {
+fn wait_os_held(expected: &str, label: &str, baseline: &str) -> Result<(), String> {
     let mut ended_unlocked = false;
     let mut last_state = String::new();
-    let baseline = log_baseline();
     let held = wait_until(Duration::from_secs(25), || {
         let status = transact(&pipe_name(), status_body()).unwrap_or_default();
         let state = status_state(&status).unwrap_or_default();
@@ -646,7 +648,7 @@ fn wait_os_held(expected: &str, label: &str) -> Result<(), String> {
         // reconnect on a real machine asks for credentials unless auto-logon
         // is on. A missing confirmation line cannot take this branch.
         if state == "Unlocked" && !os_held {
-            if confirmed_since(&baseline, expected) {
+            if confirmed_since(baseline, expected) {
                 return true;
             }
             ended_unlocked = true;
@@ -709,10 +711,11 @@ fn clock_one_order(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
             order_name(order)
         ));
     }
+    let baseline = log_baseline();
     stop_in_order(guard, order)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
     spawn_service(guard, None, &pause, false)?;
-    wait_os_held("absent", &format!("clock {}", order_name(order)))?;
+    wait_os_held("absent", &format!("clock {}", order_name(order)), &baseline)?;
     hard_stop(guard)?;
     clear_os_hold()?;
     Ok(())
@@ -1098,8 +1101,13 @@ fn pump_physical_pin_hook(
         let _ = ready.send(Err(()));
         return Err(());
     };
-    let _ = ready.send(Ok(()));
     let mut message = unsafe { std::mem::zeroed::<MSG>() };
+    // The hook is delivered on this thread's queue. The queue does not
+    // exist until the first peek. SendInput before that times the hook
+    // out and Windows removes it, so the guard still sees the key as
+    // injected.
+    let _ = unsafe { PeekMessageW(std::ptr::addr_of_mut!(message), None, 0, 0, PM_REMOVE) };
+    let _ = ready.send(Ok(()));
     while stop.try_recv().is_err() {
         while unsafe { PeekMessageW(std::ptr::addr_of_mut!(message), None, 0, 0, PM_REMOVE) }
             .as_bool()
