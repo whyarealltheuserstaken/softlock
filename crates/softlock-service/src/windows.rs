@@ -74,6 +74,9 @@ static HOST_SESSION: AtomicU64 = AtomicU64::new(u64::MAX);
 static PIN_STATUS: Mutex<String> = Mutex::new(String::new());
 static PIN_LOADED: Mutex<String> = Mutex::new(String::new());
 static SESSION_TX: Mutex<Option<Sender<SessionEvent>>> = Mutex::new(None);
+/// Set when the confirmed OS lock was a disconnect. The unlock notification
+/// that follows is not the owner signing back in. SPEC section 7.
+static DISCONNECT_HELD: AtomicBool = AtomicBool::new(false);
 
 const ACCEPT_CONTROLS: u32 = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SESSIONCHANGE;
 
@@ -213,6 +216,14 @@ fn run_os_lock(session: u32, caller: softlock_core::Caller) -> Result<(), OsLock
                     ("elapsed_us", &elapsed_us),
                     ("policy", softlock_core::policy_seam()),
                 ],
+            );
+            DISCONNECT_HELD.store(
+                matches!(
+                    method,
+                    softlock_core::Method::DisconnectConsole
+                        | softlock_core::Method::DisconnectOwnSession
+                ),
+                Ordering::Release,
             );
             Ok(())
         }
@@ -603,6 +614,12 @@ fn remember_pin_status() {
 
 fn apply_session_events(authority: &Arc<Mutex<Authority>>, events: &Receiver<SessionEvent>) {
     while let Ok(event) = events.try_recv() {
+        if matches!(event, SessionEvent::OsUnlocked) && DISCONNECT_HELD.load(Ordering::Acquire) {
+            // Disconnect confirms the OS lock. The unlock notice that Windows
+            // raises for that disconnect must not revert the marker and
+            // report Unlocked on the same session. SPEC section 7.
+            continue;
+        }
         let mut guard = authority
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());

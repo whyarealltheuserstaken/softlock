@@ -233,6 +233,16 @@ pub enum HeldStart {
     StayOsLocked,
 }
 
+/// A confirmed OS lock is released only when the logon actually changed.
+/// The same logon on an active console is not the owner signing back in.
+/// SPEC section 7 keeps that state `OsLocked`.
+pub fn release_os_hold(fact: SessionFact) -> bool {
+    matches!(
+        fact,
+        SessionFact::DifferentLogon | SessionFact::SessionGone | SessionFact::DifferentBoot
+    )
+}
+
 pub fn held_start(doc: &SettingsJournal, console_active: bool) -> Option<HeldStart> {
     if !doc.os_confirmed || doc.says_locked() || !doc.entries.is_empty() {
         return None;
@@ -1581,6 +1591,10 @@ mod tests {
         assert_eq!(held_start(&doc, true), Some(HeldStart::OwnerReturned));
         doc.says_locked = true;
         assert_eq!(held_start(&doc, false), None);
+        assert!(!release_os_hold(SessionFact::SameLogon));
+        assert!(!release_os_hold(SessionFact::Unknown));
+        assert!(release_os_hold(SessionFact::DifferentLogon));
+        assert!(release_os_hold(SessionFact::SessionGone));
     }
 
     #[test]

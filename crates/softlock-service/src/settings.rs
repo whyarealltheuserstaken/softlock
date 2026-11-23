@@ -14,8 +14,8 @@ use softlock_core::{
     SettingsJournal, StartAction, allowed_previous_for, commit_then_change, encode_document,
     executable_may_run_as_system, fault_log, held_start, lockdown_document, lockdown_policy,
     mark_workstation_clear, original_previous, parse_document, reassert_write, recovery_action,
-    repair_action, repair_entry_name, restore_action_for, restore_sid, with_config_acl,
-    workstation_value_after_attempt,
+    release_os_hold, repair_action, repair_entry_name, restore_action_for, restore_sid,
+    with_config_acl, workstation_value_after_attempt,
 };
 
 use crate::journal_store::{load_journal, save_journal};
@@ -92,6 +92,12 @@ impl SettingsEngine {
         if let Some(held) = held_start(&doc, console_active) {
             return match held {
                 HeldStart::OwnerReturned => {
+                    // An active console with the same logon is the desktop
+                    // we disconnected, not a new sign-in. Stay OsLocked.
+                    let fact = observe_lock(doc.lock, true);
+                    if !release_os_hold(fact) {
+                        return Ok(Boot::StayOsLocked);
+                    }
                     let empty = encode_document(&SettingsJournal::empty()).map_err(fault_log)?;
                     save_journal(&empty).map_err(|_| "not-durable")?;
                     Ok(Boot::Idle)

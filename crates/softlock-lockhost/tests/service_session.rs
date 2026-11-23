@@ -1229,9 +1229,12 @@ fn install_service(
         String::from_utf8_lossy(&created.stdout),
         String::from_utf8_lossy(&created.stderr)
     );
-    if !env.is_empty() {
-        set_service_environment(name, env);
-    }
+    let journal = std::env::temp_dir().join(format!("{name}-journal"));
+    let _ = fs::remove_dir_all(&journal);
+    fs::create_dir_all(&journal).expect("journal dir");
+    let mut service_env = env.to_vec();
+    service_env.push(format!("SOFTLOCK_JOURNAL_DIR={}", journal.display()));
+    set_service_environment(name, &service_env);
     let started = Command::new("sc.exe")
         .args(["start", name])
         .output()

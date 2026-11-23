@@ -100,7 +100,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p target
-          cargo tree -e features --locked \
+          cargo tree -e no-dev -e features --locked \
             -p softlock-app -p softlock-service -p softlock-lockhost \
             -p softlock-broker -p softlock-windows -p softlock-macos -p softlock-linux \
             > target/product-features.txt
@@ -192,7 +192,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p target
-          cargo tree -e features --locked \
+          cargo tree -e no-dev -e features --locked \
             -p softlock-app -p softlock-service -p softlock-lockhost \
             -p softlock-broker -p softlock-windows -p softlock-macos -p softlock-linux \
             > target/product-features.txt
@@ -308,7 +308,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p target
-          cargo tree -e features --locked \
+          cargo tree -e no-dev -e features --locked \
             -p softlock-app -p softlock-service -p softlock-lockhost \
             -p softlock-broker -p softlock-windows -p softlock-macos -p softlock-linux \
             > target/product-features.txt
