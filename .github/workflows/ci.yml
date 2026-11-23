@@ -687,43 +687,6 @@ jobs:
           print("ci suite ok", report["summary"])
           PY
 
-  # Temporary. Repeats the quit-lock hold test. Removed once those repeats are green.
-  flake-repeat:
-    name: flake repeat (${{ matrix.os }})
-    needs: changes
-    if: |
-      always() &&
-      needs.changes.result == 'success'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2022, windows-2025]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
-        with:
-          toolchain: 1.100.0
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: flake-repeat-${{ matrix.os }}
-      - name: Windows target
-        run: rustup target add x86_64-pc-windows-msvc
-      - name: Repeat the quit-lock hold test
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $filter = @(
-            'quit_os_lock_returns_before_the_call_finishes',
-            'a_quit_while_unlocking_schedules_once_the_session_is_locked'
-          )
-          cargo test --locked -p softlock-lockhost --features simulated-physical --lib --target x86_64-pc-windows-msvc -- @filter --test-threads=8
-          1..20 | ForEach-Object {
-            Write-Host "quit repeat $_"
-            cargo test --locked -p softlock-lockhost --features simulated-physical --lib --target x86_64-pc-windows-msvc -- @filter --test-threads=8
-          }
-
   ci-ok:
     name: ci ok
     runs-on: ubuntu-latest
@@ -736,7 +699,6 @@ jobs:
       - seam4
       - seam3
       - linux-hardware
-      - flake-repeat
     if: always()
     steps:
       - name: Required checks
@@ -762,4 +724,3 @@ jobs:
           check seam4 "${{ needs.seam4.result }}"
           check seam3 "${{ needs.seam3.result }}"
           check linux-hardware "${{ needs.linux-hardware.result }}"
-          check flake-repeat "${{ needs.flake-repeat.result }}"
