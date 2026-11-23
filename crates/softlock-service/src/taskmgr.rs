@@ -432,6 +432,42 @@ pub fn owner_config_file() -> Result<PathBuf, &'static str> {
     Ok(PathBuf::from(path))
 }
 
+pub struct ConsoleImpersonation {
+    token: HANDLE,
+}
+
+impl Drop for ConsoleImpersonation {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Security::RevertToSelf();
+            if !self.token.0.is_null() {
+                let _ = windows::Win32::Foundation::CloseHandle(self.token);
+            }
+        }
+    }
+}
+
+/// The profile is the console user's. LocalSystem may be denied on the way
+/// there, so the create runs as that user and then reverts.
+pub fn impersonate_console_user() -> Result<ConsoleImpersonation, &'static str> {
+    use windows::Win32::Security::ImpersonateLoggedOnUser;
+    let session = crate::windows::console_session();
+    if session == 0xFFFF_FFFF {
+        return Err("sid");
+    }
+    let mut token = HANDLE::default();
+    unsafe {
+        windows::Win32::System::RemoteDesktop::WTSQueryUserToken(session, &mut token)
+            .map_err(|_| "sid")?;
+        if let Err(error) = ImpersonateLoggedOnUser(token) {
+            let _ = windows::Win32::Foundation::CloseHandle(token);
+            let _ = error;
+            return Err("sid");
+        }
+    }
+    Ok(ConsoleImpersonation { token })
+}
+
 pub fn console_sid() -> Result<String, &'static str> {
     let session = crate::windows::console_session();
     if session == 0xFFFF_FFFF {

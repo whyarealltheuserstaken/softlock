@@ -61,43 +61,9 @@ pub fn configured_path() -> Result<PathBuf, &'static str> {
 }
 
 fn config_reason(error: io::Error) -> &'static str {
-    match error.raw_os_error() {
-        Some(2) => "config-2",
-        Some(3) => "config-3",
-        Some(5) => "config-5",
-        Some(50) => "config-50",
-        Some(32) => "config-32",
-        Some(87) => "config-87",
-        Some(123) => "config-123",
-        Some(161) => "config-161",
-        Some(267) => "config-267",
-        _ => {
-            let text = error.to_string();
-            match text.as_str() {
-                "reparse" => "config-reparse",
-                "sid" => "config-sid",
-                "drive" => "config-drive",
-                "name" => "config-name",
-                "config" => "config-path",
-                "acl" => "config-acl",
-                "privilege missing" => "config-privilege",
-                "open-5" => "open-5",
-                "open-2" => "open-2",
-                "open-3" => "open-3",
-                "create-5" => "create-5",
-                "create-3" => "create-3",
-                "claim-5" => "claim-5",
-                "claim-87" => "claim-87",
-                "claim-1307" => "claim-1307",
-                "write-5" => "write-5",
-                "open" => "open",
-                "create" => "create",
-                "claim" => "claim",
-                "write" => "write",
-                _ => "config",
-            }
-        }
-    }
+    let code = error.raw_os_error().unwrap_or(-1);
+    let text = error.to_string().replace(' ', "_");
+    Box::leak(format!("cfg_{code}_{text}").into_boxed_str())
 }
 
 fn test_config_dir() -> Option<PathBuf> {
@@ -227,6 +193,11 @@ pub fn testing_restore_dacl(path: &Path, sddl: &str) -> io::Result<()> {
 }
 
 fn ensure_file(path: &Path) -> io::Result<()> {
+    if let Ok(handle) = open_config(path, false) {
+        drop_handle(handle);
+        return Ok(());
+    }
+    let _user = crate::taskmgr::impersonate_console_user().map_err(io::Error::other)?;
     match open_config(path, false) {
         Ok(handle) => {
             drop_handle(handle);
