@@ -68,7 +68,11 @@ impl Session {
         fs::create_dir_all(&root).expect("temp");
         let pin_dir = root.join("pin");
         let log = root.join("service.log");
+        let journal_dir = root.join("journal");
+        let config_dir = root.join("config");
         fs::create_dir_all(&pin_dir).expect("pin dir");
+        fs::create_dir_all(&journal_dir).expect("journal dir");
+        fs::create_dir_all(&config_dir).expect("config dir");
         static PIPES: AtomicU64 = AtomicU64::new(0);
         let pipe = format!(
             r"\\.\pipe\softlock-e689-{}-{}",
@@ -85,6 +89,8 @@ impl Session {
             .env("SOFTLOCK_STUB_OS_LOCK", stub)
             .env("SOFTLOCK_PIN_DIR", &pin_dir)
             .env("SOFTLOCK_LOG", &log)
+            .env("SOFTLOCK_JOURNAL_DIR", &journal_dir)
+            .env("SOFTLOCK_CONFIG_DIR", &config_dir)
             .env("SOFTLOCK_PIPE", &pipe)
             .env("SOFTLOCK_RUN_NONCE", extra.to_string())
             .env("SOFTLOCK_INSTALL_DIR", r"C:\no\such\install")
