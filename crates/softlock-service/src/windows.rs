@@ -617,9 +617,9 @@ fn apply_session_events(authority: &Arc<Mutex<Authority>>, events: &Receiver<Ses
         if matches!(event, SessionEvent::OsUnlocked) && DISCONNECT_HELD.load(Ordering::Acquire) {
             // Windows raises an unlock notice for the disconnect itself,
             // including when some other console session is already active.
-            // That notice is not the owner signing back in. A lock-screen
-            // confirmation clears this flag, so a later real unlock still
-            // counts. SPEC section 7.
+            // That notice is not the owner signing back in. The supervisor
+            // clears this flag when the same logon is the console again,
+            // and that path runs the repair task's revert. SPEC section 7.
             continue;
         }
         let mut guard = authority
@@ -706,6 +706,7 @@ fn supervise(
             .try_lock()
             .map(|mut guard| guard.poll_host(Instant::now(), alive))
             .unwrap_or(HostAction::Hold);
+        release_returned_owner(&authority);
         drain_os_lock(&authority);
         if let HostAction::Respawn { arm: arm_again } = action {
             // The previous wait must not stay Waiting across this process.
@@ -733,6 +734,25 @@ fn supervise(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn release_returned_owner(authority: &Arc<Mutex<Authority>>) {
+    if !DISCONNECT_HELD.load(Ordering::Acquire) {
+        return;
+    }
+    let mut guard = authority
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !matches!(guard.state(), softlock_core::LockState::OsLocked { .. }) {
+        return;
+    }
+    if !guard.platform_mut().release_if_owner_returned() {
+        return;
+    }
+    // The marker is gone via repair_leftover, the same function
+    // `--repair-settings` runs. The next Lock in this process can start.
+    DISCONNECT_HELD.store(false, Ordering::Release);
+    guard.release_after_repair();
 }
 
 fn arm_frame(authority: &Arc<Mutex<Authority>>, id: u64) -> Option<Vec<u8>> {

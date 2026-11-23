@@ -311,6 +311,31 @@ impl SettingsEngine {
         Ok(())
     }
 
+    /// The owner signed back into the session this process disconnected.
+    /// Clears the marker with [`Self::repair_leftover`], the function
+    /// `--repair-settings` runs after `repair_action` allows `OsLocked`.
+    pub fn release_if_owner_returned(&mut self) -> Result<bool, &'static str> {
+        let Some(text) = load_journal().map_err(|_| "journal")? else {
+            return Ok(false);
+        };
+        let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
+        let Some(saved) = doc.lock else {
+            return Ok(false);
+        };
+        let state = if doc.os_confirmed {
+            softlock_core::ProductState::OsLocked
+        } else {
+            return Ok(false);
+        };
+        if softlock_core::sign_in_release(state, crate::taskmgr::owner_session_returned(saved))
+            != softlock_core::RepairAction::Revert
+        {
+            return Ok(false);
+        }
+        self.repair_leftover()?;
+        Ok(true)
+    }
+
     pub fn repair_leftover(&mut self) -> Result<(), &'static str> {
         let Some(text) = load_journal().map_err(|_| "journal")? else {
             return Ok(());

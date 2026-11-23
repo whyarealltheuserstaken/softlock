@@ -93,17 +93,8 @@ impl Authority {
     /// Loads a file that already exists when the service starts. A document
     /// that does not parse leaves the built-in config in place and is reported.
     pub fn load_existing_config(&mut self, text: &str) {
-        match softlock_core::Config::parse(text) {
-            Ok(_) => {
-                let revision = self.controller.config_revision();
-                let _ = self.handle_public(
-                    Role::App,
-                    RequestKind::PutConfig {
-                        toml: text.to_string(),
-                        base_revision: revision,
-                    },
-                );
-            }
+        match self.controller.install_startup_config(text) {
+            Ok(()) => {}
             Err(errors) => {
                 self.record_config_result(&ResponseKind::Invalid { errors });
             }
@@ -133,6 +124,10 @@ impl Authority {
 
     pub fn notify(&mut self, event: Event) {
         self.controller.handle(event);
+    }
+
+    pub fn release_after_repair(&mut self) {
+        self.controller.release_after_repair();
     }
 
     pub fn session_os_locked(&self) -> bool {
@@ -1044,12 +1039,13 @@ mod startup_config_tests {
         let mut authority = authority_in(&dir);
         authority
             .load_existing_config("schema_version = 1\n[lock]\nhotkey = \"Ctrl+Alt+Shift+K\"\n");
-        let ResponseKind::Config { toml, .. } =
+        let ResponseKind::Config { toml, revision } =
             authority.handle_public(Role::App, RequestKind::GetConfig)
         else {
             panic!("config");
         };
         assert!(toml.contains("Ctrl+Alt+Shift+K"), "{toml}");
+        assert_eq!(revision, 1, "startup load consumed the base revision");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

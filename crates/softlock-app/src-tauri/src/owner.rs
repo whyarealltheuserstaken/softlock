@@ -588,12 +588,15 @@ fn observe_config(seen: &mut String) {
         return;
     };
     if disk != *seen {
-        *seen = disk.clone();
         let locked = current_view().locked();
+        // A failed read of the effective config must not swallow the edit.
+        // The next poll tries the same bytes again.
         let Some(effective) = current_config() else {
             return;
         };
-        match actions::config_disk_action(locked, &effective, &disk) {
+        let action = actions::config_disk_action(locked, &effective, &disk);
+        *seen = disk.clone();
+        match action {
             actions::ConfigDisk::Save => {
                 let previous_hotkey = registered_hotkey();
                 if let Some(revision) = config_revision() {

@@ -579,6 +579,19 @@ pub fn current_lock_identity() -> Option<LockIdentity> {
     })
 }
 
+/// The console session is the one recorded at lock time, it is active, and
+/// the logon LUID matches. Used after this process confirmed a disconnect.
+pub fn owner_session_returned(saved: LockIdentity) -> bool {
+    let console = crate::windows::console_session();
+    let active = console_is_active().unwrap_or(false);
+    let logon = if console == u32::MAX {
+        None
+    } else {
+        logon_luid(console).ok()
+    };
+    softlock_core::owner_reconnected(saved, console, active, logon)
+}
+
 /// Compare the journaled uptime and logon with this boot. A failed query is
 /// [`SessionFact::Unknown`], which startup fails closed on. A wall-clock
 /// change is not a different boot: only a smaller unbiased uptime is.

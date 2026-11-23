@@ -1646,6 +1646,38 @@ fn failed_revert_after_sign_in_disarms_and_asks_for_repair() {
 }
 
 #[test]
+fn a_sign_in_repair_lets_the_next_lock_start_and_unlock() {
+    let mut controller = locked_started();
+    controller.handle(Event::HostExited);
+    controller.handle(Event::OsLockConfirmed);
+    assert!(
+        matches!(controller.state(), LockState::OsLocked { .. }),
+        "the disconnect did not confirm"
+    );
+    // The service has run repair_leftover. This is the state half of that route.
+    controller.release_after_repair();
+    assert!(
+        matches!(controller.state(), LockState::Unlocked),
+        "repair left {:?}",
+        controller.state()
+    );
+    controller.handle(Event::LockRequested {
+        source: LockSource::App,
+    });
+    assert!(
+        matches!(controller.state(), LockState::Locked { .. }),
+        "the next lock did not start: {:?}",
+        controller.state()
+    );
+    verify(&mut controller);
+    assert!(
+        matches!(controller.state(), LockState::Unlocked),
+        "the next lock did not unlock: {:?}",
+        controller.state()
+    );
+}
+
+#[test]
 fn os_lock_uses_the_console_session_and_its_result() {
     let mut platform = FakePlatform::new();
     platform.set_console_session(SessionId::from_raw(7));

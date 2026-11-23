@@ -290,6 +290,20 @@ impl<P: Platform> LockController<P> {
         self.config.revision()
     }
 
+    /// Install the on-disk document as the current revision. Does not bump.
+    pub fn install_startup_config(&mut self, toml: &str) -> Result<(), Vec<String>> {
+        self.config.install_startup(toml)
+    }
+
+    /// The ONLOGON repair task already reverted the journal. Leave `OsLocked`.
+    pub fn release_after_repair(&mut self) {
+        if matches!(self.state, LockState::OsLocked { .. }) {
+            self.session_os_locked = false;
+            self.broker_launched = false;
+            self.enter(LockState::Unlocked);
+        }
+    }
+
     pub fn config_toml(&self) -> &str {
         self.config.document()
     }

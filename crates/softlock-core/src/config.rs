@@ -106,6 +106,14 @@ impl ConfigStore {
         self.config.message()
     }
 
+    /// The file already on disk when the service starts is revision 1.
+    /// Loading it is not a user edit, so the revision does not move. A later
+    /// `PutConfig` still has to name that revision.
+    pub fn install_startup(&mut self, toml: &str) -> Result<(), Vec<String>> {
+        self.config = Config::parse(toml)?;
+        Ok(())
+    }
+
     pub fn apply(&mut self, toml: String, base_revision: u64) -> Result<(), ConfigError> {
         if base_revision != self.revision {
             return Err(ConfigError::Conflict);

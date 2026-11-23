@@ -83,6 +83,15 @@ impl ServicePlatform {
         engine.reassert_if_due()
     }
 
+    /// `true` when the ONLOGON repair path cleared the OsLocked marker.
+    #[cfg(windows)]
+    pub fn release_if_owner_returned(&mut self) -> bool {
+        let Some(engine) = self.settings.as_mut() else {
+            return false;
+        };
+        engine.release_if_owner_returned().unwrap_or(false)
+    }
+
     pub fn set_arm_wait(&mut self, arm: ArmWait) {
         self.arm = Some(arm);
     }

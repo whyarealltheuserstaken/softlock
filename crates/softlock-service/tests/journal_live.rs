@@ -72,6 +72,7 @@ fn live_settings_journal() {
         "restore" => restore(&mut guard),
         "recover-active" => recover_active(&mut guard),
         "clock" => clock_shift_stays_locked(&mut guard),
+        "sign-in" => sign_in_then_the_next_lock_unlocks(&mut guard),
         other => Err(format!("unknown case {other}")),
     };
     match outcome {
@@ -772,6 +773,211 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
         return Err("repair did not restore the absent value".to_string());
     }
     Ok(())
+}
+
+fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
+    realign()?;
+    set_taskmgr("absent")?;
+    seed_system_pin(&guard_dir().join("pin"))?;
+    let pause = guard_dir().join("pause-sign-in");
+    let _ = fs::remove_file(&pause);
+    spawn_service(guard, None, &pause, true)?;
+    wait_pipe()?;
+    let locked = transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+    if !locked.contains("Accepted") {
+        return Err(format!("first lock was not accepted: {locked}"));
+    }
+    if !wait_until(Duration::from_secs(20), || {
+        query_taskmgr() == "1"
+            && status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+                == Some("Locked")
+    }) {
+        return Err("first lock did not hold".to_string());
+    }
+    // The host dies. The service process stays up and confirms the disconnect.
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "softlock-lockhost.exe"])
+        .status();
+    if !wait_until(Duration::from_secs(25), session_os_held) {
+        let state = transact(&pipe_name(), status_body()).unwrap_or_default();
+        return Err(format!(
+            "the host death did not disconnect the console: {state}"
+        ));
+    }
+    // Same logon, same session, back on the console. This is the sign-in.
+    align_console()?;
+    if !wait_until(Duration::from_secs(20), || {
+        status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+            == Some("Unlocked")
+    }) {
+        let state = transact(&pipe_name(), status_body()).unwrap_or_default();
+        return Err(format!("sign-in did not clear OsLocked: {state}"));
+    }
+    let again =
+        transact(&pipe_name(), lock_now()).map_err(|error| format!("second lock: {error}"))?;
+    if !again.contains("Accepted") {
+        return Err(format!("the next lock did not start: {again}"));
+    }
+    if !wait_until(Duration::from_secs(20), || {
+        status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+            == Some("Locked")
+    }) {
+        let state = transact(&pipe_name(), status_body()).unwrap_or_default();
+        return Err(format!("the next lock did not reach Locked: {state}"));
+    }
+    type_pin_keys()?;
+    if !wait_until(Duration::from_secs(30), || {
+        status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+            == Some("Unlocked")
+    }) {
+        let state = transact(&pipe_name(), status_body()).unwrap_or_default();
+        return Err(format!("the next lock did not unlock: {state}"));
+    }
+    if query_taskmgr() != "absent" {
+        return Err(format!(
+            "unlock did not restore DisableTaskMgr ({})",
+            query_taskmgr()
+        ));
+    }
+    hard_stop(guard)?;
+    Ok(())
+}
+
+fn seed_system_pin(dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|_| "pin dir".to_string())?;
+    let secret = softlock_core::Secret::new(b"135742");
+    let hash = softlock_core::hash_softlock_pin(&secret).map_err(|_| "pin hash".to_string())?;
+    let staged = guard_dir().join("pin-hash.txt");
+    fs::write(&staged, hash.as_bytes()).map_err(|_| "pin stage".to_string())?;
+    let script = guard_dir().join("pin-seed.ps1");
+    let log = guard_dir().join("pin-seed.txt");
+    let pin_path = dir.join("pin.phc");
+    let body = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$log = '{log}'
+try {{
+  $hash = [IO.File]::ReadAllText('{staged}')
+  [IO.File]::WriteAllText('{pin}', $hash)
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class SoftlockPin {{
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string sddl, int revision, out IntPtr sd, out uint length);
+  [DllImport("advapi32.dll", SetLastError=true)]
+  public static extern bool GetSecurityDescriptorOwner(IntPtr sd, out IntPtr owner, out bool defaulted);
+  [DllImport("advapi32.dll", SetLastError=true)]
+  public static extern bool GetSecurityDescriptorDacl(IntPtr sd, out bool present, out IntPtr dacl, out bool defaulted);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern int SetNamedSecurityInfo(string name, int type, int security, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+}}
+'@
+  $sd = [IntPtr]::Zero
+  $length = [uint32]0
+  if (-not [SoftlockPin]::ConvertStringSecurityDescriptorToSecurityDescriptor('O:SYD:P(A;;FA;;;SY)', 1, [ref]$sd, [ref]$length)) {{
+    throw "convert $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+  }}
+  $owner = [IntPtr]::Zero
+  $ownerDefault = $false
+  [void][SoftlockPin]::GetSecurityDescriptorOwner($sd, [ref]$owner, [ref]$ownerDefault)
+  $present = $false
+  $dacl = [IntPtr]::Zero
+  $daclDefault = $false
+  [void][SoftlockPin]::GetSecurityDescriptorDacl($sd, [ref]$present, [ref]$dacl, [ref]$daclDefault)
+  $status = [SoftlockPin]::SetNamedSecurityInfo('{pin}', 1, 0x80000005, $owner, [IntPtr]::Zero, $dacl, [IntPtr]::Zero)
+  if ($status -ne 0) {{ throw "set $status" }}
+  'ok' | Set-Content -LiteralPath $log
+}} catch {{
+  $_ | Out-String | Set-Content -LiteralPath $log
+  exit 1
+}}
+"#,
+        log = log.display(),
+        staged = staged.display(),
+        pin = pin_path.display(),
+    );
+    fs::write(&script, body).map_err(|_| "pin script".to_string())?;
+    run_system_task("sl-pin", &script)?;
+    let _ = wait_until(Duration::from_secs(20), || log.is_file());
+    let note = fs::read_to_string(&log).unwrap_or_default();
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-pin", "/F"])
+        .status();
+    if note.trim() == "ok" {
+        Ok(())
+    } else {
+        Err(format!("pin seed failed ({note})"))
+    }
+}
+
+fn run_system_task(name: &str, script: &Path) -> Result<(), String> {
+    let powershell = std::env::var("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let bin = format!(
+        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
+        powershell.display(),
+        script.display()
+    );
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", name, "/F"])
+        .status();
+    let created = Command::new("schtasks")
+        .args([
+            "/Create", "/TN", name, "/TR", &bin, "/SC", "ONCE", "/ST", "00:00", "/RU", "SYSTEM",
+            "/RL", "HIGHEST", "/F",
+        ])
+        .status()
+        .map_err(|_| "task".to_string())?;
+    if !created.success() {
+        return Err(format!("{name} was not created"));
+    }
+    let _ = Command::new("schtasks")
+        .args(["/Run", "/TN", name])
+        .status();
+    Ok(())
+}
+
+fn type_pin_keys() -> Result<(), String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
+    let mut keys = vec![0x7Cu16];
+    keys.extend(b"135742".iter().copied().map(u16::from));
+    keys.push(0x0D);
+    for vk in keys {
+        let input = [pin_key(vk, false), pin_key(vk, true)];
+        let sent = unsafe { SendInput(&input, std::mem::size_of::<INPUT>() as i32) };
+        if sent != 2 {
+            return Err("the pin key was not delivered".to_string());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+fn pin_key(virtual_key: u16, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    };
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(virtual_key),
+                wScan: 0,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
 }
 
 fn recover_active(guard: &mut Guard) -> Result<(), String> {

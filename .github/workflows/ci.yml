@@ -93,6 +93,8 @@ jobs:
             2>&1 | tee target/seam1.txt
           grep -F "published_schema_accepts_the_default_and_rejects_an_unknown_field ... ok" target/seam1.txt
           grep -F "the_config_path_is_only_the_owner_profile_file ... ok" target/seam1.txt
+          grep -F "a_real_sign_in_clears_os_locked_by_the_repair_route ... ok" target/seam1.txt
+          grep -F "a_sign_in_repair_lets_the_next_lock_start_and_unlock ... ok" target/seam1.txt
           grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam1.txt
           grep -F "inherited_group_write_aces_lose_write_with_the_owner ... ok" target/seam1.txt
           grep -F "a_locked_file_edit_is_offered_and_an_unlocked_edit_is_saved ... ok" target/seam1.txt
@@ -185,6 +187,8 @@ jobs:
             2>&1 | tee target/seam1.txt
           grep -F "published_schema_accepts_the_default_and_rejects_an_unknown_field ... ok" target/seam1.txt
           grep -F "the_config_path_is_only_the_owner_profile_file ... ok" target/seam1.txt
+          grep -F "a_real_sign_in_clears_os_locked_by_the_repair_route ... ok" target/seam1.txt
+          grep -F "a_sign_in_repair_lets_the_next_lock_start_and_unlock ... ok" target/seam1.txt
           grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam1.txt
           grep -F "inherited_group_write_aces_lose_write_with_the_owner ... ok" target/seam1.txt
           grep -F "a_locked_file_edit_is_offered_and_an_unlocked_edit_is_saved ... ok" target/seam1.txt
@@ -301,6 +305,8 @@ jobs:
             2>&1 | tee target/seam1.txt
           grep -F "published_schema_accepts_the_default_and_rejects_an_unknown_field ... ok" target/seam1.txt
           grep -F "the_config_path_is_only_the_owner_profile_file ... ok" target/seam1.txt
+          grep -F "a_real_sign_in_clears_os_locked_by_the_repair_route ... ok" target/seam1.txt
+          grep -F "a_sign_in_repair_lets_the_next_lock_start_and_unlock ... ok" target/seam1.txt
           grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam1.txt
           grep -F "inherited_group_write_aces_lose_write_with_the_owner ... ok" target/seam1.txt
           grep -F "a_locked_file_edit_is_offered_and_an_unlocked_edit_is_saved ... ok" target/seam1.txt

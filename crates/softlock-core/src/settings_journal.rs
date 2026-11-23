@@ -233,9 +233,41 @@ pub enum HeldStart {
     StayOsLocked,
 }
 
+/// The locked session is the console again, and it is the same logon.
+/// A different console session, or the same session while it is still
+/// disconnected, is not a sign-in.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn owner_reconnected(
+    saved: LockIdentity,
+    console_session: u32,
+    console_active: bool,
+    console_logon: Option<u64>,
+) -> bool {
+    console_active
+        && console_session != u32::MAX
+        && console_session == saved.session
+        && console_logon.is_some_and(|logon| logon == saved.logon && logon != 0)
+}
+
+/// A running service that confirmed a disconnect uses this when the owner
+/// is back. It is [`repair_action`] for `OsLocked`: the same revert the
+/// ONLOGON repair task runs. A soft lock does not take this path.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn sign_in_release(state: ProductState, reconnected: bool) -> RepairAction {
+    if reconnected
+        && repair_action(state) == RepairAction::Revert
+        && state == ProductState::OsLocked
+    {
+        RepairAction::Revert
+    } else {
+        RepairAction::Refuse
+    }
+}
+
 /// A confirmed OS lock is released only when the logon actually changed.
-/// The same logon on an active console is not the owner signing back in.
-/// SPEC section 7 keeps that state `OsLocked`.
+/// The same logon on an active console is not, by itself, a new sign-in.
+/// The running service uses [`owner_reconnected`] for that. SPEC section 7
+/// keeps a restart `OsLocked` until then.
 pub fn release_os_hold(fact: SessionFact) -> bool {
     matches!(
         fact,
@@ -831,6 +863,9 @@ pub fn sddl_allowed(text: &str) -> bool {
 }
 
 pub fn config_path_allowed(path: &str) -> bool {
+    if configured_file_allowed(path) {
+        return true;
+    }
     if path.len() < 8 || path.len() > 260 || path.contains("..") || path.contains('/') {
         return false;
     }
@@ -856,6 +891,43 @@ pub fn config_path_allowed(path: &str) -> bool {
 pub fn config_dir_allowed(path: &str) -> bool {
     let file = format!("{path}\\{}", crate::config::CONFIG_FILE_NAME);
     config_path_allowed(&file)
+}
+
+/// The service's own config file when `SOFTLOCK_CONFIG_DIR` names it.
+/// The roaming profile check still rejects every other path. A journal
+/// cannot retarget the DACL at `C:\Windows` or at a path the service did
+/// not open.
+fn configured_file_allowed(path: &str) -> bool {
+    let Ok(dir) = std::env::var("SOFTLOCK_CONFIG_DIR") else {
+        return false;
+    };
+    configured_file_matches(path, &dir)
+}
+
+fn configured_file_matches(path: &str, dir: &str) -> bool {
+    if dir.is_empty()
+        || dir.contains("..")
+        || dir.contains('"')
+        || dir.contains('*')
+        || dir.contains('/')
+    {
+        return false;
+    }
+    let dir = dir.trim_end_matches(['\\', '/']);
+    let expected = format!("{dir}\\{}", crate::config::CONFIG_FILE_NAME);
+    if !path.eq_ignore_ascii_case(&expected) {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    let lower = path.to_ascii_lowercase();
+    bytes.len() >= 8
+        && bytes.len() <= 260
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && path.chars().all(|c| c.is_ascii() && !c.is_control())
+        && !lower.contains("\\windows\\")
+        && !lower.contains("\\program files")
 }
 
 fn profile_root_allowed(profile: &str) -> bool {
@@ -1637,6 +1709,37 @@ mod tests {
     }
 
     #[test]
+    fn a_real_sign_in_clears_os_locked_by_the_repair_route() {
+        let saved = LockIdentity {
+            boot: 10,
+            session: 2,
+            logon: 99,
+        };
+        // Same logon, same session, console active: the owner reconnected.
+        assert!(owner_reconnected(saved, 2, true, Some(99)));
+        // Still disconnected, a different console, or a different logon.
+        assert!(!owner_reconnected(saved, 2, false, Some(99)));
+        assert!(!owner_reconnected(saved, 4, true, Some(99)));
+        assert!(!owner_reconnected(saved, 2, true, Some(7)));
+        assert!(!owner_reconnected(saved, 2, true, None));
+        // The release is repair_action(OsLocked), which is the ONLOGON task.
+        assert_eq!(
+            sign_in_release(ProductState::OsLocked, true),
+            repair_action(ProductState::OsLocked)
+        );
+        assert_eq!(repair_action(ProductState::OsLocked), RepairAction::Revert);
+        assert_eq!(
+            sign_in_release(ProductState::OsLocked, false),
+            RepairAction::Refuse
+        );
+        // A soft lock is not ended by the console coming back.
+        assert_eq!(
+            sign_in_release(ProductState::Locked, true),
+            RepairAction::Refuse
+        );
+    }
+
+    #[test]
     fn a_real_reboot_reverts_to_unlocked() {
         let doc = task_manager_document(ALICE, SettingValue::Absent, 0).expect("journal");
         let fact = fact_after_boot(50_000_000_000, Some(10), SessionFact::SameLogon);
@@ -1978,6 +2081,25 @@ mod tests {
         assert!(!journal_dacl_exact("D:P(A;;FA;;;SY)(A;;FA;;;WD)"));
         assert!(!journal_dacl_exact("D:P(A;OICI;FA;;;SY)(A;;FA;;;BA)"));
         assert!(!journal_dacl_exact("D:P(D;;FA;;;SY)(A;;FA;;;BA)"));
+    }
+
+    #[test]
+    fn the_service_config_dir_can_be_locked() {
+        let dir = r"C:\Users\owner\AppData\Local\Temp\sl-cfg";
+        let file = format!(r"{dir}\config.toml");
+        assert!(configured_file_matches(&file, dir));
+        assert!(configured_file_matches(&format!(r"{dir}\Config.toml"), dir));
+        assert!(configured_file_matches(r"C:\Temp\config.toml", r"C:\Temp"));
+        assert!(!configured_file_matches(
+            r"C:\Windows\System32\config.toml",
+            r"C:\Windows\System32"
+        ));
+        assert!(!configured_file_matches(
+            r"C:\Program Files\SoftLock\config.toml",
+            r"C:\Program Files\SoftLock"
+        ));
+        assert!(!configured_file_matches(&file, r"C:\Temp"));
+        assert!(!configured_file_matches(&file, r"C:\Users\owner\..\Temp"));
     }
 
     #[test]
