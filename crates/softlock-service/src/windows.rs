@@ -1423,6 +1423,7 @@ fn host_test_env(key: &str) -> bool {
     if key.eq_ignore_ascii_case("SOFTLOCK_FORCE_GUARD_DOWN")
         || key.eq_ignore_ascii_case("SOFTLOCK_HOST_READY")
         || key.eq_ignore_ascii_case("SOFTLOCK_PRESENT_PHYSICAL")
+        || key.eq_ignore_ascii_case("SOFTLOCK_TYPE_PIN")
         || key.eq_ignore_ascii_case("GITHUB_ACTIONS")
         || key.eq_ignore_ascii_case("RUNNER_ENVIRONMENT")
     {

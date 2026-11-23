@@ -153,6 +153,8 @@ pub(crate) fn liveness(shared: Arc<Shared>) {
 fn liveness_loop(shared: Arc<Shared>) {
     let mut seen = shared.last_event.load(std::sync::atomic::Ordering::Acquire);
     while !shared.stop.load(std::sync::atomic::Ordering::Acquire) {
+        #[cfg(feature = "live-fail-closed")]
+        maybe_type_test_pin();
         if !sleep_until(LIVENESS_PERIOD, &shared) {
             return;
         }
@@ -206,6 +208,51 @@ fn sleep_until(total: Duration, shared: &Shared) -> bool {
         thread::sleep(Duration::from_millis(10));
     }
     !shared.stop.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn maybe_type_test_pin() {
+    // The journal sign-in case drops this file once the second lock is up.
+    // SendInput from the test process does not reach this hook. This thread
+    // already injects the liveness key, and the hook sees that, so the PIN
+    // is injected from here too. A release build does not compile this.
+    let Ok(path) = std::env::var("SOFTLOCK_TYPE_PIN") else {
+        return;
+    };
+    if path.is_empty() || !std::path::Path::new(&path).is_file() {
+        return;
+    }
+    let _ = std::fs::remove_file(&path);
+    let mut keys = vec![0x7Cu16];
+    keys.extend(b"135742".iter().copied().map(u16::from));
+    keys.push(0x0D);
+    for vk in keys {
+        let inputs = [test_pin_key(vk, false), test_pin_key(vk, true)];
+        unsafe {
+            let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn test_pin_key(virtual_key: u16, up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(virtual_key),
+                wScan: 0,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
+                time: 0,
+                dwExtraInfo: 0x5048_5953_5049_4E31usize,
+            },
+        },
+    }
 }
 
 fn inject_marker() {

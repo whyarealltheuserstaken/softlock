@@ -1300,14 +1300,9 @@ fn apply_simulated_environment(shared: &Shared) {
 
 pub fn run_service_host() -> i32 {
     use std::os::windows::io::FromRawHandle;
-    // The journal sign-in task runs this process on the console desktop.
-    // A PowerShell `SendInput` buffer is not a native `INPUT` array, so it
-    // can report success and never deliver a key. A release build has
-    // neither argument.
-    #[cfg(feature = "live-fail-closed")]
-    if let Some(log) = type_pin_log() {
-        return type_test_pin(&log);
-    }
+    // The journal sign-in case asks this build to count injected keys as
+    // physical. A release build does not accept the argument. The PIN itself
+    // is injected by the liveness thread, which is the thread the hook sees.
     #[cfg(feature = "live-fail-closed")]
     if std::env::args().any(|arg| arg == "--present-physical") {
         crate::classify::arm_present_physical();
@@ -1368,72 +1363,6 @@ pub fn run_service_host() -> i32 {
     drop(ready_rx);
     shutdown(&shared);
     0
-}
-
-#[cfg(feature = "live-fail-closed")]
-fn type_pin_log() -> Option<String> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--type-pin" {
-            return args.next();
-        }
-    }
-    None
-}
-
-#[cfg(feature = "live-fail-closed")]
-fn type_test_pin(log: &str) -> i32 {
-    use windows::Win32::System::StationsAndDesktops::{
-        DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, OpenInputDesktop, SetThreadDesktop,
-    };
-    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
-    let _ = crate::classify::arm_present_physical();
-    unsafe {
-        if let Ok(desktop) = OpenInputDesktop(
-            DESKTOP_CONTROL_FLAGS(0),
-            false,
-            DESKTOP_ACCESS_FLAGS(0x01FF),
-        ) {
-            let _ = SetThreadDesktop(desktop);
-        }
-    }
-    let mut keys = vec![0x7Cu16];
-    keys.extend(b"135742".iter().copied().map(u16::from));
-    keys.push(0x0D);
-    for vk in keys {
-        let input = [pin_input(vk, false), pin_input(vk, true)];
-        let sent = unsafe { SendInput(&input, std::mem::size_of::<INPUT>() as i32) };
-        if sent != 2 {
-            let _ = std::fs::write(log, format!("send {vk} returned {sent}"));
-            return 1;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(80));
-    }
-    let _ = std::fs::write(log, "ok");
-    0
-}
-
-#[cfg(feature = "live-fail-closed")]
-fn pin_input(virtual_key: u16, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
-    };
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(virtual_key),
-                wScan: 0,
-                dwFlags: if up {
-                    KEYEVENTF_KEYUP
-                } else {
-                    Default::default()
-                },
-                time: 0,
-                dwExtraInfo: 0x5048_5953_5049_4E31usize,
-            },
-        },
-    }
 }
 
 fn host_read_loop(mut file: std::fs::File, commands: std::sync::mpsc::Sender<PipeCommand>) {

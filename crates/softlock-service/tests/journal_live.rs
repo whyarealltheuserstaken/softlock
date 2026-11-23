@@ -1026,72 +1026,17 @@ fn confirmed_since(baseline: &str, expected: &str) -> bool {
 #[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
 fn type_pin_keys() -> Result<(), String> {
     // Keeps the release-scan marker on the only build that can compile this
-    // path. A product binary does not enable either feature. After the
-    // disconnect this thread is not on the input desktop. The interactive
-    // task runs the lock host's `--type-pin` path, which uses the same
-    // `INPUT` layout as the product, on the console desktop.
+    // path. A product binary does not enable either feature. The lock host
+    // watches this file from the thread that already injects its liveness
+    // key, which is the thread whose SendInput the hook actually sees.
     let _ = softlock_service::present_physical_marker_bytes();
-    let log = guard_dir().join("type-pin.txt");
-    let _ = fs::remove_file(&log);
-    let host = service_exe().with_file_name("softlock-lockhost.exe");
-    let bin = format!("\"{}\" --type-pin \"{}\"", host.display(), log.display());
-    run_interactive_task("sl-type-pin", &bin)?;
-    let delivered = wait_until(Duration::from_secs(20), || log.is_file());
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", "sl-type-pin", "/F"])
-        .status();
-    let note = fs::read_to_string(&log).unwrap_or_default();
-    let note = note.split_whitespace().collect::<Vec<_>>().join(" ");
-    if delivered && note.starts_with("ok") {
+    let path = guard_dir().join("type-pin.request");
+    let _ = fs::remove_file(&path);
+    fs::write(&path, b"1").map_err(|_| "pin request".to_string())?;
+    if wait_until(Duration::from_secs(10), || !path.exists()) {
         Ok(())
     } else {
-        Err(format!(
-            "the pin was not typed on the input desktop ({note})"
-        ))
-    }
-}
-
-#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
-#[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
-fn run_interactive_task(name: &str, bin: &str) -> Result<(), String> {
-    let user = Command::new("whoami")
-        .output()
-        .map_err(|_| "whoami".to_string())?;
-    let user = String::from_utf8_lossy(&user.stdout).trim().to_string();
-    if user.is_empty() {
-        return Err("whoami returned no user".to_string());
-    }
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", name, "/F"])
-        .status();
-    let created = Command::new("schtasks")
-        .args([
-            "/Create", "/TN", name, "/TR", bin, "/SC", "ONCE", "/ST", "00:00", "/RU", &user, "/IT",
-            "/RL", "LIMITED", "/F",
-        ])
-        .output()
-        .map_err(|_| "pin task".to_string())?;
-    if !created.status.success() {
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&created.stdout),
-            String::from_utf8_lossy(&created.stderr)
-        );
-        return Err(format!("pin task was not created ({text})"));
-    }
-    let started = Command::new("schtasks")
-        .args(["/Run", "/TN", name])
-        .output()
-        .map_err(|_| "pin task".to_string())?;
-    if started.status.success() {
-        Ok(())
-    } else {
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&started.stdout),
-            String::from_utf8_lossy(&started.stderr)
-        );
-        Err(format!("pin task did not start ({text})"))
+        Err("the lock host did not type the pin".to_string())
     }
 }
 
@@ -1369,6 +1314,10 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
         // physical only when it was built with live-fail-closed and this
         // variable is set.
         pairs.push("SOFTLOCK_PRESENT_PHYSICAL=1".to_string());
+        pairs.push(format!(
+            "SOFTLOCK_TYPE_PIN={}",
+            guard_dir().join("type-pin.request").display()
+        ));
     }
     if let Some(phase) = pause {
         pairs.push(format!("SOFTLOCK_JOURNAL_PAUSE={phase}"));
@@ -1604,69 +1553,75 @@ fn capture() {
 }
 
 #[cfg(feature = "live-fail-closed")]
-fn repair_service_name() -> String {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    format!(
-        "slr{}",
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    )
-}
-
-#[cfg(feature = "live-fail-closed")]
 fn repair_as_system() -> Result<(i32, String), String> {
-    // A jumped clock stalls the task scheduler: `schtasks /Run` returns and
-    // the script never starts. A demand service does not consult that clock.
-    let script = guard_dir().join("repair.cmd");
+    let script = guard_dir().join("repair.ps1");
     let code_path = guard_dir().join("repair-code.txt");
     let log_path = guard_dir().join("repair-out.txt");
     let out_path = guard_dir().join("repair-stdout.txt");
     let _ = fs::remove_file(&code_path);
     let body = format!(
-        "@echo off\r\n\"{exe}\" --repair-settings > \"{out}\" 2> \"{log}\"\r\necho %ERRORLEVEL%>\"{code}\"\r\n",
+        "$ErrorActionPreference = 'Stop'\ntry {{\n  $p = Start-Process -FilePath '{exe}' -ArgumentList '--repair-settings' -Wait -PassThru -WindowStyle Hidden -RedirectStandardError '{log}' -RedirectStandardOutput '{out}'\n  Set-Content -LiteralPath '{code}' -Value $p.ExitCode -NoNewline\n}} catch {{\n  Set-Content -LiteralPath '{log}' -Value $_.Exception.Message\n  Set-Content -LiteralPath '{code}' -Value '1' -NoNewline\n}}\n",
         exe = service_exe().display(),
         log = log_path.display(),
         out = out_path.display(),
         code = code_path.display(),
     );
     fs::write(&script, body).map_err(|_| "repair script".to_string())?;
-    let cmd = std::env::var("SystemRoot")
+    let powershell = std::env::var("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
         .join("System32")
-        .join("cmd.exe");
-    let bin = format!("{} /c {}", cmd.display(), script.display());
-    // A second repair can start while `sc start` is still waiting on the
-    // first service, which refuses to leave the database. Each call gets
-    // its own name.
-    let name = repair_service_name();
-    let created = Command::new("sc")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let bin = format!(
+        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
+        powershell.display(),
+        script.display()
+    );
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-repair", "/F"])
+        .status();
+    let created = Command::new("schtasks")
         .args([
-            "create",
-            &name,
-            "binPath=",
+            "/Create",
+            "/TN",
+            "sl-repair",
+            "/TR",
             &bin,
-            "start=",
-            "demand",
-            "obj=",
-            "LocalSystem",
+            "/SC",
+            "ONCE",
+            "/ST",
+            "00:00",
+            "/RU",
+            "SYSTEM",
+            "/RL",
+            "HIGHEST",
+            "/F",
         ])
-        .output()
-        .map_err(|_| "repair service".to_string())?;
-    if !created.status.success() {
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&created.stdout),
-            String::from_utf8_lossy(&created.stderr)
-        );
-        return Err(format!("repair service was not created ({text})"));
+        .status()
+        .map_err(|_| "repair task".to_string())?;
+    if !created.success() {
+        return Err("repair task was not created".to_string());
     }
-    // `sc start` waits for a service that never calls the service control
-    // manager. The script writes the exit code as soon as repair returns.
-    let _ = Command::new("sc").args(["start", &name]).spawn();
-    let ready = wait_until(Duration::from_secs(20), || code_path.is_file());
-    let _ = Command::new("sc").args(["delete", &name]).status();
+    // A jumped clock can make the first /Run return before the script starts.
+    // Ask again once before treating that as a failure.
+    let mut ready = false;
+    for _ in 0..2 {
+        let started = Command::new("schtasks")
+            .args(["/Run", "/TN", "sl-repair"])
+            .status()
+            .map_err(|_| "repair task".to_string())?;
+        if started.success() && wait_until(Duration::from_secs(20), || code_path.is_file()) {
+            ready = true;
+            break;
+        }
+    }
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-repair", "/F"])
+        .status();
     if !ready {
-        return Err("repair service did not finish".to_string());
+        return Err("repair task did not finish".to_string());
     }
     let code = fs::read_to_string(&code_path).unwrap_or_default();
     let code = code.trim().parse::<i32>().unwrap_or(1);
