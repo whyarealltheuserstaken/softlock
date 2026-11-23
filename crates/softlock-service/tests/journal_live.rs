@@ -812,24 +812,42 @@ fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
         return Err("first lock did not hold".to_string());
     }
     // The host dies. The service process stays up and confirms the disconnect.
+    // The runner's auto-logon can bring this logon back before the next
+    // sample. That is the sign-in, so Unlocked after the confirmation is
+    // the same success as a disconnect we still have to reconnect.
+    let log_at = fs::read_to_string(guard_dir().join("service.log"))
+        .map(|text| text.len())
+        .unwrap_or(0);
     let _ = Command::new("taskkill")
         .args(["/F", "/IM", "softlock-lockhost.exe"])
         .status();
-    if !wait_until(Duration::from_secs(25), session_os_held) {
+    let held = wait_until(Duration::from_secs(25), || {
+        session_os_held()
+            || (status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+                == Some("Unlocked")
+                && confirmed_since(log_at))
+    });
+    let signed_back = !session_os_held()
+        && status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+            == Some("Unlocked")
+        && confirmed_since(log_at);
+    if !held && !signed_back {
         let state = transact(&pipe_name(), status_body()).unwrap_or_default();
         return Err(format!(
             "the host death did not disconnect the console: {state}"
         ));
     }
-    // Same logon, same session, back on the console. The service clears
-    // OsLocked itself once that sign-in is the console. No repair command.
-    align_console()?;
-    if !wait_until(Duration::from_secs(25), || {
-        status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
-            == Some("Unlocked")
-    }) {
-        let state = transact(&pipe_name(), status_body()).unwrap_or_default();
-        return Err(format!("sign-in did not clear OsLocked: {state}"));
+    if !signed_back {
+        // Same logon, same session, back on the console. The service clears
+        // OsLocked itself once that sign-in is the console. No repair command.
+        align_console()?;
+        if !wait_until(Duration::from_secs(25), || {
+            status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+                == Some("Unlocked")
+        }) {
+            let state = transact(&pipe_name(), status_body()).unwrap_or_default();
+            return Err(format!("sign-in did not clear OsLocked: {state}"));
+        }
     }
     // The disconnected session's host was dropped. The replacement has to
     // be ready before this lock, or the arm wait fail-closes.
@@ -965,23 +983,68 @@ fn run_system_task(name: &str, script: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "live-fail-closed")]
+fn confirmed_since(log_at: usize) -> bool {
+    let log = fs::read_to_string(guard_dir().join("service.log")).unwrap_or_default();
+    log.get(log_at..)
+        .unwrap_or("")
+        .contains("os-lock result=confirmed")
+        && query_taskmgr() == "absent"
+}
+
 #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
 #[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
 fn type_pin_keys() -> Result<(), String> {
     // Keeps the release-scan marker on the only build that can compile this
     // hook. A product binary does not enable either feature.
     let _ = softlock_service::present_physical_marker_bytes();
+    // The low-level hook runs on the thread that installed it, and only
+    // while that thread pumps messages. SendInput from this thread would
+    // otherwise stay marked injected, and the guard would drop it.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let hook = thread::spawn(move || pump_physical_pin_hook(ready_tx, stop_rx));
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "pin hook".to_string())?
+        .map_err(|_| "pin hook".to_string())?;
+    let mut keys = vec![0x7Cu16];
+    keys.extend(b"135742".iter().copied().map(u16::from));
+    keys.push(0x0D);
+    let mut failed = None;
+    for vk in keys {
+        let input = [pin_key(vk, false), pin_key(vk, true)];
+        let sent = unsafe {
+            windows::Win32::UI::Input::KeyboardAndMouse::SendInput(
+                &input,
+                std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::INPUT>() as i32,
+            )
+        };
+        if sent != 2 {
+            failed = Some("the pin key was not delivered".to_string());
+            break;
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+    let _ = stop_tx.send(());
+    let _ = hook.join();
+    failed.map_or(Ok(()), Err)
+}
+
+#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+#[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
+fn pump_physical_pin_hook(
+    ready: std::sync::mpsc::Sender<Result<(), ()>>,
+    stop: std::sync::mpsc::Receiver<()>,
+) -> Result<(), ()> {
     use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, LLKHF_INJECTED, SetWindowsHookExW,
-        UnhookWindowsHookEx, WH_KEYBOARD_LL,
+        CallNextHookEx, DispatchMessageW, KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, LLKHF_INJECTED,
+        MSG, PM_REMOVE, PeekMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+        WH_KEYBOARD_LL,
     };
     use windows::core::PCWSTR;
-    // SendInput is always marked injected, and the guard does not queue
-    // injected keys. This hook is installed after the Lock Host, so it runs
-    // first and presents the key as physical before the guard sees it.
     unsafe extern "system" fn present_physical(
         code: i32,
         wparam: WPARAM,
@@ -1001,23 +1064,26 @@ fn type_pin_keys() -> Result<(), String> {
             Some(HINSTANCE(module.0)),
             0,
         )
-    }
-    .map_err(|_| "pin hook".to_string())?;
-    let mut keys = vec![0x7Cu16];
-    keys.extend(b"135742".iter().copied().map(u16::from));
-    keys.push(0x0D);
-    let mut failed = None;
-    for vk in keys {
-        let input = [pin_key(vk, false), pin_key(vk, true)];
-        let sent = unsafe { SendInput(&input, std::mem::size_of::<INPUT>() as i32) };
-        if sent != 2 {
-            failed = Some("the pin key was not delivered".to_string());
-            break;
+    };
+    let Ok(hook) = hook else {
+        let _ = ready.send(Err(()));
+        return Err(());
+    };
+    let _ = ready.send(Ok(()));
+    let mut message = unsafe { std::mem::zeroed::<MSG>() };
+    while stop.try_recv().is_err() {
+        while unsafe { PeekMessageW(std::ptr::addr_of_mut!(message), None, 0, 0, PM_REMOVE) }
+            .as_bool()
+        {
+            unsafe {
+                let _ = TranslateMessage(std::ptr::addr_of!(message));
+                DispatchMessageW(std::ptr::addr_of!(message));
+            }
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(5));
     }
     let _ = unsafe { UnhookWindowsHookEx(hook) };
-    failed.map_or(Ok(()), Err)
+    Ok(())
 }
 
 #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]

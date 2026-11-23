@@ -347,9 +347,7 @@ impl SettingsEngine {
         // when the service is not the process that sees the event. A session
         // that merely looks active before it has left is not a sign-in.
         if doc.os_confirmed {
-            let returned = doc
-                .lock
-                .is_some_and(|saved| crate::taskmgr::owner_session_returned(saved));
+            let returned = doc.lock.is_some_and(crate::taskmgr::owner_session_returned);
             if softlock_core::sign_in_release(softlock_core::ProductState::OsLocked, returned)
                 != softlock_core::RepairAction::Revert
             {

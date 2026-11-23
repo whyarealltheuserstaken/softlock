@@ -64,7 +64,15 @@ impl Session {
         // A host whose OS lock failed stays guarded after its service dies.
         // Kill any survivor before the next service starts.
         stop_lock_hosts();
-        let root = std::env::temp_dir().join(format!("svc-{}", std::process::id()));
+        // A failed unlock leaves a journal that says locked. The next service
+        // must not boot from that file: recovery fail-closes, and every later
+        // test then looks already locked.
+        static SESSIONS: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "svc-{}-{}",
+            std::process::id(),
+            SESSIONS.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("temp");
         let pin_dir = root.join("pin");
