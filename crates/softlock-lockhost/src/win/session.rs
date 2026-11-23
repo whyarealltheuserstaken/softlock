@@ -1300,6 +1300,10 @@ fn apply_simulated_environment(shared: &Shared) {
 
 pub fn run_service_host() -> i32 {
     use std::os::windows::io::FromRawHandle;
+    #[cfg(feature = "live-fail-closed")]
+    if softlock_windows::runner_may_lock().is_ok() {
+        crate::classify::arm_present_physical();
+    }
 
     let mut read_handle = None;
     let mut write_handle = None;

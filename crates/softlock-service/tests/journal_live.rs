@@ -1343,6 +1343,13 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
         format!("SOFTLOCK_PIN_DIR={}", guard_dir().join("pin").display()),
         format!("SOFTLOCK_STOP_FILE={}", guard_dir().join("stop").display()),
     ];
+    if std::env::var("SOFTLOCK_JOURNAL_LIVE").ok().as_deref() == Some("sign-in") {
+        // The lock host is in the console session. SendInput from this
+        // process does not arrive with the tag intact. The host counts
+        // injected keys as physical only when it was built with
+        // live-fail-closed and this variable is set.
+        pairs.push("SOFTLOCK_PRESENT_PHYSICAL=1".to_string());
+    }
     if let Some(phase) = pause {
         pairs.push(format!("SOFTLOCK_JOURNAL_PAUSE={phase}"));
         pairs.push(format!(

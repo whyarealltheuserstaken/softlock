@@ -749,7 +749,7 @@ fn open_user_file(path: &std::path::Path, write: bool) -> Option<File> {
     };
     // Each component is opened from the parent handle, with the reparse
     // option, so a junction swapped in between checks is not followed.
-    let mut current = open_relative(None, &format!(r"\??\{drive}\"), DIR_OPEN, true)?;
+    let mut current = open_root(drive)?;
     if handle_is_reparse(current) {
         close_user_handle(current);
         return None;
@@ -889,21 +889,39 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+fn open_root(drive: &str) -> Option<windows::Win32::Foundation::HANDLE> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::core::PCWSTR;
+    // `NtCreateFile` on `\??\C:\` plus `FileAttributeTagInfo` fails for the
+    // volume root, and a failed query was treated as a reparse. Every config
+    // read then stopped. `CreateFileW` is the same root open the service uses.
+    let path = wide(&format!("{drive}\\"));
+    unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            DIR_OPEN,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        .ok()
+    }
+}
+
 fn handle_is_reparse(handle: windows::Win32::Foundation::HANDLE) -> bool {
     use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo,
-        GetFileInformationByHandleEx,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
     };
-    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
-    let ok = unsafe {
-        GetFileInformationByHandleEx(
-            handle,
-            FileAttributeTagInfo,
-            &mut info as *mut FILE_ATTRIBUTE_TAG_INFO as *mut core::ffi::c_void,
-            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
-        )
-    };
-    ok.is_err() || info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(handle, &mut info) }.is_err() {
+        return true;
+    }
+    info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
 }
 
 fn notice_text() -> String {
@@ -1301,6 +1319,17 @@ mod owner_file_tests {
     }
 
     #[test]
+    fn a_plain_config_file_is_read() {
+        let dir = temp_dir("sl-read");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "schema_version = 1\n").expect("write");
+        assert_eq!(
+            read_user_file(&path).as_deref(),
+            Some("schema_version = 1\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn an_oversized_config_file_is_not_read() {
         let dir = temp_dir("sl-over");
         let path = dir.join("config.toml");

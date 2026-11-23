@@ -5,8 +5,12 @@
 //! an injected event as simulated-physical when `dwExtraInfo` equals the
 //! per-run nonce. Release builds compile this module without that branch.
 
+#[cfg(feature = "live-fail-closed")]
+use std::sync::atomic::AtomicBool;
 #[cfg(feature = "simulated-physical")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+use std::sync::atomic::Ordering;
 
 /// One low-level keyboard or mouse event, reduced to the fields classification needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +47,10 @@ pub fn classify(input: HookInput) -> InputClass {
     // Windows hands each hook the original flags. This tag is honored only
     // in a `live-fail-closed` binary, which the release scan rejects.
     #[cfg(feature = "live-fail-closed")]
-    if input.extra_info == PRESENT_PHYSICAL_EXTRA {
+    if PRESENT_INJECTED.load(Ordering::SeqCst)
+        || input.extra_info == PRESENT_PHYSICAL_EXTRA
+        || input.extra_info == (PRESENT_PHYSICAL_EXTRA & 0xFFFF_FFFF)
+    {
         let _ = present_physical_marker();
         return InputClass::Physical;
     }
@@ -57,6 +64,22 @@ pub fn classify(input: HookInput) -> InputClass {
 /// `dwExtraInfo` the journal test writes. Same literal as `journal_live`.
 #[cfg(feature = "live-fail-closed")]
 const PRESENT_PHYSICAL_EXTRA: u64 = 0x5048_5953_5049_4E31;
+
+#[cfg(feature = "live-fail-closed")]
+static PRESENT_INJECTED: AtomicBool = AtomicBool::new(false);
+
+/// The journal service sets `SOFTLOCK_PRESENT_PHYSICAL=1` for the sign-in
+/// case. `SendInput` from the test process does not land in the console
+/// session's hook as a tagged physical key. The host, built with
+/// `live-fail-closed` and started on a hosted runner, then counts injected
+/// keys as physical. A release build does not compile this.
+#[cfg(all(feature = "live-fail-closed", windows))]
+pub fn arm_present_physical() {
+    if std::env::var("SOFTLOCK_PRESENT_PHYSICAL").ok().as_deref() == Some("1") {
+        PRESENT_INJECTED.store(true, Ordering::SeqCst);
+        let _ = present_physical_marker();
+    }
+}
 
 #[cfg(feature = "live-fail-closed")]
 #[inline(never)]
