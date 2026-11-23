@@ -687,6 +687,77 @@ jobs:
           print("ci suite ok", report["summary"])
           PY
 
+  hotkey-repeat:
+    name: hotkey lock x20 (${{ matrix.image }})
+    needs: changes
+    if: always() && needs.changes.result == 'success'
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: hotkey-lock-${{ matrix.image }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/softlock-app/package-lock.json
+      - name: Windows target
+        run: rustup target add x86_64-pc-windows-msvc
+      - name: Front end for the app binary
+        working-directory: crates/softlock-app
+        run: npm ci && npm run build
+      - name: Repeat the hotkey lock probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          cargo build --locked -p softlock-service -p softlock-lockhost \
+            --features softlock-service/simulated-physical,softlock-lockhost/simulated-physical \
+            --target x86_64-pc-windows-msvc
+          cargo test --locked -p softlock-lockhost --features simulated-physical \
+            --target x86_64-pc-windows-msvc --test service_session --no-run \
+            --message-format=json > target/service-session-build.json
+          exe_win=$(python .github/lock-host-test-exe.py target/service-session-build.json service_session)
+          exe=$(cygpath -u "$exe_win")
+          test -f "$exe"
+          case "$exe" in
+            *service_session*) ;;
+            *) echo "unexpected test executable: $exe"; exit 1 ;;
+          esac
+          passes=0
+          for i in $(seq 1 20); do
+            set +e
+            "$exe" --exact global_hotkey_locks_and_the_probe_confirms --test-threads=1 --nocapture >"target/hotkey-$i.txt" 2>&1
+            status=$?
+            set -e
+            taskkill //IM softlock-lockhost.exe //F || true
+            taskkill //IM softlock-service.exe //F || true
+            taskkill //IM softlock-app.exe //F || true
+            if [[ "$status" -ne 0 ]]; then
+              echo "run $i failed"
+              cat "target/hotkey-$i.txt"
+              exit 1
+            fi
+            if ! grep -F "global_hotkey_locks_and_the_probe_confirms ... ok" "target/hotkey-$i.txt"; then
+              echo "run $i did not record a pass"
+              cat "target/hotkey-$i.txt"
+              exit 1
+            fi
+            passes=$((passes + 1))
+            echo "run $i ok"
+          done
+          echo "hotkey lock repeat: ${passes} passed"
+          test "$passes" -eq 20
+
   ci-ok:
     name: ci ok
     runs-on: ubuntu-latest
@@ -699,6 +770,7 @@ jobs:
       - seam4
       - seam3
       - linux-hardware
+      - hotkey-repeat
     if: always()
     steps:
       - name: Required checks
@@ -724,3 +796,4 @@ jobs:
           check seam4 "${{ needs.seam4.result }}"
           check seam3 "${{ needs.seam3.result }}"
           check linux-hardware "${{ needs.linux-hardware.result }}"
+          check hotkey-repeat "${{ needs.hotkey-repeat.result }}"
