@@ -195,7 +195,9 @@ pub fn owner_lock_rights() -> &'static [OwnerRight] {
 }
 
 pub fn owner_right_denied(path: &Path, access: u32) -> io::Result<bool> {
-    match open_with_access(path, access | SYNCHRONIZE) {
+    // FILE_READ_ATTRIBUTES lets the reparse query run. FR already grants it,
+    // so a locked file still denies the right under test.
+    match open_with_access(path, access | FILE_READ_ATTRIBUTES | SYNCHRONIZE) {
         Ok(handle) => {
             let reparse = handle_is_reparse(handle)?;
             drop_handle(handle);

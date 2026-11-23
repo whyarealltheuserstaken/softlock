@@ -8,7 +8,8 @@ mod owner;
     any(feature = "simulated-physical", feature = "live-fail-closed")
 ))]
 pub use owner::{
-    accept_config, config_offer, decline_config, poll_config_once, refresh_from_service,
+    accept_config as accept_offered_config, config_offer, decline_config as decline_offered_config,
+    poll_config_once, refresh_from_service,
 };
 
 use tauri::Manager;

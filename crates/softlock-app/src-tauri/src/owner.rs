@@ -1131,6 +1131,7 @@ mod owner_file_tests {
     use crate::client::OwnerView;
     use softlock_core::{MAX_CONFIG_BYTES, StateName};
     use std::sync::atomic::Ordering;
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, UnregisterHotKey,
     };
@@ -1138,6 +1139,15 @@ mod owner_file_tests {
         CreateWindowExW, DefWindowProcW, HWND_MESSAGE, RegisterClassW, WNDCLASSW,
     };
     use windows::core::PCWSTR;
+
+    unsafe extern "system" fn probe_wndproc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
@@ -1178,7 +1188,9 @@ mod owner_file_tests {
     #[test]
     fn an_unknown_view_does_not_offer_a_changed_config_file() {
         let dir = temp_dir("sl-offer");
-        std::env::set_var("SOFTLOCK_CONFIG_DIR", &dir);
+        unsafe {
+            std::env::set_var("SOFTLOCK_CONFIG_DIR", &dir);
+        }
         std::fs::write(
             dir.join(softlock_core::CONFIG_FILE_NAME),
             "schema_version = 1\n[lock]\nhotkey = \"Ctrl+Alt+Shift+K\"\n",
@@ -1204,7 +1216,7 @@ mod owner_file_tests {
         let instance = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) }
             .expect("module");
         let class = WNDCLASSW {
-            lpfnWndProc: Some(DefWindowProcW),
+            lpfnWndProc: Some(probe_wndproc),
             hInstance: instance.into(),
             lpszClassName: PCWSTR(class_name.as_ptr()),
             ..Default::default()

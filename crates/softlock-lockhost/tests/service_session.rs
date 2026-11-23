@@ -2495,7 +2495,7 @@ fn a_locked_file_edit_is_offered_and_applied_on_accept() {
     );
     assert!(softlock_app_lib::refresh_from_service());
     assert!(
-        softlock_app_lib::accept_config(),
+        softlock_app_lib::accept_offered_config(),
         "PutConfig did not return Applied"
     );
     let after = session.config().expect("config");
@@ -2528,7 +2528,7 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
         }),
         "the locked edit did not raise the offer"
     );
-    softlock_app_lib::decline_config();
+    softlock_app_lib::decline_offered_config();
     assert!(!softlock_app_lib::config_offer());
     let disk = fs::read_to_string(&path).expect("restored file");
     assert!(
@@ -2543,9 +2543,11 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
 }
 
 fn arm_owner(session: &Session) {
-    std::env::set_var("SOFTLOCK_PIPE", session.pipe());
-    std::env::set_var("SOFTLOCK_CONFIG_DIR", &session.config_dir);
-    std::env::set_var("SOFTLOCK_NO_AUTOSTART", "1");
+    unsafe {
+        std::env::set_var("SOFTLOCK_PIPE", session.pipe());
+        std::env::set_var("SOFTLOCK_CONFIG_DIR", &session.config_dir);
+        std::env::set_var("SOFTLOCK_NO_AUTOSTART", "1");
+    }
 }
 
 fn wait_for_file(path: &Path, timeout: Duration) -> Option<String> {
