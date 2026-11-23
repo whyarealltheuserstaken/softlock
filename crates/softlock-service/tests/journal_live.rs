@@ -552,6 +552,7 @@ fn kill_before_apply(guard: &mut Guard, previous: &str, order: KillOrder) -> Res
         &format!("before {previous} {}", order_name(order)),
     )?;
     hard_stop(guard)?;
+    clear_os_hold()?;
     realign()?;
     if query_taskmgr() != previous {
         return Err(format!(
@@ -593,6 +594,7 @@ fn kill_after_apply(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
     let status = transact(&pipe_name(), status_body()).unwrap_or_default();
     let state = status_state(&status).unwrap_or_default();
     hard_stop(guard)?;
+    clear_os_hold()?;
     if !still || query_taskmgr() != "absent" {
         return Err(format!(
             "settings were not the absent original after the owner returned (state {state}, {})",
@@ -679,6 +681,7 @@ fn clock_one_order(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
     spawn_service(guard, None, &pause, false)?;
     wait_os_held("absent", &format!("clock {}", order_name(order)))?;
     hard_stop(guard)?;
+    clear_os_hold()?;
     Ok(())
 }
 
@@ -1356,6 +1359,24 @@ fn repair_as_system() -> Result<(i32, String), String> {
     repair_settings()
 }
 
+fn clear_os_hold() -> Result<(), String> {
+    // The confirmed disconnect stays OsLocked for this logon. The next lock
+    // in this session is a new check, so the marker has to be cleared once
+    // the assertion has passed. Repair is the supported way to drop it.
+    let (code, _note) = repair_settings()?;
+    if code == 0 {
+        return Ok(());
+    }
+    let (code, note) = repair_as_system()?;
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "repair did not clear the OS lock marker ({code} {note})"
+        ))
+    }
+}
+
 fn repair_settings() -> Result<(i32, String), String> {
     let output = Command::new(service_exe())
         .arg("--repair-settings")
@@ -1506,6 +1527,7 @@ fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
             .all(|(key, name, previous, _)| query_value(key, name) == *previous)
     });
     hard_stop(guard)?;
+    clear_os_hold()?;
     realign()?;
     if !restored {
         return Err(format!(
