@@ -82,14 +82,14 @@ fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
     }
     // The service is blocked after the flush. A stop file is not read until
     // that pause ends, which would apply the value. Kill it.
-    hard_stop(guard);
+    hard_stop(guard)?;
     if query_taskmgr() != previous {
         return Err(format!("kill changed DisableTaskMgr from {previous}"));
     }
     let _ = wait_until(Duration::from_secs(5), || !host_running());
     spawn_service(guard, None, &pause)?;
     let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == previous);
-    hard_stop(guard);
+    hard_stop(guard)?;
     if !restored {
         return Err(format!("restart did not restore {previous}"));
     }
@@ -113,11 +113,11 @@ fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
     if !applied {
         return Err("DisableTaskMgr was not set to 1".to_string());
     }
-    hard_stop(guard);
+    hard_stop(guard)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
     spawn_service(guard, None, &pause)?;
     let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == "absent");
-    hard_stop(guard);
+    hard_stop(guard)?;
     if !restored {
         return Err("restart did not restore an absent value".to_string());
     }
@@ -146,7 +146,7 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     if query_taskmgr() != "1" {
         return Err("repair changed DisableTaskMgr while locked".to_string());
     }
-    hard_stop(guard);
+    hard_stop(guard)?;
     let first = repair_settings()?;
     let second = repair_settings()?;
     if first != 0 || second != 0 {
@@ -383,12 +383,16 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
     }
 }
 
-fn hard_stop(_guard: &mut Guard) {
+fn hard_stop(_guard: &mut Guard) -> Result<(), String> {
     // A live host OS-locks the console when its service pipe closes, and the
     // service OS-locks when it sees the host die. Freeze the host first so
     // neither side can lock the session, then kill the service and the host.
-    // The next boot must see the host gone and revert.
-    let _ = suspend_host();
+    // The next boot must see the host gone and revert. A host that is already
+    // gone has nothing to freeze. A host that is still running and cannot be
+    // suspended fails the test.
+    if host_running() {
+        suspend_host()?;
+    }
     kill_service_process();
     let _ = Command::new("taskkill")
         .args(["/F", "/IM", "softlock-service.exe"])
@@ -402,6 +406,7 @@ fn hard_stop(_guard: &mut Guard) {
         }
         thread::sleep(Duration::from_millis(100));
     }
+    Ok(())
 }
 
 fn suspend_host() -> Result<(), String> {

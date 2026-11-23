@@ -70,6 +70,11 @@ impl ServicePlatform {
         self.settings_required = true;
     }
 
+    #[cfg(all(windows, test))]
+    pub(crate) fn settings_are_required(&self) -> bool {
+        self.settings_required && self.settings.is_none()
+    }
+
     #[cfg(windows)]
     pub fn poll_settings(&mut self) -> Result<(), &'static str> {
         let Some(engine) = self.settings.as_mut() else {
