@@ -2,7 +2,8 @@
 //!
 //! The document is written and flushed before a setting changes. Restore
 //! writes the previous value back, including when that value was absent.
-//! Only [`TASK_MANAGER`] is applied here, and only an allow-listed DWORD.
+//! The lockdown rows are an allow-list. A DWORD outside that list is not
+//! written. Nothing here disables Windows Hello or the password sign-in.
 
 use std::path::Path;
 use std::time::Duration;
@@ -14,12 +15,94 @@ use crate::name::PRODUCT_DISPLAY_NAME;
 /// Re-assert the locked value on this interval, and on a registry notification.
 pub const REASSERT_AFTER: Duration = Duration::from_secs(5);
 
-/// The one policy this journal applies. Later hardening items use the same document.
+/// The one policy ticket 16 applied. Later rows use the same document.
 pub const TASK_MANAGER: &str = "DisableTaskMgr";
 
 pub const JOURNAL_VERSION: u32 = 1;
 
+/// User and machine System policy key.
+pub const SYSTEM_POLICY: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\System";
+
+/// User Explorer policy key. Sign out and shutdown live here.
+pub const EXPLORER_POLICY: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+
 const LOCKED_DWORD: u32 = 1;
+
+/// Where a lockdown value is written. User values use the locked user's SID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyHive {
+    User,
+    Machine,
+}
+
+/// One allow-listed policy. `locked` is the value while the session is locked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockdownPolicy {
+    pub target: &'static str,
+    pub locked: u32,
+    pub hive: PolicyHive,
+    pub subkey: &'static str,
+}
+
+/// Ctrl+Alt+Del and UAC rows. Task Manager stays from ticket 16.
+pub const LOCKDOWN: &[LockdownPolicy] = &[
+    LockdownPolicy {
+        target: TASK_MANAGER,
+        locked: 1,
+        hive: PolicyHive::User,
+        subkey: SYSTEM_POLICY,
+    },
+    LockdownPolicy {
+        target: "NoLogoff",
+        locked: 1,
+        hive: PolicyHive::User,
+        subkey: EXPLORER_POLICY,
+    },
+    LockdownPolicy {
+        target: "DisableChangePassword",
+        locked: 1,
+        hive: PolicyHive::User,
+        subkey: SYSTEM_POLICY,
+    },
+    LockdownPolicy {
+        target: "HideFastUserSwitching",
+        locked: 1,
+        hive: PolicyHive::Machine,
+        subkey: SYSTEM_POLICY,
+    },
+    LockdownPolicy {
+        target: "DisableLockWorkstation",
+        locked: 1,
+        hive: PolicyHive::User,
+        subkey: SYSTEM_POLICY,
+    },
+    LockdownPolicy {
+        target: "NoClose",
+        locked: 1,
+        hive: PolicyHive::User,
+        subkey: EXPLORER_POLICY,
+    },
+    LockdownPolicy {
+        target: "ConsentPromptBehaviorAdmin",
+        locked: 1,
+        hive: PolicyHive::Machine,
+        subkey: SYSTEM_POLICY,
+    },
+    LockdownPolicy {
+        target: "ConsentPromptBehaviorUser",
+        locked: 0,
+        hive: PolicyHive::Machine,
+        subkey: SYSTEM_POLICY,
+    },
+];
+
+/// These change who can sign in. The lockdown list must not name them.
+const SIGN_IN_BLOCKERS: &[&str] = &[
+    "scforceoption",
+    "DisabledCredentialProviders",
+    "AllowDomainPINLogon",
+    "DisablePasswordUnlock",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
@@ -45,6 +128,9 @@ pub struct SettingsJournal {
     /// The user who was locked. Restore writes this hive and no other.
     #[serde(default)]
     pub sid: String,
+    /// Flushed before `DisableLockWorkstation` is cleared for a real OS lock.
+    #[serde(default)]
+    pub workstation_clear: bool,
     pub says_locked: bool,
     pub failures: u32,
     pub entries: Vec<SettingEntry>,
@@ -133,6 +219,7 @@ impl SettingsJournal {
         Self {
             v: JOURNAL_VERSION,
             sid: String::new(),
+            workstation_clear: false,
             says_locked: false,
             failures: 0,
             entries: Vec::new(),
@@ -178,6 +265,7 @@ pub fn task_manager_document(
     Ok(SettingsJournal {
         v: JOURNAL_VERSION,
         sid: sid.to_string(),
+        workstation_clear: false,
         says_locked: true,
         failures,
         entries: vec![SettingEntry {
@@ -188,6 +276,109 @@ pub fn task_manager_document(
             },
         }],
     })
+}
+
+pub fn lockdown_policy(target: &str) -> Option<&'static LockdownPolicy> {
+    LOCKDOWN.iter().find(|policy| policy.target == target)
+}
+
+pub fn lockdown_target(target: &str) -> bool {
+    lockdown_policy(target).is_some()
+}
+
+/// A sign-in policy is never a lockdown row. Windows Hello and the password
+/// stay available at the real lock screen.
+pub fn blocks_owner_sign_in(target: &str) -> bool {
+    SIGN_IN_BLOCKERS
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(target))
+}
+
+pub fn allowed_previous_for(target: &str, value: SettingValue) -> bool {
+    match value {
+        SettingValue::Absent => lockdown_policy(target).is_some(),
+        SettingValue::Dword { value } => allowed_dword(target, value),
+    }
+}
+
+fn allowed_dword(target: &str, value: u32) -> bool {
+    match target {
+        "ConsentPromptBehaviorAdmin" => value <= 5,
+        "ConsentPromptBehaviorUser" => matches!(value, 0 | 1 | 3),
+        _ if lockdown_policy(target).is_some() => matches!(value, 0 | 1),
+        _ => false,
+    }
+}
+
+/// Every lockdown row, once. `previous` is what restore writes back.
+pub fn lockdown_document(
+    sid: &str,
+    previous: &[(&str, SettingValue)],
+    failures: u32,
+) -> Result<SettingsJournal, JournalFault> {
+    if !sid_is_safe(sid) {
+        return Err(JournalFault::Sid);
+    }
+    if previous.len() != LOCKDOWN.len() {
+        return Err(JournalFault::Target);
+    }
+    let mut entries = Vec::with_capacity(LOCKDOWN.len());
+    for policy in LOCKDOWN {
+        let Some((_, value)) = previous.iter().find(|(target, _)| *target == policy.target) else {
+            return Err(JournalFault::Target);
+        };
+        if !allowed_previous_for(policy.target, *value) {
+            return Err(JournalFault::Value);
+        }
+        entries.push(SettingEntry {
+            target: policy.target.to_string(),
+            previous: *value,
+            new_value: SettingValue::Dword {
+                value: policy.locked,
+            },
+        });
+    }
+    Ok(SettingsJournal {
+        v: JOURNAL_VERSION,
+        sid: sid.to_string(),
+        workstation_clear: false,
+        says_locked: true,
+        failures,
+        entries,
+    })
+}
+
+/// Record that `DisableLockWorkstation` is about to be cleared. The previous
+/// value stays so restore is exact. The save has to finish before the delete.
+pub fn mark_workstation_clear(doc: &SettingsJournal) -> Result<SettingsJournal, JournalFault> {
+    validate(doc)?;
+    if !doc
+        .entries
+        .iter()
+        .any(|entry| entry.target == "DisableLockWorkstation")
+    {
+        return Err(JournalFault::Target);
+    }
+    let mut next = doc.clone();
+    next.workstation_clear = true;
+    Ok(next)
+}
+
+/// `skip` is true only while a workstation lock has cleared that one value.
+pub fn reassert_write(
+    target: &str,
+    locked: SettingValue,
+    current: SettingValue,
+    skip: bool,
+) -> Option<SettingValue> {
+    if skip && target == "DisableLockWorkstation" {
+        return None;
+    }
+    if current == locked {
+        None
+    } else {
+        Some(locked)
+    }
 }
 
 pub fn encode_document(doc: &SettingsJournal) -> Result<Vec<u8>, JournalFault> {
@@ -217,24 +408,47 @@ fn validate(doc: &SettingsJournal) -> Result<(), JournalFault> {
     }
     let mut seen = std::collections::BTreeSet::new();
     for entry in &doc.entries {
-        if entry.target != TASK_MANAGER {
+        if lockdown_policy(&entry.target).is_none() {
             return Err(JournalFault::Target);
         }
         if !seen.insert(entry.target.clone()) {
             return Err(JournalFault::Duplicate);
         }
-        if !allowed_previous(entry.previous) {
+        if !allowed_previous_for(&entry.target, entry.previous) {
             return Err(JournalFault::Value);
         }
-        if entry.new_value
-            != (SettingValue::Dword {
-                value: LOCKED_DWORD,
-            })
-        {
+        let locked = lockdown_policy(&entry.target)
+            .expect("target was just checked")
+            .locked;
+        if entry.new_value != (SettingValue::Dword { value: locked }) {
             return Err(JournalFault::Value);
         }
     }
+    if doc.workstation_clear
+        && !doc
+            .entries
+            .iter()
+            .any(|entry| entry.target == "DisableLockWorkstation")
+    {
+        return Err(JournalFault::Target);
+    }
     Ok(())
+}
+
+/// `Ok(None)` means the current value already matches and the write is skipped.
+pub fn restore_action_for(
+    target: &str,
+    previous: SettingValue,
+    current: SettingValue,
+) -> Result<Option<SettingValue>, JournalFault> {
+    if !allowed_previous_for(target, previous) {
+        return Err(JournalFault::Value);
+    }
+    if current == previous {
+        Ok(None)
+    } else {
+        Ok(Some(previous))
+    }
 }
 
 /// `Ok(None)` means the current value already matches and the write is skipped.
@@ -666,7 +880,11 @@ mod tests {
         let ok = task_manager_document(ALICE, SettingValue::Absent, 3).expect("doc");
         let bytes = encode_document(&ok).expect("encode");
         assert_eq!(parse_document(&bytes).expect("parse"), ok);
-        assert!(parse_document(br#"{"v":1,"says_locked":true,"failures":0,"entries":[{"target":"NoClose","previous":{"kind":"absent"},"new_value":{"kind":"dword","value":1}}]}"#).is_err());
+        assert!(parse_document(br#"{"v":1,"says_locked":true,"failures":0,"entries":[{"target":"NotAPolicy","previous":{"kind":"absent"},"new_value":{"kind":"dword","value":1}}]}"#).is_err());
+        let legacy = br#"{"v":1,"sid":"S-1-5-21-1-2-3-1001","says_locked":true,"failures":0,"entries":[{"target":"DisableTaskMgr","previous":{"kind":"absent"},"new_value":{"kind":"dword","value":1}}]}"#;
+        let parsed = parse_document(legacy).expect("ticket 16 journal");
+        assert!(!parsed.workstation_clear);
+        assert_eq!(parsed.entries().len(), 1);
         assert!(parse_document(br#"{"v":1,"says_locked":true,"failures":0,"entries":[{"target":"DisableTaskMgr","previous":{"kind":"sz","value":"1"},"new_value":{"kind":"dword","value":1}}]}"#).is_err());
         assert!(
             parse_document(br#"{"v":2,"says_locked":false,"failures":0,"entries":[]}"#).is_err()

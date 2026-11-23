@@ -14,6 +14,37 @@ use std::time::{Duration, Instant};
 use softlock_core::SERVICE_NAME;
 
 const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System";
+const EXPLORER: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+const MACHINE: &str = r"HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System";
+
+struct Saved {
+    key: &'static str,
+    name: &'static str,
+    value: String,
+}
+
+fn rows() -> Vec<Saved> {
+    [
+        snap(KEY, "DisableTaskMgr"),
+        snap(EXPLORER, "NoLogoff"),
+        snap(KEY, "DisableChangePassword"),
+        snap(MACHINE, "HideFastUserSwitching"),
+        snap(KEY, "DisableLockWorkstation"),
+        snap(EXPLORER, "NoClose"),
+        snap(MACHINE, "ConsentPromptBehaviorAdmin"),
+        snap(MACHINE, "ConsentPromptBehaviorUser"),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn snap(key: &'static str, name: &'static str) -> Saved {
+    Saved {
+        key,
+        name,
+        value: query_value(key, name),
+    }
+}
 
 #[test]
 fn live_settings_journal() {
@@ -30,9 +61,8 @@ fn live_settings_journal() {
     fs::create_dir_all(guard_dir()).expect("temp");
     fs::create_dir_all(artifact_dir()).expect("artifact");
     ensure_service().expect("LocalSystem service");
-    let original = query_taskmgr();
     let mut guard = Guard {
-        original: original.clone(),
+        rows: rows(),
         reported: false,
     };
     let outcome = match case.as_str() {
@@ -61,6 +91,7 @@ fn restore(guard: &mut Guard) -> Result<(), String> {
     }
     kill_after_apply(guard)?;
     reassert_and_repair(guard)?;
+    every_row_restores(guard)?;
     Ok(())
 }
 
@@ -138,6 +169,14 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
         .status();
     if !wait_until(Duration::from_secs(8), || query_taskmgr() == "1") {
         return Err("cleared DisableTaskMgr was not re-asserted within 5 s".to_string());
+    }
+    let _ = set_value(EXPLORER, "NoLogoff", "absent");
+    let _ = set_value(MACHINE, "ConsentPromptBehaviorUser", "3");
+    if !wait_until(Duration::from_secs(8), || {
+        query_value(EXPLORER, "NoLogoff") == "1"
+            && query_value(MACHINE, "ConsentPromptBehaviorUser") == "0"
+    }) {
+        return Err("a Group Policy overwrite was not re-asserted".to_string());
     }
     let repair = repair_settings()?;
     if repair == 0 {
@@ -229,7 +268,7 @@ fn status_state(json: &str) -> Option<String> {
 }
 
 struct Guard {
-    original: String,
+    rows: Vec<Saved>,
     reported: bool,
 }
 
@@ -240,7 +279,9 @@ impl Drop for Guard {
             .status();
         kill_service_process();
         let _ = Command::new("sc").args(["delete", SERVICE_NAME]).status();
-        let _ = set_taskmgr(&self.original);
+        for row in &self.rows {
+            let _ = set_value(row.key, row.name, &row.value);
+        }
         if !self.reported {
             capture();
             write_result(r#"{"ok":false,"reason":"ended"}"#);
@@ -537,9 +578,20 @@ fn journal_ready(path: &Path) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
         return false;
     };
-    text.contains("DisableTaskMgr")
-        && text.contains("\"says_locked\":true")
+    text.contains("\"says_locked\":true")
         && text.contains("\"sid\":\"S-1-5-21-")
+        && [
+            "DisableTaskMgr",
+            "NoLogoff",
+            "DisableChangePassword",
+            "HideFastUserSwitching",
+            "DisableLockWorkstation",
+            "NoClose",
+            "ConsentPromptBehaviorAdmin",
+            "ConsentPromptBehaviorUser",
+        ]
+        .iter()
+        .all(|name| text.contains(name))
 }
 
 fn journal_file() -> PathBuf {
@@ -555,8 +607,12 @@ fn journal_file() -> PathBuf {
 }
 
 fn query_taskmgr() -> String {
+    query_value(KEY, "DisableTaskMgr")
+}
+
+fn query_value(key: &str, name: &str) -> String {
     let output = Command::new("reg")
-        .args(["query", KEY, "/v", "DisableTaskMgr"])
+        .args(["query", key, "/v", name])
         .output();
     let Ok(output) = output else {
         return "absent".to_string();
@@ -565,44 +621,78 @@ fn query_taskmgr() -> String {
         return "absent".to_string();
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    if text.contains("0x1") {
-        "1".to_string()
-    } else if text.contains("0x0") {
-        "0".to_string()
-    } else {
-        "other".to_string()
-    }
+    let Some(hex) = text.split_whitespace().find(|part| part.starts_with("0x")) else {
+        return "other".to_string();
+    };
+    let Ok(value) = u32::from_str_radix(hex.trim_start_matches("0x"), 16) else {
+        return "other".to_string();
+    };
+    value.to_string()
 }
 
 fn set_taskmgr(value: &str) -> Result<(), String> {
+    set_value(KEY, "DisableTaskMgr", value)
+}
+
+fn set_value(key: &str, name: &str, value: &str) -> Result<(), String> {
     if value == "absent" {
         let _ = Command::new("reg")
-            .args(["delete", KEY, "/v", "DisableTaskMgr", "/f"])
+            .args(["delete", key, "/v", name, "/f"])
             .status();
-        if query_taskmgr() != "absent" {
-            return Err("could not delete DisableTaskMgr".to_string());
+        if query_value(key, name) != "absent" {
+            return Err(format!("could not delete {name}"));
         }
         return Ok(());
     }
     let status = Command::new("reg")
-        .args([
-            "add",
-            KEY,
-            "/v",
-            "DisableTaskMgr",
-            "/t",
-            "REG_DWORD",
-            "/d",
-            value,
-            "/f",
-        ])
+        .args(["add", key, "/v", name, "/t", "REG_DWORD", "/d", value, "/f"])
         .status()
         .map_err(|_| "reg add".to_string())?;
-    if status.success() && query_taskmgr() == value {
+    if status.success() && query_value(key, name) == value {
         Ok(())
     } else {
-        Err("could not set DisableTaskMgr".to_string())
+        Err(format!("could not set {name}"))
     }
+}
+
+fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
+    let chosen = [
+        (KEY, "DisableTaskMgr", "absent", "1"),
+        (EXPLORER, "NoLogoff", "0", "1"),
+        (KEY, "DisableChangePassword", "1", "1"),
+        (MACHINE, "HideFastUserSwitching", "absent", "1"),
+        (KEY, "DisableLockWorkstation", "0", "1"),
+        (EXPLORER, "NoClose", "1", "1"),
+        (MACHINE, "ConsentPromptBehaviorAdmin", "5", "1"),
+        (MACHINE, "ConsentPromptBehaviorUser", "3", "0"),
+    ];
+    for (key, name, previous, _) in chosen {
+        set_value(key, name, previous)?;
+    }
+    let pause = guard_dir().join("pause-rows");
+    spawn_service(guard, None, &pause)?;
+    wait_pipe()?;
+    transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+    if !wait_until(Duration::from_secs(20), || {
+        chosen
+            .iter()
+            .all(|(key, name, _, locked)| query_value(key, name) == *locked)
+    }) {
+        return Err("lock did not set every Ctrl+Alt+Del and UAC row".to_string());
+    }
+    hard_stop(guard);
+    let _ = wait_until(Duration::from_secs(5), || !host_running());
+    spawn_service(guard, None, &pause)?;
+    let restored = wait_until(Duration::from_secs(20), || {
+        chosen
+            .iter()
+            .all(|(key, name, previous, _)| query_value(key, name) == *previous)
+    });
+    hard_stop(guard);
+    if !restored {
+        return Err("restart did not restore every row".to_string());
+    }
+    Ok(())
 }
 
 fn installed_service_running() -> bool {

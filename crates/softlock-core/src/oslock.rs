@@ -238,6 +238,12 @@ pub fn policy_seam() -> &'static str {
     "leave-disable-lock-workstation"
 }
 
+/// Fail-closed and hard lock clear `DisableLockWorkstation` only before
+/// `LockWorkStation`. The disconnect fall-back does not depend on that value.
+pub fn clears_disable_lock_workstation(caller: Caller) -> bool {
+    caller.steps().contains(&Method::LockWorkStation)
+}
+
 pub fn failed_closed_log(caller: Caller, attempts: &[Attempt]) -> String {
     let mut line = format!("failed-closed caller={}", caller.name());
     for attempt in attempts {

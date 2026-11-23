@@ -26,6 +26,9 @@ softlock-core = { path = "../softlock-core", optional = true }
 softlock-lockhost = { path = "../softlock-lockhost", optional = true }
 softlock-service = { path = "../softlock-service", optional = true }
 
+[dev-dependencies]
+softlock-core = { path = "../softlock-core" }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Foundation",

@@ -170,6 +170,19 @@ fn run_os_lock(session: u32, caller: softlock_core::Caller) -> Result<(), OsLock
     if stub_os_lock() {
         return Err(OsLockError::Failed);
     }
+    let clears = softlock_core::clears_disable_lock_workstation(caller);
+    if clears {
+        match crate::settings::clear_disable_lock_workstation_for_os_lock() {
+            Ok(true) => crate::audit(
+                "os-lock",
+                &[("policy", "cleared"), ("target", "DisableLockWorkstation")],
+            ),
+            Ok(false) => crate::audit("os-lock", &[("policy", "unchanged")]),
+            Err(reason) => {
+                crate::audit("os-lock", &[("policy", "clear-failed"), ("reason", reason)]);
+            }
+        }
+    }
     let result = match caller {
         softlock_core::Caller::Service => softlock_windows::run_service_disconnect(session),
         _ => softlock_windows::run_service(session, request_host_primary),
@@ -181,6 +194,16 @@ fn run_os_lock(session: u32, caller: softlock_core::Caller) -> Result<(), OsLock
     }
     match result.outcome {
         softlock_core::Outcome::Confirmed { method } => {
+            // The other rows stay at their locked values until unlock. Only
+            // DisableLockWorkstation was cleared, and only so this call could
+            // lock. Put that locked value back before reporting confirmation.
+            if clears && let Err(reason) = crate::settings::reapply_disable_lock_workstation() {
+                crate::audit(
+                    "os-lock",
+                    &[("result", "reapply-failed"), ("reason", reason)],
+                );
+                return Err(OsLockError::Failed);
+            }
             crate::audit(
                 "os-lock",
                 &[
@@ -194,6 +217,12 @@ fn run_os_lock(session: u32, caller: softlock_core::Caller) -> Result<(), OsLock
             Ok(())
         }
         softlock_core::Outcome::FailedClosed { attempts } => {
+            if clears && let Err(reason) = crate::settings::reapply_disable_lock_workstation() {
+                crate::audit(
+                    "os-lock",
+                    &[("policy", "reapply-failed"), ("reason", reason)],
+                );
+            }
             let detail = softlock_core::failed_closed_log(caller, &attempts);
             crate::audit(
                 "os-lock",

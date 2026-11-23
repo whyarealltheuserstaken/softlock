@@ -49,9 +49,9 @@ pub use name::{
 };
 pub use oslock::{
     Attempt, CONFIRM_BUDGET, Caller, Expect, Method, NoticeKind, NoticeLog, Observation, OsLockOps,
-    Outcome, StepFault, caller_for_service, confirmed, console_notice, fail_closed,
-    failed_closed_log, policy_seam, session_for_expect, stays_guarded, tick_is_on_or_after,
-    within_budget,
+    Outcome, StepFault, caller_for_service, clears_disable_lock_workstation, confirmed,
+    console_notice, fail_closed, failed_closed_log, policy_seam, session_for_expect, stays_guarded,
+    tick_is_on_or_after, within_budget,
 };
 pub use pin::{
     MIN_PIN_LEN, PIN_MEMORY_KIB, PIN_PARALLELISM, PIN_SALT_LEN, PIN_TIME_COST, PinHashError,
@@ -66,13 +66,15 @@ pub use platform::{
     UNSUPPORTED_PLATFORM_MESSAGE, UnsupportedPlatform, UserId, Verdict,
 };
 pub use settings_journal::{
-    CommitFault, DirFacts, DirFault, DirOwner, HostPresence, JournalFault, ProductState,
-    REASSERT_AFTER, RepairAction, SettingEntry, SettingValue, SettingsJournal, StartAction,
-    TASK_MANAGER, admit_directory, allowed_previous, commit_then_change, console_user_from,
+    CommitFault, DirFacts, DirFault, DirOwner, HostPresence, JournalFault, LOCKDOWN,
+    LockdownPolicy, PolicyHive, ProductState, REASSERT_AFTER, RepairAction, SettingEntry,
+    SettingValue, SettingsJournal, StartAction, TASK_MANAGER, admit_directory, allowed_previous,
+    allowed_previous_for, blocks_owner_sign_in, commit_then_change, console_user_from,
     dir_fault_log, encode_document, executable_may_run_as_system, expand_profile_image, fault_log,
-    hive_target_allowed, host_identity, journal_dacl_exact, parent_dacl_trusted, parse_document,
-    reassert_due, repair_action, repair_entry_name, restore_action, restore_sid, same_exe_path,
-    service_start_action, sid_is_safe, task_manager_document,
+    hive_target_allowed, host_identity, journal_dacl_exact, lockdown_document, lockdown_policy,
+    lockdown_target, mark_workstation_clear, parent_dacl_trusted, parse_document, reassert_due,
+    reassert_write, repair_action, repair_entry_name, restore_action, restore_action_for,
+    restore_sid, same_exe_path, service_start_action, sid_is_safe, task_manager_document,
 };
 pub use state::{
     ArmStep, DisarmStep, FailReason, Fallback, HeartbeatReport, LaunchNonce, LockSource, LockState,
