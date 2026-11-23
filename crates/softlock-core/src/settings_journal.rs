@@ -1478,9 +1478,19 @@ pub fn journal_dacl_exact(text: &str) -> bool {
         .trim()
         .replace("S-1-5-18", "SY")
         .replace("S-1-5-32-544", "BA");
-    let Some(body) = text.strip_prefix("D:P") else {
+    // Windows reads a protected DACL back as `D:PAI`. The auto-inherit
+    // marker is not an ACE. The protected bit and the two allows are.
+    let Some(body) = text.strip_prefix("D:") else {
         return false;
     };
+    let Some(split) = body.find('(') else {
+        return false;
+    };
+    let flags = &body[..split];
+    if !flags.contains('P') || flags.chars().any(|c| !matches!(c, 'P' | 'A' | 'I' | 'R')) {
+        return false;
+    }
+    let body = &body[split..];
     if body.contains("(D;") || body.contains("ID") {
         return false;
     }
@@ -2107,6 +2117,7 @@ mod tests {
     #[test]
     fn the_journal_dacl_accepts_either_ace_order_and_refuses_anything_else() {
         assert!(journal_dacl_exact("D:P(A;;FA;;;SY)(A;;FA;;;BA)"));
+        assert!(journal_dacl_exact("D:PAI(A;;FA;;;SY)(A;;FA;;;BA)"));
         assert!(journal_dacl_exact("D:P(A;;FA;;;BA)(A;;FA;;;SY)"));
         assert!(journal_dacl_exact(
             "D:P(A;;FA;;;S-1-5-18)(A;;FA;;;S-1-5-32-544)"

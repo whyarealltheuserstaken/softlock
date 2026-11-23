@@ -28,6 +28,9 @@ fn main() {
             #[cfg(windows)]
             {
                 let code = softlock_service::repair_main();
+                // `process::exit` does not flush a redirected stderr buffer,
+                // so the repair task would report a bare exit code.
+                let _ = std::io::Write::flush(&mut std::io::stderr());
                 std::process::exit(code);
             }
             #[cfg(not(windows))]

@@ -435,16 +435,33 @@ public class SoftlockAcl {{
 #[cfg(feature = "live-fail-closed")]
 fn session_aligned() -> bool {
     use windows::Win32::System::RemoteDesktop::{
-        ProcessIdToSessionId, WTSGetActiveConsoleSessionId,
+        ProcessIdToSessionId, WTSActive, WTSConnectState, WTSFreeMemory,
+        WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW,
     };
     use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::core::PWSTR;
     unsafe {
         let console = WTSGetActiveConsoleSessionId();
         let mut mine = 0u32;
         if ProcessIdToSessionId(GetCurrentProcessId(), &mut mine).is_err() {
             return false;
         }
-        mine != 0 && mine != u32::MAX && mine == console
+        if mine == 0 || mine == u32::MAX || mine != console {
+            return false;
+        }
+        // The session id matches before the console is WTSActive. Repair
+        // refuses until the logon is active, so wait for that state.
+        let mut buffer = PWSTR::null();
+        let mut bytes = 0u32;
+        if WTSQuerySessionInformationW(None, console, WTSConnectState, &mut buffer, &mut bytes)
+            .is_err()
+            || buffer.is_null()
+        {
+            return false;
+        }
+        let state = *buffer.0.cast::<u32>();
+        WTSFreeMemory(buffer.0.cast());
+        state == WTSActive.0 as u32
     }
 }
 
@@ -1663,14 +1680,22 @@ fn clear_os_hold() -> Result<(), String> {
     if code == 0 {
         return Ok(());
     }
-    let (code, note) = repair_as_system()?;
-    if code == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "repair did not clear the OS lock marker ({code} {note})"
-        ))
+    // The console session id can match while the logon is not active yet.
+    // Repair refuses that. Ask again once the session has had time to settle.
+    let mut code = 1;
+    let mut note = String::new();
+    for attempt in 0..3 {
+        (code, note) = repair_as_system()?;
+        if code == 0 {
+            return Ok(());
+        }
+        if attempt + 1 < 3 {
+            thread::sleep(Duration::from_secs(2));
+        }
     }
+    Err(format!(
+        "repair did not clear the OS lock marker ({code} {note})"
+    ))
 }
 
 fn repair_settings() -> Result<(i32, String), String> {
