@@ -560,7 +560,17 @@ fn rewrite_owner_ace(ace: &str, owner: &str) -> Result<(String, bool), JournalFa
             .iter()
             .any(|sid| trustee_matches(parts[5], sid))
         && ace_grants_write(parts[2]);
-    if console_write || group_write {
+    if console_write {
+        // Read plus WRITE_DAC. File write is gone, and the service can still
+        // put the original descriptor back when it runs as this user.
+        Ok((
+            format!(
+                "(A;{};FRDC;{};{};{})",
+                parts[1], parts[3], parts[4], parts[5]
+            ),
+            true,
+        ))
+    } else if group_write {
         Ok((
             format!("(A;{};FR;{};{};{})", parts[1], parts[3], parts[4], parts[5]),
             true,
@@ -1526,7 +1536,7 @@ mod tests {
         assert!(locked.contains("(A;OICIID;FR;;;S-1-1-0)"), "{locked}");
         assert!(locked.contains("(A;ID;FR;;;S-1-5-32-545)"), "{locked}");
         assert!(locked.contains("(A;ID;FR;;;S-1-5-11)"), "{locked}");
-        assert!(locked.contains(&format!("(A;;FR;;;{owner})")), "{locked}");
+        assert!(locked.contains(&format!("(A;;FRDC;;;{owner})")), "{locked}");
         assert!(!locked.contains("FA"), "{locked}");
     }
 
@@ -1537,7 +1547,10 @@ mod tests {
         let locked = dacl_without_owner_write(&dacl, user).expect("rewrite");
         assert!(locked.starts_with("D:P"), "{locked}");
         assert!(locked.contains("(A;;FA;;;SY)"), "{locked}");
-        assert!(locked.contains(&format!("(A;ID;FR;;;{user})")), "{locked}");
+        assert!(
+            locked.contains(&format!("(A;ID;FRDC;;;{user})")),
+            "{locked}"
+        );
         assert!(!locked.contains(&format!("FA;;;{user}")), "{locked}");
     }
 
@@ -1548,7 +1561,7 @@ mod tests {
         let locked = dacl_without_owner_write(dacl, user).expect("rewrite");
         assert!(locked.starts_with("D:P"), "{locked}");
         assert!(locked.contains("(A;;FA;;;SY)"), "{locked}");
-        assert!(locked.contains("(A;;FR;;;LA)"), "{locked}");
+        assert!(locked.contains("(A;;FRDC;;;LA)"), "{locked}");
         assert!(locked.contains("(A;;FR;;;WD)"), "{locked}");
         assert!(!locked.contains("FA;;;LA"), "{locked}");
     }
