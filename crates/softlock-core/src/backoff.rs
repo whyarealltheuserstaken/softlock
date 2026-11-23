@@ -352,13 +352,22 @@ mod tests {
     fn a_password_budget_stays_under_the_lockout_threshold() {
         assert_eq!(password_attempt_limit(10), Some(8));
         assert_eq!(password_attempt_limit(5), Some(3));
-        assert_eq!(password_attempt_limit(2), Some(1));
-        assert_eq!(password_attempt_limit(1), Some(1));
+        assert_eq!(password_attempt_limit(3), Some(1));
+        // Threshold 2 or 1 cannot leave a failure of margin, so the path
+        // allows no password attempts at all.
+        assert_eq!(password_attempt_limit(2), Some(0));
+        assert_eq!(password_attempt_limit(1), Some(0));
         assert_eq!(password_attempt_limit(0), None);
         let unread = unreadable_lockout_policy();
-        assert_eq!(unread.threshold, 3);
-        assert_eq!(password_attempt_limit(unread.threshold), Some(1));
+        assert_eq!(password_attempt_limit(unread.threshold), Some(0));
         assert!(unread.window >= Duration::from_secs(99_999 * 60));
+        let now = ClockSample {
+            tick: 1_000,
+            wall_ms: 1_000,
+        };
+        let blocked = password_gate(&[], unread, now);
+        assert!(blocked.exhausted);
+        assert!(!blocked.allow);
     }
 
     #[test]
@@ -444,6 +453,90 @@ mod tests {
         assert!(aged.allow, "both clocks left the window");
         assert!(!aged.exhausted);
         assert_eq!(aged.active, 0);
+    }
+
+    #[test]
+    fn the_window_resets_only_after_the_latest_failure_ages_out_on_both_clocks() {
+        // Windows keeps the whole bad-password count until the observation
+        // window has passed since the last failure, then clears it at once.
+        // Aging each stamp on its own hands the attempt back and locks the
+        // account. These are the times a throwaway probe was allowed through.
+        let policy = LockoutPolicy {
+            threshold: 10,
+            window: Duration::from_secs(600),
+        };
+        let times = [0u64, 30, 90, 210, 510, 630, 750, 870, 1110, 1230];
+        let allowed = allowed_at(policy, &times);
+        assert!(
+            allowed <= 8,
+            "threshold 10 allowed {allowed} attempts with no 10-minute gap after the last failure"
+        );
+        assert!(allowed < times.len());
+
+        // Threshold 5, 10-minute window. The fourth and fifth attempts sit
+        // where the oldest stamp would have aged out and the latest has not.
+        let five = LockoutPolicy {
+            threshold: 5,
+            window: Duration::from_secs(600),
+        };
+        let tight = allowed_at(five, &[0, 30, 90, 600, 660]);
+        assert!(
+            tight <= 3,
+            "threshold 5 with a 10-minute window allowed {tight}"
+        );
+
+        let half_hour = LockoutPolicy {
+            threshold: 5,
+            window: Duration::from_secs(30 * 60),
+        };
+        let wider = allowed_at(half_hour, &[0, 30, 90, 1800, 1860]);
+        assert!(
+            wider <= 3,
+            "threshold 5 with a 30-minute window allowed {wider}"
+        );
+
+        let mut stamps = Vec::new();
+        for secs in [0u64, 30, 90] {
+            let now = at(secs);
+            stamps.push(PasswordStamp {
+                tick: now.tick,
+                wall_ms: now.wall_ms,
+            });
+        }
+        // Only the oldest failure has left the window. The latest has not,
+        // so the count is still every failure, not two.
+        let oldest_only = password_gate(&stamps, five, at(600));
+        assert_eq!(oldest_only.active, 3);
+        assert!(oldest_only.exhausted);
+        assert!(!oldest_only.allow);
+
+        let cleared = password_gate(&stamps, five, at(90 + 600));
+        assert_eq!(cleared.active, 0);
+        assert!(!cleared.exhausted);
+        assert!(cleared.allow);
+    }
+
+    fn at(secs: u64) -> ClockSample {
+        // Tick 0 is an untrusted stamp and never ages out. Offsets sit on a
+        // normal clock.
+        ClockSample {
+            tick: 10_000_000 + secs * 1000,
+            wall_ms: 50_000_000 + secs * 1000,
+        }
+    }
+
+    fn allowed_at(policy: LockoutPolicy, times: &[u64]) -> usize {
+        let mut stamps = Vec::new();
+        for secs in times {
+            let now = at(*secs);
+            if password_gate(&stamps, policy, now).allow {
+                stamps.push(PasswordStamp {
+                    tick: now.tick,
+                    wall_ms: now.wall_ms,
+                });
+            }
+        }
+        stamps.len()
     }
 
     #[test]

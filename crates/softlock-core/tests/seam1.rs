@@ -1284,12 +1284,18 @@ fn pin_and_password_failures_use_separate_counters() {
     assert_eq!(softlock_core::password_attempt_limit(5), Some(3));
     assert_eq!(
         softlock_core::password_attempt_limit(softlock_core::unreadable_lockout_policy().threshold),
-        Some(1)
+        Some(0),
+        "an unreadable lockout policy allows no password attempt"
     );
     let now = softlock_core::ClockSample {
         tick: 1_000_000,
         wall_ms: 2_000_000,
     };
+    let unread = softlock_core::password_gate(&[], softlock_core::unreadable_lockout_policy(), now);
+    assert!(
+        unread.exhausted && !unread.allow,
+        "an unreadable policy must offer the PIN instead of a password attempt"
+    );
     let stamp = softlock_core::PasswordStamp {
         tick: now.tick,
         wall_ms: now.wall_ms,
@@ -1298,6 +1304,67 @@ fn pin_and_password_failures_use_separate_counters() {
     assert!(!waiting.allow);
     assert_eq!(waiting.wait, Duration::from_secs(30));
     assert_eq!(controller.failure_count(), 2);
+}
+
+#[test]
+fn windows_keeps_every_failure_until_the_latest_one_leaves_the_window() {
+    // The same sequences a throwaway probe used. Aging failures out one by
+    // one allowed a tenth logon with no 10-minute gap, and it allowed a
+    // fifth logon at threshold 5 for both a 10-minute and a 30-minute window.
+    let ten_minutes = softlock_core::LockoutPolicy {
+        threshold: 10,
+        window: Duration::from_secs(600),
+    };
+    let probed = [0u64, 30, 90, 210, 510, 630, 750, 870, 1110, 1230];
+    assert!(
+        password_attempts_allowed(ten_minutes, &probed) <= 8,
+        "threshold 10 handed attempts back inside one observation window"
+    );
+    let five = softlock_core::LockoutPolicy {
+        threshold: 5,
+        window: Duration::from_secs(600),
+    };
+    assert!(password_attempts_allowed(five, &[0, 30, 90, 600, 660]) <= 3);
+    let half_hour = softlock_core::LockoutPolicy {
+        threshold: 5,
+        window: Duration::from_secs(30 * 60),
+    };
+    assert!(password_attempts_allowed(half_hour, &[0, 30, 90, 1800, 1860]) <= 3);
+
+    let stamps: Vec<softlock_core::PasswordStamp> = [0u64, 30, 90]
+        .into_iter()
+        .map(|secs| {
+            let now = password_clock(secs);
+            softlock_core::PasswordStamp {
+                tick: now.tick,
+                wall_ms: now.wall_ms,
+            }
+        })
+        .collect();
+    let oldest_aged = softlock_core::password_gate(&stamps, five, password_clock(600));
+    assert_eq!(oldest_aged.active, 3);
+    assert!(!oldest_aged.allow);
+}
+
+fn password_clock(secs: u64) -> softlock_core::ClockSample {
+    softlock_core::ClockSample {
+        tick: 10_000_000 + secs * 1000,
+        wall_ms: 50_000_000 + secs * 1000,
+    }
+}
+
+fn password_attempts_allowed(policy: softlock_core::LockoutPolicy, times: &[u64]) -> usize {
+    let mut stamps = Vec::new();
+    for secs in times {
+        let now = password_clock(*secs);
+        if softlock_core::password_gate(&stamps, policy, now).allow {
+            stamps.push(softlock_core::PasswordStamp {
+                tick: now.tick,
+                wall_ms: now.wall_ms,
+            });
+        }
+    }
+    stamps.len()
 }
 
 #[test]

@@ -1058,7 +1058,9 @@ fn password_attempts_stay_under_the_lockout_threshold() {
         "the password path called LogonUser more or less than the cap"
     );
     assert!(!mid.locked_out, "the account locked inside the cap");
-    advance_clock(&clock, 3_600_000, 1_000);
+    // Age only the oldest failure, on both clocks. The latest failure is
+    // still inside the 10-minute window, so Windows has not reset the count.
+    advance_clock(&clock, 520_000, 520_000);
     send_virtual_key(VK_TAB, session.extra).expect("tab");
     thread::sleep(Duration::from_millis(150));
     for _ in 0..8 {
@@ -1172,6 +1174,39 @@ unsafe extern "system" fn enum_window_title(
 }
 
 #[test]
+#[test]
+fn outside_failures_stop_the_password_path_before_the_threshold() {
+    let _guard = gate();
+    forget_password_attempts();
+    let _policy = LockoutGuard::set_window(5, 30, 30);
+    let account = PasswordAccount::create();
+    let wrong = softlock_core::Secret::new(b"wrong-password-value");
+    for _ in 0..3 {
+        assert!(
+            !softlock_service::network_logon(&account.name, ".", &wrong),
+            "an outside wrong password was accepted"
+        );
+    }
+    let seeded = softlock_service::account_lockout(&account.name).expect("seeded");
+    assert_eq!(seeded.bad_password_count, 3);
+    assert!(!seeded.locked_out, "seeding locked the account");
+    let env = account.session_env();
+    let session = Session::launch_extra(None, false, "1", None, &env);
+    session.lock().expect("lock");
+    for _ in 0..4 {
+        type_password("wrong-password-value", session.extra);
+        thread::sleep(Duration::from_millis(300));
+    }
+    let after = softlock_service::account_lockout(&account.name).expect("after");
+    assert!(
+        after.bad_password_count < 5,
+        "SoftLock called LogonUser after outside failures had used the margin: {}",
+        after.bad_password_count
+    );
+    assert!(!after.locked_out, "the account locked out");
+}
+
+#[test]
 fn network_logon_lockout_count() {
     let _guard = gate();
     let _policy = LockoutGuard::set(3);
@@ -1185,13 +1220,16 @@ fn network_logon_lockout_count() {
         }
     }
     let after = softlock_service::account_lockout(&account.name).expect("after");
-    println!(
-        "lockout-measure threshold=3 before_bad={} after_bad={} before_locked={} after_locked={} wrong_logons_accepted={}",
-        before.bad_password_count,
-        after.bad_password_count,
-        before.locked_out,
+    assert_eq!(before.bad_password_count, 0);
+    assert!(!before.locked_out);
+    assert_eq!(accepted, 0, "a wrong network logon was accepted");
+    assert_eq!(
+        after.bad_password_count, 3,
+        "a rejected network logon did not reach the threshold"
+    );
+    assert!(
         after.locked_out,
-        accepted
+        "the account did not lock at the threshold"
     );
 }
 
