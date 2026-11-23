@@ -168,9 +168,16 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
                     .to_string(),
             );
         }
-        softlock_service::testing_restore_dacl(&path, &original)
-            .map_err(|_| "reassert".to_string())?;
-        if !wait_until(Duration::from_secs(8), || !owner_can_write(&path)) {
+        // The locked DACL no longer lets the console user write it. The
+        // external change has to come from LocalSystem, which still has full
+        // control.
+        restore_dacl_as_system(&path, &original)?;
+        if !wait_until(Duration::from_secs(15), || owner_can_write(&path)) {
+            return Err(
+                "the external DACL restore did not grant the console user write".to_string(),
+            );
+        }
+        if !wait_until(Duration::from_secs(12), || !owner_can_write(&path)) {
             return Err("an external DACL change was not re-asserted".to_string());
         }
         hard_stop(guard)?;
@@ -273,6 +280,70 @@ fn align_console() -> Result<(), String> {
     } else {
         let note = fs::read_to_string(&log).unwrap_or_default();
         Err(format!("console session was not the test session ({note})"))
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn restore_dacl_as_system(path: &Path, sddl: &str) -> Result<(), String> {
+    let script = guard_dir().join("restore-dacl.ps1");
+    let body = format!(
+        "$sd = New-Object System.Security.AccessControl.FileSecurity\n$sd.SetSecurityDescriptorSddlForm('{sddl}')\nSet-Acl -LiteralPath '{path}' -AclObject $sd\n",
+        path = path.display(),
+    );
+    fs::write(&script, body).map_err(|_| "dacl script".to_string())?;
+    let powershell = std::env::var("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let bin = format!(
+        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
+        powershell.display(),
+        script.display()
+    );
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "SoftLockDacl", "/F"])
+        .status();
+    let created = Command::new("schtasks")
+        .args([
+            "/Create",
+            "/TN",
+            "SoftLockDacl",
+            "/TR",
+            &bin,
+            "/SC",
+            "ONCE",
+            "/ST",
+            "00:00",
+            "/RU",
+            "SYSTEM",
+            "/RL",
+            "HIGHEST",
+            "/F",
+        ])
+        .status()
+        .map_err(|_| "dacl task".to_string())?;
+    if !created.success() {
+        return Err("dacl task was not created".to_string());
+    }
+    let started = Command::new("schtasks")
+        .args(["/Run", "/TN", "SoftLockDacl"])
+        .status()
+        .map_err(|_| "dacl task".to_string())?;
+    let granted =
+        started.success() && wait_until(Duration::from_secs(15), || owner_can_write(path));
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "SoftLockDacl", "/F"])
+        .status();
+    if granted {
+        Ok(())
+    } else {
+        let current = softlock_service::testing_dacl(path)
+            .map_err(|error| error.to_string())
+            .unwrap_or_else(|error| error);
+        Err(format!("dacl task did not restore write ({current})"))
     }
 }
 
