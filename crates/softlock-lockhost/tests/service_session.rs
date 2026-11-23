@@ -832,6 +832,19 @@ fn net_user_failure(output: &std::process::Output) -> String {
     format!("{kind} ({})", output.status)
 }
 
+fn forget_password_attempts() {
+    let data = softlock_service::service_data_directory();
+    let Some(parent) = data.parent() else {
+        return;
+    };
+    let path = parent
+        .join(format!("{}Journal", softlock_core::SERVICE_NAME))
+        .join("journal.json");
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+}
+
 fn assert_not_locked_out(name: &str) {
     let info = softlock_service::account_lockout(name).expect("account info");
     assert!(
@@ -844,6 +857,7 @@ fn assert_not_locked_out(name: &str) {
 #[test]
 fn right_password_unlocks_and_wrong_password_does_not() {
     let _guard = gate();
+    forget_password_attempts();
     let _policy = LockoutGuard::set(10);
     let account = PasswordAccount::create();
     let clock = std::env::temp_dir().join(format!("sl-clock-{}", std::process::id()));
@@ -888,6 +902,7 @@ fn right_password_unlocks_and_wrong_password_does_not() {
 #[test]
 fn service_log_omits_the_password() {
     let _guard = gate();
+    forget_password_attempts();
     let _policy = LockoutGuard::set(10);
     let account = PasswordAccount::create();
     let session = Session::launch_extra(None, false, "1", None, &account.session_env());
@@ -904,6 +919,7 @@ fn service_log_omits_the_password() {
 #[test]
 fn another_accounts_password_does_not_unlock() {
     let _guard = gate();
+    forget_password_attempts();
     let _policy = LockoutGuard::set(10);
     let session_user = PasswordAccount::named("a");
     let other = PasswordAccount::named("b");
@@ -925,6 +941,7 @@ fn another_accounts_password_does_not_unlock() {
 #[test]
 fn tab_switches_from_pin_to_password() {
     let _guard = gate();
+    forget_password_attempts();
     let _policy = LockoutGuard::set(10);
     let account = PasswordAccount::create();
     let session = Session::launch_extra(None, true, "1", None, &account.session_env());
@@ -947,6 +964,7 @@ fn tab_switches_from_pin_to_password() {
 #[test]
 fn backoff_survives_a_service_restart() {
     let _guard = gate();
+    forget_password_attempts();
     let _policy = LockoutGuard::set(10);
     let account = PasswordAccount::create();
     let env = account.session_env();
@@ -994,6 +1012,7 @@ fn backoff_survives_a_service_restart() {
 #[test]
 fn password_attempts_stay_under_the_lockout_threshold() {
     let _guard = gate();
+    forget_password_attempts();
     let _policy = LockoutGuard::set_window(5, 10, 10);
     let account = PasswordAccount::create();
     let clock = std::env::temp_dir().join(format!("sl-cap-{}", std::process::id()));
@@ -1008,8 +1027,11 @@ fn password_attempts_stay_under_the_lockout_threshold() {
     let session = Session::launch_extra(None, true, "1", None, &env);
     session.set_pin().expect("set pin");
     session.lock().expect("lock");
+    // The first key only opens the prompt. Tab after that switches to the password.
+    send_virtual_key(VK_F13, session.extra).expect("open prompt");
+    thread::sleep(Duration::from_millis(200));
     send_virtual_key(VK_TAB, session.extra).expect("tab");
-    thread::sleep(Duration::from_millis(150));
+    thread::sleep(Duration::from_millis(200));
     for step in 0..3 {
         type_password("wrong-password-value", session.extra);
         thread::sleep(Duration::from_millis(400));
@@ -1020,10 +1042,11 @@ fn password_attempts_stay_under_the_lockout_threshold() {
         }
     }
     assert!(
-        wait_for(Duration::from_secs(5), || {
+        wait_for(Duration::from_secs(8), || {
             prompt_says("Password unavailable")
         }),
-        "the prompt did not report the password path exhausted"
+        "the prompt did not report the password path exhausted ({})",
+        prompt_debug(&session)
     );
     assert!(
         prompt_says("Enter PIN"),
@@ -1090,6 +1113,7 @@ fn advance_clock(path: &Path, tick_delta: u64, wall_delta: u64) {
 
 fn prompt_says(needle: &str) -> bool {
     *PROMPT_NEEDLE.lock().expect("needle") = needle.to_string();
+    OVERLAY_TITLES.lock().expect("titles").clear();
     let mut found = false;
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::EnumWindows(
@@ -1100,16 +1124,40 @@ fn prompt_says(needle: &str) -> bool {
     found
 }
 
+fn prompt_debug(session: &Session) -> String {
+    let _ = prompt_says("Password unavailable");
+    let titles = OVERLAY_TITLES.lock().expect("titles").join("; ");
+    let log = fs::read_to_string(&session.log).unwrap_or_default();
+    let mut lines: Vec<&str> = log.lines().rev().take(8).collect();
+    lines.reverse();
+    format!("overlay=[{titles}] log={}", lines.join(" | "))
+}
+
 static PROMPT_NEEDLE: Mutex<String> = Mutex::new(String::new());
+static OVERLAY_TITLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 unsafe extern "system" fn enum_window_title(
     hwnd: windows::Win32::Foundation::HWND,
     param: windows::Win32::Foundation::LPARAM,
 ) -> windows::core::BOOL {
+    let mut class = [0u16; 64];
+    let class_len =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class) };
+    if class_len <= 0 {
+        return windows::core::BOOL(1);
+    }
+    let class_name = String::from_utf16_lossy(&class[..class_len as usize]);
+    if class_name != "softlock_overlay" {
+        return windows::core::BOOL(1);
+    }
     let mut buf = [0u16; 256];
     let count = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buf) };
     if count > 0 {
         let text = String::from_utf16_lossy(&buf[..count as usize]);
+        OVERLAY_TITLES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(text.clone());
         let needle = PROMPT_NEEDLE
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
