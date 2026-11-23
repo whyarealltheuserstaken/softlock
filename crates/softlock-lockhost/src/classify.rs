@@ -69,8 +69,8 @@ const PRESENT_PHYSICAL_EXTRA: u64 = 0x5048_5953_5049_4E31;
 static PRESENT_INJECTED: AtomicBool = AtomicBool::new(false);
 
 /// The journal service passes `--present-physical` for the sign-in case.
-/// `SendInput` reaches the console hook with `dwExtraInfo` cleared, so the
-/// tag alone never counts. A release build does not compile this.
+/// The keys are injected, and this build counts them as physical. A release
+/// build does not compile this.
 #[cfg(all(feature = "live-fail-closed", windows))]
 pub fn arm_present_physical() {
     PRESENT_INJECTED.store(true, Ordering::SeqCst);

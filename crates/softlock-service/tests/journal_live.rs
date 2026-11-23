@@ -1026,52 +1026,141 @@ fn confirmed_since(baseline: &str, expected: &str) -> bool {
 #[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
 fn type_pin_keys() -> Result<(), String> {
     // Keeps the release-scan marker on the only build that can compile this
-    // path. A product binary does not enable either feature. The lock host
-    // honors `PRESENT_PHYSICAL_EXTRA` only when it was built with
-    // `live-fail-closed`. Clearing `LLKHF_INJECTED` from this process does
-    // not change the flags Windows delivers to the host's hook.
+    // path. A product binary does not enable either feature. After the
+    // disconnect this thread is not on the input desktop, so SendInput from
+    // here returns success and the console hook never sees the keys.
+    // `last_physical_input_ms` stayed null on 3d6d754 for that reason. An
+    // interactive task runs on the console desktop, which is where the lock
+    // host installed its hook.
     let _ = softlock_service::present_physical_marker_bytes();
-    let mut keys = vec![0x7Cu16];
-    keys.extend(b"135742".iter().copied().map(u16::from));
-    keys.push(0x0D);
-    for vk in keys {
-        let input = [pin_key(vk, false), pin_key(vk, true)];
-        let sent = unsafe {
-            windows::Win32::UI::Input::KeyboardAndMouse::SendInput(
-                &input,
-                std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::INPUT>() as i32,
-            )
-        };
-        if sent != 2 {
-            return Err("the pin key was not delivered".to_string());
-        }
-        thread::sleep(Duration::from_millis(80));
+    let script = guard_dir().join("type-pin.ps1");
+    let log = guard_dir().join("type-pin.txt");
+    let _ = fs::remove_file(&log);
+    let body = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$log = '{log}'
+try {{
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class SoftlockPinKeys {{
+  [StructLayout(LayoutKind.Explicit, Size = 40)]
+  public struct INPUT {{
+    [FieldOffset(0)] public uint type;
+    [FieldOffset(8)] public ushort wVk;
+    [FieldOffset(10)] public ushort wScan;
+    [FieldOffset(12)] public uint dwFlags;
+    [FieldOffset(16)] public uint time;
+    [FieldOffset(24)] public ulong extra;
+  }}
+  [DllImport("user32.dll", SetLastError=true)]
+  public static extern uint SendInput(uint n, INPUT[] inputs, int cb);
+  [DllImport("user32.dll", SetLastError=true)]
+  public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+  [DllImport("user32.dll", SetLastError=true)]
+  public static extern bool SetThreadDesktop(IntPtr desktop);
+}}
+'@
+  $desk = [SoftlockPinKeys]::OpenInputDesktop(0, $false, 0x1FF)
+  $switched = $false
+  if ($desk -ne [IntPtr]::Zero) {{
+    $switched = [SoftlockPinKeys]::SetThreadDesktop($desk)
+  }}
+  $extra = [Convert]::ToUInt64('5048595350494E31', 16)
+  foreach ($vk in 0x7C,0x31,0x33,0x35,0x37,0x34,0x32,0x0D) {{
+    $down = New-Object SoftlockPinKeys+INPUT
+    $down.type = 1
+    $down.wVk = [uint16]$vk
+    $down.extra = $extra
+    $up = New-Object SoftlockPinKeys+INPUT
+    $up.type = 1
+    $up.wVk = [uint16]$vk
+    $up.dwFlags = 2
+    $up.extra = $extra
+    $n = [SoftlockPinKeys]::SendInput(2, @($down, $up), 40)
+    if ($n -ne 2) {{
+      throw "send $vk n=$n err=$([Runtime.InteropServices.Marshal]::GetLastWin32Error()) desk=$desk switched=$switched"
+    }}
+    Start-Sleep -Milliseconds 80
+  }}
+  "ok desk=$desk switched=$switched" | Set-Content -LiteralPath $log
+}} catch {{
+  $_ | Out-String | Set-Content -LiteralPath $log
+  exit 1
+}}
+"#,
+        log = log.display(),
+    );
+    fs::write(&script, body).map_err(|_| "pin script".to_string())?;
+    run_interactive_task("sl-type-pin", &script)?;
+    let delivered = wait_until(Duration::from_secs(20), || log.is_file());
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-type-pin", "/F"])
+        .status();
+    let note = fs::read_to_string(&log).unwrap_or_default();
+    let note = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    if delivered && note.starts_with("ok") {
+        Ok(())
+    } else {
+        Err(format!(
+            "the pin was not typed on the input desktop ({note})"
+        ))
     }
-    Ok(())
 }
 
 #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
 #[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
-fn pin_key(virtual_key: u16, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
-    };
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(virtual_key),
-                wScan: 0,
-                dwFlags: if up {
-                    KEYEVENTF_KEYUP
-                } else {
-                    Default::default()
-                },
-                time: 0,
-                // "PHYSPIN1". Must match `PRESENT_PHYSICAL_EXTRA` in the lock host.
-                dwExtraInfo: 0x5048_5953_5049_4E31usize,
-            },
-        },
+fn run_interactive_task(name: &str, script: &Path) -> Result<(), String> {
+    let user = Command::new("whoami")
+        .output()
+        .map_err(|_| "whoami".to_string())?;
+    let user = String::from_utf8_lossy(&user.stdout).trim().to_string();
+    if user.is_empty() {
+        return Err("whoami returned no user".to_string());
+    }
+    let powershell = std::env::var("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let bin = format!(
+        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
+        powershell.display(),
+        script.display()
+    );
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", name, "/F"])
+        .status();
+    let created = Command::new("schtasks")
+        .args([
+            "/Create", "/TN", name, "/TR", &bin, "/SC", "ONCE", "/ST", "00:00", "/RU", &user,
+            "/IT", "/RL", "LIMITED", "/F",
+        ])
+        .output()
+        .map_err(|_| "pin task".to_string())?;
+    if !created.status.success() {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&created.stdout),
+            String::from_utf8_lossy(&created.stderr)
+        );
+        return Err(format!("pin task was not created ({text})"));
+    }
+    let started = Command::new("schtasks")
+        .args(["/Run", "/TN", name])
+        .output()
+        .map_err(|_| "pin task".to_string())?;
+    if started.status.success() {
+        Ok(())
+    } else {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&started.stdout),
+            String::from_utf8_lossy(&started.stderr)
+        );
+        Err(format!("pin task did not start ({text})"))
     }
 }
 
@@ -1344,10 +1433,10 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
         format!("SOFTLOCK_STOP_FILE={}", guard_dir().join("stop").display()),
     ];
     if std::env::var("SOFTLOCK_JOURNAL_LIVE").ok().as_deref() == Some("sign-in") {
-        // The lock host is in the console session. SendInput from this
-        // process does not arrive with the tag intact. The host counts
-        // injected keys as physical only when it was built with
-        // live-fail-closed and this variable is set.
+        // The lock host is in the console session. The sign-in PIN is
+        // injected on the input desktop. The host counts those keys as
+        // physical only when it was built with live-fail-closed and this
+        // variable is set.
         pairs.push("SOFTLOCK_PRESENT_PHYSICAL=1".to_string());
     }
     if let Some(phase) = pause {
