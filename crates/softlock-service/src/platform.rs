@@ -91,6 +91,13 @@ impl ServicePlatform {
         self.arm.clone()
     }
 
+    /// True when locking has to wait for a Lock Host. The Windows service
+    /// installs the slot. Unit tests leave it unset and report `Locked`
+    /// with no desktop guard.
+    pub fn awaits_host(&self) -> bool {
+        self.arm.is_some()
+    }
+
     pub fn set_report(&mut self, guard: GuardHealth, overlay: OverlayHealth) {
         self.guard = guard;
         self.overlay = overlay;

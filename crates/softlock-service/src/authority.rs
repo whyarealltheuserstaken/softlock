@@ -98,7 +98,20 @@ impl Authority {
     }
 
     pub fn state_name(&self) -> StateName {
-        self.controller.state().name()
+        self.public_state(self.controller.state().name())
+    }
+
+    /// The controller enters `Locked` as soon as the arm slot is marked, so a
+    /// lost host still fails closed. The hooks are not in until `HostReady`.
+    /// Until then the public name stays `Arming`. A platform with no arm slot
+    /// has no desktop guard to wait for and reports `Locked` immediately.
+    fn public_state(&self, name: StateName) -> StateName {
+        if name == StateName::Locked && self.controller.platform().awaits_host() && !self.host_ready
+        {
+            StateName::Arming
+        } else {
+            name
+        }
     }
 
     pub fn last_fallback(&self) -> Option<softlock_core::Fallback> {
@@ -515,10 +528,36 @@ impl Authority {
     }
 
     fn response(&self) -> ResponseKind {
-        self.controller
+        let response = self
+            .controller
             .last_response()
             .cloned()
-            .unwrap_or(ResponseKind::Unsupported)
+            .unwrap_or(ResponseKind::Unsupported);
+        match response {
+            ResponseKind::Status {
+                state,
+                lock_source,
+                guard,
+                overlay,
+                last_fallback,
+            } => ResponseKind::Status {
+                state: self.public_state(state),
+                lock_source,
+                guard,
+                overlay,
+                last_fallback,
+            },
+            ResponseKind::Hello {
+                service_version,
+                state,
+                capabilities,
+            } => ResponseKind::Hello {
+                service_version,
+                state: self.public_state(state),
+                capabilities,
+            },
+            other => other,
+        }
     }
 }
 
@@ -644,10 +683,28 @@ pub fn stub_os_lock() -> bool {
 mod host_ready_tests {
     use softlock_core::{
         HostToService, LaunchNonce, LockSource, LockState, RequestKind, ResponseKind, Role,
+        StateName,
     };
 
-    use super::Authority;
-    use crate::platform::{OsLock, ServicePlatform};
+    use super::{Authority, HostLoss};
+    use crate::platform::{ArmWait, OsLock, ServicePlatform};
+
+    fn lock_hotkey(authority: &mut Authority) -> ResponseKind {
+        authority.handle_public(
+            Role::App,
+            RequestKind::Lock {
+                source: LockSource::Hotkey,
+                note: None,
+            },
+        )
+    }
+
+    fn status_state(authority: &mut Authority) -> StateName {
+        match authority.handle_public(Role::App, RequestKind::GetStatus) {
+            ResponseKind::Status { state, .. } => state,
+            other => panic!("GetStatus returned {other:?}"),
+        }
+    }
 
     #[test]
     fn forged_host_ready_leaves_the_host_not_ready() {
@@ -681,5 +738,50 @@ mod host_ready_tests {
             .accept_host(HostToService::HostReady { monitors: 2, nonce })
             .expect("the real HostReady still arms");
         assert!(authority.host_ready());
+    }
+
+    /// A desktop lock marks the arm slot and the controller enters `Locked`
+    /// so a lost host still fails closed. Callers are told `Arming` until
+    /// `HostReady`, which the Lock Host sends only after its hooks are in.
+    #[test]
+    fn locked_is_not_reported_until_the_host_hooks_are_in() {
+        let mut bare = Authority::new(ServicePlatform::new(OsLock::Fails), true);
+        let _ = bare.issue_launch_nonce().expect("nonce");
+        assert_eq!(lock_hotkey(&mut bare), ResponseKind::Accepted);
+        assert_eq!(bare.state_name(), StateName::Locked);
+        assert_eq!(status_state(&mut bare), StateName::Locked);
+
+        let mut platform = ServicePlatform::new(OsLock::Fails);
+        platform.set_arm_wait(ArmWait::new());
+        let mut authority = Authority::new(platform, true);
+        let nonce = authority.issue_launch_nonce().expect("nonce");
+        assert_eq!(lock_hotkey(&mut authority), ResponseKind::Accepted);
+        assert!(
+            matches!(authority.state(), LockState::Locked { .. }),
+            "the controller left Locked before the host was ready"
+        );
+        assert!(authority.session_needs_a_host());
+        assert_eq!(authority.state_name(), StateName::Arming);
+        assert_eq!(status_state(&mut authority), StateName::Arming);
+        authority
+            .accept_host(HostToService::HostReady { monitors: 1, nonce })
+            .expect("host ready");
+        assert!(authority.host_ready());
+        assert_eq!(authority.state_name(), StateName::Locked);
+        assert_eq!(status_state(&mut authority), StateName::Locked);
+    }
+
+    #[test]
+    fn host_loss_before_ready_still_fails_closed() {
+        let mut platform = ServicePlatform::new(OsLock::Fails);
+        platform.set_arm_wait(ArmWait::new());
+        let mut authority = Authority::new(platform, true);
+        let _ = authority.issue_launch_nonce().expect("nonce");
+        assert_eq!(lock_hotkey(&mut authority), ResponseKind::Accepted);
+        assert_eq!(authority.state_name(), StateName::Arming);
+        authority.note_host_lost(HostLoss::GuardDown);
+        assert!(matches!(authority.state(), LockState::FailingClosed { .. }));
+        assert_ne!(authority.state_name(), StateName::Unlocked);
+        assert_ne!(authority.state_name(), StateName::Locked);
     }
 }
