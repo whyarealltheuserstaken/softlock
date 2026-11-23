@@ -16,7 +16,7 @@ use windows::Win32::Storage::FileSystem::{
 
 use crate::secrets::{
     dacl_sddl_handle, delete_by_handle, drop_handle, handle_is_reparse, not_found, open_child,
-    open_root, os_error,
+    open_child_at, open_root, os_error,
 };
 
 const FILE_LIST_DIRECTORY: u32 = 0x0001;
@@ -62,8 +62,34 @@ pub fn configured_path() -> Result<PathBuf, &'static str> {
     } else {
         crate::taskmgr::owner_config_file()?
     };
-    ensure_file(&path).map_err(|_| "config")?;
+    ensure_file(&path).map_err(config_reason)?;
     Ok(path)
+}
+
+fn config_reason(error: io::Error) -> &'static str {
+    match error.raw_os_error() {
+        Some(2) => "config-2",
+        Some(3) => "config-3",
+        Some(5) => "config-5",
+        Some(32) => "config-32",
+        Some(87) => "config-87",
+        Some(123) => "config-123",
+        Some(161) => "config-161",
+        Some(267) => "config-267",
+        _ => {
+            let text = error.to_string();
+            match text.as_str() {
+                "reparse" => "config-reparse",
+                "sid" => "config-sid",
+                "drive" => "config-drive",
+                "name" => "config-name",
+                "config" => "config-path",
+                "acl" => "config-acl",
+                "privilege missing" => "config-privilege",
+                _ => "config",
+            }
+        }
+    }
 }
 
 fn test_config_dir() -> Option<PathBuf> {
@@ -277,7 +303,7 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
         let next = match open_child(directory, name, DIR_ACCESS, true, false) {
             Ok(handle) => handle,
             Err(error) if create && not_found(&error) => {
-                open_child(directory, name, DIR_ACCESS, true, true)?
+                open_child_at(directory, name, DIR_ACCESS, true, true, false)?
             }
             Err(error) => {
                 drop_handle(directory);
@@ -295,7 +321,7 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
     let file = match open_child(directory, name, FILE_ACCESS, false, false) {
         Ok(handle) => handle,
         Err(error) if create && not_found(&error) => {
-            open_child(directory, name, FILE_ACCESS, false, true)?
+            open_child_at(directory, name, FILE_ACCESS, false, true, false)?
         }
         Err(error) => {
             drop_handle(directory);

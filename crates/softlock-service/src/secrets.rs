@@ -1479,6 +1479,21 @@ pub(crate) fn open_child(
     directory_file: bool,
     create: bool,
 ) -> io::Result<windows::Win32::Foundation::HANDLE> {
+    open_child_at(directory, name, access, directory_file, create, true)
+}
+
+/// `reparse` asks for `FILE_OPEN_REPARSE_POINT`. Creating a new object passes
+/// false: that flag with a create disposition is rejected, and the caller
+/// checks the new handle is not a reparse point.
+#[cfg(windows)]
+pub(crate) fn open_child_at(
+    directory: windows::Win32::Foundation::HANDLE,
+    name: &str,
+    access: u32,
+    directory_file: bool,
+    create: bool,
+    reparse: bool,
+) -> io::Result<windows::Win32::Foundation::HANDLE> {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
     if name.is_empty() || name.contains('\\') || name.contains('/') || name.contains("..") {
@@ -1503,11 +1518,14 @@ pub(crate) fn open_child(
         information: 0,
     };
     let mut raw = std::ptr::null_mut();
-    let options = if directory_file {
-        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT_OPTION
+    let mut options = if directory_file {
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
     } else {
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT_OPTION
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
     };
+    if reparse {
+        options |= FILE_OPEN_REPARSE_POINT_OPTION;
+    }
     let disposition = if create { 3 } else { FILE_OPEN };
     let status = unsafe {
         NtCreateFile(
