@@ -25,6 +25,9 @@ struct OwnerViewDto {
     status_line: String,
     service_line: String,
     notice: String,
+    config_errors: String,
+    config_offer: bool,
+    config_hotkey: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -74,6 +77,42 @@ fn view_dto(view: &OwnerView) -> OwnerViewDto {
         status_line: status_line(view.service_running, view.state),
         service_line: service_line(view.service_running).to_string(),
         notice: shown_notice(),
+        config_errors: shown_config_errors(),
+        config_offer: shown_config_offer(),
+        config_hotkey: shown_config_hotkey(),
+    }
+}
+
+fn shown_config_errors() -> String {
+    #[cfg(windows)]
+    {
+        owner::config_errors()
+    }
+    #[cfg(not(windows))]
+    {
+        String::new()
+    }
+}
+
+fn shown_config_offer() -> bool {
+    #[cfg(windows)]
+    {
+        owner::config_offer()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn shown_config_hotkey() -> String {
+    #[cfg(windows)]
+    {
+        owner::config_hotkey()
+    }
+    #[cfg(not(windows))]
+    {
+        String::new()
     }
 }
 
@@ -161,6 +200,15 @@ fn pin_outcome(outcome: owner::PinSend) -> PinOutcome {
 }
 
 #[tauri::command]
+fn accept_config() -> OwnerViewDto {
+    #[cfg(windows)]
+    {
+        let _ = owner::accept_config();
+    }
+    view_dto(&shown_view())
+}
+
+#[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     #[cfg(windows)]
     if owner::request_quit() {
@@ -201,6 +249,7 @@ pub fn run() {
             lock_from_app,
             lock_for_real,
             set_pin,
+            accept_config,
             quit_app
         ])
         .run(tauri::generate_context!())

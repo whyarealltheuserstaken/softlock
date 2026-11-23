@@ -52,12 +52,17 @@ static VIEW: OnceLock<Mutex<OwnerView>> = OnceLock::new();
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static QUIT: AtomicBool = AtomicBool::new(false);
 static HOTKEY_OK: AtomicBool = AtomicBool::new(true);
+static HOTKEY_LABEL: Mutex<String> = Mutex::new(String::new());
 static AUTOSTART_CODE: AtomicU32 = AtomicU32::new(0);
 static WATCH_THREAD: AtomicU32 = AtomicU32::new(0);
 static STATUS_SEQ: AtomicU64 = AtomicU64::new(0);
 static APP: OnceLock<AppHandle> = OnceLock::new();
 static LOCK_WAKE: OnceLock<Sender<TrayAction>> = OnceLock::new();
 static FALLBACK_NOTICE: Mutex<String> = Mutex::new(String::new());
+static CONFIG_ERRORS: Mutex<String> = Mutex::new(String::new());
+static CONFIG_OFFER: AtomicBool = AtomicBool::new(false);
+static CONFIG_HOTKEY: Mutex<String> = Mutex::new(String::new());
+static PENDING_CONFIG: Mutex<String> = Mutex::new(String::new());
 
 enum TrayAction {
     Lock(LockSource),
@@ -133,6 +138,7 @@ pub fn run(app: Option<AppHandle>) -> i32 {
     }
     start_lock_worker();
     thread::spawn(watch_states);
+    thread::spawn(watch_config_file);
     let code = window_loop();
     // The watch thread blocks in ReadFile until the next StateChanged. Cancelling
     // that read lets the process leave without joining it.
@@ -159,6 +165,71 @@ pub fn request_quit() -> bool {
 /// Same lock the settings button uses. The window proc only queues it.
 pub fn lock_from_app() {
     enqueue_lock(LockSource::App);
+}
+
+pub fn accept_config() -> bool {
+    if current_view().locked() || !CONFIG_OFFER.load(Ordering::Acquire) {
+        return false;
+    }
+    let pending = PENDING_CONFIG
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if pending.is_empty() {
+        return false;
+    }
+    let Some(revision) = config_revision() else {
+        return false;
+    };
+    match transact(RequestKind::PutConfig {
+        toml: pending,
+        base_revision: revision,
+    }) {
+        Ok(ResponseKind::Applied) => {
+            CONFIG_OFFER.store(false, Ordering::Release);
+            *PENDING_CONFIG
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = String::new();
+            *CONFIG_ERRORS
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = String::new();
+            refresh_hotkey();
+            if let Ok(view) = view_slot().lock() {
+                publish(&view);
+            }
+            true
+        }
+        Ok(ResponseKind::Invalid { errors }) => {
+            *CONFIG_ERRORS
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = errors.join("\n");
+            false
+        }
+        _ => false,
+    }
+}
+
+pub fn config_errors() -> String {
+    CONFIG_ERRORS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
+pub fn config_offer() -> bool {
+    CONFIG_OFFER.load(Ordering::Acquire)
+}
+
+pub fn config_hotkey() -> String {
+    let label = CONFIG_HOTKEY
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if label.is_empty() {
+        actions::hotkey_label("")
+    } else {
+        label
+    }
 }
 
 fn enqueue_lock(source: LockSource) {
@@ -291,6 +362,9 @@ fn publish(view: OwnerView) {
                 status_line: status_line(view.service_running, view.state),
                 service_line: service_line(view.service_running).to_string(),
                 notice: notice_text(),
+                config_errors: config_errors(),
+                config_offer: config_offer(),
+                config_hotkey: config_hotkey(),
             },
         );
     }
@@ -305,6 +379,9 @@ struct ViewEvent {
     status_line: String,
     service_line: String,
     notice: String,
+    config_errors: String,
+    config_offer: bool,
+    config_hotkey: String,
 }
 
 fn state_label(state: Option<softlock_core::StateName>) -> String {
@@ -317,6 +394,200 @@ pub fn set_fallback_notice(notice: String) {
     *FALLBACK_NOTICE
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = notice;
+}
+
+fn registered_hotkey() -> actions::Hotkey {
+    current_config()
+        .and_then(|document| actions::hotkey_from_document(&document))
+        .unwrap_or_else(actions::default_hotkey)
+}
+
+fn current_hotkey_label() -> Option<String> {
+    current_config().map(|document| actions::hotkey_label(&document))
+}
+
+fn current_config() -> Option<String> {
+    match transact(RequestKind::GetConfig) {
+        Ok(ResponseKind::Config { toml, .. }) => Some(toml),
+        _ => None,
+    }
+}
+
+fn config_revision() -> Option<u64> {
+    match transact(RequestKind::GetConfig) {
+        Ok(ResponseKind::Config { revision, .. }) => Some(revision),
+        _ => None,
+    }
+}
+
+fn refresh_hotkey() {
+    let label = current_config()
+        .map(|document| actions::hotkey_label(&document))
+        .unwrap_or_else(|| actions::hotkey_label(""));
+    *CONFIG_HOTKEY
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = label;
+}
+
+fn watch_config_file() {
+    let mut seen = String::new();
+    while !QUIT.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(400));
+        let Some(path) = profile_config_path() else {
+            continue;
+        };
+        let Some(disk) = read_user_file(&path) else {
+            continue;
+        };
+        if disk != seen {
+            seen = disk.clone();
+            let locked = current_view().locked();
+            let effective = current_config().unwrap_or_default();
+            match actions::config_disk_action(locked, &effective, &disk) {
+                actions::ConfigDisk::Save => {
+                    if let Some(revision) = config_revision() {
+                        match transact(RequestKind::PutConfig {
+                            toml: disk,
+                            base_revision: revision,
+                        }) {
+                            Ok(ResponseKind::Invalid { errors }) => {
+                                *CONFIG_ERRORS
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner()) =
+                                    errors.join("\n");
+                                if let Ok(view) = view_slot().lock() {
+                                    publish(&view);
+                                }
+                            }
+                            Ok(ResponseKind::Applied) => {
+                                *CONFIG_ERRORS
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner()) = String::new();
+                                refresh_hotkey();
+                                if let Ok(view) = view_slot().lock() {
+                                    publish(&view);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                actions::ConfigDisk::Offer => {
+                    CONFIG_OFFER.store(true, Ordering::Release);
+                    *PENDING_CONFIG
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = disk;
+                    if let Ok(view) = view_slot().lock() {
+                        publish(&view);
+                    }
+                }
+                actions::ConfigDisk::Unchanged => {}
+            }
+        }
+        let errors_path = path.with_file_name(softlock_core::CONFIG_ERRORS_NAME);
+        if let Some(errors) = read_user_file(&errors_path) {
+            let mut slot = CONFIG_ERRORS
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if *slot != errors {
+                *slot = errors;
+                drop(slot);
+                if let Ok(view) = view_slot().lock() {
+                    publish(&view);
+                }
+            }
+        }
+    }
+}
+
+fn profile_config_path() -> Option<std::path::PathBuf> {
+    #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+    if let Ok(dir) = std::env::var("SOFTLOCK_CONFIG_DIR")
+        && !dir.is_empty()
+        && config_override_allowed()
+    {
+        return Some(std::path::PathBuf::from(dir).join(softlock_core::CONFIG_FILE_NAME));
+    }
+    roaming_config()
+}
+
+#[cfg(feature = "simulated-physical")]
+fn config_override_allowed() -> bool {
+    true
+}
+
+#[cfg(all(feature = "live-fail-closed", not(feature = "simulated-physical")))]
+fn config_override_allowed() -> bool {
+    softlock_windows::runner_may_lock().is_ok()
+}
+
+fn roaming_config() -> Option<std::path::PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        FOLDERID_RoamingAppData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
+    };
+    let wide =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KNOWN_FOLDER_FLAG(0), None) }
+            .ok()?;
+    let text = unsafe { wide.to_string() }.ok()?;
+    unsafe { CoTaskMemFree(Some(wide.0.cast())) };
+    Some(
+        std::path::PathBuf::from(text)
+            .join(softlock_core::SERVICE_NAME)
+            .join(softlock_core::CONFIG_FILE_NAME),
+    )
+}
+
+fn read_user_file(path: &std::path::Path) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ, GetFileAttributesW, OPEN_EXISTING,
+    };
+    let text = path.to_string_lossy().replace('/', "\\");
+    if text.contains("..") {
+        return None;
+    }
+    let mut prefix = String::new();
+    for (index, part) in text.split('\\').enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if index == 0 {
+            prefix = format!("{part}\\");
+        } else {
+            if !prefix.ends_with('\\') {
+                prefix.push('\\');
+            }
+            prefix.push_str(part);
+        }
+        let wide = wide(&prefix);
+        let attrs = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
+        if attrs == u32::MAX {
+            return None;
+        }
+        if attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return None;
+        }
+    }
+    let wide = wide(&text);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        .ok()?
+    };
+    let mut file = unsafe { File::from_raw_handle(handle.0) };
+    let mut body = String::new();
+    use std::io::Read;
+    file.read_to_string(&mut body).ok()?;
+    Some(body)
 }
 
 fn notice_text() -> String {
@@ -348,8 +619,13 @@ fn write_status(view: &OwnerView) {
     } else {
         "failed"
     };
+    let label = HOTKEY_LABEL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
     let mut text = status_text(view);
     text.push_str(&format!("hotkey={hotkey}\n"));
+    text.push_str(&format!("chord={label}\n"));
     text.push_str(&format!("notice={}\n", notice_text()));
     text.push_str(&format!("seq={seq}\n"));
     text.push_str(&format!("hwnd={}\n", WINDOW.load(Ordering::Acquire)));
@@ -449,7 +725,7 @@ fn window_loop() -> i32 {
     };
     WINDOW.store(hwnd.0 as isize, Ordering::Release);
     publish_owner_hwnd(hwnd);
-    let hotkey = actions::default_hotkey();
+    let hotkey = registered_hotkey();
     let registered = unsafe {
         RegisterHotKey(
             Some(hwnd),
@@ -458,6 +734,10 @@ fn window_loop() -> i32 {
             u32::from(hotkey.virtual_key),
         )
     };
+    let label = current_hotkey_label().unwrap_or_else(|| "Ctrl+Alt+Shift+L".to_string());
+    *HOTKEY_LABEL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = label;
     HOTKEY_OK.store(registered.is_ok(), Ordering::Release);
     add_tray(hwnd);
     publish(current_view());

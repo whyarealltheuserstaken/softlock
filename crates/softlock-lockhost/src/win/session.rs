@@ -41,7 +41,7 @@ pub struct DevConfig {
 }
 
 pub(crate) enum PipeCommand {
-    Arm,
+    Arm { message: Option<String> },
     Disarm,
     OsLock,
     Quit,
@@ -548,7 +548,8 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             Some(PipeCommand::Disarm) => break,
             Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             Some(PipeCommand::Quit) => service_gone = true,
-            Some(PipeCommand::Arm) | None => {}
+            Some(PipeCommand::Arm { message }) => overlay::set_message(message.as_deref()),
+            None => {}
         }
         if service_gone {
             arm_quit_lock(&mut quit_tried, controller.state());
@@ -1254,7 +1255,10 @@ fn wait_for_arm(shared: &Shared) -> bool {
             return false;
         }
         match next_command(shared) {
-            Some(PipeCommand::Arm) => return true,
+            Some(PipeCommand::Arm { message }) => {
+                overlay::set_message(message.as_deref());
+                return true;
+            }
             Some(PipeCommand::Disarm) => return false,
             Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             // Hooks are installed only after Arm. Quit before that is not
@@ -1357,7 +1361,7 @@ pub fn run_service_host() -> i32 {
 fn host_read_loop(mut file: std::fs::File, commands: std::sync::mpsc::Sender<PipeCommand>) {
     while let Ok(frame) = softlock_core::read_prefixed_frame(&mut file) {
         let command = match softlock_core::decode_service_frame(&frame) {
-            Ok(softlock_core::ServiceToHost::Arm) => Some(PipeCommand::Arm),
+            Ok(softlock_core::ServiceToHost::Arm { message }) => Some(PipeCommand::Arm { message }),
             Ok(softlock_core::ServiceToHost::Disarm) => Some(PipeCommand::Disarm),
             Ok(softlock_core::ServiceToHost::OsLock) => Some(PipeCommand::OsLock),
             Ok(softlock_core::ServiceToHost::PromptResult { .. }) => None,

@@ -25,6 +25,10 @@ export interface OwnerView {
   serviceStop: boolean;
   fieldError: string | null;
   notice: string;
+  configErrors: string;
+  configOffer: boolean;
+  configHotkey: string;
+  editing: boolean;
 }
 
 /** Same shape as the Tauri `platform_status` command. */
@@ -41,6 +45,7 @@ export interface IpcBridge {
   subscribe(onChange: (view: OwnerView) => void): () => void;
   quit(): OwnerView;
   current(): OwnerView;
+  acceptConfig(): OwnerView;
 }
 
 declare global {
@@ -51,6 +56,10 @@ declare global {
     __SOFTLOCK_PIN_RESULT__?: string;
     __SOFTLOCK_SET_NOTICE__?: (notice: string) => void;
     __SOFTLOCK_FALLBACK__?: (atUtcMs: number, reason: string) => void;
+    __SOFTLOCK_CONFIG_ERRORS__?: (errors: string) => void;
+    __SOFTLOCK_CONFIG_OFFER__?: (pending: boolean) => void;
+    __SOFTLOCK_CONFIG_DISK__?: (document: string) => void;
+    __SOFTLOCK_ACCEPT_CONFIG__?: () => void;
   }
 }
 
@@ -96,6 +105,10 @@ function emptyView(): OwnerView {
     serviceStop: false,
     fieldError: null,
     notice: "",
+    configErrors: "",
+    configOffer: false,
+    configHotkey: "Ctrl+Alt+Shift+L",
+    editing: true,
   };
 }
 
@@ -105,6 +118,7 @@ function failClosed(previous: OwnerView): OwnerView {
     serviceRunning: false,
     locked: true,
     state: "Locked",
+    editing: false,
     fieldError: previous.fieldError,
     serviceStop: false,
   };
@@ -114,14 +128,18 @@ class FakeBridge implements IpcBridge {
   readonly kind = FAKE_BRIDGE;
   private view = emptyView();
   private listeners = new Set<(view: OwnerView) => void>();
+  private effective = "hotkey = \"Ctrl+Alt+Shift+L\"\n";
+  private pending: string | null = null;
 
   constructor() {
     window.__SOFTLOCK_PUSH_STATE__ = (state: string) => {
+      const locked = state !== "Unlocked";
       this.view = {
         ...this.view,
         serviceRunning: true,
         state,
-        locked: state !== "Unlocked",
+        locked,
+        editing: !locked && !this.view.configOffer,
       };
       this.emit();
     };
@@ -132,6 +150,20 @@ class FakeBridge implements IpcBridge {
     window.__SOFTLOCK_SET_NOTICE__ = (notice: string) => {
       this.view = { ...this.view, notice };
       this.emit();
+    };
+    window.__SOFTLOCK_CONFIG_ERRORS__ = (errors: string) => {
+      this.view = { ...this.view, configErrors: errors };
+      this.emit();
+    };
+    window.__SOFTLOCK_CONFIG_OFFER__ = (pending: boolean) => {
+      this.view = { ...this.view, configOffer: pending, editing: !pending && !this.view.locked };
+      this.emit();
+    };
+    window.__SOFTLOCK_CONFIG_DISK__ = (document: string) => {
+      this.noteDisk(document);
+    };
+    window.__SOFTLOCK_ACCEPT_CONFIG__ = () => {
+      this.acceptOnService();
     };
     window.__SOFTLOCK_FALLBACK__ = (atUtcMs: number, reason: string) => {
       this.view = {
@@ -169,6 +201,7 @@ class FakeBridge implements IpcBridge {
       serviceRunning: true,
       locked: true,
       state: "Locked",
+      editing: false,
       lockSource: source,
       sources,
       serviceStop: false,
@@ -216,6 +249,49 @@ class FakeBridge implements IpcBridge {
     };
     this.emit();
     return this.view;
+  }
+
+  acceptConfig(): OwnerView {
+    this.acceptOnService();
+    return this.view;
+  }
+
+  private noteDisk(document: string) {
+    if (this.view.locked || this.view.configOffer) {
+      this.pending = document;
+      this.view = {
+        ...this.view,
+        configOffer: true,
+        editing: false,
+        configHotkey: hotkeyOf(this.effective),
+      };
+    } else {
+      this.effective = document;
+      this.pending = null;
+      this.view = {
+        ...this.view,
+        configOffer: false,
+        editing: true,
+        configHotkey: hotkeyOf(document),
+      };
+    }
+    this.emit();
+  }
+
+  private acceptOnService() {
+    if (this.view.locked || !this.view.configOffer || this.pending === null) {
+      this.emit();
+      return;
+    }
+    this.effective = this.pending;
+    this.pending = null;
+    this.view = {
+      ...this.view,
+      configOffer: false,
+      editing: true,
+      configHotkey: hotkeyOf(this.effective),
+    };
+    this.emit();
   }
 
   quit(): OwnerView {
@@ -304,6 +380,26 @@ class TauriBridge implements IpcBridge {
     return this.view;
   }
 
+  acceptConfig(): OwnerView {
+    if (this.view.locked || !this.view.configOffer) {
+      this.emit();
+      return this.view;
+    }
+    void this.acceptOnService();
+    return this.view;
+  }
+
+  private async acceptOnService() {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const dto = await invoke<ViewDto>("accept_config");
+      this.apply(dto);
+    } catch {
+      this.view = failClosed(this.view);
+      this.emit();
+    }
+  }
+
   quit(): OwnerView {
     this.view = { ...this.view, quit: true, serviceStop: false };
     this.emit();
@@ -351,6 +447,10 @@ class TauriBridge implements IpcBridge {
       sources,
       serviceStop: false,
       notice: dto.notice ?? this.view.notice,
+      configErrors: dto.config_errors ?? this.view.configErrors,
+      configOffer: dto.config_offer ?? this.view.configOffer,
+      configHotkey: dto.config_hotkey ?? this.view.configHotkey,
+      editing: dto.service_running && !dto.locked && !(dto.config_offer ?? this.view.configOffer),
     };
     this.emit();
   }
@@ -370,6 +470,14 @@ interface ViewDto {
   status_line: string;
   service_line: string;
   notice?: string;
+  config_errors?: string;
+  config_offer?: boolean;
+  config_hotkey?: string;
+}
+
+function hotkeyOf(document: string): string {
+  const match = document.match(/hotkey\s*=\s*"([^"]+)"/);
+  return match?.[1] ?? "Ctrl+Alt+Shift+L";
 }
 
 export function createIpcBridge(): IpcBridge {

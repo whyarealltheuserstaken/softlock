@@ -2561,3 +2561,33 @@ fn host_loss_while_the_os_lock_is_down_retries_and_never_unlocks() {
         "host loss while the OS lock is down ended Unlocked"
     );
 }
+
+#[test]
+fn published_schema_accepts_the_default_and_rejects_an_unknown_field() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/schema/config.schema.json");
+    let published = std::fs::read_to_string(&path).expect("published schema");
+    let generated = softlock_core::published_schema_json();
+    assert_eq!(
+        published.trim(),
+        generated.trim(),
+        "schema drifted from the Rust types"
+    );
+    let defaults = softlock_core::Config::initial().document().to_string();
+    softlock_core::schema_accepts_document(&published, &defaults).expect("default file");
+    assert!(softlock_core::Config::parse(&defaults).is_ok());
+    let unknown = format!("unknown_field = true\n{defaults}");
+    assert!(softlock_core::schema_accepts_document(&published, &unknown).is_err());
+    let nested = format!("{defaults}\nunknown_nested = true\n");
+    assert!(
+        softlock_core::schema_accepts_document(&published, &nested).is_err(),
+        "a nested unknown field must be rejected"
+    );
+    let errors = softlock_core::Config::parse(&unknown).expect_err("unknown field");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error == "unknown field: unknown_field"),
+        "{errors:?}"
+    );
+}

@@ -29,6 +29,20 @@ use super::session::{OVERLAY_MARKER, Shared};
 
 const CLASS_NAME: PCWSTR = w!("softlock_overlay");
 
+static LOCK_MESSAGE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub(crate) fn set_message(message: Option<&str>) {
+    let mut slot = LOCK_MESSAGE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    slot.clear();
+    if let Some(message) = message {
+        if message.chars().count() <= 200 && !message.chars().any(|c| c.is_control()) {
+            slot.push_str(message);
+        }
+    }
+}
+
 pub(crate) fn create(shared: &Shared) -> Result<(), ()> {
     register_class()?;
     let monitors = monitor_rects();
@@ -321,11 +335,20 @@ fn caption() -> Vec<u16> {
     } else {
         String::new()
     };
+    let custom = LOCK_MESSAGE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let custom = if custom.is_empty() {
+        String::new()
+    } else {
+        format!("\n{custom}")
+    };
     let text = if prompt {
         let dots = "\u{25cf}".repeat(chars as usize);
-        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nEnter PIN\n{dots}{notice}")
+        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nEnter PIN\n{dots}{notice}{custom}")
     } else {
-        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nPress any key to unlock{notice}")
+        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nPress any key to unlock{notice}{custom}")
     };
     utf16(&text)
 }

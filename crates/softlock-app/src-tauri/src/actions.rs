@@ -21,12 +21,48 @@ pub struct Hotkey {
 
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn default_hotkey() -> Hotkey {
-    Hotkey {
+    hotkey_from_document(&softlock_core::Config::initial().document()).unwrap_or(Hotkey {
         control: true,
         alt: true,
         shift: true,
         virtual_key: u16::from(b'L'),
+    })
+}
+
+pub fn hotkey_from_document(document: &str) -> Option<Hotkey> {
+    let chord = softlock_core::hotkey_in_document(document)?;
+    Some(Hotkey {
+        control: chord.control,
+        alt: chord.alt,
+        shift: chord.shift,
+        virtual_key: chord.virtual_key,
+    })
+}
+
+/// What the file watcher does with bytes that differ from the effective config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigDisk {
+    Unchanged,
+    /// Unlocked: send the bytes with `PutConfig`.
+    Save,
+    /// Locked: keep the effective config and wait for the apply prompt.
+    Offer,
+}
+
+pub fn config_disk_action(locked: bool, effective: &str, disk: &str) -> ConfigDisk {
+    if disk == effective {
+        ConfigDisk::Unchanged
+    } else if locked {
+        ConfigDisk::Offer
+    } else {
+        ConfigDisk::Save
     }
+}
+
+pub fn hotkey_label(document: &str) -> String {
+    softlock_core::hotkey_in_document(document)
+        .map(|chord| chord.label)
+        .unwrap_or_else(|| "Ctrl+Alt+Shift+L".to_string())
 }
 
 /// `None` means the action stays in the app and is not a pipe request.
@@ -368,6 +404,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_locked_file_edit_is_offered_and_an_unlocked_edit_is_saved() {
+        let effective = "hotkey = \"Ctrl+Alt+Shift+L\"\n";
+        let edited = "hotkey = \"Ctrl+Alt+Shift+K\"\n";
+        assert_eq!(
+            config_disk_action(true, effective, edited),
+            ConfigDisk::Offer
+        );
+        assert_eq!(
+            config_disk_action(false, effective, edited),
+            ConfigDisk::Save
+        );
+        assert_eq!(
+            config_disk_action(false, effective, effective),
+            ConfigDisk::Unchanged
+        );
+    }
+
     fn default_hotkey_is_ctrl_alt_shift_l() {
         let hotkey = default_hotkey();
         assert!(hotkey.control);

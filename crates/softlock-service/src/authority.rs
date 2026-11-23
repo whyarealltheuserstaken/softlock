@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 use softlock_core::{
-    Event, GuardHealth, HeartbeatReport, HostToService, LaunchNonce, LockController, LockSource,
-    LockState, MethodId, OverlayHealth, RequestKind, ResponseKind, Role, Secret, ServiceToHost,
-    StateName, Verdict, decode_request_frame, hash_softlock_pin, verify_softlock_pin,
+    CONFIG_ERRORS_NAME, ConfigOffer, Event, GuardHealth, HeartbeatReport, HostToService,
+    LaunchNonce, LockController, LockSource, LockState, MethodId, OverlayHealth, RequestKind,
+    ResponseKind, Role, Secret, ServiceToHost, StateName, Verdict, decode_request_frame,
+    hash_softlock_pin, verify_softlock_pin,
 };
 
 use crate::log::{audit, source_name};
@@ -69,6 +70,8 @@ pub struct Authority {
     arm_deadline: Option<Instant>,
     /// The hung host is still alive and has to be replaced.
     arm_replace: bool,
+    config_dir: Option<PathBuf>,
+    offer: ConfigOffer,
 }
 
 impl Authority {
@@ -84,7 +87,54 @@ impl Authority {
             next_os_retry: None,
             arm_deadline: None,
             arm_replace: false,
+            config_dir: None,
+            offer: ConfigOffer::new(""),
         }
+    }
+
+    pub fn set_config_dir(&mut self, dir: PathBuf) {
+        self.config_dir = Some(dir);
+    }
+
+    pub fn lock_screen_message(&self) -> Option<String> {
+        let message = self.controller.config_message();
+        if message.is_empty() {
+            None
+        } else {
+            Some(message.to_string())
+        }
+    }
+
+    pub fn note_config_on_disk(&mut self, disk: &str) {
+        if self.offer.pending().is_none() {
+            self.offer = ConfigOffer::new(self.controller.config_toml());
+        }
+        let locked = !matches!(self.controller.state(), LockState::Unlocked)
+            || self.controller.session_os_locked();
+        self.offer.note_disk(locked, disk);
+    }
+
+    pub fn config_offer(&self) -> Option<&str> {
+        self.offer.pending()
+    }
+
+    pub fn accept_config_offer(&mut self) -> ResponseKind {
+        let Some(toml) = self.offer.pending().map(str::to_string) else {
+            return ResponseKind::Conflict;
+        };
+        let revision = self.controller.config_revision();
+        let response = self.handle_public(
+            Role::App,
+            RequestKind::PutConfig {
+                toml,
+                base_revision: revision,
+            },
+        );
+        if matches!(response, ResponseKind::Applied) {
+            self.offer.accept();
+            self.offer.replace_effective(self.controller.config_toml());
+        }
+        response
     }
 
     pub fn platform_mut(&mut self) -> &mut ServicePlatform {
@@ -97,6 +147,10 @@ impl Authority {
 
     pub fn notify(&mut self, event: Event) {
         self.controller.handle(event);
+    }
+
+    pub fn session_os_locked(&self) -> bool {
+        self.controller.session_os_locked()
     }
 
     pub fn state(&self) -> &LockState {
@@ -204,8 +258,60 @@ impl Authority {
             }
             other => {
                 self.controller.handle(Event::Public { role, kind: other });
-                self.response()
+                let response = self.response();
+                self.record_config_result(&response);
+                response
             }
+        }
+    }
+}
+
+fn write_errors(path: &Path, errors: &[String]) -> std::io::Result<()> {
+    let body = errors.join("\n");
+    #[cfg(windows)]
+    {
+        crate::config_file::write_bytes(path, body.as_bytes())
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && meta.file_type().is_symlink()
+        {
+            return Err(std::io::Error::other("reparse"));
+        }
+        std::fs::write(path, body)
+    }
+}
+
+impl Authority {
+    fn record_config_result(&self, response: &ResponseKind) {
+        let Some(dir) = &self.config_dir else {
+            return;
+        };
+        let path = dir.join(CONFIG_ERRORS_NAME);
+        match response {
+            ResponseKind::Invalid { errors } => {
+                let _ = write_errors(&path, errors);
+            }
+            ResponseKind::Applied => {
+                #[cfg(windows)]
+                {
+                    let _ = crate::config_file::remove_file(&path);
+                }
+                #[cfg(not(windows))]
+                {
+                    if let Ok(meta) = std::fs::symlink_metadata(&path)
+                        && meta.file_type().is_symlink()
+                    {
+                        return;
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -706,7 +812,7 @@ pub fn pipe_path() -> String {
     softlock_core::pipe_name()
 }
 
-fn test_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn test_path(name: &str) -> Option<PathBuf> {
     #[cfg(feature = "simulated-physical")]
     {
         if let Ok(path) = std::env::var(name) {

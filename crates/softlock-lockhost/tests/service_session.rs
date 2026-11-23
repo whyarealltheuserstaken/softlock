@@ -1366,6 +1366,51 @@ fn physical_reached(probe: &Probe, extra: u64) -> bool {
 }
 
 #[test]
+fn changing_the_hotkey_makes_the_new_hotkey_lock() {
+    let _guard = gate();
+    softlock_windows::runner_may_lock().expect("refusing the hotkey change off a hosted runner");
+    let session = Session::start(None, true);
+    let toml = "[lock]\nhotkey = \"Ctrl+Alt+Shift+K\"\n";
+    let put = format!(
+        r#"{{"v":1,"id":8,"kind":"PutConfig","toml":"{}","base_revision":1}}"#,
+        json_escape(toml)
+    );
+    let applied = session.transact(&put).expect("put");
+    assert!(
+        applied.contains("Applied"),
+        "the new hotkey was not saved: {applied}"
+    );
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let status_path = session.pin_dir.join("owner-status.txt");
+    let _owner = KillChild(Some(spawn_owner(&session, &status_path)));
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let text = status_file(&status_path);
+            text.contains("hotkey=ok") && text.contains("chord=Ctrl+Alt+Shift+K")
+        }),
+        "the app did not register the saved hotkey: {}",
+        status_file(&status_path)
+    );
+    let before = status_seq(&status_file(&status_path));
+    send_chord(u16::from(b'K'));
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let text = status_file(&status_path);
+            status_seq(&text) > before && text.contains("state=Locked")
+        }),
+        "the saved hotkey did not lock: {}",
+        status_file(&status_path)
+    );
+}
+
+fn json_escape(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+#[test]
 fn global_hotkey_locks_and_the_probe_confirms() {
     let _guard = gate();
     let session = Session::start(None, true);
@@ -1754,9 +1799,9 @@ fn read_frame_deadline(handle: HANDLE, timeout: Duration) -> Result<Vec<u8>, Str
     }
 }
 
-fn send_default_hotkey() {
+fn send_chord(key: u16) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
-    let keys = [0xA2u16, 0xA4, 0xA0, u16::from(b'L')];
+    let keys = [0xA2u16, 0xA4, 0xA0, key];
     let mut inputs = Vec::new();
     for key in keys {
         inputs.push(chord_key(key, false));
@@ -1770,6 +1815,10 @@ fn send_default_hotkey() {
         inputs.len() as u32,
         "SendInput did not deliver the hotkey"
     );
+}
+
+fn send_default_hotkey() {
+    send_chord(u16::from(b'L'));
 }
 
 fn chord_key(virtual_key: u16, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {

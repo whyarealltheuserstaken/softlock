@@ -64,6 +64,8 @@ fn live_settings_journal() {
     let mut guard = Guard {
         rows: rows(),
         reported: false,
+        config_path: None,
+        config_dacl: None,
     };
     let outcome = match case.as_str() {
         "restore" => restore(&mut guard),
@@ -95,7 +97,64 @@ fn restore(guard: &mut Guard) -> Result<(), String> {
     }
     kill_after_apply(guard)?;
     reassert_and_repair(guard)?;
+    config_acl_round_trip(guard)?;
     Ok(())
+}
+
+fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
+    #[cfg(not(feature = "live-fail-closed"))]
+    {
+        let _ = guard;
+        return Err("the config ACL proof needs live-fail-closed".to_string());
+    }
+    #[cfg(feature = "live-fail-closed")]
+    {
+        let path = softlock_service::owner_config_file().map_err(|reason| reason.to_string())?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|_| "config dir".to_string())?;
+        }
+        if !path.exists() {
+            fs::write(
+                &path,
+                "schema_version = 1\n\n[lock]\nhotkey = \"Ctrl+Alt+Shift+L\"\n",
+            )
+            .map_err(|_| "config write".to_string())?;
+        }
+        let original = softlock_service::testing_dacl(&path).map_err(|_| "dacl".to_string())?;
+        guard.config_path = Some(path.clone());
+        guard.config_dacl = Some(original.clone());
+        let pause = guard_dir().join("pause-config");
+        spawn_service(guard, None, &pause)?;
+        wait_pipe()?;
+        transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+        if !wait_until(Duration::from_secs(20), || !owner_can_write(&path)) {
+            return Err("the owner could still write the config file while locked".to_string());
+        }
+        softlock_service::testing_restore_dacl(&path, &original)
+            .map_err(|_| "reassert".to_string())?;
+        if !wait_until(Duration::from_secs(8), || !owner_can_write(&path)) {
+            return Err("an external DACL change was not re-asserted".to_string());
+        }
+        hard_stop(guard)?;
+        let _ = wait_until(Duration::from_secs(5), || !host_running());
+        spawn_service(guard, None, &pause)?;
+        let restored = wait_until(Duration::from_secs(20), || {
+            softlock_service::testing_dacl(&path)
+                .ok()
+                .is_some_and(|current| current == original)
+                && owner_can_write(&path)
+        });
+        hard_stop(guard)?;
+        if !restored {
+            return Err("boot after the host was gone did not restore the config ACL".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn owner_can_write(path: &Path) -> bool {
+    std::fs::OpenOptions::new().write(true).open(path).is_ok()
 }
 
 fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
@@ -273,6 +332,8 @@ fn status_state(json: &str) -> Option<String> {
 struct Guard {
     rows: Vec<Saved>,
     reported: bool,
+    config_path: Option<PathBuf>,
+    config_dacl: Option<String>,
 }
 
 impl Drop for Guard {
@@ -284,6 +345,11 @@ impl Drop for Guard {
         let _ = Command::new("sc").args(["delete", SERVICE_NAME]).status();
         for row in &self.rows {
             let _ = set_value(row.key, row.name, &row.value);
+        }
+        let _ = (&self.config_path, &self.config_dacl);
+        #[cfg(feature = "live-fail-closed")]
+        if let (Some(path), Some(dacl)) = (&self.config_path, &self.config_dacl) {
+            let _ = softlock_service::testing_restore_dacl(path, dacl);
         }
         if !self.reported {
             capture();

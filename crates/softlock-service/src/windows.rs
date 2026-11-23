@@ -381,6 +381,11 @@ fn session_event(
 }
 
 fn install_journal(authority: &mut Authority) {
+    if let Ok(path) = crate::config_file::configured_path()
+        && let Some(dir) = path.parent()
+    {
+        authority.set_config_dir(dir.to_path_buf());
+    }
     match crate::settings::SettingsEngine::open() {
         Ok(mut engine) => match engine.boot() {
             Ok(crate::settings::Boot::FailClosed(journal)) => {
@@ -638,7 +643,7 @@ fn supervise(
     while !STOP.load(Ordering::Acquire) {
         if arm.is_waiting() && !arm_sent {
             next_id = next_id.saturating_add(1);
-            if let Ok(frame) = encode_service(next_id, &ServiceToHost::Arm)
+            if let Some(frame) = arm_frame(&authority, next_id)
                 && let Some(tx) = writer
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
@@ -683,7 +688,7 @@ fn supervise(
                     Some(child.writer.clone());
                 if arm_again {
                     next_id = next_id.saturating_add(1);
-                    if let Ok(frame) = encode_service(next_id, &ServiceToHost::Arm) {
+                    if let Some(frame) = arm_frame(&authority, next_id) {
                         let _ = child.writer.send(frame);
                         arm_sent = true;
                     }
@@ -693,6 +698,14 @@ fn supervise(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn arm_frame(authority: &Arc<Mutex<Authority>>, id: u64) -> Option<Vec<u8>> {
+    let message = authority
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .lock_screen_message();
+    encode_service(id, &ServiceToHost::Arm { message }).ok()
 }
 
 fn thread_is_suspended(thread: HANDLE) -> bool {

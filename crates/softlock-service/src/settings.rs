@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use softlock_core::PRODUCT_DISPLAY_NAME;
 use softlock_core::{
-    CommitFault, HardenError, Journal, JournalEntry, JournalFault, LOCKDOWN, ProductState,
-    RepairAction, SERVICE_NAME, SettingValue, SettingsJournal, StartAction, allowed_previous_for,
-    commit_then_change, encode_document, executable_may_run_as_system, fault_log,
-    lockdown_document, lockdown_policy, mark_workstation_clear, parse_document, reassert_write,
-    repair_action, repair_entry_name, restore_action_for, restore_sid, service_start_action,
-    workstation_value_after_attempt,
+    CONFIG_FILE, CommitFault, HardenError, Journal, JournalEntry, JournalFault, LOCKDOWN,
+    ProductState, RepairAction, SERVICE_NAME, SettingValue, SettingsJournal, StartAction,
+    allowed_previous_for, commit_then_change, encode_document, executable_may_run_as_system,
+    fault_log, lockdown_document, lockdown_policy, mark_workstation_clear, parse_document,
+    reassert_write, repair_action, repair_entry_name, restore_action_for, restore_sid,
+    service_start_action, with_config_acl, workstation_value_after_attempt,
 };
 
 use crate::journal_store::{load_journal, save_journal};
@@ -49,6 +49,7 @@ pub struct SettingsEngine {
     watcher: Mutex<Option<JoinHandle<()>>>,
     /// An active lock must keep the lockdown rows. Revert does not clear them.
     preserve: bool,
+    config: Option<softlock_core::SettingEntry>,
 }
 
 impl SettingsEngine {
@@ -68,6 +69,7 @@ impl SettingsEngine {
             last: Instant::now(),
             watcher: Mutex::new(None),
             preserve: false,
+            config: None,
         })
     }
 
@@ -81,6 +83,11 @@ impl SettingsEngine {
             return Ok(Boot::Idle);
         }
         self.sid = restore_sid(&doc).map_err(fault_log)?.to_string();
+        self.config = doc
+            .entries()
+            .iter()
+            .find(|entry| entry.target == CONFIG_FILE)
+            .cloned();
         let console = match console_is_active() {
             Ok(active) => active,
             Err(_) if doc.says_locked() => {
@@ -124,13 +131,31 @@ impl SettingsEngine {
             })?;
             previous.push((policy.target, value));
         }
-        let doc = lockdown_document(&self.sid, &previous, journal.failures()).map_err(|fault| {
+        let mut doc =
+            lockdown_document(&self.sid, &previous, journal.failures()).map_err(|fault| {
+                crate::audit(
+                    "settings",
+                    &[("result", "failed"), ("reason", fault_log(fault))],
+                );
+                HardenError::Failed
+            })?;
+        self.config = None;
+        let path = crate::config_file::configured_path().map_err(|reason| {
+            crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+            HardenError::Failed
+        })?;
+        let entry = crate::config_file::prepare_entry(&path).map_err(|reason| {
+            crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+            HardenError::Failed
+        })?;
+        doc = with_config_acl(doc, entry.clone()).map_err(|fault| {
             crate::audit(
                 "settings",
                 &[("result", "failed"), ("reason", fault_log(fault))],
             );
             HardenError::Failed
         })?;
+        self.config = Some(entry);
         self.pending = Some(doc);
         for (target, value) in &previous {
             let locked = lockdown_policy(target)
@@ -138,7 +163,7 @@ impl SettingsEngine {
                 .unwrap_or(1);
             journal.record(JournalEntry {
                 target: (*target).to_string(),
-                previous: previous_text(*value),
+                previous: previous_text(value),
                 new_value: locked.to_string(),
             });
         }
@@ -159,6 +184,7 @@ impl SettingsEngine {
         })?;
         let sid = self.sid.clone();
         RESTORED.store(false, Ordering::Release);
+        let config = self.config.clone();
         let saved = commit_then_change(
             || save_journal(&bytes).map_err(|_| JournalFault::NotDurable),
             || {
@@ -168,10 +194,16 @@ impl SettingsEngine {
                 // journal until unlock.
                 pause_for("before");
                 for entry in doc.entries() {
+                    if entry.target == CONFIG_FILE {
+                        continue;
+                    }
                     let Some(policy) = lockdown_policy(&entry.target) else {
                         return Err("target");
                     };
-                    write_lockdown(&sid, policy, entry.new_value)?;
+                    write_lockdown(&sid, policy, entry.new_value.clone())?;
+                }
+                if let Some(entry) = &config {
+                    crate::config_file::apply_entry(entry)?;
                 }
                 pause_for("after");
                 Ok(())
@@ -218,7 +250,7 @@ impl SettingsEngine {
                     SettingValue::Dword { value }
                 }
             };
-            if !allowed_previous_for(&entry.target, previous) {
+            if !allowed_previous_for(&entry.target, &previous) {
                 return Err("value");
             }
             self.write_previous(&entry.target, previous)?;
@@ -250,18 +282,24 @@ impl SettingsEngine {
         let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
         let skip_workstation = SKIP_WORKSTATION.load(Ordering::Acquire) || doc.workstation_clear;
         for entry in doc.entries() {
+            if entry.target == CONFIG_FILE {
+                continue;
+            }
             let Some(policy) = lockdown_policy(&entry.target) else {
                 return Err("target");
             };
             let current = read_lockdown(&self.sid, policy)?;
             let skip = skip_workstation && entry.target == "DisableLockWorkstation";
-            if let Some(next) = reassert_write(&entry.target, entry.new_value, current, skip) {
+            if let Some(next) = reassert_write(&entry.target, &entry.new_value, &current, skip) {
                 write_lockdown(&self.sid, policy, next)?;
                 crate::audit(
                     "settings",
                     &[("result", "reasserted"), ("target", policy.target)],
                 );
             }
+        }
+        if let Some(entry) = self.config.clone() {
+            crate::config_file::reassert_entry(&entry)?;
         }
         self.last = Instant::now();
         Ok(())
@@ -284,7 +322,7 @@ impl SettingsEngine {
             return Err("target");
         };
         let current = read_lockdown(&self.sid, policy)?;
-        match restore_action_for(target, previous, current).map_err(|_| "value")? {
+        match restore_action_for(target, &previous, &current).map_err(|_| "value")? {
             Some(next) => write_lockdown(&self.sid, policy, next),
             None => Ok(()),
         }
@@ -293,11 +331,16 @@ impl SettingsEngine {
     fn revert_document(&mut self, doc: &SettingsJournal) -> Result<(), &'static str> {
         RESTORED.store(true, Ordering::Release);
         for entry in doc.entries() {
+            if entry.target == CONFIG_FILE {
+                crate::config_file::restore_entry(entry)?;
+                continue;
+            }
             if lockdown_policy(&entry.target).is_none() {
                 return Err("target");
             }
-            self.write_previous(&entry.target, entry.previous)?;
+            self.write_previous(&entry.target, entry.previous.clone())?;
         }
+        self.config = None;
         let empty = encode_document(&SettingsJournal::empty()).map_err(|_| "malformed")?;
         save_journal(&empty).map_err(|_| "not-durable")?;
         SKIP_WORKSTATION.store(false, Ordering::Release);
@@ -333,10 +376,11 @@ impl SettingsEngine {
     }
 }
 
-fn previous_text(value: SettingValue) -> Option<String> {
+fn previous_text(value: &SettingValue) -> Option<String> {
     match value {
         SettingValue::Absent => None,
         SettingValue::Dword { value } => Some(value.to_string()),
+        SettingValue::Sddl { .. } => None,
     }
 }
 
@@ -345,10 +389,11 @@ fn memory_journal(doc: &SettingsJournal) -> Journal {
     for entry in doc.entries() {
         journal.record(JournalEntry {
             target: entry.target.clone(),
-            previous: previous_text(entry.previous),
-            new_value: match entry.new_value {
+            previous: previous_text(&entry.previous),
+            new_value: match &entry.new_value {
                 SettingValue::Dword { value } => value.to_string(),
                 SettingValue::Absent => "0".to_string(),
+                SettingValue::Sddl { value } => value.clone(),
             },
         });
     }

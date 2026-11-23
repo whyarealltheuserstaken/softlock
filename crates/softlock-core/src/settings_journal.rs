@@ -4,6 +4,8 @@
 //! writes the previous value back, including when that value was absent.
 //! The lockdown rows are an allow-list. A DWORD outside that list is not
 //! written. Nothing here disables Windows Hello or the password sign-in.
+//! [`CONFIG_FILE`] is the config file DACL, restored exactly from the
+//! journaled SDDL.
 
 use std::path::Path;
 use std::time::Duration;
@@ -17,6 +19,9 @@ pub const REASSERT_AFTER: Duration = Duration::from_secs(5);
 
 /// The one policy ticket 16 applied. Later rows use the same document.
 pub const TASK_MANAGER: &str = "DisableTaskMgr";
+
+/// The user-editable config file's DACL. The path is the entry's `path`.
+pub const CONFIG_FILE: &str = "ConfigFileAcl";
 
 pub const JOURNAL_VERSION: u32 = 1;
 
@@ -104,19 +109,23 @@ const SIGN_IN_BLOCKERS: &[&str] = &[
     "DisablePasswordUnlock",
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum SettingValue {
     #[serde(rename = "absent")]
     Absent,
     #[serde(rename = "dword")]
     Dword { value: u32 },
+    #[serde(rename = "sddl")]
+    Sddl { value: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingEntry {
     pub target: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
     pub previous: SettingValue,
     pub new_value: SettingValue,
 }
@@ -243,11 +252,11 @@ impl SettingsJournal {
     }
 }
 
-pub fn allowed_previous(value: SettingValue) -> bool {
+pub fn allowed_previous(value: &SettingValue) -> bool {
     match value {
         SettingValue::Absent => true,
         SettingValue::Dword { value: 0 | 1 } => true,
-        SettingValue::Dword { .. } => false,
+        SettingValue::Dword { .. } | SettingValue::Sddl { .. } => false,
     }
 }
 
@@ -259,7 +268,7 @@ pub fn task_manager_document(
     if !sid_is_safe(sid) {
         return Err(JournalFault::Sid);
     }
-    if !allowed_previous(previous) {
+    if !allowed_previous(&previous) {
         return Err(JournalFault::Value);
     }
     Ok(SettingsJournal {
@@ -270,6 +279,7 @@ pub fn task_manager_document(
         failures,
         entries: vec![SettingEntry {
             target: TASK_MANAGER.to_string(),
+            path: String::new(),
             previous,
             new_value: SettingValue::Dword {
                 value: LOCKED_DWORD,
@@ -294,10 +304,11 @@ pub fn blocks_owner_sign_in(target: &str) -> bool {
         .any(|name| name.eq_ignore_ascii_case(target))
 }
 
-pub fn allowed_previous_for(target: &str, value: SettingValue) -> bool {
+pub fn allowed_previous_for(target: &str, value: &SettingValue) -> bool {
     match value {
         SettingValue::Absent => lockdown_policy(target).is_some(),
-        SettingValue::Dword { value } => allowed_dword(target, value),
+        SettingValue::Dword { value } => allowed_dword(target, *value),
+        SettingValue::Sddl { .. } => false,
     }
 }
 
@@ -327,12 +338,13 @@ pub fn lockdown_document(
         let Some((_, value)) = previous.iter().find(|(target, _)| *target == policy.target) else {
             return Err(JournalFault::Target);
         };
-        if !allowed_previous_for(policy.target, *value) {
+        if !allowed_previous_for(policy.target, value) {
             return Err(JournalFault::Value);
         }
         entries.push(SettingEntry {
             target: policy.target.to_string(),
-            previous: *value,
+            path: String::new(),
+            previous: value.clone(),
             new_value: SettingValue::Dword {
                 value: policy.locked,
             },
@@ -367,8 +379,8 @@ pub fn mark_workstation_clear(doc: &SettingsJournal) -> Result<SettingsJournal, 
 /// `skip` is true only while a workstation lock has cleared that one value.
 pub fn reassert_write(
     target: &str,
-    locked: SettingValue,
-    current: SettingValue,
+    locked: &SettingValue,
+    current: &SettingValue,
     skip: bool,
 ) -> Option<SettingValue> {
     if skip && target == "DisableLockWorkstation" {
@@ -377,7 +389,7 @@ pub fn reassert_write(
     if current == locked {
         None
     } else {
-        Some(locked)
+        Some(locked.clone())
     }
 }
 
@@ -408,13 +420,31 @@ fn validate(doc: &SettingsJournal) -> Result<(), JournalFault> {
     }
     let mut seen = std::collections::BTreeSet::new();
     for entry in &doc.entries {
-        if lockdown_policy(&entry.target).is_none() {
-            return Err(JournalFault::Target);
-        }
         if !seen.insert(entry.target.clone()) {
             return Err(JournalFault::Duplicate);
         }
-        if !allowed_previous_for(&entry.target, entry.previous) {
+        if entry.target == CONFIG_FILE {
+            if !config_path_allowed(&entry.path) {
+                return Err(JournalFault::Target);
+            }
+            let SettingValue::Sddl { value: previous } = &entry.previous else {
+                return Err(JournalFault::Value);
+            };
+            let SettingValue::Sddl { value: locked } = &entry.new_value else {
+                return Err(JournalFault::Value);
+            };
+            if !sddl_allowed(previous) || !sddl_allowed(locked) {
+                return Err(JournalFault::Value);
+            }
+            continue;
+        }
+        if lockdown_policy(&entry.target).is_none() {
+            return Err(JournalFault::Target);
+        }
+        if !entry.path.is_empty() {
+            return Err(JournalFault::Target);
+        }
+        if !allowed_previous_for(&entry.target, &entry.previous) {
             return Err(JournalFault::Value);
         }
         let locked = lockdown_policy(&entry.target)
@@ -435,11 +465,193 @@ fn validate(doc: &SettingsJournal) -> Result<(), JournalFault> {
     Ok(())
 }
 
+pub fn config_acl_entry(
+    path: &str,
+    previous: &str,
+    locked: &str,
+) -> Result<SettingEntry, JournalFault> {
+    let entry = SettingEntry {
+        target: CONFIG_FILE.to_string(),
+        path: path.to_string(),
+        previous: SettingValue::Sddl {
+            value: previous.to_string(),
+        },
+        new_value: SettingValue::Sddl {
+            value: locked.to_string(),
+        },
+    };
+    if !config_path_allowed(&entry.path) {
+        return Err(JournalFault::Target);
+    }
+    let SettingValue::Sddl { value: previous } = &entry.previous else {
+        return Err(JournalFault::Value);
+    };
+    let SettingValue::Sddl { value: locked } = &entry.new_value else {
+        return Err(JournalFault::Value);
+    };
+    if !sddl_allowed(previous) || !sddl_allowed(locked) {
+        return Err(JournalFault::Value);
+    }
+    Ok(entry)
+}
+
+pub fn with_config_acl(
+    mut doc: SettingsJournal,
+    entry: SettingEntry,
+) -> Result<SettingsJournal, JournalFault> {
+    if entry.target != CONFIG_FILE {
+        return Err(JournalFault::Target);
+    }
+    doc.entries.push(entry);
+    validate(&doc)?;
+    Ok(doc)
+}
+
+const GROUP_WRITE_SIDS: &[&str] = &["S-1-1-0", "S-1-5-11", "S-1-5-32-545"];
+
+/// Replace the owner's allow ACE with read rights, and inherited write ACEs
+/// for Users, Everyone, and Authenticated Users.
+pub fn dacl_without_owner_write(dacl: &str, owner: &str) -> Result<String, JournalFault> {
+    if !sddl_allowed(dacl) || !sid_is_safe(owner) {
+        return Err(JournalFault::Value);
+    }
+    let mut out = String::new();
+    let mut rest = dacl;
+    let mut matches = 0usize;
+    while let Some(start) = rest.find('(') {
+        out.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find(')') else {
+            return Err(JournalFault::Value);
+        };
+        let ace = &rest[start..=start + end];
+        let (rewritten, hit) = rewrite_owner_ace(ace, owner)?;
+        if hit {
+            matches += 1;
+        }
+        out.push_str(&rewritten);
+        rest = &rest[start + end + 1..];
+    }
+    out.push_str(rest);
+    if matches == 0 {
+        return Err(JournalFault::Value);
+    }
+    if !sddl_allowed(&out) {
+        return Err(JournalFault::Value);
+    }
+    Ok(out)
+}
+
+fn rewrite_owner_ace(ace: &str, owner: &str) -> Result<(String, bool), JournalFault> {
+    let inner = ace
+        .strip_prefix('(')
+        .and_then(|text| text.strip_suffix(')'))
+        .ok_or(JournalFault::Value)?;
+    let parts: Vec<&str> = inner.split(';').collect();
+    if parts.len() != 6 {
+        return Err(JournalFault::Value);
+    }
+    let owner_ace = parts[0] == "A" && sid_eq(parts[5], owner);
+    let inherited_group = parts[0] == "A"
+        && parts[1].contains("ID")
+        && GROUP_WRITE_SIDS.iter().any(|sid| sid_eq(parts[5], sid))
+        && ace_grants_write(parts[2]);
+    if owner_ace || inherited_group {
+        Ok((
+            format!("(A;{};FR;{};{};{})", parts[1], parts[3], parts[4], parts[5]),
+            true,
+        ))
+    } else {
+        Ok((ace.to_string(), false))
+    }
+}
+
+fn ace_grants_write(rights: &str) -> bool {
+    if rights.eq_ignore_ascii_case("FR") || rights.eq_ignore_ascii_case("GR") {
+        return false;
+    }
+    if let Some(hex) = rights
+        .strip_prefix("0x")
+        .or_else(|| rights.strip_prefix("0X"))
+    {
+        let Ok(mask) = u32::from_str_radix(hex, 16) else {
+            return true;
+        };
+        // FILE_WRITE_DATA, FILE_APPEND_DATA, FILE_WRITE_EA, FILE_WRITE_ATTRIBUTES,
+        // DELETE, WRITE_DAC, WRITE_OWNER, and the generic write bit.
+        return mask & (0x0000_0116 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000) != 0;
+    }
+    let upper = rights.to_ascii_uppercase();
+    upper.contains("FA")
+        || upper.contains("GA")
+        || upper.contains("GW")
+        || upper.contains("WD")
+        || upper.contains("AD")
+        || upper.contains("DC")
+        || upper.contains("WE")
+        || upper.contains("WO")
+        || upper.contains("SD")
+}
+
+fn sid_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+pub fn sddl_allowed(text: &str) -> bool {
+    if text.len() < 4 || text.len() > 4096 || !text.starts_with("D:") {
+        return false;
+    }
+    text.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | ';' | '(' | ')' | ' '))
+        && text.contains('(')
+        && !text.contains("..")
+}
+
+pub fn config_path_allowed(path: &str) -> bool {
+    if path.len() < 8 || path.len() > 260 || path.contains("..") || path.contains('/') {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    if !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return false;
+    }
+    if !path.chars().all(|c| c.is_ascii() && !c.is_control()) {
+        return false;
+    }
+    let suffix = format!(
+        "\\AppData\\Roaming\\{}\\{}",
+        crate::name::SERVICE_NAME,
+        crate::config::CONFIG_FILE_NAME
+    );
+    let Some(profile) = path.strip_suffix(&suffix) else {
+        return false;
+    };
+    let mut parts = profile.split('\\');
+    let drive = parts.next();
+    let users = parts.next();
+    let account = parts.next();
+    drive.is_some_and(|text| text.len() == 2 && text.as_bytes()[1] == b':')
+        && users.is_some_and(|text| text.eq_ignore_ascii_case("Users"))
+        && account.is_some_and(account_component)
+        && parts.next().is_none()
+}
+
+fn account_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.len() <= 64
+        && name.chars().all(|c| {
+            c.is_ascii()
+                && !c.is_control()
+                && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
+}
+
 /// `Ok(None)` means the current value already matches and the write is skipped.
 pub fn restore_action_for(
     target: &str,
-    previous: SettingValue,
-    current: SettingValue,
+    previous: &SettingValue,
+    current: &SettingValue,
 ) -> Result<Option<SettingValue>, JournalFault> {
     if !allowed_previous_for(target, previous) {
         return Err(JournalFault::Value);
@@ -447,22 +659,45 @@ pub fn restore_action_for(
     if current == previous {
         Ok(None)
     } else {
-        Ok(Some(previous))
+        Ok(Some(previous.clone()))
     }
 }
 
 /// `Ok(None)` means the current value already matches and the write is skipped.
 pub fn restore_action(
-    previous: SettingValue,
-    current: SettingValue,
+    previous: &SettingValue,
+    current: &SettingValue,
 ) -> Result<Option<SettingValue>, JournalFault> {
+    if matches!(previous, SettingValue::Sddl { .. }) || matches!(current, SettingValue::Sddl { .. })
+    {
+        let SettingValue::Sddl {
+            value: previous_text,
+        } = previous
+        else {
+            return Err(JournalFault::Value);
+        };
+        let SettingValue::Sddl {
+            value: current_text,
+        } = current
+        else {
+            return Err(JournalFault::Value);
+        };
+        if !sddl_allowed(previous_text) || !sddl_allowed(current_text) {
+            return Err(JournalFault::Value);
+        }
+        return if previous_text == current_text {
+            Ok(None)
+        } else {
+            Ok(Some(previous.clone()))
+        };
+    }
     if !allowed_previous(previous) {
         return Err(JournalFault::Value);
     }
     if current == previous {
         Ok(None)
     } else {
-        Ok(Some(previous))
+        Ok(Some(previous.clone()))
     }
 }
 
@@ -858,16 +1093,16 @@ mod tests {
 
     #[test]
     fn absent_zero_and_admin_one_restore_exactly() {
-        let absent =
-            restore_action(SettingValue::Absent, SettingValue::Dword { value: 1 }).expect("absent");
+        let absent = restore_action(&SettingValue::Absent, &SettingValue::Dword { value: 1 })
+            .expect("absent");
         let zero = restore_action(
-            SettingValue::Dword { value: 0 },
-            SettingValue::Dword { value: 1 },
+            &SettingValue::Dword { value: 0 },
+            &SettingValue::Dword { value: 1 },
         )
         .expect("zero");
         let admin = restore_action(
-            SettingValue::Dword { value: 1 },
-            SettingValue::Dword { value: 1 },
+            &SettingValue::Dword { value: 1 },
+            &SettingValue::Dword { value: 1 },
         )
         .expect("admin");
         assert_eq!(absent, Some(SettingValue::Absent));
@@ -880,20 +1115,20 @@ mod tests {
     fn a_second_restore_does_not_change_the_value() {
         let previous = SettingValue::Dword { value: 0 };
         let mut current = SettingValue::Dword { value: 1 };
-        let first = restore_action(previous, current).expect("first");
+        let first = restore_action(&previous, &current).expect("first");
         current = first.expect("write");
-        let second = restore_action(previous, current).expect("second");
+        let second = restore_action(&previous, &current).expect("second");
         assert_eq!(second, None);
         assert_eq!(current, previous);
-        let third = restore_action(SettingValue::Absent, SettingValue::Absent).expect("third");
+        let third = restore_action(&SettingValue::Absent, &SettingValue::Absent).expect("third");
         assert_eq!(third, None);
     }
 
     #[test]
     fn a_disallowed_dword_is_not_restored_or_applied() {
         let err = restore_action(
-            SettingValue::Dword { value: 2 },
-            SettingValue::Dword { value: 1 },
+            &SettingValue::Dword { value: 2 },
+            &SettingValue::Dword { value: 1 },
         );
         assert_eq!(err, Err(JournalFault::Value));
         assert_eq!(
@@ -1216,6 +1451,37 @@ mod tests {
         assert!(!journal_dacl_exact("D:P(A;;FA;;;SY)(A;;FA;;;WD)"));
         assert!(!journal_dacl_exact("D:P(A;OICI;FA;;;SY)(A;;FA;;;BA)"));
         assert!(!journal_dacl_exact("D:P(D;;FA;;;SY)(A;;FA;;;BA)"));
+    }
+
+    #[test]
+    fn the_config_path_is_only_the_owner_profile_file() {
+        let service = crate::name::SERVICE_NAME;
+        let ok = format!(r"C:\Users\owner\AppData\Roaming\{service}\config.toml");
+        assert!(config_path_allowed(&ok));
+        assert!(!config_path_allowed(r"C:\Temp\config.toml"));
+        assert!(!config_path_allowed(&format!(
+            r"C:\Users\owner\AppData\Local\{service}\config.toml"
+        )));
+        assert!(!config_path_allowed(&format!(
+            r"C:\Users\owner\AppData\Roaming\{service}\other.toml"
+        )));
+        assert!(!config_path_allowed(&format!(
+            r"C:\Users\..\AppData\Roaming\{service}\config.toml"
+        )));
+    }
+
+    #[test]
+    fn inherited_group_write_aces_lose_write_with_the_owner() {
+        let owner = "S-1-5-21-1-2-3-1001";
+        let dacl = format!(
+            "D:(A;OICIID;FA;;;S-1-1-0)(A;ID;0x1301bf;;;S-1-5-32-545)(A;ID;FA;;;S-1-5-11)(A;;FA;;;{owner})"
+        );
+        let locked = dacl_without_owner_write(&dacl, owner).expect("rewrite");
+        assert!(locked.contains("(A;OICIID;FR;;;S-1-1-0)"), "{locked}");
+        assert!(locked.contains("(A;ID;FR;;;S-1-5-32-545)"), "{locked}");
+        assert!(locked.contains("(A;ID;FR;;;S-1-5-11)"), "{locked}");
+        assert!(locked.contains(&format!("(A;;FR;;;{owner})")), "{locked}");
+        assert!(!locked.contains("FA"), "{locked}");
     }
 
     #[test]

@@ -6,6 +6,8 @@
 
 mod authority;
 #[cfg(windows)]
+mod config_file;
+#[cfg(windows)]
 mod journal_store;
 #[cfg(feature = "live-fail-closed")]
 mod live_marker;
@@ -37,8 +39,13 @@ pub use pincheck::marker_bytes;
 pub use platform::{ArmWait, OsLock, ServicePlatform};
 pub use secrets::PinStore;
 
+#[cfg(all(windows, feature = "live-fail-closed"))]
+pub use config_file::{testing_dacl, testing_restore_dacl};
 #[cfg(windows)]
 pub use secrets::{SYSTEM_ONLY_SDDL, dacl_sddl, is_reparse_point, user_read_denied};
+
+#[cfg(windows)]
+pub use taskmgr::owner_config_file;
 
 #[cfg(windows)]
 pub use settings::{

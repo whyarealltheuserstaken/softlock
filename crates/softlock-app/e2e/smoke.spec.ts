@@ -118,6 +118,37 @@ test("quitting the app does not stop the service", async ({ page }) => {
   await expect(page.getByTestId("service-line")).toHaveText("Service running");
 });
 
+test("an invalid edit shows the field error and keeps editing closed while locked", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.evaluate(() => window.__SOFTLOCK_CONFIG_ERRORS__?.("lock.hotkey: unsupported chord"));
+  await expect(page.getByTestId("config-errors")).toHaveText("lock.hotkey: unsupported chord");
+  await page.evaluate(() => window.__SOFTLOCK_PUSH_STATE__?.("Locked"));
+  await expect(page.locator("main")).toHaveAttribute("data-editing", "off");
+  await expect(page.locator("main")).toHaveAttribute("data-locked", "on");
+});
+
+test("a file edit made while locked waits for the apply prompt", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.locator("main")).toHaveAttribute("data-config-hotkey", "Ctrl+Alt+Shift+L");
+  await page.evaluate(() => window.__SOFTLOCK_PUSH_STATE__?.("Locked"));
+  await page.evaluate(() =>
+    window.__SOFTLOCK_CONFIG_DISK__?.('hotkey = "Ctrl+Alt+Shift+K"\n'),
+  );
+  await page.evaluate(() => window.__SOFTLOCK_PUSH_STATE__?.("Unlocked"));
+  await expect(page.getByTestId("config-offer")).toHaveText(
+    "Apply changes made to the config file?",
+  );
+  await expect(page.locator("main")).toHaveAttribute("data-config-offer", "pending");
+  await expect(page.locator("main")).toHaveAttribute("data-config-hotkey", "Ctrl+Alt+Shift+L");
+  await page.getByTestId("accept-config").click();
+  await expect(page.locator("main")).toHaveAttribute("data-config-offer", "none");
+  await expect(page.locator("main")).toHaveAttribute("data-config-hotkey", "Ctrl+Alt+Shift+K");
+  await expect(page.locator("main")).toHaveAttribute("data-editing", "on");
+  await expect(page.locator("main")).toHaveAttribute("data-locked", "off");
+});
+
 async function expectUnsupported(browser: Browser) {
   const context = await browser.newContext({ baseURL: origin });
   await context.addInitScript((message) => {

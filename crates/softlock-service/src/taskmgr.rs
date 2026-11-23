@@ -56,12 +56,13 @@ pub fn write_lockdown(
     policy: &LockdownPolicy,
     value: SettingValue,
 ) -> Result<(), &'static str> {
-    if !sid_is_safe(sid) || !softlock_core::allowed_previous_for(policy.target, value) {
+    if !sid_is_safe(sid) || !softlock_core::allowed_previous_for(policy.target, &value) {
         return Err("value");
     }
     match value {
         SettingValue::Absent => delete_lockdown(sid, policy),
         SettingValue::Dword { value } => set_lockdown(sid, policy, value),
+        SettingValue::Sddl { .. } => Err("value"),
     }
 }
 
@@ -411,6 +412,25 @@ fn win32(status: windows::Win32::Foundation::WIN32_ERROR) -> Result<(), &'static
     } else {
         Err("registry")
     }
+}
+
+pub fn owner_config_file() -> Result<PathBuf, &'static str> {
+    use std::path::PathBuf;
+    let sid = console_sid()?;
+    let raw = profile_path(&sid)?;
+    let root = windows_directory()?;
+    let drive = system_drive(&root)?;
+    let expanded =
+        softlock_core::expand_profile_image(&raw, &root, &drive).map_err(|_| "profile")?;
+    let path = format!(
+        "{expanded}\\AppData\\Roaming\\{}\\{}",
+        softlock_core::SERVICE_NAME,
+        softlock_core::CONFIG_FILE_NAME
+    );
+    if !softlock_core::config_path_allowed(&path) {
+        return Err("profile");
+    }
+    Ok(PathBuf::from(path))
 }
 
 pub fn console_sid() -> Result<String, &'static str> {

@@ -8,8 +8,8 @@ use crate::heartbeat::{ARM_STEP_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BE
 use crate::ipc::{RequestKind, ResponseKind};
 use crate::journal::Journal;
 use crate::platform::{
-    AwakeGuard, AwakeRequest, Credentials, Hardening, InputGuard, LockScreenLook, Overlay,
-    PhysicalInputSink, Platform, Power, SessionControl, Verdict, standard_hardening_plan,
+    AwakeGuard, AwakeRequest, Credentials, DisplayMode, Hardening, InputGuard, LockScreenLook,
+    Overlay, PhysicalInputSink, Platform, Power, SessionControl, Verdict, standard_hardening_plan,
 };
 use crate::state::{
     ArmStep, DisarmStep, FailReason, Fallback, HeartbeatReport, LaunchNonce, LockSource, LockState,
@@ -294,6 +294,14 @@ impl<P: Platform> LockController<P> {
         self.config.document()
     }
 
+    pub fn config_hotkey(&self) -> &str {
+        self.config.hotkey()
+    }
+
+    pub fn config_message(&self) -> &str {
+        self.config.message()
+    }
+
     pub fn last_response(&self) -> Option<&ResponseKind> {
         self.last_response.as_ref()
     }
@@ -377,11 +385,13 @@ impl<P: Platform> LockController<P> {
                     Err(_) => self.fail_closed(FailReason::ArmStep { step }),
                 }
             }
-            ArmStep::Overlay => match Overlay::show(&mut self.platform, &LockScreenLook::default())
-            {
-                Ok(()) => self.enter_arm(source, ArmStep::Hardening),
-                Err(_) => self.fail_closed(FailReason::ArmStep { step }),
-            },
+            ArmStep::Overlay => {
+                let look = self.lock_look();
+                match Overlay::show(&mut self.platform, &look) {
+                    Ok(()) => self.enter_arm(source, ArmStep::Hardening),
+                    Err(_) => self.fail_closed(FailReason::ArmStep { step }),
+                }
+            }
             ArmStep::Hardening => match self.journal_and_apply() {
                 Ok(()) => self.enter_arm(source, ArmStep::Power),
                 Err(_) => self.fail_closed(FailReason::ArmStep { step }),
@@ -953,6 +963,21 @@ fn request_name(kind: &RequestKind) -> &'static str {
         RequestKind::Subscribe => "Subscribe",
         RequestKind::CheckUpdate => "CheckUpdate",
         RequestKind::InstallUpdate { .. } => "InstallUpdate",
+    }
+}
+
+impl<P: Platform> LockController<P> {
+    fn lock_look(&self) -> LockScreenLook {
+        let message = self.config.message();
+        LockScreenLook {
+            display: DisplayMode::Opaque,
+            message: if message.is_empty() {
+                None
+            } else {
+                Some(message.to_string())
+            },
+            show_clock: true,
+        }
     }
 }
 

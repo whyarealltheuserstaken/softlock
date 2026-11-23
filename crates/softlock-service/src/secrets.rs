@@ -1463,6 +1463,72 @@ pub(crate) fn create_directory_relative(
 }
 
 #[cfg(windows)]
+pub(crate) fn open_root(drive: &str) -> io::Result<windows::Win32::Foundation::HANDLE> {
+    if drive.len() != 2 || !drive.as_bytes()[0].is_ascii_alphabetic() || drive.as_bytes()[1] != b':'
+    {
+        return Err(io::Error::other("drive"));
+    }
+    open_directory(Path::new(&format!("{drive}\\")), false)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_child(
+    directory: windows::Win32::Foundation::HANDLE,
+    name: &str,
+    access: u32,
+    directory_file: bool,
+    create: bool,
+) -> io::Result<windows::Win32::Foundation::HANDLE> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    if name.is_empty() || name.contains('\\') || name.contains('/') || name.contains("..") {
+        return Err(io::Error::other("name"));
+    }
+    let mut wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut unicode = UnicodeString {
+        length: ((wide_name.len() - 1) * 2) as u16,
+        maximum_length: (wide_name.len() * 2) as u16,
+        buffer: wide_name.as_mut_ptr(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: directory.0,
+        object_name: &mut unicode,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut iosb = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut raw = std::ptr::null_mut();
+    let options = if directory_file {
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT_OPTION
+    } else {
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT_OPTION
+    };
+    let disposition = if create { 3 } else { FILE_OPEN };
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw,
+            access,
+            &mut attributes,
+            &mut iosb,
+            std::ptr::null_mut(),
+            if create { FILE_ATTRIBUTE_NORMAL.0 } else { 0 },
+            0x0000_0001 | 0x0000_0002 | 0x0000_0004,
+            disposition,
+            options,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    nt_result(status)?;
+    Ok(HANDLE(raw))
+}
+
+#[cfg(windows)]
 pub(crate) fn open_relative(
     directory: windows::Win32::Foundation::HANDLE,
     name: &str,

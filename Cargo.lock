@@ -3188,6 +3188,7 @@ dependencies = [
  "getrandom 0.2.17",
  "insta",
  "proptest",
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "toml 0.8.2",

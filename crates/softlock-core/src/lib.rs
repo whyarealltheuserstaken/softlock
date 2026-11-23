@@ -23,7 +23,10 @@ mod settings_journal;
 mod state;
 
 pub use backoff::delay_after_failure;
-pub use config::Config;
+pub use config::{
+    CONFIG_ERRORS_NAME, CONFIG_FILE_NAME, Config, ConfigOffer, HotkeyChord, MAX_CONFIG_BYTES,
+    UserConfig, hotkey_in_document, parse_hotkey, published_schema_json, schema_accepts_document,
+};
 pub use controller::Event;
 pub use controller::{LockController, Rejection};
 pub use decision::{PinAuthority, PinDecision};
@@ -66,16 +69,17 @@ pub use platform::{
     UNSUPPORTED_PLATFORM_MESSAGE, UnsupportedPlatform, UserId, Verdict,
 };
 pub use settings_journal::{
-    CommitFault, DirFacts, DirFault, DirOwner, HostPresence, JournalFault, LOCKDOWN,
+    CONFIG_FILE, CommitFault, DirFacts, DirFault, DirOwner, HostPresence, JournalFault, LOCKDOWN,
     LockdownPolicy, PolicyHive, ProductState, REASSERT_AFTER, RepairAction, SettingEntry,
     SettingValue, SettingsJournal, StartAction, TASK_MANAGER, admit_directory, allowed_previous,
-    allowed_previous_for, blocks_owner_sign_in, commit_then_change, console_user_from,
-    dir_fault_log, encode_document, executable_may_run_as_system, expand_profile_image, fault_log,
+    allowed_previous_for, blocks_owner_sign_in, commit_then_change, config_acl_entry,
+    config_path_allowed, console_user_from, dacl_without_owner_write, dir_fault_log,
+    encode_document, executable_may_run_as_system, expand_profile_image, fault_log,
     hive_target_allowed, host_identity, journal_dacl_exact, lockdown_document, lockdown_policy,
     lockdown_target, mark_workstation_clear, parent_dacl_trusted, parse_document, reassert_due,
     reassert_write, repair_action, repair_entry_name, restore_action, restore_action_for,
-    restore_sid, same_exe_path, service_start_action, sid_is_safe, task_manager_document,
-    workstation_value_after_attempt,
+    restore_sid, same_exe_path, sddl_allowed, service_start_action, sid_is_safe,
+    task_manager_document, with_config_acl, workstation_value_after_attempt,
 };
 pub use state::{
     ArmStep, DisarmStep, FailReason, Fallback, HeartbeatReport, LaunchNonce, LockSource, LockState,
