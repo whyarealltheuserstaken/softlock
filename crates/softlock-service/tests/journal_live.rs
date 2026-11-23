@@ -1274,6 +1274,33 @@ fn ensure_service() -> Result<(), String> {
     }
 }
 
+/// Boot a service that should revert a leftover journal. A boot that still
+/// sees the host we just killed fails closed and leaves the registry locked.
+/// One more boot is the bound; both waits stay inside this test.
+fn restart_until(
+    guard: &mut Guard,
+    pause_file: &Path,
+    attach: bool,
+    mut ready: impl FnMut() -> bool,
+) -> bool {
+    for attempt in 0..2 {
+        let _ = wait_until(Duration::from_secs(5), || !host_running());
+        if host_running() {
+            return false;
+        }
+        if spawn_service(guard, None, pause_file, attach).is_err() {
+            return false;
+        }
+        if wait_until(Duration::from_secs(20), &mut ready) {
+            return true;
+        }
+        if attempt == 0 && hard_stop(guard).is_err() {
+            return false;
+        }
+    }
+    false
+}
+
 fn spawn_service(
     _guard: &mut Guard,
     pause: Option<&str>,
@@ -1895,9 +1922,7 @@ fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
         ));
     }
     hard_stop(guard)?;
-    let _ = wait_until(Duration::from_secs(5), || !host_running());
-    spawn_service(guard, None, &pause, true)?;
-    let restored = wait_until(Duration::from_secs(25), || {
+    let restored = restart_until(guard, &pause, true, || {
         chosen
             .iter()
             .all(|(key, name, previous, _)| query_value(key, name) == *previous)
