@@ -250,6 +250,7 @@ fn lookup_sid(sid: PSID) -> Result<(Wide, Wide), ()> {
     Ok((Wide(name), Wide(domain)))
 }
 
+#[cfg(feature = "simulated-physical")]
 fn sid_for_account(user: &str, domain: &str) -> Result<String, ()> {
     let qualified = if domain == "." {
         user.to_string()

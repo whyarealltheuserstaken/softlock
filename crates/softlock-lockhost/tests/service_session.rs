@@ -757,8 +757,19 @@ impl PasswordAccount {
     }
 
     fn named(suffix: &str) -> Self {
-        let name = format!("slw{}{suffix}", std::process::id());
-        let password = random_password(&name);
+        // Short names and a known-good password. `net user` on the runner
+        // rejects a password that contains three consecutive characters of
+        // the account name, and a long random password was rejected outright.
+        let name = format!("xq{suffix}");
+        let password = match suffix {
+            "a" => "Aa1!QkzzMm9v".to_string(),
+            "b" => "Bb2@RlaaNn8w".to_string(),
+            _ => "Cc3#SmbbOo7x".to_string(),
+        };
+        assert!(
+            !password_shares_name_token(&password, &name),
+            "the test password overlaps the account name"
+        );
         let _ = Command::new("net.exe")
             .args(["user", &name, "/delete"])
             .output();
@@ -769,7 +780,7 @@ impl PasswordAccount {
         assert!(
             added.status.success(),
             "could not create the local test account: {}",
-            added.status
+            net_user_failure(&added)
         );
         Self { name, password }
     }
@@ -791,22 +802,30 @@ impl Drop for PasswordAccount {
     }
 }
 
-fn random_password(name: &str) -> String {
-    let mut raw = [0u8; 12];
-    getrandom::getrandom(&mut raw).expect("random");
-    let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-    let mut body = String::new();
-    for byte in raw {
-        body.push(alphabet[(byte as usize) % alphabet.len()] as char);
-    }
-    let password = format!("Aa1!{body}");
-    assert!(
-        !password
-            .to_ascii_lowercase()
-            .contains(&name.to_ascii_lowercase()),
-        "the generated password contained the account name"
-    );
-    password
+fn password_shares_name_token(password: &str, name: &str) -> bool {
+    let password = password.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    let chars: Vec<char> = name.chars().collect();
+    chars.windows(3).any(|token| {
+        let text: String = token.iter().collect();
+        password.contains(&text)
+    })
+}
+
+fn net_user_failure(output: &std::process::Output) -> String {
+    let text = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    let kind = if text.contains("password") {
+        "password-policy"
+    } else if text.contains("exists") {
+        "exists"
+    } else if text.contains("denied") {
+        "denied"
+    } else if text.contains("syntax") {
+        "syntax"
+    } else {
+        "other"
+    };
+    format!("{kind} ({})", output.status)
 }
 
 fn assert_not_locked_out(name: &str) {
