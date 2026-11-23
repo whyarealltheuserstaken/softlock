@@ -641,9 +641,7 @@ fn set_security_handle(
     // call to fail on its own; the lock must not depend on a privilege the
     // console user was never granted if WRITE_DAC is enough.
     let _security =
-        let _security =
-            crate::secrets::enable_privilege_scoped(windows::Win32::Security::SE_SECURITY_NAME)
-                .ok();
+        crate::secrets::enable_privilege_scoped(windows::Win32::Security::SE_SECURITY_NAME).ok();
     let _restore = crate::secrets::enable_privilege_scoped(SE_RESTORE_NAME).ok();
     let wide = sddl
         .encode_utf16()
