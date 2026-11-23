@@ -167,7 +167,12 @@ pub fn lock_from_app() {
     enqueue_lock(LockSource::App);
 }
 
-pub fn decline_config() {
+pub fn decline_config() -> bool {
+    // Same rule as accept: a locked session does not write the config file.
+    // The service holds the DACL until the owner unlocks.
+    if current_view().locked() {
+        return false;
+    }
     let effective = current_config();
     CONFIG_OFFER.store(false, Ordering::Release);
     *PENDING_CONFIG
@@ -175,12 +180,14 @@ pub fn decline_config() {
         .unwrap_or_else(|poison| poison.into_inner()) = String::new();
     if let Some(document) = effective
         && let Some(path) = profile_config_path()
+        && !write_user_file(&path, &document)
     {
-        let _ = write_user_file(&path, &document);
+        return false;
     }
     if let Ok(view) = view_slot().lock() {
         publish(&view);
     }
+    true
 }
 
 pub fn accept_config() -> bool {
@@ -718,6 +725,12 @@ fn open_user_file(path: &std::path::Path, write: bool) -> Option<File> {
     if text.contains("..") {
         return None;
     }
+    let Some(parent) = path.parent() else {
+        return None;
+    };
+    if !parents_are_plain(parent) {
+        return None;
+    }
     let wide = wide(&text);
     let access = if write {
         FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0
@@ -743,6 +756,64 @@ fn open_user_file(path: &std::path::Path, write: bool) -> Option<File> {
         return None;
     }
     Some(unsafe { File::from_raw_handle(handle.0) })
+}
+
+/// Every parent is opened with `FILE_FLAG_OPEN_REPARSE_POINT`. A junction
+/// or mount point on the way to the file is refused, not followed.
+fn parents_are_plain(path: &std::path::Path) -> bool {
+    use std::path::{Component, PathBuf};
+    let mut current = PathBuf::new();
+    let mut saw_root = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => {
+                current.push(component);
+            }
+            Component::RootDir => {
+                current.push(component);
+                saw_root = true;
+                if !directory_is_plain(&current) {
+                    return false;
+                }
+            }
+            Component::Normal(_) | Component::CurDir | Component::ParentDir => {
+                current.push(component);
+                if saw_root && !directory_is_plain(&current) {
+                    return false;
+                }
+            }
+        }
+    }
+    saw_root
+}
+
+fn directory_is_plain(path: &std::path::Path) -> bool {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let text = path.to_string_lossy().replace('/', "\\");
+    let wide = wide(&text);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        .ok()
+    };
+    let Some(handle) = handle else {
+        return false;
+    };
+    let reparse = handle_is_reparse(handle);
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    !reparse
 }
 
 fn handle_is_reparse(handle: windows::Win32::Foundation::HANDLE) -> bool {

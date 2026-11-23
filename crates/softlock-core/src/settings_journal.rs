@@ -146,6 +146,23 @@ pub struct SettingsJournal {
     pub says_locked: bool,
     pub failures: u32,
     pub entries: Vec<SettingEntry>,
+    /// Boot time and the logon that was locked. Absent on a journal written
+    /// before this field existed, which startup treats as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<LockIdentity>,
+}
+
+/// The boot and the logon recorded when the journal was saved.
+/// Compared at the next service start. The file that holds it is
+/// SYSTEM and Administrators only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockIdentity {
+    /// `BootTime` from `SystemTimeOfDayInformation`, in FILETIME units.
+    pub boot: u64,
+    /// Console session id at lock time.
+    pub session: u32,
+    /// That session's logon LUID (`AuthenticationId`).
+    pub logon: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +252,7 @@ impl SettingsJournal {
             says_locked: false,
             failures: 0,
             entries: Vec::new(),
+            lock: None,
         }
     }
 
@@ -288,6 +306,7 @@ pub fn task_manager_document(
                 value: LOCKED_DWORD,
             },
         }],
+        lock: None,
     })
 }
 
@@ -360,6 +379,7 @@ pub fn lockdown_document(
         says_locked: true,
         failures,
         entries,
+        lock: None,
     })
 }
 
@@ -469,6 +489,11 @@ fn validate(doc: &SettingsJournal) -> Result<(), JournalFault> {
             .any(|entry| entry.target == "DisableLockWorkstation")
     {
         return Err(JournalFault::Target);
+    }
+    if let Some(lock) = doc.lock
+        && (lock.boot == 0 || lock.logon == 0 || lock.session == u32::MAX)
+    {
+        return Err(JournalFault::Value);
     }
     Ok(())
 }
@@ -883,29 +908,52 @@ pub fn commit_then_change<E>(
     change().map_err(CommitFault::Change)
 }
 
-/// A live Lock Host in an active console session is still locked.
-/// A dead host is not an active lock, so startup reverts the journal.
+/// What startup could prove about the logon that the journal recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionFact {
+    /// Same boot, and the same logon still holds the recorded session id.
+    SameLogon,
+    /// The boot time changed. This is a reboot or a power loss.
+    DifferentBoot,
+    /// That session id is not in the current session list.
+    SessionGone,
+    /// The session id is present and a different logon holds it.
+    DifferentLogon,
+    /// A query failed, or the journal has no identity. That is not proof
+    /// the lock ended.
+    Unknown,
+}
+
+/// Startup with a locked journal.
 ///
-/// `session_known` is false when the console query failed. That failure
-/// used to fail closed before looking at the host, so a restart after the
-/// host was killed left the locked dword in place. A dead host still reverts.
+/// A different boot, a missing session, or a different logon is
+/// `NoActiveLock`: revert and stay `Unlocked`. The same logon, a dead Lock
+/// Host, an active console, or any query error is still the lock. That
+/// returns [`StartAction::FailClosed`], which asks for the OS lock and
+/// does not end `Unlocked`. SPEC Decision 5 (`Recovering` transitions) and
+/// section 7: policies stay applied until the OS lock is confirmed.
+///
+/// `console_active` and `host` do not override that. A dead host used to
+/// revert. That unlocked a session whose logon had not ended.
 pub fn recovery_action(
     doc: &SettingsJournal,
-    session_known: bool,
+    fact: SessionFact,
     console_active: bool,
     host: HostPresence,
 ) -> StartAction {
     if doc.is_empty() {
         return StartAction::Idle;
     }
-    if !session_known {
-        return if host == HostPresence::Dead || !doc.says_locked() {
-            StartAction::Revert
-        } else {
-            StartAction::FailClosed
-        };
+    if !doc.says_locked() {
+        return StartAction::Revert;
     }
-    service_start_action(doc, console_active, host)
+    let _ = (console_active, host);
+    match fact {
+        SessionFact::DifferentBoot | SessionFact::SessionGone | SessionFact::DifferentLogon => {
+            StartAction::Revert
+        }
+        SessionFact::SameLogon | SessionFact::Unknown => StartAction::FailClosed,
+    }
 }
 
 /// The value a restart writes back. The journaled previous wins, so a
@@ -936,16 +984,9 @@ pub fn service_start_action(
     console_active: bool,
     host: HostPresence,
 ) -> StartAction {
-    if doc.is_empty() {
-        return StartAction::Idle;
-    }
-    let live = doc.says_locked
-        && (host == HostPresence::Unknown || (console_active && host == HostPresence::Alive));
-    if live {
-        StartAction::FailClosed
-    } else {
-        StartAction::Revert
-    }
+    // No boot or logon comparison has been supplied. A locked journal is
+    // therefore the same session, or unknown. Either one fails closed.
+    recovery_action(doc, SessionFact::SameLogon, console_active, host)
 }
 
 /// The hive written at lock time. The console user is not a substitute.
@@ -1381,8 +1422,10 @@ mod tests {
     fn an_absent_value_is_deleted_after_a_restart_mid_lock() {
         let doc = task_manager_document(ALICE, SettingValue::Absent, 0).expect("journal");
         let live = SettingValue::Dword { value: 1 };
+        // A proven different boot is the reboot case. The locked dword is
+        // deleted. The same boot does not take this path.
         assert_eq!(
-            recovery_action(&doc, false, true, HostPresence::Dead),
+            recovery_action(&doc, SessionFact::DifferentBoot, true, HostPresence::Dead),
             StartAction::Revert
         );
         assert_eq!(startup_steps()[0], StartupStep::RecoverJournal);
@@ -1395,6 +1438,63 @@ mod tests {
         );
         assert_ne!(previous, SettingValue::Dword { value: 0 });
         assert_ne!(previous, live);
+    }
+
+    #[test]
+    fn a_different_boot_reverts_to_unlocked() {
+        let doc = task_manager_document(ALICE, SettingValue::Absent, 0).expect("journal");
+        assert_eq!(
+            recovery_action(&doc, SessionFact::DifferentBoot, false, HostPresence::Dead),
+            StartAction::Revert
+        );
+        assert_eq!(
+            recovery_action(&doc, SessionFact::SessionGone, true, HostPresence::Alive),
+            StartAction::Revert
+        );
+        assert_eq!(
+            recovery_action(&doc, SessionFact::DifferentLogon, true, HostPresence::Dead),
+            StartAction::Revert
+        );
+    }
+
+    #[test]
+    fn the_same_boot_with_a_dead_host_fails_closed() {
+        let doc =
+            task_manager_document(ALICE, SettingValue::Dword { value: 0 }, 0).expect("journal");
+        // FailClosed is the OS-lock request. Startup does not revert, and it
+        // does not report Unlocked, while this logon is still the one we locked.
+        assert_eq!(
+            recovery_action(&doc, SessionFact::SameLogon, false, HostPresence::Dead),
+            StartAction::FailClosed
+        );
+    }
+
+    #[test]
+    fn a_wts_query_error_fails_closed() {
+        let doc = task_manager_document(ALICE, SettingValue::Absent, 0).expect("journal");
+        assert_eq!(
+            recovery_action(&doc, SessionFact::Unknown, false, HostPresence::Dead),
+            StartAction::FailClosed
+        );
+        let mut bare = doc.clone();
+        bare.lock = None;
+        assert_eq!(
+            recovery_action(&bare, SessionFact::Unknown, true, HostPresence::Dead),
+            StartAction::FailClosed
+        );
+    }
+
+    #[test]
+    fn an_active_console_with_a_dead_host_fails_closed() {
+        let doc = task_manager_document(ALICE, SettingValue::Absent, 0).expect("journal");
+        assert_eq!(
+            recovery_action(&doc, SessionFact::SameLogon, true, HostPresence::Dead),
+            StartAction::FailClosed
+        );
+        assert_eq!(
+            service_start_action(&doc, true, HostPresence::Dead),
+            StartAction::FailClosed
+        );
     }
 
     #[test]
@@ -1411,11 +1511,11 @@ mod tests {
         );
         assert_eq!(
             service_start_action(&locked, true, HostPresence::Dead),
-            StartAction::Revert
+            StartAction::FailClosed
         );
         assert_eq!(
             service_start_action(&locked, false, HostPresence::Alive),
-            StartAction::Revert
+            StartAction::FailClosed
         );
         assert_eq!(
             service_start_action(&locked, false, HostPresence::Unknown),

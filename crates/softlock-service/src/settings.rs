@@ -19,7 +19,8 @@ use softlock_core::{
 
 use crate::journal_store::{load_journal, save_journal};
 use crate::taskmgr::{
-    console_is_active, console_sid, lock_host_running, read_lockdown, watch_policy, write_lockdown,
+    console_is_active, console_sid, current_lock_identity, lock_host_running, observe_lock,
+    read_lockdown, watch_policy, write_lockdown,
 };
 
 static SKIP_WORKSTATION: AtomicBool = AtomicBool::new(false);
@@ -47,9 +48,6 @@ pub struct SettingsEngine {
     stop: Arc<AtomicBool>,
     last: Instant,
     watcher: Mutex<Option<JoinHandle<()>>>,
-    /// An active lock must keep the lockdown rows. Revert does not clear them.
-    preserve: bool,
-    config: Option<softlock_core::SettingEntry>,
 }
 
 impl SettingsEngine {
@@ -68,8 +66,6 @@ impl SettingsEngine {
             stop: Arc::new(AtomicBool::new(false)),
             last: Instant::now(),
             watcher: Mutex::new(None),
-            preserve: false,
-            config: None,
         })
     }
 
@@ -83,23 +79,23 @@ impl SettingsEngine {
             return Ok(Boot::Idle);
         }
         self.sid = restore_sid(&doc).map_err(fault_log)?.to_string();
-        self.config = doc
-            .entries()
-            .iter()
-            .find(|entry| entry.target == CONFIG_FILE)
-            .cloned();
-        let (session_known, console_active) = match console_is_active() {
-            Ok(active) => (true, active),
-            Err(_) => (false, false),
-        };
-        match recovery_action(&doc, session_known, console_active, lock_host_running()) {
+        // A failed WTS query comes back as SessionFact::Unknown and fails
+        // closed. A proven different boot, a missing session, or a different
+        // logon is the only revert. SPEC Decision 5 and section 7.
+        let console = console_is_active();
+        let mut fact = observe_lock(doc.lock);
+        if console.is_err() && fact == softlock_core::SessionFact::SameLogon {
+            fact = softlock_core::SessionFact::Unknown;
+        }
+        match recovery_action(&doc, fact, console.unwrap_or(false), lock_host_running()) {
             StartAction::Idle => Ok(Boot::Idle),
             StartAction::Revert => {
                 self.revert_document(&doc)?;
                 Ok(Boot::Reverted)
             }
             StartAction::FailClosed => {
-                self.preserve = true;
+                // Hold the rows until the OS lock is confirmed. The controller
+                // reverts then, from this journal. SPEC section 7.
                 self.hold();
                 if doc.workstation_clear {
                     reapply_disable_lock_workstation()?;
@@ -145,12 +141,13 @@ impl SettingsEngine {
                 );
                 HardenError::Failed
             })?;
-        self.config = None;
-        // The seam 3 service runs as the console user. Setting a protected
-        // DACL on its private config file needs a privilege that user does
-        // not have, and a failed row fail-closes the lock. The hosted proof
-        // covers the real profile file as LocalSystem.
-        if crate::config_file::test_config_dir().is_none() {
+        doc.lock = current_lock_identity();
+        // The seam service runs as the console user. A protected DACL on its
+        // private file needs a privilege that user does not have, and a failed
+        // row fail-closes the lock. SOFTLOCK_LOCK_CONFIG_ACL=1 is the decline
+        // proof, which does take that lock. The hosted LocalSystem job covers
+        // the real profile file.
+        if lock_config_acl() {
             let path = crate::config_file::configured_path().map_err(|reason| {
                 crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
                 HardenError::Failed
@@ -163,7 +160,7 @@ impl SettingsEngine {
                 crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
                 HardenError::Failed
             })?;
-            doc = with_config_acl(doc, entry.clone()).map_err(|fault| {
+            doc = with_config_acl(doc, entry).map_err(|fault| {
                 crate::audit(
                     "settings",
                     &[("result", "failed"), ("reason", fault_log(fault))],
@@ -177,7 +174,6 @@ impl SettingsEngine {
                 );
                 HardenError::Failed
             })?;
-            self.config = Some(entry);
         }
         self.pending = Some(doc);
         for (target, value) in &previous {
@@ -254,9 +250,8 @@ impl SettingsEngine {
     }
 
     pub fn revert_memory(&mut self, journal: &Journal) -> Result<(), &'static str> {
-        if self.preserve {
-            return Ok(());
-        }
+        // Called when the OS lock is confirmed, or when the owner unlocks.
+        // SPEC section 7 reverts the journal at confirmation, not before.
         if let Some(text) = load_journal().map_err(|_| "journal")? {
             let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
             return self.revert_document(&doc);
@@ -292,7 +287,6 @@ impl SettingsEngine {
             return Ok(());
         }
         self.sid = restore_sid(&doc).map_err(fault_log)?.to_string();
-        self.preserve = false;
         self.revert_document(&doc)
     }
 
@@ -364,7 +358,6 @@ impl SettingsEngine {
             }
             self.write_previous(&entry.target, entry.previous.clone())?;
         }
-        self.config = None;
         let empty = encode_document(&SettingsJournal::empty()).map_err(|_| "malformed")?;
         save_journal(&empty).map_err(|_| "not-durable")?;
         SKIP_WORKSTATION.store(false, Ordering::Release);
@@ -398,6 +391,13 @@ impl SettingsEngine {
         let sid = self.sid.clone();
         *slot = Some(thread::spawn(move || watch_policy(&sid, &stop, &notified)));
     }
+}
+
+fn lock_config_acl() -> bool {
+    if crate::config_file::test_config_dir().is_none() {
+        return true;
+    }
+    std::env::var("SOFTLOCK_LOCK_CONFIG_ACL").ok().as_deref() == Some("1")
 }
 
 fn previous_text(value: &SettingValue) -> Option<String> {

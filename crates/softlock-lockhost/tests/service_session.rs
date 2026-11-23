@@ -2509,8 +2509,13 @@ fn a_locked_file_edit_is_offered_and_applied_on_accept() {
 fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
     softlock_windows::runner_may_lock().expect("refusing the config edit off a hosted runner");
     let _guard = gate();
-    let session = Session::start(None, true);
+    // Ask the service to lock this file's DACL the same way it locks the
+    // real profile. The other seam sessions leave the private directory
+    // unlocked because a failed protected DACL would fail-close every lock.
+    let session =
+        Session::launch_extra(None, true, "1", None, &[("SOFTLOCK_LOCK_CONFIG_ACL", "1")]);
     arm_owner(&session);
+    session.set_pin().expect("set pin");
     let locked = session.lock().expect("lock");
     assert!(
         locked.contains("Accepted"),
@@ -2520,15 +2525,40 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
     let path = session.config_dir.join("config.toml");
     let original = wait_for_file(&path, Duration::from_secs(10)).expect("config file");
     let edited = original.replace("Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+K");
-    fs::write(&path, &edited).expect("write");
+    let denied = fs::write(&path, &edited);
+    assert!(
+        denied.is_err(),
+        "the locked config file still accepted a write"
+    );
+    assert!(
+        !softlock_app_lib::decline_offered_config(),
+        "decline wrote the config file while locked"
+    );
+    assert_eq!(
+        fs::read_to_string(&path).expect("locked file"),
+        original,
+        "decline changed the file while locked"
+    );
+    type_pin(session.extra);
+    assert!(
+        wait_for(Duration::from_secs(30), || {
+            session
+                .status()
+                .ok()
+                .is_some_and(|status| status.contains("Unlocked"))
+        }),
+        "the pin did not unlock"
+    );
+    assert!(softlock_app_lib::refresh_from_service());
+    fs::write(&path, &edited).expect("write after unlock");
     assert!(
         wait_for(Duration::from_secs(10), || {
             softlock_app_lib::poll_config_once();
             softlock_app_lib::config_offer()
         }),
-        "the locked edit did not raise the offer"
+        "the edit after unlock did not raise the offer"
     );
-    softlock_app_lib::decline_offered_config();
+    assert!(softlock_app_lib::decline_offered_config());
     assert!(!softlock_app_lib::config_offer());
     let disk = fs::read_to_string(&path).expect("restored file");
     assert!(

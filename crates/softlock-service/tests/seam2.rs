@@ -698,18 +698,31 @@ fn get_config_and_validate_config_work_for_lock_client() {
 #[test]
 fn an_absent_value_is_deleted_after_a_restart_mid_lock() {
     use softlock_core::{
-        HostPresence, SettingValue, StartAction, StartupStep, original_previous, recovery_action,
-        restore_action, startup_steps, task_manager_document,
+        HostPresence, SessionFact, SettingValue, StartAction, StartupStep, original_previous,
+        recovery_action, restore_action, startup_steps, task_manager_document,
     };
     let doc =
         task_manager_document("S-1-5-21-1-2-3-1001", SettingValue::Absent, 0).expect("journal");
     let live = SettingValue::Dword { value: 1 };
-    // The console query failed and the host is already gone. Recovery deletes
-    // the locked dword. It does not write zero, and it runs before config load
-    // so the live value is not journaled as the original.
+    // A different boot deletes the locked dword. It does not write zero, and
+    // it runs before config load so the live value is not journaled as the
+    // original. The same logon, a query error, and a dead host on an active
+    // console fail closed instead of ending Unlocked.
     assert_eq!(
-        recovery_action(&doc, false, true, HostPresence::Dead),
+        recovery_action(&doc, SessionFact::DifferentBoot, true, HostPresence::Dead),
         StartAction::Revert
+    );
+    assert_eq!(
+        recovery_action(&doc, SessionFact::SameLogon, false, HostPresence::Dead),
+        StartAction::FailClosed
+    );
+    assert_eq!(
+        recovery_action(&doc, SessionFact::Unknown, false, HostPresence::Dead),
+        StartAction::FailClosed
+    );
+    assert_eq!(
+        recovery_action(&doc, SessionFact::SameLogon, true, HostPresence::Dead),
+        StartAction::FailClosed
     );
     assert_eq!(
         startup_steps(),

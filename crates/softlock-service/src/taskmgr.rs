@@ -7,8 +7,9 @@ use std::thread;
 use std::time::Duration;
 
 use softlock_core::{
-    HostPresence, LockdownPolicy, PolicyHive, SettingValue, console_user_from,
-    expand_profile_image, hive_target_allowed, host_identity, same_exe_path, sid_is_safe,
+    HostPresence, LockIdentity, LockdownPolicy, PolicyHive, SessionFact, SettingValue,
+    console_user_from, expand_profile_image, hive_target_allowed, host_identity, same_exe_path,
+    sid_is_safe,
 };
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE};
 use windows::Win32::System::Registry::{
@@ -557,6 +558,134 @@ pub fn console_is_active() -> Result<bool, &'static str> {
         let state = *buffer.0.cast::<u32>();
         WTSFreeMemory(buffer.0.cast());
         Ok(state == WTSActive.0 as u32)
+    }
+}
+
+/// Boot time and the console logon, recorded into the journal at lock time.
+pub fn current_lock_identity() -> Option<LockIdentity> {
+    let session = crate::windows::console_session();
+    if session == u32::MAX {
+        return None;
+    }
+    let boot = boot_filetime().ok()?;
+    let logon = logon_luid(session).ok()?;
+    if boot == 0 || logon == 0 {
+        return None;
+    }
+    Some(LockIdentity {
+        boot,
+        session,
+        logon,
+    })
+}
+
+/// Compare the journaled boot and logon with this boot. A failed query is
+/// [`SessionFact::Unknown`], which startup fails closed on.
+pub fn observe_lock(saved: Option<LockIdentity>) -> SessionFact {
+    let Some(saved) = saved else {
+        return SessionFact::Unknown;
+    };
+    let Ok(boot) = boot_filetime() else {
+        return SessionFact::Unknown;
+    };
+    if boot != saved.boot {
+        return SessionFact::DifferentBoot;
+    }
+    match session_listed(saved.session) {
+        Err(()) => SessionFact::Unknown,
+        Ok(false) => SessionFact::SessionGone,
+        Ok(true) => match logon_luid(saved.session) {
+            Err(()) => SessionFact::Unknown,
+            Ok(logon) if logon != saved.logon => SessionFact::DifferentLogon,
+            Ok(_) => SessionFact::SameLogon,
+        },
+    }
+}
+
+fn boot_filetime() -> Result<u64, ()> {
+    #[repr(C)]
+    struct TimeOfDay {
+        boot_time: i64,
+        current_time: i64,
+        time_zone_bias: i64,
+        time_zone_id: u32,
+        reserved: u32,
+        boot_time_bias: u64,
+        sleep_time_bias: u64,
+    }
+    let mut info = TimeOfDay {
+        boot_time: 0,
+        current_time: 0,
+        time_zone_bias: 0,
+        time_zone_id: 0,
+        reserved: 0,
+        boot_time_bias: 0,
+        sleep_time_bias: 0,
+    };
+    let mut returned = 0u32;
+    let status = unsafe {
+        NtQuerySystemInformation(
+            3,
+            &mut info as *mut TimeOfDay as *mut core::ffi::c_void,
+            std::mem::size_of::<TimeOfDay>() as u32,
+            &mut returned,
+        )
+    };
+    if status < 0 || info.boot_time <= 0 {
+        Err(())
+    } else {
+        Ok(info.boot_time as u64)
+    }
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQuerySystemInformation(
+        class: u32,
+        buffer: *mut core::ffi::c_void,
+        length: u32,
+        returned: *mut u32,
+    ) -> i32;
+}
+
+fn session_listed(session: u32) -> Result<bool, ()> {
+    use windows::Win32::System::RemoteDesktop::{WTSEnumerateSessionsW, WTSFreeMemory};
+    unsafe {
+        let mut info = std::ptr::null_mut();
+        let mut count = 0u32;
+        WTSEnumerateSessionsW(None, 0, 1, &mut info, &mut count).map_err(|_| ())?;
+        if info.is_null() {
+            return Err(());
+        }
+        let rows = std::slice::from_raw_parts(info, count as usize);
+        let found = rows.iter().any(|row| row.SessionId == session);
+        WTSFreeMemory(info.cast());
+        Ok(found)
+    }
+}
+
+fn logon_luid(session: u32) -> Result<u64, ()> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_STATISTICS, TokenStatistics};
+    use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
+    unsafe {
+        let mut token = HANDLE::default();
+        WTSQueryUserToken(session, &mut token).map_err(|_| ())?;
+        let mut stats = TOKEN_STATISTICS::default();
+        let mut needed = 0u32;
+        let read = GetTokenInformation(
+            token,
+            TokenStatistics,
+            Some((&mut stats as *mut TOKEN_STATISTICS).cast()),
+            std::mem::size_of::<TOKEN_STATISTICS>() as u32,
+            &mut needed,
+        );
+        let _ = CloseHandle(token);
+        read.map_err(|_| ())?;
+        let low = stats.AuthenticationId.LowPart as u64;
+        let high = stats.AuthenticationId.HighPart as u32 as u64;
+        let logon = (high << 32) | low;
+        if logon == 0 { Err(()) } else { Ok(logon) }
     }
 }
 

@@ -492,6 +492,7 @@ fn console_user_sid() -> Result<String, String> {
 }
 
 fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
+    realign()?;
     set_taskmgr(previous)?;
     let pause = guard_dir().join(format!("pause-{previous}"));
     let _ = fs::remove_file(&pause);
@@ -517,6 +518,7 @@ fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
     spawn_service(guard, None, &pause)?;
     let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == previous);
     hard_stop(guard)?;
+    realign()?;
     if !restored {
         return Err(format!("restart did not restore {previous}"));
     }
@@ -527,12 +529,15 @@ fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
 }
 
 fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
+    realign()?;
     set_taskmgr("absent")?;
     let pause = guard_dir().join("pause-after");
     let _ = fs::remove_file(&pause);
     // Hold the service after the registry write, before it can OS-lock the
     // session or revert. The value is 1; killing both processes leaves the
-    // journal durable for the restart to restore.
+    // journal durable. The restart is the same boot and the same logon, so
+    // it must OS-lock or disconnect and must not end Unlocked. Settings are
+    // restored once that lock is confirmed (SPEC section 7).
     spawn_service(guard, Some("after"), &pause)?;
     wait_pipe()?;
     lock_in_background();
@@ -543,10 +548,45 @@ fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
     hard_stop(guard)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
     spawn_service(guard, None, &pause)?;
-    let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == "absent");
+    let mut ended_unlocked = false;
+    let mut last_state = String::new();
+    let held = wait_until(Duration::from_secs(25), || {
+        let status = transact(&pipe_name(), status_body()).unwrap_or_default();
+        let state = status_state(&status).unwrap_or_default();
+        last_state = state.clone();
+        if state == "Unlocked" {
+            ended_unlocked = true;
+            return true;
+        }
+        let os_held = state == "OsLocked" || session_os_held();
+        os_held && query_taskmgr() == "absent"
+    });
+    if ended_unlocked {
+        hard_stop(guard)?;
+        return Err("restart ended Unlocked with no OS lock".to_string());
+    }
+    if !held {
+        hard_stop(guard)?;
+        return Err(format!(
+            "restart did not OS-lock or disconnect and restore (state {last_state}, value {})",
+            query_taskmgr()
+        ));
+    }
+    // The owner coming back is a console reconnect in this test. The product
+    // never calls WTSConnectSession. The restored value has to still be the
+    // absent original after that.
+    realign()?;
+    let still = wait_until(Duration::from_secs(10), || query_taskmgr() == "absent");
+    let status = transact(&pipe_name(), status_body()).unwrap_or_default();
+    let state = status_state(&status).unwrap_or_default();
     hard_stop(guard)?;
-    if !restored {
-        return Err("restart did not restore an absent value".to_string());
+    if !still || query_taskmgr() != "absent" {
+        return Err(format!(
+            "settings were not the absent original after the owner returned (state {state})"
+        ));
+    }
+    if state == "Unlocked" && query_taskmgr() != "absent" {
+        return Err("unlock left DisableTaskMgr set".to_string());
     }
     Ok(())
 }
@@ -651,24 +691,65 @@ fn recover_active(guard: &mut Guard) -> Result<(), String> {
             saw_unlocked = true;
         }
         last = status;
-        let fail_closed = matches!(
-            state.as_deref(),
-            Some("FailingClosed" | "Locked" | "OsLocked")
-        );
-        query_taskmgr() == "1" && fail_closed
+        match state.as_deref() {
+            // Still guarded: the locked dword stays.
+            Some("FailingClosed" | "Locked" | "Recovering") => query_taskmgr() == "1",
+            // OS lock confirmed: section 7 reverts the journal.
+            Some("OsLocked") => query_taskmgr() == "0",
+            _ => false,
+        }
     });
     if saw_unlocked {
+        let _ = boot.kill();
+        let _ = boot.wait();
         return Err("an active lock returned to Unlocked".to_string());
     }
     let _ = boot.kill();
     let _ = boot.wait();
-    if !closed || query_taskmgr() != "1" {
+    let value = query_taskmgr();
+    if !closed || (value != "1" && value != "0") {
         return Err(format!(
-            "an active journal did not keep DisableTaskMgr: {last} value {}",
-            query_taskmgr()
+            "an active journal did not stay fail-closed: {last} value {value}"
         ));
     }
     Ok(())
+}
+
+fn session_os_held() -> bool {
+    use windows::Win32::System::RemoteDesktop::{
+        WTSConnectState, WTSDisconnected, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+        WTSQuerySessionInformationW,
+    };
+    use windows::core::PWSTR;
+    let session = unsafe { WTSGetActiveConsoleSessionId() };
+    if session == u32::MAX {
+        return true;
+    }
+    let mut buffer = PWSTR::null();
+    let mut bytes = 0u32;
+    let state = unsafe {
+        if WTSQuerySessionInformationW(None, session, WTSConnectState, &mut buffer, &mut bytes)
+            .is_err()
+            || buffer.is_null()
+        {
+            return false;
+        }
+        let state = *buffer.0.cast::<u32>();
+        WTSFreeMemory(buffer.0.cast());
+        state
+    };
+    state == WTSDisconnected.0 as u32
+}
+
+fn realign() -> Result<(), String> {
+    #[cfg(feature = "live-fail-closed")]
+    {
+        align_console()
+    }
+    #[cfg(not(feature = "live-fail-closed"))]
+    {
+        Ok(())
+    }
 }
 
 fn status_state(json: &str) -> Option<String> {
@@ -859,8 +940,8 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
 fn hard_stop(_guard: &mut Guard) -> Result<(), String> {
     // A live host OS-locks the console when its service pipe closes, and the
     // service OS-locks when it sees the host die. Freeze the host first so
-    // neither side can lock the session, then kill the service and the host.
-    // The next boot must see the host gone and revert. A host that is already
+    // neither side locks the session during the kill. The next boot of the
+    // same logon fails closed and requests the OS lock. A host that is already
     // gone has nothing to freeze. A host that is still running and cannot be
     // suspended fails the test.
     if host_running() {
@@ -1210,12 +1291,13 @@ fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
     hard_stop(guard)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
     spawn_service(guard, None, &pause)?;
-    let restored = wait_until(Duration::from_secs(20), || {
+    let restored = wait_until(Duration::from_secs(25), || {
         chosen
             .iter()
             .all(|(key, name, previous, _)| query_value(key, name) == *previous)
     });
     hard_stop(guard)?;
+    realign()?;
     if !restored {
         return Err(format!(
             "restart did not restore every row: {}",
