@@ -2495,14 +2495,16 @@ fn a_locked_file_edit_is_offered_and_applied_on_accept() {
         "the new value was in effect while locked: {during}"
     );
     type_pin(session.extra);
+    let unlocked = wait_for(Duration::from_secs(30), || {
+        session
+            .status()
+            .ok()
+            .is_some_and(|status| status.contains("\"state\":\"Unlocked\""))
+    });
+    let status = session.status().unwrap_or_default();
     assert!(
-        wait_for(Duration::from_secs(30), || {
-            session
-                .status()
-                .ok()
-                .is_some_and(|status| status.contains("Unlocked"))
-        }),
-        "the pin did not unlock"
+        unlocked && status.contains("\"state\":\"Unlocked\""),
+        "the pin did not unlock after the accepted locked edit: {status}"
     );
     assert!(softlock_app_lib::refresh_from_service());
     assert!(
@@ -2551,14 +2553,16 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
         "decline changed the file while locked"
     );
     type_pin(session.extra);
+    let unlocked = wait_for(Duration::from_secs(30), || {
+        session
+            .status()
+            .ok()
+            .is_some_and(|status| status.contains("\"state\":\"Unlocked\""))
+    });
+    let status = session.status().unwrap_or_default();
     assert!(
-        wait_for(Duration::from_secs(30), || {
-            session
-                .status()
-                .ok()
-                .is_some_and(|status| status.contains("Unlocked"))
-        }),
-        "the pin did not unlock"
+        unlocked && status.contains("\"state\":\"Unlocked\""),
+        "the pin did not unlock after the declined locked edit: {status}"
     );
     assert!(softlock_app_lib::refresh_from_service());
     fs::write(&path, &edited).expect("write after unlock");

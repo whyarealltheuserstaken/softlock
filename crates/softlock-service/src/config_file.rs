@@ -135,15 +135,39 @@ pub fn reassert_entry(entry: &SettingEntry) -> Result<(), &'static str> {
     let SettingValue::Sddl { value: locked } = &entry.new_value else {
         return Err("value");
     };
-    let handle = open_entry(entry).map_err(|_| "acl")?;
+    // The locked DACL grants read and denies WRITE_DAC, including to the
+    // owner. Opening with WRITE_DAC fails, the error fail-closes the lock,
+    // and the correct PIN is rejected. Read the descriptor first. A
+    // canonical reprint of the same lock is held.
+    let directory = entry.target == CONFIG_DIR;
+    let path = Path::new(&entry.path);
+    let handle = open_dacl_read(path, directory).map_err(|_| "acl")?;
     let current = dacl_sddl_handle(handle).map_err(|_| "acl");
-    let result = match current {
-        Ok(current) if current == *locked => Ok(()),
-        Ok(_) => set_dacl_handle(handle, locked),
-        Err(reason) => Err(reason),
-    };
+    drop_handle(handle);
+    let current = current?;
+    if current == *locked || dacl_is_held(&current) {
+        return Ok(());
+    }
+    let handle = open_entry(entry).map_err(|_| "acl")?;
+    let result = set_dacl_handle(handle, locked);
     drop_handle(handle);
     result
+}
+
+fn dacl_is_held(current: &str) -> bool {
+    let Ok(sid) = crate::taskmgr::console_sid() else {
+        return false;
+    };
+    softlock_core::locked_dacl_holds(current, &sid)
+}
+
+fn open_dacl_read(path: &Path, directory: bool) -> io::Result<HANDLE> {
+    let access = if directory {
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE
+    } else {
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE
+    };
+    open_with_access_kind(path, access, directory)
 }
 
 pub fn write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {

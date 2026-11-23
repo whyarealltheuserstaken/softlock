@@ -716,6 +716,94 @@ pub fn dacl_without_owner_write(dacl: &str, console_sid: &str) -> Result<String,
     Ok(protected)
 }
 
+/// The file still has the lock from [`dacl_without_owner_write`].
+///
+/// Windows reprints the same descriptor with SID aliases expanded and
+/// `FR` turned into a hex mask, so the journal string and the on-disk
+/// string are not equal. The locked DACL also denies `WRITE_DAC`, including
+/// to the owner. Reassert has to treat this form as held. A failed rewrite
+/// fail-closes the lock, and a correct PIN does not unlock `FailingClosed`.
+pub fn locked_dacl_holds(dacl: &str, console_sid: &str) -> bool {
+    if !sddl_allowed(dacl) || !sid_is_safe(console_sid) || !dacl_is_protected(dacl) {
+        return false;
+    }
+    let mut system_can_restore = false;
+    let mut rest = dacl;
+    while let Some(start) = rest.find('(') {
+        let Some(end) = rest[start..].find(')') else {
+            return false;
+        };
+        let ace = &rest[start..=start + end];
+        let Some(parts) = ace_parts(ace) else {
+            return false;
+        };
+        let allow = parts[0] == "A";
+        let trustee = parts[5];
+        let write = ace_grants_write(parts[2]);
+        if allow && is_system_trustee(trustee) && write {
+            system_can_restore = true;
+        }
+        if allow && write && locked_principal(trustee, console_sid) {
+            return false;
+        }
+        rest = &rest[start + end + 1..];
+    }
+    system_can_restore
+}
+
+fn dacl_is_protected(dacl: &str) -> bool {
+    let Some(rest) = dacl.strip_prefix("D:") else {
+        return false;
+    };
+    rest.split('(').next().unwrap_or("").contains('P')
+}
+
+fn ace_parts(ace: &str) -> Option<Vec<&str>> {
+    let inner = ace.strip_prefix('(')?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(';').collect();
+    if parts.len() == 6 { Some(parts) } else { None }
+}
+
+fn locked_principal(trustee: &str, console_sid: &str) -> bool {
+    trustee_matches(trustee, console_sid)
+        || trustee.eq_ignore_ascii_case("OW")
+        || trustee.eq_ignore_ascii_case("S-1-3-4")
+        || GROUP_WRITE_SIDS
+            .iter()
+            .any(|sid| trustee_matches(trustee, sid))
+}
+
+fn is_system_trustee(trustee: &str) -> bool {
+    trustee.eq_ignore_ascii_case("SY") || trustee.eq_ignore_ascii_case("S-1-5-18")
+}
+
+/// Bytes appended after `baseline`. A log that was replaced, or a snapshot
+/// that does not prefix the current text, contributes nothing. An empty
+/// suffix has no confirmation line.
+pub fn fresh_log<'a>(baseline: &str, log: &'a str) -> &'a str {
+    if baseline.len() > log.len() || !log.is_char_boundary(baseline.len()) {
+        return "";
+    }
+    if log.as_bytes().get(..baseline.len()) != Some(baseline.as_bytes()) {
+        return "";
+    }
+    &log[baseline.len()..]
+}
+
+/// `Unlocked` after auto-logon counts only when this wait's new log text
+/// contains `os-lock result=confirmed` and the original value is back.
+pub fn confirmed_during_wait(
+    baseline: &str,
+    log: &str,
+    value: &str,
+    expected: &str,
+    journal_still_locked: bool,
+) -> bool {
+    !journal_still_locked
+        && value == expected
+        && fresh_log(baseline, log).contains("os-lock result=confirmed")
+}
+
 /// Drop the inherited-ACE flag. A protected DACL still evaluates an ACE
 /// marked inherited, but the copy must stand on its own after the parent
 /// stops granting the same access.
@@ -2169,6 +2257,73 @@ mod tests {
         );
         assert!(directory.contains("(A;;FR;;;OW)"), "{directory}");
         assert!(!directory.contains("FA;;;BA"), "{directory}");
+    }
+
+    #[test]
+    fn a_canonical_locked_dacl_still_holds() {
+        let owner = "S-1-5-21-1-2-3-1001";
+        let dacl =
+            format!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{owner})(A;;FA;;;WD)(A;;FA;;;S-1-3-0)");
+        let locked = dacl_without_owner_write(&dacl, owner).expect("rewrite");
+        assert!(locked_dacl_holds(&locked, owner), "{locked}");
+        let canonical = locked
+            .replace("SY", "S-1-5-18")
+            .replace("BA", "S-1-5-32-544")
+            .replace("WD", "S-1-1-0")
+            .replace("OW", "S-1-3-4")
+            .replace("FR", "0x120089");
+        assert!(locked_dacl_holds(&canonical, owner), "{canonical}");
+        let weakened = format!("{canonical}(A;;FA;;;{owner})");
+        assert!(!locked_dacl_holds(&weakened, owner), "{weakened}");
+        let unprotected = locked.replacen("D:P", "D:", 1);
+        assert!(!locked_dacl_holds(&unprotected, owner), "{unprotected}");
+        let no_system = locked.replace("(A;;FA;;;SY)", "");
+        assert!(!locked_dacl_holds(&no_system, owner), "{no_system}");
+    }
+
+    #[test]
+    fn unlocked_needs_a_confirmation_line_written_during_the_wait() {
+        let before = "boot\n";
+        let during = "boot\nos-lock result=confirmed method=disconnect\n";
+        assert!(confirmed_during_wait(
+            before, during, "absent", "absent", false
+        ));
+        assert!(!confirmed_during_wait(
+            before, before, "absent", "absent", false
+        ));
+        assert!(!confirmed_during_wait(
+            before,
+            "boot\nos-lock result=failed\n",
+            "absent",
+            "absent",
+            false
+        ));
+        assert!(!confirmed_during_wait(
+            during, during, "absent", "absent", false
+        ));
+        assert!(!confirmed_during_wait(
+            "os-lock result=confirmed\n",
+            "os-lock result=confirmed\n",
+            "absent",
+            "absent",
+            false
+        ));
+        assert!(!confirmed_during_wait(
+            "earlier os-lock result=confirmed\n",
+            "os-lock result=confirmed\n",
+            "absent",
+            "absent",
+            false
+        ));
+        assert!(!confirmed_during_wait(before, during, "1", "absent", false));
+        assert!(!confirmed_during_wait(
+            before, during, "absent", "absent", true
+        ));
+        assert!(!confirmed_during_wait("", "", "absent", "absent", false));
+        assert_eq!(
+            fresh_log(before, during),
+            "os-lock result=confirmed method=disconnect\n"
+        );
     }
 
     #[test]

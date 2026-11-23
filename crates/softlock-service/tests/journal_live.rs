@@ -611,35 +611,29 @@ fn kill_after_apply(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
 fn wait_os_held(expected: &str, label: &str) -> Result<(), String> {
     let mut ended_unlocked = false;
     let mut last_state = String::new();
-    let log_at = fs::read_to_string(guard_dir().join("service.log"))
-        .map(|text| text.len())
-        .unwrap_or(0);
+    let baseline = log_baseline();
     let held = wait_until(Duration::from_secs(25), || {
         let status = transact(&pipe_name(), status_body()).unwrap_or_default();
         let state = status_state(&status).unwrap_or_default();
         last_state = state.clone();
         let os_held = session_os_held();
         // Unlocked with no confirmed OS lock is a fail-open. Unlocked after
-        // `os-lock result=confirmed`, with the original value back, is the
-        // owner (or the runner's auto-logon) returning to this logon. The
-        // service clears OsLocked itself. A reconnect on a real machine asks
-        // for credentials unless auto-logon is on.
+        // `os-lock result=confirmed` was written during this wait, with the
+        // original value back, is the owner (or the runner's auto-logon)
+        // returning to this logon. The service clears OsLocked itself. A
+        // reconnect on a real machine asks for credentials unless auto-logon
+        // is on. A missing confirmation line cannot take this branch.
         if state == "Unlocked" && !os_held {
-            let log = fs::read_to_string(guard_dir().join("service.log")).unwrap_or_default();
-            let fresh = log.get(log_at..).unwrap_or("");
-            if fresh.contains("os-lock result=confirmed")
-                && query_taskmgr() == expected
-                && !journal_ready(&journal_file())
-            {
+            if confirmed_since(&baseline, expected) {
                 return true;
             }
             ended_unlocked = true;
-            return true;
+            return false;
         }
         let reported = state == "OsLocked" || os_held;
         reported && query_taskmgr() == expected && !journal_ready(&journal_file())
     });
-    if ended_unlocked {
+    if !held && ended_unlocked {
         return Err(format!(
             "{label} ended Unlocked with no OS lock (value {})",
             query_taskmgr()
@@ -815,9 +809,7 @@ fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
     // The runner's auto-logon can bring this logon back before the next
     // sample. That is the sign-in, so Unlocked after the confirmation is
     // the same success as a disconnect we still have to reconnect.
-    let log_at = fs::read_to_string(guard_dir().join("service.log"))
-        .map(|text| text.len())
-        .unwrap_or(0);
+    let baseline = log_baseline();
     let _ = Command::new("taskkill")
         .args(["/F", "/IM", "softlock-lockhost.exe"])
         .status();
@@ -825,12 +817,12 @@ fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
         session_os_held()
             || (status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
                 == Some("Unlocked")
-                && confirmed_since(log_at))
+                && confirmed_since(&baseline, "absent"))
     });
     let signed_back = !session_os_held()
         && status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
             == Some("Unlocked")
-        && confirmed_since(log_at);
+        && confirmed_since(&baseline, "absent");
     if !held && !signed_back {
         let state = transact(&pipe_name(), status_body()).unwrap_or_default();
         return Err(format!(
@@ -844,6 +836,7 @@ fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
         if !wait_until(Duration::from_secs(25), || {
             status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
                 == Some("Unlocked")
+                && confirmed_since(&baseline, "absent")
         }) {
             let state = transact(&pipe_name(), status_body()).unwrap_or_default();
             return Err(format!("sign-in did not clear OsLocked: {state}"));
@@ -983,13 +976,25 @@ fn run_system_task(name: &str, script: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "live-fail-closed")]
-fn confirmed_since(log_at: usize) -> bool {
+fn log_baseline() -> String {
+    match fs::read_to_string(guard_dir().join("service.log")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // An unread snapshot must not treat the whole file as new. A sentinel
+        // that cannot prefix a real log keeps the suffix empty.
+        Err(_) => "\u{0}unreadable".to_string(),
+    }
+}
+
+fn confirmed_since(baseline: &str, expected: &str) -> bool {
     let log = fs::read_to_string(guard_dir().join("service.log")).unwrap_or_default();
-    log.get(log_at..)
-        .unwrap_or("")
-        .contains("os-lock result=confirmed")
-        && query_taskmgr() == "absent"
+    softlock_core::confirmed_during_wait(
+        baseline,
+        &log,
+        &query_taskmgr(),
+        expected,
+        journal_ready(&journal_file()),
+    )
 }
 
 #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
