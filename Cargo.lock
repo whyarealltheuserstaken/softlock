@@ -3235,7 +3235,9 @@ dependencies = [
 name = "softlock-service"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.2.17",
  "insta",
+ "libc",
  "proptest",
  "serde_json",
  "softlock-core",

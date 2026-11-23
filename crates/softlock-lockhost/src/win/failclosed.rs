@@ -13,7 +13,7 @@
 //! shows the error and the retry still runs. Ctrl+Alt+Del is the secure
 //! attention sequence and is not swallowed.
 
-#[cfg(any(test, feature = "simulated-physical"))]
+#[cfg(feature = "simulated-physical")]
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "simulated-physical")]
 use std::sync::atomic::AtomicU8;
@@ -86,28 +86,108 @@ use softlock_core::{Caller, Method, Outcome, failed_closed_log};
 #[cfg(feature = "simulated-physical")]
 static OS_LOCK_STUB: AtomicU8 = AtomicU8::new(1);
 
-#[cfg(test)]
-static BLOCK_OS_LOCK: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-static OS_LOCK_HELD: AtomicU64 = AtomicU64::new(0);
-
 /// Holds `lock_or_disconnect` on the worker so a test can see that the
-/// window thread already returned. The held call does not touch Windows.
-#[cfg(test)]
-pub(crate) fn block_os_lock_for_test(block: bool) {
-    BLOCK_OS_LOCK.store(block, Ordering::Release);
+/// caller already returned. The held call does not touch Windows.
+///
+/// The flag and the "entered" count share one mutex with the condition
+/// variable. A quit test used to publish the flag with an atomic, then drop
+/// its lock before clearing the flag, so the next test could arm the hold
+/// and have the previous `Drop` turn it off before the worker looked.
+#[cfg(all(test, feature = "simulated-physical"))]
+struct OsLockHold {
+    block: bool,
+    entered: u64,
+    inside: u64,
 }
 
-/// How many workers have entered the hold. A test waits for this to move
-/// before it clears the block, so the worker cannot reach Windows.
-#[cfg(test)]
+#[cfg(all(test, feature = "simulated-physical"))]
+struct OsLockGate {
+    state: std::sync::Mutex<OsLockHold>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(all(test, feature = "simulated-physical"))]
+static OS_LOCK_HOLD: OsLockGate = OsLockGate {
+    state: std::sync::Mutex::new(OsLockHold {
+        block: false,
+        entered: 0,
+        inside: 0,
+    }),
+    cv: std::sync::Condvar::new(),
+};
+
+#[cfg(all(test, feature = "simulated-physical"))]
+fn hold_lock() -> std::sync::MutexGuard<'static, OsLockHold> {
+    OS_LOCK_HOLD
+        .state
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+#[cfg(all(test, feature = "simulated-physical"))]
+pub(crate) fn block_os_lock_for_test(block: bool) {
+    let mut state = hold_lock();
+    state.block = block;
+    OS_LOCK_HOLD.cv.notify_all();
+}
+
+#[cfg(all(test, feature = "simulated-physical"))]
 pub(crate) fn os_lock_held_count() -> u64 {
-    OS_LOCK_HELD.load(Ordering::Acquire)
+    hold_lock().entered
+}
+
+/// Blocks until a worker has entered the hold after `before`.
+#[cfg(all(test, feature = "simulated-physical"))]
+pub(crate) fn wait_until_os_lock_held(before: u64) {
+    let mut state = hold_lock();
+    while state.entered == before {
+        state = OS_LOCK_HOLD
+            .cv
+            .wait(state)
+            .unwrap_or_else(|poison| poison.into_inner());
+    }
+}
+
+/// Wakes the worker, then waits until it has left the hold and the caller
+/// reports the quit result is no longer in flight.
+#[cfg(all(test, feature = "simulated-physical"))]
+pub(crate) fn release_os_lock_for_test(still_running: impl Fn() -> bool) {
+    let mut state = hold_lock();
+    state.block = false;
+    OS_LOCK_HOLD.cv.notify_all();
+    while state.inside > 0 || still_running() {
+        state = OS_LOCK_HOLD
+            .cv
+            .wait(state)
+            .unwrap_or_else(|poison| poison.into_inner());
+    }
+}
+
+#[cfg(all(test, feature = "simulated-physical"))]
+pub(crate) fn note_quit_os_finished() {
+    let _state = hold_lock();
+    OS_LOCK_HOLD.cv.notify_all();
+}
+
+#[cfg(all(test, feature = "simulated-physical"))]
+pub(crate) fn wait_for_os_lock_signal<T>(mut poll: impl FnMut() -> Option<T>) -> T {
+    let mut state = hold_lock();
+    loop {
+        if let Some(value) = poll() {
+            return value;
+        }
+        state = OS_LOCK_HOLD
+            .cv
+            .wait(state)
+            .unwrap_or_else(|poison| poison.into_inner());
+    }
 }
 
 pub(crate) fn lock_or_disconnect(session: u32) -> RealLock {
     let _ = session;
-    #[cfg(test)]
+    // The hold exists only in the simulated-physical unit-test build. A
+    // production quit still calls the service-dead path below.
+    #[cfg(all(test, feature = "simulated-physical"))]
     if held_for_test() {
         return decide(false, false);
     }
@@ -120,15 +200,23 @@ pub(crate) fn lock_or_disconnect(session: u32) -> RealLock {
     finish(result, Caller::LockHost)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "simulated-physical"))]
 fn held_for_test() -> bool {
-    if !BLOCK_OS_LOCK.load(Ordering::Acquire) {
+    let mut state = hold_lock();
+    if !state.block {
         return false;
     }
-    OS_LOCK_HELD.fetch_add(1, Ordering::Release);
-    while BLOCK_OS_LOCK.load(Ordering::Acquire) {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+    state.entered += 1;
+    state.inside += 1;
+    OS_LOCK_HOLD.cv.notify_all();
+    while state.block {
+        state = OS_LOCK_HOLD
+            .cv
+            .wait(state)
+            .unwrap_or_else(|poison| poison.into_inner());
     }
+    state.inside -= 1;
+    OS_LOCK_HOLD.cv.notify_all();
     true
 }
 

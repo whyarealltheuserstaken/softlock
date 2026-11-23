@@ -23,6 +23,10 @@ softlock-core = { path = "../softlock-core" }
 tracing = "0.1.41"
 zeroize = { version = "1.8.2", default-features = false, features = ["alloc"] }
 
+[target.'cfg(unix)'.dependencies]
+getrandom = "0.2.16"
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 softlock-windows = { path = "../softlock-windows" }
 windows = { version = "0.62", features = [
