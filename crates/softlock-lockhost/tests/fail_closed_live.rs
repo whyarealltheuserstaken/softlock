@@ -116,7 +116,6 @@ fn live_fail_closed() {
             .unwrap_or(0)
     };
     let _ = fs::remove_file(&mark);
-    let started = Instant::now();
     match case.as_str() {
         "kill-host" => {
             let pid = host_before.expect("lock host");
@@ -140,6 +139,9 @@ fn live_fail_closed() {
         "hold-ready" | "exit-before-ready" => {}
         other => panic!("unknown case {other}"),
     }
+    // The fault is done. taskkill can take longer than the remaining budget,
+    // and that time is not the service's.
+    let started = Instant::now();
     let mut confirmed_at = None;
     while started.elapsed() < Duration::from_secs(1) {
         if case != "kill-service"
