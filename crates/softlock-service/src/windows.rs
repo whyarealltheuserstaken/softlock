@@ -1990,6 +1990,44 @@ fn set_status(
 }
 
 #[cfg(test)]
+mod settings_boot {
+    use super::install_journal;
+    use crate::Authority;
+    use crate::platform::{OsLock, ServicePlatform};
+    use crate::settings::fail_open_for_test;
+    use softlock_core::{FailReason, LockState};
+
+    #[test]
+    fn an_open_error_fails_closed_on_service_start() {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                fail_open_for_test(false);
+            }
+        }
+        let _clear = Clear;
+        fail_open_for_test(true);
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), false);
+        install_journal(&mut authority);
+        assert!(
+            matches!(
+                authority.state(),
+                LockState::FailingClosed {
+                    reason: FailReason::SessionActive
+                }
+            ),
+            "an open error left {:?}",
+            authority.state()
+        );
+        assert!(
+            !authority.returned_to_unlocked(),
+            "an open error returned to Unlocked"
+        );
+        assert!(authority.platform_mut().settings_are_required());
+    }
+}
+
+#[cfg(test)]
 mod session_filter {
     use super::session_event;
     use softlock_core::SessionEvent;
