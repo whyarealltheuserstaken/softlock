@@ -898,18 +898,31 @@ fn capture() {
 
 #[cfg(feature = "live-fail-closed")]
 fn repair_as_system() -> Result<(i32, String), String> {
-    let script = guard_dir().join("repair.cmd");
+    let script = guard_dir().join("repair.ps1");
     let code_path = guard_dir().join("repair-code.txt");
     let log_path = guard_dir().join("repair-out.txt");
+    let out_path = guard_dir().join("repair-stdout.txt");
     let _ = fs::remove_file(&code_path);
     let body = format!(
-        "@echo off\r\n\"{}\" --repair-settings > \"{}\" 2>&1\r\necho %ERRORLEVEL%> \"{}\"\r\n",
-        service_exe().display(),
-        log_path.display(),
-        code_path.display()
+        "$ErrorActionPreference = 'Stop'\ntry {{\n  $p = Start-Process -FilePath '{exe}' -ArgumentList '--repair-settings' -Wait -PassThru -WindowStyle Hidden -RedirectStandardError '{log}' -RedirectStandardOutput '{out}'\n  Set-Content -LiteralPath '{code}' -Value $p.ExitCode -NoNewline\n}} catch {{\n  Set-Content -LiteralPath '{log}' -Value $_.Exception.Message\n  Set-Content -LiteralPath '{code}' -Value '1' -NoNewline\n}}\n",
+        exe = service_exe().display(),
+        log = log_path.display(),
+        out = out_path.display(),
+        code = code_path.display(),
     );
     fs::write(&script, body).map_err(|_| "repair script".to_string())?;
-    let bin = script.display().to_string();
+    let powershell = std::env::var("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let bin = format!(
+        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
+        powershell.display(),
+        script.display()
+    );
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "sl-repair", "/F"])
         .status();
@@ -949,6 +962,8 @@ fn repair_as_system() -> Result<(i32, String), String> {
     let code = fs::read_to_string(&code_path).unwrap_or_default();
     let code = code.trim().parse::<i32>().unwrap_or(1);
     let mut note = fs::read_to_string(&log_path).unwrap_or_default();
+    note.push(' ');
+    note.push_str(&fs::read_to_string(&out_path).unwrap_or_default());
     note = note
         .chars()
         .map(|c| if c.is_control() || c == '"' { ' ' } else { c })
