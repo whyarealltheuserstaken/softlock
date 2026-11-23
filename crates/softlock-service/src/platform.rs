@@ -83,13 +83,12 @@ impl ServicePlatform {
         engine.reassert_if_due()
     }
 
-    /// `true` when the ONLOGON repair path cleared the OsLocked marker.
+    /// Whether the journal still records a confirmed OS lock.
     #[cfg(windows)]
-    pub fn release_if_owner_returned(&mut self) -> bool {
-        let Some(engine) = self.settings.as_mut() else {
-            return false;
-        };
-        engine.release_if_owner_returned().unwrap_or(false)
+    pub fn os_confirmed_marker(&mut self) -> Option<bool> {
+        self.settings
+            .as_mut()
+            .and_then(crate::settings::SettingsEngine::os_confirmed_marker)
     }
 
     pub fn set_arm_wait(&mut self, arm: ArmWait) {

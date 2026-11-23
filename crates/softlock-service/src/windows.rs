@@ -618,8 +618,8 @@ fn apply_session_events(authority: &Arc<Mutex<Authority>>, events: &Receiver<Ses
             // Windows raises an unlock notice for the disconnect itself,
             // including when some other console session is already active.
             // That notice is not the owner signing back in. The supervisor
-            // clears this flag when the same logon is the console again,
-            // and that path runs the repair task's revert. SPEC section 7.
+            // leaves OsLocked until `--repair-settings` removes the marker,
+            // which it does only when this logon is the console. SPEC section 7.
             continue;
         }
         let mut guard = authority
@@ -706,9 +706,23 @@ fn supervise(
             .try_lock()
             .map(|mut guard| guard.poll_host(Instant::now(), alive))
             .unwrap_or(HostAction::Hold);
-        release_returned_owner(&authority);
+        let signed_in = release_returned_owner(&authority);
+        if signed_in {
+            // The host that was spawned for the disconnected session is not
+            // the next lock's host. The following iteration starts a new one.
+            arm.failed();
+            arm_sent = false;
+            if let Some(child) = host
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+            {
+                let _ = child.stop();
+            }
+            *writer.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+        }
         drain_os_lock(&authority);
-        if let HostAction::Respawn { arm: arm_again } = action {
+        if !signed_in && let HostAction::Respawn { arm: arm_again } = action {
             // The previous wait must not stay Waiting across this process.
             arm.failed();
             arm_sent = false;
@@ -736,23 +750,36 @@ fn supervise(
     }
 }
 
-fn release_returned_owner(authority: &Arc<Mutex<Authority>>) {
+/// Set once this process has seen the marker its own disconnect wrote.
+/// A later empty journal is the repair task, not a journal that was never
+/// written.
+static MARKER_SEEN: AtomicBool = AtomicBool::new(false);
+
+fn release_returned_owner(authority: &Arc<Mutex<Authority>>) -> bool {
     if !DISCONNECT_HELD.load(Ordering::Acquire) {
-        return;
+        return false;
     }
     let mut guard = authority
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     if !matches!(guard.state(), softlock_core::LockState::OsLocked { .. }) {
-        return;
+        return false;
     }
-    if !guard.platform_mut().release_if_owner_returned() {
-        return;
+    match guard.platform_mut().os_confirmed_marker() {
+        Some(true) => {
+            MARKER_SEEN.store(true, Ordering::Release);
+            false
+        }
+        Some(false) if MARKER_SEEN.load(Ordering::Acquire) => {
+            // `--repair-settings` removed the marker. That is the ONLOGON
+            // route, and it only does so when this logon is the console.
+            MARKER_SEEN.store(false, Ordering::Release);
+            DISCONNECT_HELD.store(false, Ordering::Release);
+            guard.release_after_repair();
+            true
+        }
+        _ => false,
     }
-    // The marker is gone via repair_leftover, the same function
-    // `--repair-settings` runs. The next Lock in this process can start.
-    DISCONNECT_HELD.store(false, Ordering::Release);
-    guard.release_after_repair();
 }
 
 fn arm_frame(authority: &Arc<Mutex<Authority>>, id: u64) -> Option<Vec<u8>> {

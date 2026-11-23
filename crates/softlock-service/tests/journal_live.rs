@@ -72,7 +72,10 @@ fn live_settings_journal() {
         "restore" => restore(&mut guard),
         "recover-active" => recover_active(&mut guard),
         "clock" => clock_shift_stays_locked(&mut guard),
+        #[cfg(feature = "live-fail-closed")]
         "sign-in" => sign_in_then_the_next_lock_unlocks(&mut guard),
+        #[cfg(not(feature = "live-fail-closed"))]
+        "sign-in" => Err("the sign-in case is compiled with live-fail-closed".to_string()),
         other => Err(format!("unknown case {other}")),
     };
     match outcome {
@@ -775,6 +778,7 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "live-fail-closed")]
 fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
     realign()?;
     set_taskmgr("absent")?;
@@ -804,8 +808,13 @@ fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
             "the host death did not disconnect the console: {state}"
         ));
     }
-    // Same logon, same session, back on the console. This is the sign-in.
+    // Same logon, same session, back on the console. The repair task is the
+    // sign-in route. Reconnecting alone does not clear the marker.
     align_console()?;
+    let (code, note) = repair_as_system()?;
+    if code != 0 {
+        return Err(format!("sign-in repair failed ({code} {note})"));
+    }
     if !wait_until(Duration::from_secs(20), || {
         status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
             == Some("Unlocked")
@@ -813,6 +822,9 @@ fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
         let state = transact(&pipe_name(), status_body()).unwrap_or_default();
         return Err(format!("sign-in did not clear OsLocked: {state}"));
     }
+    // The disconnected session's host was dropped. The replacement has to
+    // be ready before this lock, or the arm wait fail-closes.
+    thread::sleep(Duration::from_secs(2));
     let again =
         transact(&pipe_name(), lock_now()).map_err(|error| format!("second lock: {error}"))?;
     if !again.contains("Accepted") {
@@ -843,6 +855,7 @@ fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "live-fail-closed")]
 fn seed_system_pin(dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|_| "pin dir".to_string())?;
     let secret = softlock_core::Secret::new(b"135742");
@@ -910,6 +923,7 @@ public class SoftlockPin {{
     }
 }
 
+#[cfg(feature = "live-fail-closed")]
 fn run_system_task(name: &str, script: &Path) -> Result<(), String> {
     let powershell = std::env::var("SystemRoot")
         .map(PathBuf::from)
@@ -942,22 +956,58 @@ fn run_system_task(name: &str, script: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "live-fail-closed")]
 fn type_pin_keys() -> Result<(), String> {
+    use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, LLKHF_INJECTED, SetWindowsHookExW,
+        UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    };
+    use windows::core::PCWSTR;
+    // SendInput is always marked injected, and the guard does not queue
+    // injected keys. This hook is installed after the Lock Host, so it runs
+    // first and presents the key as physical before the guard sees it.
+    unsafe extern "system" fn present_physical(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code >= 0 {
+            let info = &mut *(lparam.0 as *mut KBDLLHOOKSTRUCT);
+            info.flags = KBDLLHOOKSTRUCT_FLAGS(info.flags.0 & !LLKHF_INJECTED.0);
+        }
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+    let module = unsafe { GetModuleHandleW(PCWSTR::null()) }.unwrap_or_default();
+    let hook = unsafe {
+        SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(present_physical),
+            Some(HINSTANCE(module.0)),
+            0,
+        )
+    }
+    .map_err(|_| "pin hook".to_string())?;
     let mut keys = vec![0x7Cu16];
     keys.extend(b"135742".iter().copied().map(u16::from));
     keys.push(0x0D);
+    let mut failed = None;
     for vk in keys {
         let input = [pin_key(vk, false), pin_key(vk, true)];
         let sent = unsafe { SendInput(&input, std::mem::size_of::<INPUT>() as i32) };
         if sent != 2 {
-            return Err("the pin key was not delivered".to_string());
+            failed = Some("the pin key was not delivered".to_string());
+            break;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Ok(())
+    let _ = unsafe { UnhookWindowsHookEx(hook) };
+    failed.map_or(Ok(()), Err)
 }
 
+#[cfg(feature = "live-fail-closed")]
 fn pin_key(virtual_key: u16, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
@@ -1566,9 +1616,10 @@ fn repair_as_system() -> Result<(i32, String), String> {
 }
 
 fn clear_os_hold() -> Result<(), String> {
-    // The confirmed disconnect stays OsLocked for this logon. The next lock
-    // in this session is a new check, so the marker has to be cleared once
-    // the assertion has passed. Repair is the supported way to drop it.
+    // The confirmed disconnect stays OsLocked for this logon. Repair drops
+    // the marker only once this logon is the console again, which is the
+    // sign-in the next check starts from.
+    realign()?;
     let (code, _note) = repair_settings()?;
     if code == 0 {
         return Ok(());
