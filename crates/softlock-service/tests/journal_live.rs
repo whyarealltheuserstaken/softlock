@@ -1022,15 +1022,16 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
 
 fn hard_stop(_guard: &mut Guard) -> Result<(), String> {
     // A live host OS-locks the console when its service pipe closes, and the
-    // service OS-locks when it sees the host die. Freeze the host first so
-    // neither side locks the session during the kill. The next boot of the
-    // same logon fails closed and requests the OS lock. A host that exits
-    // between the snapshot and the open is already stopped. A host that is
-    // still listed and cannot be suspended fails the test.
-    settle_host()?;
-    // The service OS-locks when it observes the host die. The service has to
-    // be gone before the host is killed, or that recovery finishes during
-    // the kill and the next start finds a reverted journal.
+    // service OS-locks when it sees the host die or go silent. Freeze the
+    // service first. Freezing the host stops its heartbeats, and a service
+    // that is still scheduled will finish the OS lock and revert the journal
+    // before this kill returns. The next boot of the same logon is the
+    // recovery under test. A process that exits between the snapshot and the
+    // open is already stopped. One that is still listed and cannot be
+    // suspended fails the test.
+    freeze("softlock-service.exe")?;
+    freeze("softlock-lockhost.exe")?;
+    // The service has to be gone before the host is killed.
     let service_deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let _ = Command::new("taskkill")
@@ -1060,13 +1061,13 @@ fn hard_stop(_guard: &mut Guard) -> Result<(), String> {
     }
 }
 
-fn settle_host() -> Result<(), String> {
+fn freeze(image: &str) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        if let Some(pid) = host_pid() {
-            return suspend_pid(pid);
+        if let Some(pid) = image_pid(image) {
+            return suspend_pid(image, pid);
         }
-        if !host_running() {
+        if !image_running(image) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -1074,16 +1075,16 @@ fn settle_host() -> Result<(), String> {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    if let Some(pid) = host_pid() {
-        suspend_pid(pid)
-    } else if host_running() {
-        Err("lock host pid".to_string())
+    if let Some(pid) = image_pid(image) {
+        suspend_pid(image, pid)
+    } else if image_running(image) {
+        Err(format!("{image} pid"))
     } else {
         Ok(())
     }
 }
 
-fn suspend_pid(pid: u32) -> Result<(), String> {
+fn suspend_pid(image: &str, pid: u32) -> Result<(), String> {
     unsafe {
         let opened = windows::Win32::System::Threading::OpenProcess(
             windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS(0x0800),
@@ -1091,18 +1092,18 @@ fn suspend_pid(pid: u32) -> Result<(), String> {
             pid,
         );
         let Ok(process) = opened else {
-            return if host_pid() == Some(pid) {
-                Err("open host".to_string())
+            return if image_pid(image) == Some(pid) {
+                Err(format!("open {image}"))
             } else {
                 Ok(())
             };
         };
         let status = NtSuspendProcess(process.0);
         let _ = windows::Win32::Foundation::CloseHandle(process);
-        if status == 0 || host_pid() != Some(pid) {
+        if status == 0 || image_pid(image) != Some(pid) {
             Ok(())
         } else {
-            Err(format!("suspend host returned {status}"))
+            Err(format!("suspend {image} returned {status}"))
         }
     }
 }
@@ -1119,21 +1120,16 @@ fn image_running(image: &str) -> bool {
         .contains(&image.to_ascii_lowercase())
 }
 
-fn host_pid() -> Option<u32> {
+fn image_pid(image: &str) -> Option<u32> {
     let output = Command::new("tasklist")
-        .args([
-            "/FI",
-            "IMAGENAME eq softlock-lockhost.exe",
-            "/FO",
-            "CSV",
-            "/NH",
-        ])
+        .args(["/FI", &format!("IMAGENAME eq {image}"), "/FO", "CSV", "/NH"])
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let line = text
-        .lines()
-        .find(|line| line.to_ascii_lowercase().contains("softlock-lockhost.exe"))?;
+    let line = text.lines().find(|line| {
+        line.to_ascii_lowercase()
+            .contains(&image.to_ascii_lowercase())
+    })?;
     let pid = line.split(',').nth(1)?.trim().trim_matches('"');
     pid.parse().ok()
 }
