@@ -300,6 +300,9 @@ impl SettingsEngine {
         if RESTORED.load(Ordering::Acquire) {
             return Ok(());
         }
+        // A failed row must not spin. The next attempt waits the normal
+        // interval even when this one returns an error before the end.
+        self.last = Instant::now();
         let Some(text) = load_journal().map_err(|_| "journal")? else {
             return Ok(());
         };
@@ -323,7 +326,6 @@ impl SettingsEngine {
                 );
             }
         }
-        self.last = Instant::now();
         Ok(())
     }
 

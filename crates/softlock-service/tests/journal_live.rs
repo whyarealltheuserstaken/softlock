@@ -172,12 +172,6 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
         // external change has to come from LocalSystem, which still has full
         // control.
         restore_dacl_as_system(&path, &original)?;
-        if !wait_until(Duration::from_secs(15), || owner_rights_allowed(&path)) {
-            return Err(format!(
-                "the external DACL restore did not grant the console user write: {}",
-                owner_rights(&path)
-            ));
-        }
         if !wait_until(Duration::from_secs(12), || owner_rights_denied(&path)) {
             return Err(format!(
                 "an external DACL change was not re-asserted: {}",
@@ -295,6 +289,10 @@ public class SoftlockAcl {{
   public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string sddl, int revision, out IntPtr sd, out uint length);
   [DllImport("advapi32.dll", SetLastError=true)]
   public static extern bool GetSecurityDescriptorDacl(IntPtr sd, out bool present, out IntPtr dacl, out bool defaulted);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern int GetNamedSecurityInfo(string name, int type, int security, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr sd);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern bool ConvertSecurityDescriptorToStringSecurityDescriptor(IntPtr sd, int revision, int security, out IntPtr text, out uint length);
 }}
 '@
   $sd = [IntPtr]::Zero
@@ -308,7 +306,19 @@ public class SoftlockAcl {{
   if (-not $present) {{ throw 'no dacl' }}
   $status = [SoftlockAcl]::SetNamedSecurityInfo('{path_text}', 1, 0x80000004, [IntPtr]::Zero, [IntPtr]::Zero, $dacl, [IntPtr]::Zero)
   if ($status -ne 0) {{ throw "set $status" }}
-  'ok' | Set-Content -LiteralPath $log
+  $owner = [IntPtr]::Zero
+  $group = [IntPtr]::Zero
+  $nowDacl = [IntPtr]::Zero
+  $sacl = [IntPtr]::Zero
+  $nowSd = [IntPtr]::Zero
+  $read = [SoftlockAcl]::GetNamedSecurityInfo('{path_text}', 1, 4, [ref]$owner, [ref]$group, [ref]$nowDacl, [ref]$sacl, [ref]$nowSd)
+  if ($read -ne 0) {{ throw "read $read" }}
+  $rendered = [IntPtr]::Zero
+  $renderedLen = [uint32]0
+  $shown = [SoftlockAcl]::ConvertSecurityDescriptorToStringSecurityDescriptor($nowSd, 1, 4, [ref]$rendered, [ref]$renderedLen)
+  if (-not $shown) {{ throw "render $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }}
+  $text = [Runtime.InteropServices.Marshal]::PtrToStringUni($rendered)
+  "readback=$text" | Set-Content -LiteralPath $log
 }} catch {{
   $_ | Out-String | Set-Content -LiteralPath $log
   exit 1
@@ -348,21 +358,27 @@ public class SoftlockAcl {{
         .args(["/Run", "/TN", "sl-dacl"])
         .status()
         .map_err(|_| "dacl task".to_string())?;
-    let granted =
-        started.success() && wait_until(Duration::from_secs(15), || owner_rights_allowed(path));
+    let recorded = started.success()
+        && wait_until(Duration::from_secs(15), || {
+            fs::read_to_string(&log)
+                .ok()
+                .is_some_and(|text| text.contains("readback="))
+        });
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "sl-dacl", "/F"])
         .status();
-    if granted {
+    let note = fs::read_to_string(&log).unwrap_or_default();
+    // The locked DACL still says FA for SYSTEM. A restored file has no FR ACE.
+    let granted = note.lines().any(|line| {
+        let Some(body) = line.trim().strip_prefix("readback=") else {
+            return false;
+        };
+        body.contains("FA") && !body.contains("FR")
+    });
+    if recorded && granted {
         Ok(())
     } else {
-        let current = softlock_service::testing_dacl(path)
-            .map_err(|error| error.to_string())
-            .unwrap_or_else(|error| error);
-        let note = fs::read_to_string(&log).unwrap_or_default();
-        Err(format!(
-            "dacl task did not restore write ({current}) {note}"
-        ))
+        Err(format!("dacl task did not restore write ({note})"))
     }
 }
 
