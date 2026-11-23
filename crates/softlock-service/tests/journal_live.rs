@@ -616,7 +616,7 @@ fn clock_shift_stays_locked(guard: &mut Guard) -> Result<(), String> {
             query_taskmgr()
         ));
     }
-    hard_stop(guard)?;
+    hard_stop_service_first(guard)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
     spawn_service(guard, None, &pause)?;
     let mut ended_unlocked = false;
@@ -1020,16 +1020,27 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
     }
 }
 
-fn hard_stop(_guard: &mut Guard) -> Result<(), String> {
+fn hard_stop(guard: &mut Guard) -> Result<(), String> {
+    // Freeze the host, then kill the service before the host. The restore
+    // cases are inside the journal pause. Freezing the service there let the
+    // kill change the registry value and left the restart Unlocked.
+    stop_processes(guard, false)
+}
+
+fn hard_stop_service_first(guard: &mut Guard) -> Result<(), String> {
+    // The service OS-locks when the host goes silent. Freeze the service
+    // before the host so that silence cannot finish the OS lock.
+    stop_processes(guard, true)
+}
+
+fn stop_processes(_guard: &mut Guard, freeze_service: bool) -> Result<(), String> {
     // A live host OS-locks the console when its service pipe closes, and the
-    // service OS-locks when it sees the host die or go silent. Freeze the
-    // service first. Freezing the host stops its heartbeats, and a service
-    // that is still scheduled will finish the OS lock and revert the journal
-    // before this kill returns. The next boot of the same logon is the
-    // recovery under test. A process that exits between the snapshot and the
-    // open is already stopped. One that is still listed and cannot be
-    // suspended fails the test.
-    freeze("softlock-service.exe")?;
+    // service OS-locks when it sees the host die. A process that exits between
+    // the snapshot and the open is already stopped. One that is still listed
+    // and cannot be suspended fails the test.
+    if freeze_service {
+        freeze("softlock-service.exe")?;
+    }
     freeze("softlock-lockhost.exe")?;
     // The service has to be gone before the host is killed.
     let service_deadline = Instant::now() + Duration::from_secs(3);
