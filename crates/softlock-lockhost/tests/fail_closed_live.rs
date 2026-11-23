@@ -119,44 +119,42 @@ fn live_fail_closed() {
             .unwrap_or(0)
     };
     let _ = fs::remove_file(&mark);
-    let mut started = Instant::now();
-    match case.as_str() {
+    let started = match case.as_str() {
         "kill-host" => {
             let pid = host_before.expect("lock host");
             let process = unsafe {
                 OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid).expect("open host")
             };
-            started = Instant::now();
+            let started = Instant::now();
             unsafe {
                 let _ = TerminateProcess(process, 1);
                 let _ = CloseHandle(process);
             }
+            started
         }
         "suspend-host" => {
             suspend_process(host_before.expect("lock host"));
-            started = Instant::now();
+            Instant::now()
         }
         "kill-service" => {
             child.kill().expect("kill service");
-            started = Instant::now();
+            Instant::now()
         }
         "stop-while-locked" => {
             fs::write(&stop_file, b"stop").expect("stop file");
-            started = Instant::now();
+            Instant::now()
         }
         "unhealthy-guard" => {
             fs::write(&guard_file, b"down").expect("guard file");
-            started = Instant::now();
+            Instant::now()
         }
         "tray-hard-lock" => {
             post_tray_hard_lock(&hwnd_file);
-            started = Instant::now();
+            Instant::now()
         }
-        "hold-ready" | "exit-before-ready" => {
-            started = Instant::now();
-        }
+        "hold-ready" | "exit-before-ready" => Instant::now(),
         other => panic!("unknown case {other}"),
-    }
+    };
     let mut confirmed_at = None;
     while started.elapsed() < Duration::from_secs(1) {
         if case != "kill-service"
