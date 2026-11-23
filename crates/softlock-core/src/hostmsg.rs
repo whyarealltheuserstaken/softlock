@@ -34,6 +34,14 @@ pub enum ServiceToHost {
     PromptResult {
         accepted: bool,
         backoff_ms: u64,
+        /// This result is for the account password. The host must not apply
+        /// it to the PIN backoff, and it must not swallow PIN keystrokes.
+        #[serde(default)]
+        password_path: bool,
+        /// The password budget for this observation window is used up.
+        /// The prompt says so and keeps the PIN available.
+        #[serde(default)]
+        password_exhausted: bool,
     },
 }
 

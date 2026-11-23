@@ -672,7 +672,7 @@ fn backoff_attempts_one_through_four_have_no_delay_then_double_from_thirty_secon
     let mut controller = locked_started();
     for attempt in 1..=3 {
         controller.handle(Event::SubmitSecret {
-            method: MethodId::os_password(),
+            method: MethodId::softlock_pin(),
             secret: Secret::new("nope"),
         });
         assert_eq!(controller.failure_count(), attempt);
@@ -688,7 +688,7 @@ fn backoff_attempts_one_through_four_have_no_delay_then_double_from_thirty_secon
     }
 
     controller.handle(Event::SubmitSecret {
-        method: MethodId::os_password(),
+        method: MethodId::softlock_pin(),
         secret: Secret::new("nope"),
     });
     assert_eq!(controller.failure_count(), 4);
@@ -707,7 +707,7 @@ fn backoff_attempts_one_through_four_have_no_delay_then_double_from_thirty_secon
     ));
 
     controller.handle(Event::SubmitSecret {
-        method: MethodId::os_password(),
+        method: MethodId::softlock_pin(),
         secret: Secret::new("nope"),
     });
     assert_eq!(
@@ -721,7 +721,7 @@ fn backoff_attempts_one_through_four_have_no_delay_then_double_from_thirty_secon
         Duration::from_secs(30) - Duration::from_millis(1),
     );
     controller.handle(Event::SubmitSecret {
-        method: MethodId::os_password(),
+        method: MethodId::softlock_pin(),
         secret: Secret::new("nope"),
     });
     assert_eq!(controller.failure_count(), 4);
@@ -737,7 +737,7 @@ fn backoff_attempts_one_through_four_have_no_delay_then_double_from_thirty_secon
     ];
     for (attempt, seconds) in schedule {
         controller.handle(Event::SubmitSecret {
-            method: MethodId::os_password(),
+            method: MethodId::softlock_pin(),
             secret: Secret::new("nope"),
         });
         assert_eq!(controller.failure_count(), attempt);
@@ -758,7 +758,7 @@ fn backoff_attempts_one_through_four_have_no_delay_then_double_from_thirty_secon
         source: LockSource::Hotkey,
     });
     controller.handle(Event::SubmitSecret {
-        method: MethodId::os_password(),
+        method: MethodId::softlock_pin(),
         secret: Secret::new("nope"),
     });
     assert_eq!(controller.failure_count(), 1);
@@ -1256,17 +1256,13 @@ fn a_confirmed_os_lock_stays_locked_across_a_service_restart() {
 }
 
 #[test]
-fn pin_and_password_failures_share_one_lock_session_counter() {
+fn pin_and_password_failures_use_separate_counters() {
     let mut controller = locked_started();
     controller.handle(Event::SubmitSecret {
         method: MethodId::softlock_pin(),
         secret: Secret::new("nope"),
     });
     controller.handle(Event::SubmitSecret {
-        method: MethodId::os_password(),
-        secret: Secret::new("nope"),
-    });
-    controller.handle(Event::SubmitSecret {
         method: MethodId::softlock_pin(),
         secret: Secret::new("nope"),
     });
@@ -1274,10 +1270,34 @@ fn pin_and_password_failures_share_one_lock_session_counter() {
         method: MethodId::os_password(),
         secret: Secret::new("nope"),
     });
-    assert_eq!(controller.failure_count(), 4);
-    assert_eq!(controller.backoff_delay(), Duration::from_secs(30));
+    assert_eq!(controller.failure_count(), 2);
+    assert_eq!(controller.backoff_delay(), Duration::ZERO);
+    assert!(matches!(controller.state(), LockState::Locked { .. }));
     let leaked = format!("{:?}", controller.rejection_log());
     assert!(!leaked.contains("nope"));
+
+    let policy = softlock_core::LockoutPolicy {
+        threshold: 10,
+        window: Duration::from_secs(600),
+    };
+    assert_eq!(softlock_core::password_attempt_limit(10), Some(8));
+    assert_eq!(softlock_core::password_attempt_limit(5), Some(3));
+    assert_eq!(
+        softlock_core::password_attempt_limit(softlock_core::unreadable_lockout_policy().threshold),
+        Some(1)
+    );
+    let now = softlock_core::ClockSample {
+        tick: 1_000_000,
+        wall_ms: 2_000_000,
+    };
+    let stamp = softlock_core::PasswordStamp {
+        tick: now.tick,
+        wall_ms: now.wall_ms,
+    };
+    let waiting = softlock_core::password_gate(&[stamp], policy, now);
+    assert!(!waiting.allow);
+    assert_eq!(waiting.wait, Duration::from_secs(30));
+    assert_eq!(controller.failure_count(), 2);
 }
 
 #[test]
@@ -1351,7 +1371,7 @@ fn submit_secret_without_a_verified_verdict_does_not_unlock() {
     assert!(controller.platform().secrets_flag());
     controller.platform_mut().fail_revert(true);
     controller.handle(Event::SubmitSecret {
-        method: MethodId::os_password(),
+        method: MethodId::softlock_pin(),
         secret: Secret::new("ok"),
     });
     assert!(matches!(controller.state(), LockState::Locked { .. }));
@@ -1367,7 +1387,7 @@ fn submit_secret_without_a_verified_verdict_does_not_unlock() {
         .platform_mut()
         .set_secret_verdict(Verdict::Verified);
     verified.handle(Event::SubmitSecret {
-        method: MethodId::os_password(),
+        method: MethodId::softlock_pin(),
         secret: Secret::new("ok"),
     });
     assert!(
@@ -1402,7 +1422,7 @@ fn prompt_events_do_not_clear_the_backoff_deadline() {
     let mut controller = locked_started();
     for _ in 0..4 {
         controller.handle(Event::SubmitSecret {
-            method: MethodId::os_password(),
+            method: MethodId::softlock_pin(),
             secret: Secret::new("nope"),
         });
     }
@@ -1415,11 +1435,11 @@ fn prompt_events_do_not_clear_the_backoff_deadline() {
         method: MethodId::windows_hello(),
     });
     controller.handle(Event::VerificationStarted {
-        method: MethodId::os_password(),
+        method: MethodId::softlock_pin(),
     });
     assert!(!controller.backoff_delay().is_zero());
     controller.handle(Event::SubmitSecret {
-        method: MethodId::os_password(),
+        method: MethodId::softlock_pin(),
         secret: Secret::new("nope"),
     });
     assert_eq!(controller.failure_count(), count);
@@ -1575,13 +1595,13 @@ fn failing_closed_unlocks_only_through_a_matching_nonce() {
 fn note_failure_flushes_the_failure_count() {
     let mut controller = locked_started();
     controller.handle(Event::SubmitSecret {
-        method: MethodId::os_password(),
+        method: MethodId::softlock_pin(),
         secret: Secret::new("nope"),
     });
     assert_eq!(controller.journal().persisted().failures(), 1);
     let before = controller.visited().len();
     controller.handle(Event::SubmitSecret {
-        method: MethodId::os_password(),
+        method: MethodId::softlock_pin(),
         secret: Secret::new("again"),
     });
     assert!(controller.visited().len() > before);
@@ -2359,7 +2379,7 @@ fn reach(start: Start) -> LockController<FakePlatform> {
         Start::LockedVerifying => {
             let mut controller = locked_started();
             controller.handle(Event::VerificationStarted {
-                method: MethodId::os_password(),
+                method: MethodId::softlock_pin(),
             });
             controller
         }
@@ -2367,7 +2387,7 @@ fn reach(start: Start) -> LockController<FakePlatform> {
             let mut controller = locked_started();
             for _ in 0..4 {
                 controller.handle(Event::SubmitSecret {
-                    method: MethodId::os_password(),
+                    method: MethodId::softlock_pin(),
                     secret: Secret::new("nope"),
                 });
             }
@@ -2503,7 +2523,7 @@ proptest! {
                     let waiting = !controller.backoff_delay().is_zero();
                     let count = controller.failure_count();
                     controller.handle(Event::SubmitSecret {
-                        method: MethodId::os_password(),
+                        method: MethodId::softlock_pin(),
                         secret: Secret::new("secret"),
                     });
                     if waiting {
@@ -2520,10 +2540,10 @@ proptest! {
                         method: MethodId::windows_hello(),
                     });
                     controller.handle(Event::VerificationStarted {
-                        method: MethodId::os_password(),
+                        method: MethodId::softlock_pin(),
                     });
                     controller.handle(Event::SubmitSecret {
-                        method: MethodId::os_password(),
+                        method: MethodId::softlock_pin(),
                         secret: Secret::new("secret"),
                     });
                     if waiting {

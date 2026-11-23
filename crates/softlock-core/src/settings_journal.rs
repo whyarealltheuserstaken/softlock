@@ -165,6 +165,11 @@ pub struct SettingsJournal {
     /// later is a clock rollback and restarts the delay.
     #[serde(default)]
     pub written_wall_ms: u64,
+    /// Password failures still inside the Windows observation window.
+    /// A PIN failure is not one of these. Unlock keeps the list; a successful
+    /// password check clears it.
+    #[serde(default)]
+    pub password_attempts: Vec<crate::backoff::PasswordStamp>,
     pub entries: Vec<SettingEntry>,
     /// Boot time and the logon that was locked. Absent on a journal written
     /// before this field existed, which startup treats as unknown.
@@ -365,6 +370,7 @@ impl SettingsJournal {
             backoff_until_tick: 0,
             written_tick: 0,
             written_wall_ms: 0,
+            password_attempts: Vec::new(),
             entries: Vec::new(),
             lock: None,
         }
@@ -416,6 +422,7 @@ pub fn task_manager_document(
         backoff_until_tick: 0,
         written_tick: 0,
         written_wall_ms: 0,
+        password_attempts: Vec::new(),
         entries: vec![SettingEntry {
             target: TASK_MANAGER.to_string(),
             path: String::new(),
@@ -502,6 +509,7 @@ pub fn lockdown_document(
         backoff_until_tick: 0,
         written_tick: 0,
         written_wall_ms: 0,
+        password_attempts: Vec::new(),
         entries,
         lock: None,
     })

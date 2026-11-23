@@ -53,6 +53,9 @@ pub struct SettingsEngine {
     last: Instant,
     watcher: Mutex<Option<JoinHandle<()>>>,
     keep_os_lock: bool,
+    /// Password failures that still count toward Windows lockout. Revert keeps
+    /// them. A successful password check clears them.
+    password_attempts: Vec<softlock_core::PasswordStamp>,
 }
 
 impl SettingsEngine {
@@ -72,11 +75,40 @@ impl SettingsEngine {
             last: Instant::now(),
             watcher: Mutex::new(None),
             keep_os_lock: false,
+            password_attempts: Vec::new(),
         })
     }
 
     pub fn keep_os_lock_after_revert(&mut self, keep: bool) {
         self.keep_os_lock = keep;
+    }
+
+    pub fn password_attempts(&self) -> Vec<softlock_core::PasswordStamp> {
+        self.password_attempts.clone()
+    }
+
+    /// Rewrite the password-attempt list. Lockdown rows stay. A missing file
+    /// keeps the list in memory for the document the next lock writes.
+    pub fn store_password_attempts(
+        &mut self,
+        attempts: &[softlock_core::PasswordStamp],
+    ) -> Result<(), &'static str> {
+        self.password_attempts = attempts.to_vec();
+        if let Some(pending) = self.pending.as_mut() {
+            pending.password_attempts = self.password_attempts.clone();
+        }
+        let Some(text) = load_journal().map_err(|_| "unreadable")? else {
+            return Ok(());
+        };
+        let mut doc = parse_document(text.as_bytes()).map_err(|_| "malformed")?;
+        doc.password_attempts = self.password_attempts.clone();
+        let bytes = encode_document(&doc).map_err(|_| "malformed")?;
+        save_journal(&bytes).map_err(|_| "not-durable")?;
+        Ok(())
+    }
+
+    fn remember_password(&mut self, doc: &SettingsJournal) {
+        self.password_attempts = doc.password_attempts.clone();
     }
 
     pub fn boot(&mut self) -> Result<Boot, &'static str> {
@@ -85,6 +117,7 @@ impl SettingsEngine {
             return Ok(Boot::Idle);
         };
         let doc = parse_document(text.as_bytes()).map_err(|_| "malformed")?;
+        self.remember_password(&doc);
         if doc.is_empty() {
             return Ok(Boot::Idle);
         }
@@ -99,7 +132,9 @@ impl SettingsEngine {
                     if !release_os_hold(fact) {
                         return Ok(Boot::StayOsLocked);
                     }
-                    let empty = encode_document(&SettingsJournal::empty()).map_err(fault_log)?;
+                    let mut cleared = SettingsJournal::empty();
+                    cleared.password_attempts = self.password_attempts.clone();
+                    let empty = encode_document(&cleared).map_err(fault_log)?;
                     save_journal(&empty).map_err(|_| "not-durable")?;
                     Ok(Boot::Idle)
                 }
@@ -208,6 +243,7 @@ impl SettingsEngine {
                 HardenError::Failed
             })?;
         }
+        doc.password_attempts = self.password_attempts.clone();
         self.pending = Some(doc);
         for (target, value) in &previous {
             let locked = lockdown_policy(target)
@@ -427,7 +463,7 @@ impl SettingsEngine {
             }
             self.write_previous(&entry.target, entry.previous.clone())?;
         }
-        let next = if self.keep_os_lock {
+        let mut next = if self.keep_os_lock {
             let mut held = SettingsJournal::empty();
             held.sid = doc.sid.clone();
             held.os_confirmed = true;
@@ -436,6 +472,8 @@ impl SettingsEngine {
         } else {
             SettingsJournal::empty()
         };
+        next.password_attempts = doc.password_attempts.clone();
+        self.password_attempts = next.password_attempts.clone();
         let empty = encode_document(&next).map_err(|_| "malformed")?;
         save_journal(&empty).map_err(|_| "not-durable")?;
         SKIP_WORKSTATION.store(false, Ordering::Release);

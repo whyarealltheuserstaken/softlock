@@ -5,6 +5,7 @@
 //! cannot unlock itself.
 
 mod authority;
+mod clock;
 #[cfg(windows)]
 mod config_file;
 #[cfg(windows)]

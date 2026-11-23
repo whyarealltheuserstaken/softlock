@@ -11,17 +11,20 @@
 //! as well. A missing user, a logon API error, or a secret that is not a
 //! bounded UTF-8 password is a rejection. Rejections stay locked.
 //!
-//! Spike 9 still has to show whether this logon works offline for a Microsoft
-//! account, and whether each rejection increments Windows' bad-password count.
+//! A local-account rejection does increment the bad-password count. The
+//! password budget therefore stays at `threshold - 2` attempts per observation
+//! window. PIN failures are a separate counter and never call this function.
+//! Spike 9 still has to show whether an offline Microsoft account counts the
+//! same way, and whether this logon works offline for that account.
 //! The UTF-16 copy is wiped with `zeroize` before return. This module does
 //! not log the secret.
 
 use std::sync::Mutex;
 
-use softlock_core::{Secret, Verdict};
+use softlock_core::{LockoutPolicy, Secret, Verdict, unreadable_lockout_policy};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::NetworkManagement::NetManagement::{
-    NetApiBufferFree, NetUserGetInfo, USER_INFO_3,
+    NetApiBufferFree, NetUserGetInfo, NetUserModalsGet, USER_INFO_3, USER_MODALS_INFO_3,
 };
 use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
 #[cfg(feature = "simulated-physical")]
@@ -303,6 +306,80 @@ fn sid_for_account(user: &str, domain: &str) -> Result<String, ()> {
     }
     sid_buf.zeroize();
     if value.is_empty() { Err(()) } else { Ok(value) }
+}
+
+struct ModalRead {
+    policy: LockoutPolicy,
+    threshold: u32,
+    window_minutes: u32,
+    duration_minutes: u32,
+}
+
+/// The machine lockout policy. A failed read fails closed: threshold 3 and a
+/// long observation window, so the password path allows one attempt.
+pub fn read_lockout_policy() -> LockoutPolicy {
+    match read_modals() {
+        Some(read) => {
+            let threshold = read.threshold.to_string();
+            let window = read.window_minutes.to_string();
+            let duration = read.duration_minutes.to_string();
+            crate::audit(
+                "lockout",
+                &[
+                    ("result", "read"),
+                    ("threshold", &threshold),
+                    ("window_min", &window),
+                    ("duration_min", &duration),
+                ],
+            );
+            read.policy
+        }
+        None => {
+            crate::audit("lockout", &[("result", "unreadable"), ("threshold", "3")]);
+            unreadable_lockout_policy()
+        }
+    }
+}
+
+fn read_modals() -> Option<ModalRead> {
+    let mut buffer: *mut u8 = std::ptr::null_mut();
+    let status = unsafe { NetUserModalsGet(PCWSTR::null(), 3, &mut buffer) };
+    if status != 0 || buffer.is_null() {
+        return None;
+    }
+    let info = unsafe { &*buffer.cast::<USER_MODALS_INFO_3>() };
+    let threshold = info.usrmod3_lockout_threshold;
+    let window_minutes = info.usrmod3_lockout_observation_window;
+    let duration_minutes = info.usrmod3_lockout_duration;
+    unsafe {
+        let _ = NetApiBufferFree(Some(buffer.cast()));
+    }
+    Some(ModalRead {
+        policy: policy_from_minutes(threshold, window_minutes),
+        threshold,
+        window_minutes,
+        duration_minutes,
+    })
+}
+
+fn policy_from_minutes(threshold: u32, window_minutes: u32) -> LockoutPolicy {
+    if threshold == 0 {
+        return LockoutPolicy {
+            threshold: 0,
+            window: std::time::Duration::ZERO,
+        };
+    }
+    // A zero window with lockout enabled would age every failure immediately.
+    // Treat that as the long fail-closed window.
+    let minutes = if window_minutes == 0 {
+        99_999
+    } else {
+        window_minutes
+    };
+    LockoutPolicy {
+        threshold,
+        window: std::time::Duration::from_secs(u64::from(minutes) * 60),
+    }
 }
 
 fn token_sid(token: HANDLE) -> Result<String, ()> {

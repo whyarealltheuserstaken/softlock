@@ -658,6 +658,13 @@ impl<P: Platform> LockController<P> {
             drop(secret);
             return;
         }
+        // The password path has its own counter in the Service. It must not
+        // move the PIN count, and a controller verdict must not unlock on it.
+        if method.as_str() == MethodId::os_password().as_str() {
+            drop(secret);
+            self.reject("SubmitSecret");
+            return;
+        }
         if !self.backoff_delay().is_zero() {
             drop(secret);
             self.reject("SubmitSecret");

@@ -403,6 +403,7 @@ fn install_journal(authority: &mut Authority) {
         Ok(mut engine) => match engine.boot() {
             Ok(crate::settings::Boot::FailClosed(journal)) => {
                 authority.platform_mut().install_engine(engine);
+                authority.adopt_password_window();
                 authority.notify(Event::ServiceStarted {
                     journal,
                     session_active: true,
@@ -411,6 +412,7 @@ fn install_journal(authority: &mut Authority) {
             Ok(crate::settings::Boot::StayOsLocked) => {
                 let owner_back = engine.owner_back();
                 authority.platform_mut().install_engine(engine);
+                authority.adopt_password_window();
                 // A restart does not see the disconnect that confirmed the
                 // lock. Hold that disconnect anyway, and remember the owner
                 // was away when this boot did not find them on the console.
@@ -426,10 +428,14 @@ fn install_journal(authority: &mut Authority) {
                     session_active: false,
                 });
             }
-            Ok(_) => authority.platform_mut().install_engine(engine),
+            Ok(_) => {
+                authority.platform_mut().install_engine(engine);
+                authority.adopt_password_window();
+            }
             Err(reason) => {
                 crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
                 authority.platform_mut().require_settings();
+                authority.block_password_path();
                 authority.notify(Event::ServiceStarted {
                     journal: unreadable_journal(),
                     session_active: true,
@@ -439,6 +445,7 @@ fn install_journal(authority: &mut Authority) {
         Err(reason) => {
             crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
             authority.platform_mut().require_settings();
+            authority.block_password_path();
             authority.notify(Event::ServiceStarted {
                 journal: unreadable_journal(),
                 session_active: true,

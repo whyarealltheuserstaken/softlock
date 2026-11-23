@@ -683,6 +683,10 @@ struct LockoutGuard {
 
 impl LockoutGuard {
     fn set(threshold: u32) -> Self {
+        Self::set_window(threshold, 1, 1)
+    }
+
+    fn set_window(threshold: u32, duration: u32, window: u32) -> Self {
         require_hosted_runner();
         let current = Command::new("net.exe")
             .args(["accounts"])
@@ -694,7 +698,7 @@ impl LockoutGuard {
             duration: policy_field(&text, "Lockout duration (minutes)"),
             window: policy_field(&text, "Lockout observation window (minutes)"),
         };
-        apply_lockout(threshold, 1, 1);
+        apply_lockout(threshold, duration, window);
         saved
     }
 }
@@ -842,7 +846,16 @@ fn right_password_unlocks_and_wrong_password_does_not() {
     let _guard = gate();
     let _policy = LockoutGuard::set(10);
     let account = PasswordAccount::create();
-    let session = Session::launch_extra(None, false, "1", None, &account.session_env());
+    let clock = std::env::temp_dir().join(format!("sl-clock-{}", std::process::id()));
+    let _ = fs::remove_file(&clock);
+    let clock_text = clock.display().to_string();
+    let base = account.session_env();
+    let env = [
+        base[0],
+        base[1],
+        ("SOFTLOCK_CLOCK_FILE", clock_text.as_str()),
+    ];
+    let session = Session::launch_extra(None, false, "1", None, &env);
     let probe = Probe::open().expect("probe");
     probe.claim_focus();
     let locked = session.lock().expect("lock");
@@ -855,6 +868,9 @@ fn right_password_unlocks_and_wrong_password_does_not() {
         !wait_for(Duration::from_secs(3), || unlocked(&session)),
         "a wrong password unlocked"
     );
+    // The first failure waits 30s. Move both test clocks past that wait and
+    // keep them inside the one-minute observation window.
+    advance_clock(&clock, 31_000, 31_000);
     type_password(&account.password, session.extra);
     assert!(
         wait_for(Duration::from_secs(20), || unlocked(&session)),
@@ -973,6 +989,138 @@ fn backoff_survives_a_service_restart() {
         !log.contains("wrong-password-value"),
         "a typed password reached the log"
     );
+}
+
+#[test]
+fn password_attempts_stay_under_the_lockout_threshold() {
+    let _guard = gate();
+    let _policy = LockoutGuard::set_window(5, 10, 10);
+    let account = PasswordAccount::create();
+    let clock = std::env::temp_dir().join(format!("sl-cap-{}", std::process::id()));
+    let _ = fs::remove_file(&clock);
+    let clock_text = clock.display().to_string();
+    let base = account.session_env();
+    let env = [
+        base[0],
+        base[1],
+        ("SOFTLOCK_CLOCK_FILE", clock_text.as_str()),
+    ];
+    let session = Session::launch_extra(None, true, "1", None, &env);
+    session.set_pin().expect("set pin");
+    session.lock().expect("lock");
+    send_virtual_key(VK_TAB, session.extra).expect("tab");
+    thread::sleep(Duration::from_millis(150));
+    for step in 0..3 {
+        type_password("wrong-password-value", session.extra);
+        thread::sleep(Duration::from_millis(400));
+        if step == 0 {
+            advance_clock(&clock, 31_000, 31_000);
+        } else if step == 1 {
+            advance_clock(&clock, 61_000, 61_000);
+        }
+    }
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            prompt_says("Password unavailable")
+        }),
+        "the prompt did not report the password path exhausted"
+    );
+    assert!(
+        prompt_says("Enter PIN"),
+        "the exhausted prompt did not offer the PIN"
+    );
+    let mid = softlock_service::account_lockout(&account.name).expect("mid");
+    assert_eq!(
+        mid.bad_password_count, 3,
+        "the password path called LogonUser more or less than the cap"
+    );
+    assert!(!mid.locked_out, "the account locked inside the cap");
+    advance_clock(&clock, 3_600_000, 1_000);
+    send_virtual_key(VK_TAB, session.extra).expect("tab");
+    thread::sleep(Duration::from_millis(150));
+    for _ in 0..8 {
+        type_password("wrong-password-value", session.extra);
+        thread::sleep(Duration::from_millis(200));
+    }
+    let after = softlock_service::account_lockout(&account.name).expect("after");
+    assert_eq!(
+        after.bad_password_count, 3,
+        "an attempt after the cap called LogonUser"
+    );
+    assert!(!after.locked_out, "the account locked out");
+    let log = fs::read_to_string(&session.log).unwrap_or_default();
+    assert!(
+        log.contains("result=exhausted"),
+        "the service did not record exhaustion: {log}"
+    );
+    assert!(
+        !log.contains("wrong-password-value"),
+        "a typed password reached the log"
+    );
+    assert!(!log.contains(&account.password), "password reached the log");
+}
+
+fn advance_clock(path: &Path, tick_delta: u64, wall_delta: u64) {
+    let (base_tick, base_wall) = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| {
+            let mut parts = text.split_whitespace();
+            let tick = parts.next()?.parse().ok()?;
+            let wall = parts.next()?.parse().ok()?;
+            Some((tick, wall))
+        })
+        .unwrap_or_else(|| {
+            let tick = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+            let wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(0))
+                .unwrap_or(0);
+            (tick, wall)
+        });
+    fs::write(
+        path,
+        format!(
+            "{} {}",
+            base_tick.saturating_add(tick_delta),
+            base_wall.saturating_add(wall_delta)
+        ),
+    )
+    .expect("test clock");
+}
+
+fn prompt_says(needle: &str) -> bool {
+    *PROMPT_NEEDLE.lock().expect("needle") = needle.to_string();
+    let mut found = false;
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::EnumWindows(
+            Some(enum_window_title),
+            windows::Win32::Foundation::LPARAM(&mut found as *mut bool as isize),
+        );
+    }
+    found
+}
+
+static PROMPT_NEEDLE: Mutex<String> = Mutex::new(String::new());
+
+unsafe extern "system" fn enum_window_title(
+    hwnd: windows::Win32::Foundation::HWND,
+    param: windows::Win32::Foundation::LPARAM,
+) -> windows::core::BOOL {
+    let mut buf = [0u16; 256];
+    let count = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buf) };
+    if count > 0 {
+        let text = String::from_utf16_lossy(&buf[..count as usize]);
+        let needle = PROMPT_NEEDLE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if text.contains(needle.as_str()) {
+            unsafe {
+                *(param.0 as *mut bool) = true;
+            }
+            return windows::core::BOOL(0);
+        }
+    }
+    windows::core::BOOL(1)
 }
 
 #[test]

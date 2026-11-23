@@ -21,8 +21,14 @@ Run `45135643553` printed the same line on both images:
 
 A rejected `LOGON32_LOGON_NETWORK` does increment the local account's bad-password count, and the account locks once that count reaches the threshold. The fourth rejection did not raise the count past 3; the account was already locked. None of the wrong passwords were accepted.
 
-The product delay still starts after the fourth failure, which is the existing PIN curve. A Windows threshold of 3 therefore locks the account before that delay. The seam 3 unlock tests set the threshold to 10, which is above those four failures, and they fail if the test account is locked out. An administrator who sets the Windows threshold to 4 or less will have Windows lock the account first. Offline Microsoft-account counting is still spike 9.
+A rejected `LOGON32_LOGON_NETWORK` counts, so a flat wait after five failures is not enough: guessing again every 30 seconds still reaches the threshold. Offline Microsoft-account counting is still spike 9.
 
-## What the unlock tests refuse to do
+## What the password path does with that
 
-The unlock tests set the threshold to 10. Four wrong passwords are under that threshold. Those tests fail if `UF_LOCKOUT` is set on the test account. The product backoff starts after the fourth failure (30 seconds), which is before a threshold of 10.
+On each password attempt the Service reads the policy with `NetUserModalsGet` level 3 (threshold, observation window, and duration). The cap uses the threshold and the observation window. Duration is read and not used for the cap. A failed read fails closed: threshold 3 and an observation window of 99999 minutes, which allows one password attempt.
+
+The password budget is `threshold - 2` attempts per observation window, and at least one when the threshold is not 0. Threshold 0 means lockout is disabled, and the path then uses only the escalating wait. A failure stays inside the window until both the monotonic clock and the wall clock say it has aged out. The wait is the stricter of those two clocks, so a wait does not end while the failures still count. The waits escalate: 30 seconds, 1 minute, 2 minutes, 5 minutes, 10 minutes, then 15 minutes.
+
+PIN failures are a separate counter. They use the existing PIN backoff, they never call `LogonUser`, and they do not spend the password budget. Password failures do not move the PIN counter. When the password budget is used up, the prompt says the password path is unavailable and, when a PIN is stored, offers the PIN.
+
+Seam 3 `password_attempts_stay_under_the_lockout_threshold` sets the runner threshold to 5 (so the cap is 3), spreads attempts with the test clock, and checks that the bad-password count stays at 3 and the account does not lock. The test clock is `SOFTLOCK_CLOCK_FILE`, compiled only into the non-default simulated-physical build.

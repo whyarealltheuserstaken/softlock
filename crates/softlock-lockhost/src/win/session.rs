@@ -48,8 +48,15 @@ pub(crate) enum PipeCommand {
     Disarm,
     OsLock,
     Quit,
-    Methods { pin: bool, password: bool },
-    Backoff { ms: u64 },
+    Methods {
+        pin: bool,
+        password: bool,
+    },
+    Backoff {
+        ms: u64,
+        password_path: bool,
+        password_exhausted: bool,
+    },
 }
 
 pub(crate) enum PipeReport {
@@ -336,6 +343,7 @@ pub(crate) struct Shared {
     pub offer_password: AtomicBool,
     pub shift_down: AtomicBool,
     pub backoff_until: AtomicU64,
+    pub password_exhausted: AtomicBool,
     pub locked: AtomicBool,
     pub stop: AtomicBool,
     pub fail: AtomicBool,
@@ -408,6 +416,7 @@ impl Shared {
             offer_password: AtomicBool::new(true),
             shift_down: AtomicBool::new(false),
             backoff_until: AtomicU64::new(0),
+            password_exhausted: AtomicBool::new(false),
             locked: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             fail: AtomicBool::new(false),
@@ -568,7 +577,11 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             Some(PipeCommand::Quit) => service_gone = true,
             Some(PipeCommand::Arm { message }) => overlay::set_message(message.as_deref()),
             Some(PipeCommand::Methods { pin, password }) => apply_methods(&shared, pin, password),
-            Some(PipeCommand::Backoff { ms }) => set_backoff(&shared, ms),
+            Some(PipeCommand::Backoff {
+                ms,
+                password_path,
+                password_exhausted,
+            }) => apply_prompt(&shared, &mut entry, ms, password_path, password_exhausted),
             None => {}
         }
         if service_gone {
@@ -1355,6 +1368,28 @@ fn in_backoff(shared: &Shared) -> bool {
     until != 0 && monotonic_tick() < until
 }
 
+fn apply_prompt(
+    shared: &Shared,
+    entry: &mut PinEntry,
+    ms: u64,
+    password_path: bool,
+    password_exhausted: bool,
+) {
+    if !password_path {
+        set_backoff(shared, ms);
+    }
+    shared
+        .password_exhausted
+        .store(password_exhausted, Ordering::Release);
+    if password_exhausted && shared.offer_pin.load(Ordering::Acquire) {
+        entry.bytes.zeroize();
+        entry.chars = 0;
+        shared.pin_chars.store(0, Ordering::Release);
+        shared.prompt_method.store(METHOD_PIN, Ordering::Release);
+    }
+    overlay::invalidate(shared);
+}
+
 fn set_backoff(shared: &Shared, ms: u64) {
     if ms == 0 {
         shared.backoff_until.store(0, Ordering::Release);
@@ -1402,7 +1437,19 @@ fn wait_for_arm(shared: &Shared) -> bool {
             }
             Some(PipeCommand::Disarm) => return false,
             Some(PipeCommand::Methods { pin, password }) => apply_methods(shared, pin, password),
-            Some(PipeCommand::Backoff { ms }) => set_backoff(shared, ms),
+            Some(PipeCommand::Backoff {
+                ms,
+                password_path,
+                password_exhausted,
+            }) => {
+                if !password_path {
+                    set_backoff(shared, ms);
+                }
+                shared
+                    .password_exhausted
+                    .store(password_exhausted, Ordering::Release);
+                overlay::invalidate(shared);
+            }
             Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             // Hooks are installed only after Arm. Quit before that is not
             // Locked, Arming, or FailingClosed, so it must not call the OS lock.
@@ -1515,9 +1562,16 @@ fn host_read_loop(mut file: std::fs::File, commands: std::sync::mpsc::Sender<Pip
             Ok(softlock_core::ServiceToHost::Methods { pin, password }) => {
                 Some(PipeCommand::Methods { pin, password })
             }
-            Ok(softlock_core::ServiceToHost::PromptResult { backoff_ms, .. }) => {
-                Some(PipeCommand::Backoff { ms: backoff_ms })
-            }
+            Ok(softlock_core::ServiceToHost::PromptResult {
+                backoff_ms,
+                password_path,
+                password_exhausted,
+                ..
+            }) => Some(PipeCommand::Backoff {
+                ms: backoff_ms,
+                password_path,
+                password_exhausted,
+            }),
             _ => None,
         };
         if let Some(command) = command

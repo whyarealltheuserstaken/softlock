@@ -688,6 +688,7 @@ jobs:
           grep -F "another_accounts_password_does_not_unlock ... ok" target/seam3-service.txt
           grep -F "tab_switches_from_pin_to_password ... ok" target/seam3-service.txt
           grep -F "backoff_survives_a_service_restart ... ok" target/seam3-service.txt
+          grep -F "password_attempts_stay_under_the_lockout_threshold ... ok" target/seam3-service.txt
           grep -F "lockout-measure threshold=3" target/seam3-service.txt
           awk '{ gsub(/\r/, "") }
                /^test network_logon_lockout_count \.\.\./ {
