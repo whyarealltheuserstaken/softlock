@@ -1009,6 +1009,8 @@ struct PinEntry {
     bytes: Vec<u8>,
     chars: u32,
     layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+    /// One mark per typed password slot, including keys that did not finish.
+    marks: Vec<crate::key_decode::PasswordKeyMark>,
     /// A password key produced no character. Submitting would guess.
     untranslated: bool,
     /// `ToUnicodeEx` is waiting for the next key to compose this one.
@@ -1023,6 +1025,7 @@ impl Default for PinEntry {
             bytes: Vec::with_capacity(PIN_CHAR_LIMIT as usize * 4),
             chars: 0,
             layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL(std::ptr::null_mut()),
+            marks: Vec::new(),
             untranslated: false,
             dead_pending: false,
         }
@@ -1110,19 +1113,24 @@ fn on_key(
     let password = shared.prompt_method.load(Ordering::Acquire) == METHOD_PASSWORD;
     match translate(entry.layout, event, password) {
         crate::key_decode::DecodedKey::Text(mut encoded) => {
-            entry.dead_pending = false;
+            if password {
+                entry.marks.push(crate::key_decode::PasswordKeyMark::Text);
+            }
             entry.bytes.extend_from_slice(&encoded);
             encoded.zeroize();
             entry.chars = entry.chars.saturating_add(1);
+            refresh_password_flags(entry);
             shared.pin_chars.store(entry.chars, Ordering::Release);
             overlay::invalidate(shared);
         }
         other if password && crate::key_decode::password_key_failed(event.vk, &other) => {
-            if matches!(other, crate::key_decode::DecodedKey::Dead) {
-                entry.dead_pending = true;
-            } else {
-                entry.untranslated = true;
-            }
+            entry
+                .marks
+                .push(crate::key_decode::password_key_mark(&other));
+            entry.chars = entry.chars.saturating_add(1);
+            refresh_password_flags(entry);
+            shared.pin_chars.store(entry.chars, Ordering::Release);
+            overlay::invalidate(shared);
         }
         _ => {}
     }
@@ -1133,6 +1141,7 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
     if password && !crate::key_decode::password_may_submit(entry.untranslated, entry.dead_pending) {
         entry.bytes.zeroize();
         entry.chars = 0;
+        entry.marks.clear();
         entry.untranslated = false;
         entry.dead_pending = false;
         shared.pin_chars.store(0, Ordering::Release);
@@ -1146,6 +1155,7 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
     // next PIN reuses this buffer instead of abandoning a copy.
     entry.bytes.zeroize();
     entry.chars = 0;
+    entry.marks.clear();
     // `pin_chars` stays at the submitted length until the hash and the
     // controller have finished. Publishing zero first lets the next PIN's
     // keys queue during Argon2 and then look lost to a short wait.
@@ -1237,21 +1247,33 @@ fn pop_char(entry: &mut PinEntry) {
     if entry.chars == 0 {
         return;
     }
-    while entry
-        .bytes
-        .last()
-        .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+    let mark = entry.marks.pop();
+    if mark != Some(crate::key_decode::PasswordKeyMark::Untranslated)
+        && mark != Some(crate::key_decode::PasswordKeyMark::Dead)
     {
+        while entry
+            .bytes
+            .last()
+            .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+        {
+            if let Some(slot) = entry.bytes.last_mut() {
+                *slot = 0;
+            }
+            entry.bytes.pop();
+        }
         if let Some(slot) = entry.bytes.last_mut() {
             *slot = 0;
         }
         entry.bytes.pop();
     }
-    if let Some(slot) = entry.bytes.last_mut() {
-        *slot = 0;
-    }
-    entry.bytes.pop();
     entry.chars -= 1;
+    refresh_password_flags(entry);
+}
+
+fn refresh_password_flags(entry: &mut PinEntry) {
+    let (untranslated, dead_pending) = crate::key_decode::password_flags(&entry.marks);
+    entry.untranslated = untranslated;
+    entry.dead_pending = dead_pending;
 }
 
 fn translate(
@@ -1407,6 +1429,7 @@ fn switch_method(shared: &Shared, entry: &mut PinEntry) {
     };
     entry.bytes.zeroize();
     entry.chars = 0;
+    entry.marks.clear();
     entry.untranslated = false;
     entry.dead_pending = false;
     shared.prompt_method.store(next, Ordering::Release);
@@ -1435,6 +1458,9 @@ fn apply_prompt(
     if password_exhausted && shared.offer_pin.load(Ordering::Acquire) {
         entry.bytes.zeroize();
         entry.chars = 0;
+        entry.marks.clear();
+        entry.untranslated = false;
+        entry.dead_pending = false;
         shared.pin_chars.store(0, Ordering::Release);
         shared.prompt_method.store(METHOD_PIN, Ordering::Release);
     }

@@ -1198,10 +1198,9 @@ fn outside_failures_stop_the_password_path_before_the_threshold() {
         thread::sleep(Duration::from_millis(300));
     }
     let after = softlock_service::account_lockout(&account.name).expect("after");
-    assert!(
-        after.bad_password_count < 5,
-        "the password path called LogonUser after outside failures had used the margin: {}",
-        after.bad_password_count
+    assert_eq!(
+        after.bad_password_count, 3,
+        "the password path called LogonUser after outside failures had used the margin"
     );
     assert!(!after.locked_out, "the account locked out");
 }

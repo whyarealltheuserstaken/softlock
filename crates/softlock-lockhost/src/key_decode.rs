@@ -39,6 +39,34 @@ pub(crate) fn password_key_failed(vk: u16, decoded: &DecodedKey) -> bool {
     character_key(vk) && matches!(decoded, DecodedKey::Dead | DecodedKey::Untranslated)
 }
 
+/// One typed password slot. A dead or untranslated key still occupies the
+/// prompt so Backspace can take it back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PasswordKeyMark {
+    Text,
+    Untranslated,
+    Dead,
+}
+
+pub(crate) fn password_key_mark(decoded: &DecodedKey) -> PasswordKeyMark {
+    match decoded {
+        DecodedKey::Text(_) => PasswordKeyMark::Text,
+        DecodedKey::Untranslated => PasswordKeyMark::Untranslated,
+        DecodedKey::Dead => PasswordKeyMark::Dead,
+    }
+}
+
+/// Recompute the submit flags from the keys that are still in the prompt.
+pub(crate) fn password_flags(marks: &[PasswordKeyMark]) -> (bool, bool) {
+    let untranslated = marks.contains(&PasswordKeyMark::Untranslated);
+    let dead_pending = marks
+        .iter()
+        .rev()
+        .find(|mark| **mark != PasswordKeyMark::Untranslated)
+        .is_some_and(|mark| *mark == PasswordKeyMark::Dead);
+    (untranslated, dead_pending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,5 +86,34 @@ mod tests {
         assert!(!password_key_failed(0x7C, &DecodedKey::Untranslated));
         assert!(password_key_failed(b'A' as u16, &DecodedKey::Untranslated));
         assert!(password_key_failed(b'E' as u16, &DecodedKey::Dead));
+        assert_eq!(
+            password_key_mark(&DecodedKey::Untranslated),
+            PasswordKeyMark::Untranslated
+        );
+        assert_eq!(password_key_mark(&DecodedKey::Dead), PasswordKeyMark::Dead);
+        assert_eq!(
+            password_key_mark(&DecodedKey::Text(b"A".to_vec())),
+            PasswordKeyMark::Text
+        );
+    }
+
+    #[test]
+    fn backspace_clears_the_key_that_blocked_submit() {
+        let mut marks = vec![
+            PasswordKeyMark::Text,
+            PasswordKeyMark::Untranslated,
+            PasswordKeyMark::Dead,
+        ];
+        let (untranslated, dead) = password_flags(&marks);
+        assert!(!password_may_submit(untranslated, dead));
+        marks.pop();
+        let (untranslated, dead) = password_flags(&marks);
+        assert!(!password_may_submit(untranslated, dead));
+        marks.pop();
+        let (untranslated, dead) = password_flags(&marks);
+        assert!(password_may_submit(untranslated, dead));
+        marks.pop();
+        let (untranslated, dead) = password_flags(&marks);
+        assert!(password_may_submit(untranslated, dead));
     }
 }
