@@ -283,17 +283,17 @@ fn perform_hard_lock() {
     match outcome {
         Ok(ResponseKind::Accepted | ResponseKind::AlreadyLocked) => {
             if let Ok(status) = transact(RequestKind::GetStatus) {
-                publish(view_from_status(&status));
+                publish(&view_from_status(&status));
             }
         }
         Ok(_) => {
             if let Ok(status) = transact(RequestKind::GetStatus) {
-                publish(view_from_status(&status));
+                publish(&view_from_status(&status));
             } else {
-                publish(OwnerView::unknown());
+                publish(&OwnerView::unknown());
             }
         }
-        Err(_) => publish(OwnerView::unknown()),
+        Err(_) => publish(&OwnerView::unknown()),
     }
 }
 
@@ -306,10 +306,10 @@ fn perform_lock(source: LockSource) {
     match outcome {
         Ok(ResponseKind::Accepted | ResponseKind::AlreadyLocked) => {
             if let Ok(status) = transact(RequestKind::GetStatus) {
-                publish(view_from_status(&status));
+                publish(&view_from_status(&status));
                 return;
             }
-            publish(OwnerView {
+            publish(&OwnerView {
                 service_running: true,
                 state: Some(softlock_core::StateName::Locked),
                 lock_source: Some(source),
@@ -317,13 +317,13 @@ fn perform_lock(source: LockSource) {
         }
         Ok(response) => {
             if let Ok(status) = transact(RequestKind::GetStatus) {
-                publish(view_from_status(&status));
+                publish(&view_from_status(&status));
             } else {
                 let _ = response;
-                publish(OwnerView::unknown());
+                publish(&OwnerView::unknown());
             }
         }
-        Err(_) => publish(OwnerView::unknown()),
+        Err(_) => publish(&OwnerView::unknown()),
     }
 }
 
@@ -345,14 +345,14 @@ pub fn current_notice() -> String {
     notice_text()
 }
 
-fn publish(view: OwnerView) {
+fn publish(view: &OwnerView) {
     {
         let mut slot = view_slot()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         *slot = view.clone();
     }
-    write_status(&view);
+    write_status(view);
     let raw = WINDOW.load(Ordering::Acquire);
     if raw != 0 {
         let hwnd = HWND(raw as *mut core::ffi::c_void);
@@ -662,14 +662,14 @@ fn watch_states() {
         let mut io = match connect_retry() {
             Ok(io) => io,
             Err(_) => {
-                publish(OwnerView::unknown());
+                publish(&OwnerView::unknown());
                 thread::sleep(Duration::from_millis(300));
                 continue;
             }
         };
         let id = client::next_id();
         if exchange(&mut io, id, &RequestKind::Subscribe).is_err() {
-            publish(OwnerView::unknown());
+            publish(&OwnerView::unknown());
             thread::sleep(Duration::from_millis(300));
             continue;
         }
@@ -680,7 +680,7 @@ fn watch_states() {
             let frame = match client::read_one(&mut io) {
                 Ok(frame) => frame,
                 Err(_) => {
-                    publish(OwnerView::unknown());
+                    publish(&OwnerView::unknown());
                     break;
                 }
             };
@@ -690,9 +690,9 @@ fn watch_states() {
             }
             let next = client::view_after(&current_view(), &decoded);
             if decoded.is_ok() {
-                publish(next);
+                publish(&next);
             } else {
-                publish(OwnerView::unknown());
+                publish(&OwnerView::unknown());
                 break;
             }
         }
@@ -750,7 +750,7 @@ fn window_loop() -> i32 {
         .unwrap_or_else(|poison| poison.into_inner()) = label;
     HOTKEY_OK.store(registered.is_ok(), Ordering::Release);
     add_tray(hwnd);
-    publish(current_view());
+    publish(&current_view());
     let mut message = MSG::default();
     loop {
         let pulled = unsafe { GetMessageW(&mut message, None, 0, 0) };

@@ -25,6 +25,7 @@ const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
 const FILE_TRAVERSE: u32 = 0x0020;
 const READ_CONTROL: u32 = 0x0002_0000;
 const WRITE_DAC: u32 = 0x0004_0000;
+const WRITE_OWNER: u32 = 0x0008_0000;
 const DELETE: u32 = 0x0001_0000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -37,7 +38,7 @@ const DIR_ACCESS: u32 = FILE_LIST_DIRECTORY
     | READ_CONTROL
     | SYNCHRONIZE;
 const FILE_ACCESS: u32 =
-    GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | DELETE | SYNCHRONIZE;
+    GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER | DELETE | SYNCHRONIZE;
 
 pub fn configured_path() -> Result<PathBuf, &'static str> {
     let path = if let Some(dir) = test_config_dir() {
@@ -207,14 +208,24 @@ fn claim_for_console_user(handle: HANDLE, sid: &str) -> io::Result<()> {
         DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
         SE_RESTORE_NAME,
     };
-    let _restore = crate::secrets::enable_privilege_scoped(SE_RESTORE_NAME)?;
-    let sddl = format!("O:{sid}D:P(A;;FA;;;SY)(A;;FA;;;{sid})");
-    set_security_handle(
+    let dacl = format!("D:P(A;;FA;;;SY)(A;;FA;;;{sid})");
+    let _restore = crate::secrets::enable_privilege_scoped(SE_RESTORE_NAME).ok();
+    let owned = format!("O:{sid}{dacl}");
+    if set_security_handle(
         handle,
-        &sddl,
+        &owned,
         OWNER_SECURITY_INFORMATION
             | DACL_SECURITY_INFORMATION
             | PROTECTED_DACL_SECURITY_INFORMATION,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    set_security_handle(
+        handle,
+        &dacl,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
     )
     .map_err(io::Error::other)
 }

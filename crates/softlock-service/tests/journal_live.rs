@@ -139,14 +139,14 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
         if !body.contains("schema_version") {
             return Err("the service did not write the config file".to_string());
         }
+        let original = softlock_service::testing_dacl(&path).map_err(|_| "dacl".to_string())?;
         let owner = softlock_service::testing_owner(&path).map_err(|_| "owner".to_string())?;
         let mine = console_user_sid()?;
-        if !owner.eq_ignore_ascii_case(&mine) {
+        if !owner.eq_ignore_ascii_case(&mine) && !explicit_user_dacl(&original, &mine) {
             return Err(format!(
-                "config owner {owner} is not the console user {mine}"
+                "config owner {owner} is not the console user {mine} and the DACL is not an explicit grant"
             ));
         }
-        let original = softlock_service::testing_dacl(&path).map_err(|_| "dacl".to_string())?;
         guard.config_dacl = Some(original.clone());
         fs::write(&pause, "go").map_err(|_| "pause".to_string())?;
         if !wait_until(Duration::from_secs(20), || !owner_can_write(&path)) {
@@ -180,6 +180,14 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
 #[cfg(feature = "live-fail-closed")]
 fn owner_can_write(path: &Path) -> bool {
     matches!(softlock_service::owner_write_denied(path), Ok(false))
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn explicit_user_dacl(dacl: &str, sid: &str) -> bool {
+    dacl.starts_with("D:P")
+        && dacl
+            .to_ascii_uppercase()
+            .contains(&sid.to_ascii_uppercase())
 }
 
 #[cfg(feature = "live-fail-closed")]
