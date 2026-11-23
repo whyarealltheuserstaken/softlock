@@ -13,8 +13,8 @@ mod win;
 
 #[cfg(windows)]
 pub use win::{
-    CloseResult, run_lock_host, run_lock_host_primary, run_service, run_service_disconnect,
-    runner_may_lock,
+    CloseResult, run_lock_host, run_lock_host_primary, run_lock_host_service_dead, run_service,
+    run_service_disconnect, runner_may_lock,
 };
 
 #[cfg(not(windows))]

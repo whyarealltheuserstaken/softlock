@@ -1,4 +1,4 @@
-//! Apply DisableTaskMgr only after the journal is durable, and put it back exactly.
+//! Apply the lockdown rows only after the journal is durable, and put each one back exactly.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,17 +9,21 @@ use std::time::{Duration, Instant};
 
 use softlock_core::PRODUCT_DISPLAY_NAME;
 use softlock_core::{
-    CommitFault, HardenError, Journal, JournalEntry, JournalFault, ProductState, RepairAction,
-    SERVICE_NAME, SettingValue, SettingsJournal, StartAction, TASK_MANAGER, commit_then_change,
-    encode_document, executable_may_run_as_system, fault_log, parse_document, repair_action,
-    repair_entry_name, restore_action, restore_sid, service_start_action, task_manager_document,
+    CommitFault, HardenError, Journal, JournalEntry, JournalFault, LOCKDOWN, ProductState,
+    RepairAction, SERVICE_NAME, SettingValue, SettingsJournal, StartAction, allowed_previous_for,
+    commit_then_change, encode_document, executable_may_run_as_system, fault_log,
+    lockdown_document, lockdown_policy, mark_workstation_clear, parse_document, reassert_write,
+    repair_action, repair_entry_name, restore_action_for, restore_sid, service_start_action,
+    workstation_value_after_attempt,
 };
 
 use crate::journal_store::{load_journal, save_journal};
 use crate::taskmgr::{
-    console_is_active, console_sid, lock_host_running, read_task_manager, watch_policy,
-    write_task_manager,
+    console_is_active, console_sid, lock_host_running, read_lockdown, watch_policy, write_lockdown,
 };
+
+static SKIP_WORKSTATION: AtomicBool = AtomicBool::new(false);
+static RESTORED: AtomicBool = AtomicBool::new(false);
 
 pub enum Boot {
     Idle,
@@ -43,7 +47,7 @@ pub struct SettingsEngine {
     stop: Arc<AtomicBool>,
     last: Instant,
     watcher: Mutex<Option<JoinHandle<()>>>,
-    /// An active lock must keep DisableTaskMgr. Revert does not clear it.
+    /// An active lock must keep the lockdown rows. Revert does not clear them.
     preserve: bool,
 }
 
@@ -82,6 +86,9 @@ impl SettingsEngine {
             Err(_) if doc.says_locked() => {
                 self.preserve = true;
                 self.hold();
+                if doc.workstation_clear {
+                    reapply_disable_lock_workstation()?;
+                }
                 return Ok(Boot::FailClosed(memory_journal(&doc)));
             }
             Err(_) => false,
@@ -95,6 +102,9 @@ impl SettingsEngine {
             StartAction::FailClosed => {
                 self.preserve = true;
                 self.hold();
+                if doc.workstation_clear {
+                    reapply_disable_lock_workstation()?;
+                }
                 Ok(Boot::FailClosed(memory_journal(&doc)))
             }
         }
@@ -106,24 +116,32 @@ impl SettingsEngine {
             HardenError::Failed
         })?;
         self.sid = sid;
-        let previous = read_task_manager(&self.sid).map_err(|reason| {
-            crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
-            HardenError::Failed
-        })?;
-        let doc =
-            task_manager_document(&self.sid, previous, journal.failures()).map_err(|fault| {
-                crate::audit(
-                    "settings",
-                    &[("result", "failed"), ("reason", fault_log(fault))],
-                );
+        let mut previous = Vec::with_capacity(LOCKDOWN.len());
+        for policy in LOCKDOWN {
+            let value = read_lockdown(&self.sid, policy).map_err(|reason| {
+                crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
                 HardenError::Failed
             })?;
+            previous.push((policy.target, value));
+        }
+        let doc = lockdown_document(&self.sid, &previous, journal.failures()).map_err(|fault| {
+            crate::audit(
+                "settings",
+                &[("result", "failed"), ("reason", fault_log(fault))],
+            );
+            HardenError::Failed
+        })?;
         self.pending = Some(doc);
-        journal.record(JournalEntry {
-            target: TASK_MANAGER.to_string(),
-            previous: previous_text(previous),
-            new_value: "1".to_string(),
-        });
+        for (target, value) in &previous {
+            let locked = lockdown_policy(target)
+                .map(|policy| policy.locked)
+                .unwrap_or(1);
+            journal.record(JournalEntry {
+                target: (*target).to_string(),
+                previous: previous_text(*value),
+                new_value: locked.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -140,26 +158,29 @@ impl SettingsEngine {
             HardenError::Failed
         })?;
         let sid = self.sid.clone();
+        RESTORED.store(false, Ordering::Release);
         let saved = commit_then_change(
             || save_journal(&bytes).map_err(|_| JournalFault::NotDurable),
             || {
-                // The lock call is still inside the authority mutex here, so
-                // an OS-lock confirmation cannot revert this value until the
-                // pause ends. Killing the service in either pause leaves the
-                // journal durable.
+                // Killing the service in either pause leaves the journal durable.
+                // An OS-lock confirmation puts DisableLockWorkstation back to
+                // its locked value. The owner's previous values stay in the
+                // journal until unlock.
                 pause_for("before");
-                let written = write_task_manager(&sid, SettingValue::Dword { value: 1 });
+                for entry in doc.entries() {
+                    let Some(policy) = lockdown_policy(&entry.target) else {
+                        return Err("target");
+                    };
+                    write_lockdown(&sid, policy, entry.new_value)?;
+                }
                 pause_for("after");
-                written
+                Ok(())
             },
         );
         match saved {
             Ok(()) => {
                 self.hold();
-                crate::audit(
-                    "settings",
-                    &[("result", "applied"), ("target", TASK_MANAGER)],
-                );
+                crate::audit("settings", &[("result", "applied"), ("rows", "lockdown")]);
                 Ok(())
             }
             Err(CommitFault::Journal(fault)) => {
@@ -185,16 +206,22 @@ impl SettingsEngine {
             return self.revert_document(&doc);
         }
         for entry in journal.entries() {
-            if entry.target != TASK_MANAGER {
+            if lockdown_policy(&entry.target).is_none() {
                 continue;
             }
             let previous = match entry.previous.as_deref() {
                 None => SettingValue::Absent,
-                Some("0") => SettingValue::Dword { value: 0 },
-                Some("1") => SettingValue::Dword { value: 1 },
-                Some(_) => return Err("value"),
+                Some(text) => {
+                    let Ok(value) = text.parse::<u32>() else {
+                        return Err("value");
+                    };
+                    SettingValue::Dword { value }
+                }
             };
-            self.write_previous(previous)?;
+            if !allowed_previous_for(&entry.target, previous) {
+                return Err("value");
+            }
+            self.write_previous(&entry.target, previous)?;
         }
         self.release();
         Ok(())
@@ -214,13 +241,27 @@ impl SettingsEngine {
     }
 
     pub fn reassert_now(&mut self) -> Result<(), &'static str> {
-        let current = read_task_manager(&self.sid)?;
-        if current != (SettingValue::Dword { value: 1 }) {
-            write_task_manager(&self.sid, SettingValue::Dword { value: 1 })?;
-            crate::audit(
-                "settings",
-                &[("result", "reasserted"), ("target", TASK_MANAGER)],
-            );
+        if RESTORED.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some(text) = load_journal().map_err(|_| "journal")? else {
+            return Ok(());
+        };
+        let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
+        let skip_workstation = SKIP_WORKSTATION.load(Ordering::Acquire) || doc.workstation_clear;
+        for entry in doc.entries() {
+            let Some(policy) = lockdown_policy(&entry.target) else {
+                return Err("target");
+            };
+            let current = read_lockdown(&self.sid, policy)?;
+            let skip = skip_workstation && entry.target == "DisableLockWorkstation";
+            if let Some(next) = reassert_write(&entry.target, entry.new_value, current, skip) {
+                write_lockdown(&self.sid, policy, next)?;
+                crate::audit(
+                    "settings",
+                    &[("result", "reasserted"), ("target", policy.target)],
+                );
+            }
         }
         self.last = Instant::now();
         Ok(())
@@ -228,7 +269,7 @@ impl SettingsEngine {
 
     /// Wall-clock re-assert. The controller clock does not advance in the service.
     pub fn reassert_if_due(&mut self) -> Result<(), &'static str> {
-        if !self.holding.load(Ordering::Acquire) {
+        if RESTORED.load(Ordering::Acquire) || !self.holding.load(Ordering::Acquire) {
             return Ok(());
         }
         let notified = self.notified.swap(false, Ordering::AcqRel);
@@ -238,28 +279,30 @@ impl SettingsEngine {
         self.reassert_now()
     }
 
-    fn write_previous(&mut self, previous: SettingValue) -> Result<(), &'static str> {
-        let current = read_task_manager(&self.sid)?;
-        match restore_action(previous, current).map_err(|_| "value")? {
-            Some(next) => write_task_manager(&self.sid, next),
+    fn write_previous(&mut self, target: &str, previous: SettingValue) -> Result<(), &'static str> {
+        let Some(policy) = lockdown_policy(target) else {
+            return Err("target");
+        };
+        let current = read_lockdown(&self.sid, policy)?;
+        match restore_action_for(target, previous, current).map_err(|_| "value")? {
+            Some(next) => write_lockdown(&self.sid, policy, next),
             None => Ok(()),
         }
     }
 
     fn revert_document(&mut self, doc: &SettingsJournal) -> Result<(), &'static str> {
+        RESTORED.store(true, Ordering::Release);
         for entry in doc.entries() {
-            if entry.target != TASK_MANAGER {
+            if lockdown_policy(&entry.target).is_none() {
                 return Err("target");
             }
-            self.write_previous(entry.previous)?;
+            self.write_previous(&entry.target, entry.previous)?;
         }
         let empty = encode_document(&SettingsJournal::empty()).map_err(|_| "malformed")?;
         save_journal(&empty).map_err(|_| "not-durable")?;
+        SKIP_WORKSTATION.store(false, Ordering::Release);
         self.release();
-        crate::audit(
-            "settings",
-            &[("result", "restored"), ("target", TASK_MANAGER)],
-        );
+        crate::audit("settings", &[("result", "restored"), ("rows", "lockdown")]);
         Ok(())
     }
 
@@ -303,7 +346,10 @@ fn memory_journal(doc: &SettingsJournal) -> Journal {
         journal.record(JournalEntry {
             target: entry.target.clone(),
             previous: previous_text(entry.previous),
-            new_value: "1".to_string(),
+            new_value: match entry.new_value {
+                SettingValue::Dword { value } => value.to_string(),
+                SettingValue::Absent => "0".to_string(),
+            },
         });
     }
     journal.set_failures(doc.failures());
@@ -312,6 +358,60 @@ fn memory_journal(doc: &SettingsJournal) -> Journal {
     }
     journal.flush();
     journal
+}
+
+/// Journal the clear, then delete `DisableLockWorkstation`. A failed save
+/// does not change the value. Disconnect-only callers do not use this.
+pub fn clear_disable_lock_workstation_for_os_lock() -> Result<bool, &'static str> {
+    let Some(text) = load_journal().map_err(|_| "journal")? else {
+        return Ok(false);
+    };
+    let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
+    if doc.is_empty()
+        || !doc
+            .entries()
+            .iter()
+            .any(|entry| entry.target == "DisableLockWorkstation")
+    {
+        return Ok(false);
+    }
+    let sid = restore_sid(&doc).map_err(fault_log)?.to_string();
+    let policy = lockdown_policy("DisableLockWorkstation").ok_or("target")?;
+    let current = read_lockdown(&sid, policy)?;
+    if doc.workstation_clear
+        && current
+            != (SettingValue::Dword {
+                value: policy.locked,
+            })
+    {
+        SKIP_WORKSTATION.store(true, Ordering::Release);
+        return Ok(true);
+    }
+    let marked = mark_workstation_clear(&doc).map_err(fault_log)?;
+    let bytes = encode_document(&marked).map_err(fault_log)?;
+    save_journal(&bytes).map_err(|_| "not-durable")?;
+    SKIP_WORKSTATION.store(true, Ordering::Release);
+    write_lockdown(&sid, policy, SettingValue::Absent)?;
+    Ok(true)
+}
+
+/// Put `DisableLockWorkstation` back to its locked value and clear the
+/// temporary-clear flag before the registry write, so a crash cannot leave
+/// re-assert skipping an absent value. The owner's previous value stays.
+pub fn reapply_disable_lock_workstation() -> Result<(), &'static str> {
+    SKIP_WORKSTATION.store(false, Ordering::Release);
+    let Some(text) = load_journal().map_err(|_| "journal")? else {
+        return Ok(());
+    };
+    let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
+    let Some((settled, value)) = workstation_value_after_attempt(&doc).map_err(fault_log)? else {
+        return Ok(());
+    };
+    let bytes = encode_document(&settled).map_err(fault_log)?;
+    save_journal(&bytes).map_err(|_| "not-durable")?;
+    let sid = restore_sid(&settled).map_err(fault_log)?.to_string();
+    let policy = lockdown_policy("DisableLockWorkstation").ok_or("target")?;
+    write_lockdown(&sid, policy, value)
 }
 
 pub fn repair_main() -> i32 {

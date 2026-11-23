@@ -326,7 +326,7 @@ impl Hardening for ServicePlatform {
         }
         for change in &plan.changes {
             #[cfg(windows)]
-            if change.target == softlock_core::TASK_MANAGER && self.settings.is_some() {
+            if self.settings.is_some() && softlock_core::lockdown_target(&change.target) {
                 continue;
             }
             journal.record(JournalEntry {

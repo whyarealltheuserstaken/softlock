@@ -61,11 +61,18 @@ pub struct CloseResult {
 }
 
 pub fn run_lock_host() -> CloseResult {
-    run(Caller::LockHost, NO_SESSION, None)
+    run(Caller::LockHost, NO_SESSION, None, false)
+}
+
+/// The service is already gone. This process cannot update the journal, so
+/// `LockWorkStation` would wait out the whole budget while
+/// `DisableLockWorkstation` is still set. Disconnect instead.
+pub fn run_lock_host_service_dead() -> CloseResult {
+    run(Caller::LockHost, NO_SESSION, None, true)
 }
 
 pub fn run_lock_host_primary() -> CloseResult {
-    run(Caller::LockHostPrimary, NO_SESSION, None)
+    run(Caller::LockHostPrimary, NO_SESSION, None, false)
 }
 
 pub fn run_service(console: u32, ask_host: impl FnMut() -> bool + 'static) -> CloseResult {
@@ -73,18 +80,24 @@ pub fn run_service(console: u32, ask_host: impl FnMut() -> bool + 'static) -> Cl
         Caller::ServiceCoordinated,
         console,
         Some(Box::new(ask_host)),
+        false,
     )
 }
 
 pub fn run_service_disconnect(console: u32) -> CloseResult {
-    run(Caller::Service, console, None)
+    run(Caller::Service, console, None, false)
 }
 
 pub fn runner_may_lock() -> Result<(), &'static str> {
     crate::proof_allowed(hosted_from_env(), school_from_registry())
 }
 
-fn run(caller: Caller, console: u32, ask_host: Option<Box<dyn FnMut() -> bool>>) -> CloseResult {
+fn run(
+    caller: Caller,
+    console: u32,
+    ask_host: Option<Box<dyn FnMut() -> bool>>,
+    skip_workstation: bool,
+) -> CloseResult {
     let _gate = GATE.lock().unwrap_or_else(|poison| poison.into_inner());
     let console = if console == NO_SESSION {
         unsafe { WTSGetActiveConsoleSessionId() }
@@ -98,6 +111,7 @@ fn run(caller: Caller, console: u32, ask_host: Option<Box<dyn FnMut() -> bool>>)
         own: own_session().unwrap_or(console),
         listener: Listener::start(),
         ask_host,
+        skip_workstation,
         errors: Vec::new(),
         elapsed: Duration::ZERO,
         noted_lock_query: false,
@@ -122,6 +136,7 @@ struct WindowsOps {
     own: u32,
     listener: Result<Listener, String>,
     ask_host: Option<Box<dyn FnMut() -> bool>>,
+    skip_workstation: bool,
     errors: Vec<String>,
     elapsed: Duration,
     noted_lock_query: bool,
@@ -145,8 +160,10 @@ impl WindowsOps {
 
 impl OsLockOps for WindowsOps {
     fn before_lock_workstation(&mut self) -> Result<(), StepFault> {
-        // Ticket 17 clears DisableLockWorkstation here. Leaving the value
-        // alone is the whole of this seam.
+        if self.skip_workstation {
+            return Err(StepFault::Skipped);
+        }
+        // The service journals the clear. This crate never writes the value.
         Ok(())
     }
 

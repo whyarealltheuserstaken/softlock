@@ -7,8 +7,8 @@ use std::thread;
 use std::time::Duration;
 
 use softlock_core::{
-    HostPresence, SettingValue, console_user_from, expand_profile_image, hive_target_allowed,
-    host_identity, same_exe_path, sid_is_safe,
+    HostPresence, LockdownPolicy, PolicyHive, SettingValue, console_user_from,
+    expand_profile_image, hive_target_allowed, host_identity, same_exe_path, sid_is_safe,
 };
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE};
 use windows::Win32::System::Registry::{
@@ -22,41 +22,54 @@ use windows::core::PCWSTR;
 use crate::secrets::{enable_privilege_scoped, wide_str};
 
 const POLICY_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\System";
-const VALUE_NAME: &str = "DisableTaskMgr";
+const EXPLORER_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
 const REG_OPTION_OPEN_LINK: u32 = 0x0000_0008;
 
-pub fn read_task_manager(sid: &str) -> Result<SettingValue, &'static str> {
+pub fn read_lockdown(sid: &str, policy: &LockdownPolicy) -> Result<SettingValue, &'static str> {
     if !sid_is_safe(sid) {
         return Err("sid");
     }
-    let _hive = HiveGuard::ensure(sid)?;
-    let path = format!(r"{sid}\{POLICY_KEY}");
-    let Some(key) = open_users(&path, KEY_QUERY_VALUE)? else {
-        return Ok(SettingValue::Absent);
+    let key = match policy.hive {
+        PolicyHive::User => {
+            let _hive = HiveGuard::ensure(sid)?;
+            let path = format!(r"{sid}\{}", policy.subkey);
+            let Some(key) = open_users(&path, KEY_QUERY_VALUE)? else {
+                return Ok(SettingValue::Absent);
+            };
+            key
+        }
+        PolicyHive::Machine => {
+            let Some(key) = open_checked(HKEY_LOCAL_MACHINE, policy.subkey, KEY_QUERY_VALUE)?
+            else {
+                return Ok(SettingValue::Absent);
+            };
+            key
+        }
     };
-    let value = query_dword(key);
+    let value = query_dword(key, policy.target);
     close(key);
     value
 }
 
-pub fn write_task_manager(sid: &str, value: SettingValue) -> Result<(), &'static str> {
-    if !sid_is_safe(sid) {
-        return Err("sid");
+pub fn write_lockdown(
+    sid: &str,
+    policy: &LockdownPolicy,
+    value: SettingValue,
+) -> Result<(), &'static str> {
+    if !sid_is_safe(sid) || !softlock_core::allowed_previous_for(policy.target, value) {
+        return Err("value");
     }
     match value {
-        SettingValue::Absent => delete_value(sid),
-        SettingValue::Dword {
-            value: dword @ (0 | 1),
-        } => set_dword(sid, dword),
-        SettingValue::Dword { .. } => Err("value"),
+        SettingValue::Absent => delete_lockdown(sid, policy),
+        SettingValue::Dword { value } => set_lockdown(sid, policy, value),
     }
 }
 
-fn set_dword(sid: &str, value: u32) -> Result<(), &'static str> {
-    let _hive = HiveGuard::ensure(sid)?;
-    let path = format!(r"{sid}\{POLICY_KEY}");
-    let key = create_users(&path)?;
-    let name = wide_str(VALUE_NAME);
+fn set_lockdown(sid: &str, policy: &LockdownPolicy, value: u32) -> Result<(), &'static str> {
+    let (root, path, hive) = rooted(sid, policy)?;
+    let _hive = hive;
+    let key = create_key(root, &path)?;
+    let name = wide_str(policy.target);
     let bytes = value.to_le_bytes();
     let status =
         unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), None, REG_DWORD, Some(&bytes)) };
@@ -64,13 +77,13 @@ fn set_dword(sid: &str, value: u32) -> Result<(), &'static str> {
     win32(status)
 }
 
-fn delete_value(sid: &str) -> Result<(), &'static str> {
-    let _hive = HiveGuard::ensure(sid)?;
-    let path = format!(r"{sid}\{POLICY_KEY}");
-    let Some(key) = open_users(&path, KEY_SET_VALUE)? else {
+fn delete_lockdown(sid: &str, policy: &LockdownPolicy) -> Result<(), &'static str> {
+    let (root, path, hive) = rooted(sid, policy)?;
+    let _hive = hive;
+    let Some(key) = open_checked(root, &path, KEY_SET_VALUE)? else {
         return Ok(());
     };
-    let name = wide_str(VALUE_NAME);
+    let name = wide_str(policy.target);
     let status = unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) };
     close(key);
     if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND {
@@ -80,14 +93,27 @@ fn delete_value(sid: &str) -> Result<(), &'static str> {
     }
 }
 
-fn query_dword(key: HKEY) -> Result<SettingValue, &'static str> {
-    let name = wide_str(VALUE_NAME);
+fn rooted(
+    sid: &str,
+    policy: &LockdownPolicy,
+) -> Result<(HKEY, String, Option<HiveGuard>), &'static str> {
+    match policy.hive {
+        PolicyHive::User => {
+            let hive = HiveGuard::ensure(sid)?;
+            Ok((HKEY_USERS, format!(r"{sid}\{}", policy.subkey), Some(hive)))
+        }
+        PolicyHive::Machine => Ok((HKEY_LOCAL_MACHINE, policy.subkey.to_string(), None)),
+    }
+}
+
+fn query_dword(key: HKEY, name: &str) -> Result<SettingValue, &'static str> {
+    let wide = wide_str(name);
     let mut kind = REG_VALUE_TYPE::default();
     let mut size = 0u32;
     let status = unsafe {
         RegQueryValueExW(
             key,
-            PCWSTR(name.as_ptr()),
+            PCWSTR(wide.as_ptr()),
             None,
             Some(&mut kind),
             None,
@@ -108,7 +134,7 @@ fn query_dword(key: HKEY) -> Result<SettingValue, &'static str> {
     let status = unsafe {
         RegQueryValueExW(
             key,
-            PCWSTR(name.as_ptr()),
+            PCWSTR(wide.as_ptr()),
             None,
             Some(&mut kind),
             Some(buffer.as_mut_ptr()),
@@ -326,12 +352,12 @@ fn system_drive(root: &str) -> Result<String, &'static str> {
     Ok(drive.to_string())
 }
 
-fn create_users(path: &str) -> Result<HKEY, &'static str> {
+fn create_key(root: HKEY, path: &str) -> Result<HKEY, &'static str> {
     let parts: Vec<&str> = path.split('\\').filter(|part| !part.is_empty()).collect();
     if parts.is_empty() {
         return Err("registry");
     }
-    let mut current = HKEY_USERS;
+    let mut current = root;
     let mut owned: Option<HKEY> = None;
     for (index, part) in parts.iter().enumerate() {
         let name = wide_str(part);
@@ -483,9 +509,15 @@ pub fn watch_policy(sid: &str, stop: &AtomicBool, notified: &AtomicBool) {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Foundation::WAIT_OBJECT_0;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    let mut which = 0u8;
     while !stop.load(Ordering::Acquire) {
-        let path = format!(r"{sid}\{POLICY_KEY}");
-        let Ok(Some(key)) = open_users(&path, KEY_NOTIFY) else {
+        let opened = match which % 3 {
+            0 => open_users(&format!(r"{sid}\{POLICY_KEY}"), KEY_NOTIFY),
+            1 => open_users(&format!(r"{sid}\{EXPLORER_KEY}"), KEY_NOTIFY),
+            _ => open_checked(HKEY_LOCAL_MACHINE, POLICY_KEY, KEY_NOTIFY),
+        };
+        which = which.wrapping_add(1);
+        let Ok(Some(key)) = opened else {
             thread::sleep(Duration::from_secs(1));
             continue;
         };
