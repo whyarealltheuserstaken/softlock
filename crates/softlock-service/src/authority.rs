@@ -19,7 +19,7 @@ use softlock_core::{
 };
 
 use crate::log::{audit, source_name};
-use crate::platform::{ArmWait, ServicePlatform};
+use crate::platform::{ARM_READY_LIMIT, ArmWait, ServicePlatform};
 
 const SILENCE: Duration = Duration::from_millis(750);
 const OS_LOCK_RETRY: Duration = Duration::from_secs(1);
@@ -65,6 +65,10 @@ pub struct Authority {
     host_ready: bool,
     last_beat: Option<Instant>,
     next_os_retry: Option<Instant>,
+    /// `Lock` to `HostReady`. Cleared once the host is ready or lost.
+    arm_deadline: Option<Instant>,
+    /// The hung host is still alive and has to be replaced.
+    arm_replace: bool,
 }
 
 impl Authority {
@@ -78,6 +82,8 @@ impl Authority {
             host_ready: false,
             last_beat: None,
             next_os_retry: None,
+            arm_deadline: None,
+            arm_replace: false,
         }
     }
 
@@ -98,7 +104,20 @@ impl Authority {
     }
 
     pub fn state_name(&self) -> StateName {
-        self.controller.state().name()
+        self.public_state(self.controller.state().name())
+    }
+
+    /// The controller enters `Locked` as soon as the arm slot is marked, so a
+    /// lost host still fails closed. The hooks are not in until `HostReady`.
+    /// Until then the public name stays `Arming`. A platform with no arm slot
+    /// has no desktop guard to wait for and reports `Locked` immediately.
+    fn public_state(&self, name: StateName) -> StateName {
+        if name == StateName::Locked && self.controller.platform().awaits_host() && !self.host_ready
+        {
+            StateName::Arming
+        } else {
+            name
+        }
     }
 
     pub fn last_fallback(&self) -> Option<softlock_core::Fallback> {
@@ -177,7 +196,11 @@ impl Authority {
                     role,
                     kind: RequestKind::Lock { source, note: None },
                 });
-                self.response()
+                let response = self.response();
+                if matches!(response, ResponseKind::Accepted) {
+                    self.note_lock_armed();
+                }
+                response
             }
             other => {
                 self.controller.handle(Event::Public { role, kind: other });
@@ -208,6 +231,8 @@ impl Authority {
             HostToService::HostHello { .. } => Ok(None),
             HostToService::HostReady { monitors, .. } => {
                 self.host_ready = true;
+                self.arm_deadline = None;
+                self.arm_replace = false;
                 self.last_beat = Some(Instant::now());
                 self.controller.platform_mut().set_report(
                     GuardHealth {
@@ -268,6 +293,10 @@ impl Authority {
     pub fn note_host_lost(&mut self, loss: HostLoss) {
         self.host_ready = false;
         self.last_beat = None;
+        self.arm_deadline = None;
+        if let Some(arm) = self.arm_wait() {
+            arm.failed();
+        }
         #[cfg(windows)]
         if matches!(loss, HostLoss::Exited | HostLoss::Silent) {
             crate::windows::mark_host_unavailable(loss);
@@ -286,6 +315,21 @@ impl Authority {
         }
     }
 
+    /// The arm slot is still waiting and `HostReady` did not arrive. Fails
+    /// closed, and asks the supervisor to replace a host that is still alive.
+    pub fn expire_arm_wait(&mut self) {
+        if self.host_ready
+            || !matches!(
+                self.controller.state(),
+                LockState::Locked { .. } | LockState::Arming { .. }
+            )
+        {
+            return;
+        }
+        self.arm_replace = true;
+        self.note_host_lost(HostLoss::Silent);
+    }
+
     /// Respawns when the host is gone. Retries the OS lock while it is down.
     /// Neither result is Unlocked.
     pub fn poll_host(&mut self, now: Instant, process_alive: bool) -> HostAction {
@@ -296,35 +340,69 @@ impl Authority {
         let stale = self
             .last_beat
             .is_some_and(|last| now.saturating_duration_since(last) >= SILENCE);
-        if self.host_ready && (!process_alive || stale) {
+        // Death while `Locked` fails closed even when `HostReady` never
+        // arrived. The hooks are not in, and a respawn loop must not leave
+        // the public name on `Arming`.
+        if !process_alive && matches!(self.controller.state(), LockState::Locked { .. }) {
+            self.note_host_lost(HostLoss::Exited);
+        } else if self.host_ready && (!process_alive || stale) {
             self.note_host_lost(if process_alive {
                 HostLoss::Silent
             } else {
                 HostLoss::Exited
             });
         }
+        if !self.host_ready
+            && self.arm_deadline.is_some_and(|due| now >= due)
+            && matches!(
+                self.controller.state(),
+                LockState::Locked { .. }
+                    | LockState::Arming { .. }
+                    | LockState::FailingClosed { .. }
+            )
+        {
+            self.arm_replace = true;
+            self.note_host_lost(HostLoss::Silent);
+        }
         // A dead Lock Host is replaced. While the session is still locked this
         // is the emergency recovery. After a normal unlock the replacement
         // stays idle until the next Lock.
-        if !process_alive {
-            if self.controller.recovery_due() {
-                self.controller.acknowledge_recovery();
-            }
-            return HostAction::Respawn {
-                arm: self.session_needs_a_host(),
-            };
-        }
-        if self.controller.recovery_due() && !self.host_ready {
-            self.controller.acknowledge_recovery();
-            return HostAction::Respawn {
-                arm: self.session_needs_a_host(),
-            };
+        if !process_alive
+            || self.arm_replace
+            || (self.controller.recovery_due() && !self.host_ready)
+        {
+            return self.respawn(now);
         }
         if self.os_retry_due(now) {
             self.retry_os_lock();
             return HostAction::RetryLock;
         }
         HostAction::Hold
+    }
+
+    fn note_lock_armed(&mut self) {
+        if self.host_ready || !self.controller.platform().awaits_host() {
+            return;
+        }
+        if !matches!(
+            self.controller.state(),
+            LockState::Locked { .. } | LockState::Arming { .. }
+        ) {
+            return;
+        }
+        self.arm_deadline = Some(Instant::now() + ARM_READY_LIMIT);
+    }
+
+    fn respawn(&mut self, now: Instant) -> HostAction {
+        self.arm_replace = false;
+        if self.controller.recovery_due() {
+            self.controller.acknowledge_recovery();
+        }
+        let arm = self.session_needs_a_host();
+        if arm && self.controller.platform().awaits_host() {
+            self.arm_deadline = Some(now + ARM_READY_LIMIT);
+        }
+        HostAction::Respawn { arm }
     }
 
     fn os_retry_due(&mut self, now: Instant) -> bool {
@@ -515,10 +593,36 @@ impl Authority {
     }
 
     fn response(&self) -> ResponseKind {
-        self.controller
+        let response = self
+            .controller
             .last_response()
             .cloned()
-            .unwrap_or(ResponseKind::Unsupported)
+            .unwrap_or(ResponseKind::Unsupported);
+        match response {
+            ResponseKind::Status {
+                state,
+                lock_source,
+                guard,
+                overlay,
+                last_fallback,
+            } => ResponseKind::Status {
+                state: self.public_state(state),
+                lock_source,
+                guard,
+                overlay,
+                last_fallback,
+            },
+            ResponseKind::Hello {
+                service_version,
+                state,
+                capabilities,
+            } => ResponseKind::Hello {
+                service_version,
+                state: self.public_state(state),
+                capabilities,
+            },
+            other => other,
+        }
     }
 }
 
@@ -644,10 +748,42 @@ pub fn stub_os_lock() -> bool {
 mod host_ready_tests {
     use softlock_core::{
         HostToService, LaunchNonce, LockSource, LockState, RequestKind, ResponseKind, Role,
+        StateName,
     };
 
-    use super::Authority;
-    use crate::platform::{OsLock, ServicePlatform};
+    use std::time::Instant;
+
+    use super::{Authority, HostAction, HostLoss};
+    use crate::platform::{ARM_READY_LIMIT, ArmWait, OsLock, ServicePlatform};
+
+    fn lock_hotkey(authority: &mut Authority) -> ResponseKind {
+        authority.handle_public(
+            Role::App,
+            RequestKind::Lock {
+                source: LockSource::Hotkey,
+                note: None,
+            },
+        )
+    }
+
+    fn status_state(authority: &mut Authority) -> StateName {
+        match authority.handle_public(Role::App, RequestKind::GetStatus) {
+            ResponseKind::Status { state, .. } => state,
+            other => panic!("GetStatus returned {other:?}"),
+        }
+    }
+
+    fn hello_state(authority: &mut Authority) -> StateName {
+        match authority.handle_public(
+            Role::App,
+            RequestKind::Hello {
+                client_version: "0".to_string(),
+            },
+        ) {
+            ResponseKind::Hello { state, .. } => state,
+            other => panic!("Hello returned {other:?}"),
+        }
+    }
 
     #[test]
     fn forged_host_ready_leaves_the_host_not_ready() {
@@ -681,5 +817,115 @@ mod host_ready_tests {
             .accept_host(HostToService::HostReady { monitors: 2, nonce })
             .expect("the real HostReady still arms");
         assert!(authority.host_ready());
+    }
+
+    /// A desktop lock marks the arm slot and the controller enters `Locked`
+    /// so a lost host still fails closed. Callers are told `Arming` until
+    /// `HostReady`, which the Lock Host sends only after its hooks are in.
+    #[test]
+    fn locked_is_not_reported_until_the_host_hooks_are_in() {
+        let mut bare = Authority::new(ServicePlatform::new(OsLock::Fails), true);
+        let _ = bare.issue_launch_nonce().expect("nonce");
+        assert_eq!(lock_hotkey(&mut bare), ResponseKind::Accepted);
+        assert_eq!(bare.state_name(), StateName::Locked);
+        assert_eq!(status_state(&mut bare), StateName::Locked);
+
+        let mut platform = ServicePlatform::new(OsLock::Fails);
+        platform.set_arm_wait(ArmWait::new());
+        let mut authority = Authority::new(platform, true);
+        let nonce = authority.issue_launch_nonce().expect("nonce");
+        assert_eq!(lock_hotkey(&mut authority), ResponseKind::Accepted);
+        assert!(
+            matches!(authority.state(), LockState::Locked { .. }),
+            "the controller left Locked before the host was ready"
+        );
+        assert!(authority.session_needs_a_host());
+        assert_eq!(authority.state_name(), StateName::Arming);
+        assert_eq!(status_state(&mut authority), StateName::Arming);
+        assert_eq!(hello_state(&mut authority), StateName::Arming);
+        authority
+            .accept_host(HostToService::HostReady { monitors: 1, nonce })
+            .expect("host ready");
+        assert!(authority.host_ready());
+        assert_eq!(authority.state_name(), StateName::Locked);
+        assert_eq!(status_state(&mut authority), StateName::Locked);
+        assert_eq!(hello_state(&mut authority), StateName::Locked);
+    }
+
+    #[test]
+    fn host_loss_before_ready_still_fails_closed() {
+        let mut platform = ServicePlatform::new(OsLock::Fails);
+        platform.set_arm_wait(ArmWait::new());
+        let mut authority = Authority::new(platform, true);
+        let _ = authority.issue_launch_nonce().expect("nonce");
+        assert_eq!(lock_hotkey(&mut authority), ResponseKind::Accepted);
+        assert_eq!(authority.state_name(), StateName::Arming);
+        authority.note_host_lost(HostLoss::GuardDown);
+        assert!(matches!(authority.state(), LockState::FailingClosed { .. }));
+        assert_ne!(authority.state_name(), StateName::Unlocked);
+        assert_ne!(authority.state_name(), StateName::Locked);
+    }
+
+    /// The host process is gone before `HostReady`. `poll_host` has to fail
+    /// closed on that death, not only after the hooks were reported in.
+    #[test]
+    fn a_dead_host_before_ready_fails_closed() {
+        let mut platform = ServicePlatform::new(OsLock::Fails);
+        let wait = ArmWait::new();
+        platform.set_arm_wait(wait.clone());
+        let mut authority = Authority::new(platform, true);
+        let _ = authority.issue_launch_nonce().expect("nonce");
+        assert_eq!(lock_hotkey(&mut authority), ResponseKind::Accepted);
+        assert_eq!(authority.state_name(), StateName::Arming);
+        assert!(wait.is_waiting());
+        let action = authority.poll_host(Instant::now(), false);
+        assert!(
+            matches!(authority.state(), LockState::FailingClosed { .. }),
+            "a dead host before HostReady stayed {:?}",
+            authority.state()
+        );
+        assert_ne!(authority.state_name(), StateName::Arming);
+        assert_ne!(authority.state_name(), StateName::Unlocked);
+        assert!(
+            authority.os_lock_attempts() >= 1,
+            "the OS lock was not requested"
+        );
+        assert!(!wait.is_waiting(), "the arm slot stayed waiting");
+        assert_eq!(action, HostAction::Respawn { arm: true });
+    }
+
+    /// The host stays up and never sends `HostReady`. The arm deadline has to
+    /// fail closed instead of leaving the public name on `Arming`.
+    #[test]
+    fn a_host_that_never_readies_fails_closed() {
+        let mut platform = ServicePlatform::new(OsLock::Fails);
+        let wait = ArmWait::new();
+        platform.set_arm_wait(wait.clone());
+        let mut authority = Authority::new(platform, true);
+        let _ = authority.issue_launch_nonce().expect("nonce");
+        assert_eq!(lock_hotkey(&mut authority), ResponseKind::Accepted);
+        let started = Instant::now();
+        assert_eq!(authority.poll_host(started, true), HostAction::Hold);
+        assert_eq!(authority.state_name(), StateName::Arming);
+        assert!(wait.is_waiting());
+        let action = authority.poll_host(started + ARM_READY_LIMIT, true);
+        assert!(
+            matches!(
+                authority.state(),
+                LockState::FailingClosed {
+                    reason: softlock_core::FailReason::HeartbeatMissed
+                }
+            ),
+            "a missed HostReady stayed {:?}",
+            authority.state()
+        );
+        assert_ne!(authority.state_name(), StateName::Arming);
+        assert_ne!(authority.state_name(), StateName::Unlocked);
+        assert!(
+            authority.os_lock_attempts() >= 1,
+            "the OS lock was not requested"
+        );
+        assert!(!wait.is_waiting(), "the arm slot stayed waiting");
+        assert_eq!(action, HostAction::Respawn { arm: true });
     }
 }

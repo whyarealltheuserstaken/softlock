@@ -475,6 +475,11 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
         let _ = ready.send(Err(DevError::new("lock host stopped before arming")));
         return;
     }
+    #[cfg(feature = "live-fail-closed")]
+    if host_ready_fault() == Some("exit") {
+        let _ = ready.send(Err(DevError::new("lock host exited before HostReady")));
+        std::process::exit(3);
+    }
     let mut controller = LockController::new(WinPlatform::new(Arc::clone(&shared)));
     let started = Instant::now();
     controller.handle(Event::LockRequested {
@@ -488,6 +493,17 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
     }
     shared.locked.store(true, Ordering::Release);
     failclosed::publish_armed_host();
+    #[cfg(feature = "live-fail-closed")]
+    if host_ready_fault() == Some("hold") {
+        while !shared.stop.load(Ordering::Acquire) {
+            if !pump_message() && shared.stop.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        shutdown(&shared);
+        let _ = ready.send(Err(DevError::new("lock host held HostReady")));
+        return;
+    }
     // Before Ready. Lock returns only after Ready, and the test then sends
     // F13. Liveness and mouse input do not trip this flag.
     #[cfg(feature = "simulated-physical")]
@@ -625,6 +641,21 @@ fn advance_clock(
             break;
         }
         beat(controller, shared);
+    }
+}
+
+/// `hold` never sends `HostReady`. `exit` ends the process before the hooks.
+/// Both are ignored unless this binary was built with `live-fail-closed` and
+/// the machine is a hosted runner that is allowed to lock.
+#[cfg(feature = "live-fail-closed")]
+fn host_ready_fault() -> Option<&'static str> {
+    if softlock_windows::runner_may_lock().is_err() {
+        return None;
+    }
+    match std::env::var("SOFTLOCK_HOST_READY").ok().as_deref() {
+        Some("hold") => Some("hold"),
+        Some("exit") => Some("exit"),
+        _ => None,
     }
 }
 
