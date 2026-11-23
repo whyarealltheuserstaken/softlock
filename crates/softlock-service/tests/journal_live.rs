@@ -122,6 +122,9 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
         if path.exists() {
             guard.config_bytes = Some(fs::read(&path).unwrap_or_default());
             force_remove(&path);
+            if path.exists() {
+                return Err("could not remove the existing config file".to_string());
+            }
         }
         let pause = guard_dir().join("pause-config");
         let _ = fs::remove_file(&pause);
@@ -129,11 +132,19 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
         wait_pipe()?;
         let created = wait_for_config(&path);
         if !created {
+            let owner = softlock_service::testing_owner(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
+            let dacl = softlock_service::testing_dacl(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
             return Err(format!(
-                "config file before the ACL change exists={} writable={} journal={}",
+                "config file before the ACL change exists={} write={} journal={} owner={} dacl={}",
                 path.is_file(),
-                owner_can_write(&path),
-                journal_ready(&journal_file())
+                write_state(&path),
+                journal_ready(&journal_file()),
+                owner,
+                dacl
             ));
         }
         guard.config_path = Some(path.clone());
@@ -284,11 +295,21 @@ fn force_remove(path: &Path) {
     let text = path.display().to_string();
     let _ = fs::remove_file(path);
     if path.exists() {
-        let _ = Command::new("takeown").args(["/f", &text]).status();
+        let _ = Command::new("takeown").args(["/f", &text, "/a"]).status();
+        let _ = Command::new("icacls").args([&text, "/reset"]).status();
         let _ = Command::new("icacls")
             .args([&text, "/grant", "Everyone:F"])
             .status();
         let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn write_state(path: &Path) -> String {
+    match softlock_service::owner_write_denied(path) {
+        Ok(true) => "denied".to_string(),
+        Ok(false) => "allowed".to_string(),
+        Err(error) => error.to_string(),
     }
 }
 

@@ -370,7 +370,14 @@ fn open_for_owner_write(path: &Path) -> io::Result<HANDLE> {
         }
         directory = next;
     }
-    let file = open_child(directory, &parts[last], OWNER_WRITE, false, false);
+    // Synchronous opens are rejected unless SYNCHRONIZE is requested as well.
+    let file = open_child(
+        directory,
+        &parts[last],
+        OWNER_WRITE | SYNCHRONIZE,
+        false,
+        false,
+    );
     drop_handle(directory);
     let file = file?;
     if refuse_reparse(file)? {
