@@ -220,7 +220,7 @@ fn take_and_release_inhibit() -> Result<bool, String> {
             let err = read_stderr(&mut child);
             return Err(format!("systemd-inhibit exited {status}: {err}"));
         }
-        if let Some(out) = Command::new("systemd-inhibit").arg("--list").output().ok() {
+        if let Ok(out) = Command::new("systemd-inhibit").arg("--list").output() {
             let text = String::from_utf8_lossy(&out.stdout);
             let err = String::from_utf8_lossy(&out.stderr);
             last_list = if text.trim().is_empty() {
