@@ -443,8 +443,9 @@ impl Authority {
     /// Respawns when the host is gone. Retries the OS lock while it is down.
     /// Neither result is Unlocked.
     pub fn poll_host(&mut self, now: Instant, process_alive: bool) -> HostAction {
+        // A live host waits out the OS-lock chain. A dead one still fails closed.
         #[cfg(windows)]
-        if crate::windows::chain_running() {
+        if process_alive && crate::windows::chain_running() {
             return HostAction::Hold;
         }
         let stale = self
