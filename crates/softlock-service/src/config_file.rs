@@ -57,15 +57,14 @@ pub fn prepare_entry(path: &Path) -> Result<SettingEntry, &'static str> {
     let handle = open_config(path, false).map_err(|_| "config")?;
     let text = read_handle(handle);
     let previous = dacl_sddl_handle(handle);
-    let owner = owner_sid_handle(handle);
     drop_handle(handle);
     let text = text.map_err(|_| "config")?;
     if text.len() > MAX_CONFIG_BYTES {
         return Err("config");
     }
     let previous = previous.map_err(|_| "acl")?;
-    let owner = owner.map_err(|_| "acl")?;
-    let locked = dacl_without_owner_write(&previous, &owner).map_err(|_| "acl")?;
+    let console = crate::taskmgr::console_sid().map_err(|_| "sid")?;
+    let locked = dacl_without_owner_write(&previous, &console).map_err(|_| "acl")?;
     let path_text = path_text(path).map_err(|_| "acl")?;
     config_acl_entry(&path_text, &previous, &locked).map_err(fault)
 }
@@ -115,13 +114,6 @@ pub fn reassert_entry(entry: &SettingEntry) -> Result<(), &'static str> {
     result
 }
 
-pub fn read_capped(path: &Path) -> io::Result<String> {
-    let handle = open_config(path, false)?;
-    let text = read_handle(handle);
-    drop_handle(handle);
-    text
-}
-
 pub fn write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() > MAX_CONFIG_BYTES {
         return Err(io::Error::other("config exceeds the size limit"));
@@ -168,6 +160,14 @@ pub fn testing_dacl(path: &Path) -> io::Result<String> {
 }
 
 #[cfg(feature = "live-fail-closed")]
+pub fn testing_owner(path: &Path) -> io::Result<String> {
+    let handle = open_config(path, false)?;
+    let owner = owner_sid_handle(handle);
+    drop_handle(handle);
+    owner
+}
+
+#[cfg(feature = "live-fail-closed")]
 pub fn testing_restore_dacl(path: &Path, sddl: &str) -> io::Result<()> {
     let handle = open_config(path, false)?;
     let result = set_dacl_handle(handle, sddl).map_err(|_| io::Error::other("acl"));
@@ -181,12 +181,42 @@ fn ensure_file(path: &Path) -> io::Result<()> {
             drop_handle(handle);
             Ok(())
         }
-        Err(error) if not_found(&error) => {
-            let body = softlock_core::Config::initial().document();
-            write_bytes(path, body.as_bytes())
-        }
+        Err(error) if not_found(&error) => create_for_console_user(path),
         Err(error) => Err(error),
     }
+}
+
+fn create_for_console_user(path: &Path) -> io::Result<()> {
+    let sid = crate::taskmgr::console_sid().map_err(io::Error::other)?;
+    if !softlock_core::sid_is_safe(&sid) {
+        return Err(io::Error::other("sid"));
+    }
+    let handle = open_config(path, true)?;
+    if let Err(error) = claim_for_console_user(handle, &sid) {
+        drop_handle(handle);
+        return Err(error);
+    }
+    let body = softlock_core::Config::initial().document().to_string();
+    let written = write_handle(handle, body.as_bytes());
+    drop_handle(handle);
+    written
+}
+
+fn claim_for_console_user(handle: HANDLE, sid: &str) -> io::Result<()> {
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        SE_RESTORE_NAME,
+    };
+    let _restore = crate::secrets::enable_privilege_scoped(SE_RESTORE_NAME)?;
+    let sddl = format!("O:{sid}D:P(A;;FA;;;SY)(A;;FA;;;{sid})");
+    set_security_handle(
+        handle,
+        &sddl,
+        OWNER_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION
+            | PROTECTED_DACL_SECURITY_INFORMATION,
+    )
+    .map_err(io::Error::other)
 }
 
 fn fault(fault: JournalFault) -> &'static str {
@@ -339,6 +369,7 @@ fn write_handle(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "live-fail-closed")]
 fn owner_sid_handle(handle: HANDLE) -> io::Result<String> {
     use windows::Win32::Foundation::LocalFree;
     use windows::Win32::Security::Authorization::{
@@ -386,11 +417,27 @@ fn owner_sid_handle(handle: HANDLE) -> io::Result<String> {
 }
 
 fn set_dacl_handle(handle: HANDLE, sddl: &str) -> Result<(), &'static str> {
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let mut info = DACL_SECURITY_INFORMATION;
+    if sddl.starts_with("D:P") {
+        info |= PROTECTED_DACL_SECURITY_INFORMATION;
+    } else {
+        info |= UNPROTECTED_DACL_SECURITY_INFORMATION;
+    }
+    set_security_handle(handle, sddl, info)
+}
+
+fn set_security_handle(
+    handle: HANDLE,
+    sddl: &str,
+    information: windows::Win32::Security::OBJECT_SECURITY_INFORMATION,
+) -> Result<(), &'static str> {
     use windows::Win32::Foundation::LocalFree;
     use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-    use windows::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
-    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SetKernelObjectSecurity};
     use windows::core::PCWSTR;
     let wide = sddl
         .encode_utf16()
@@ -406,7 +453,7 @@ fn set_dacl_handle(handle: HANDLE, sddl: &str) -> Result<(), &'static str> {
         )
         .map_err(|_| "acl")?;
     }
-    let applied = unsafe { SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, descriptor) };
+    let applied = unsafe { SetKernelObjectSecurity(handle, information, descriptor) };
     unsafe {
         if !descriptor.0.is_null() {
             let _ = LocalFree(Some(windows::Win32::Foundation::HLOCAL(descriptor.0)));

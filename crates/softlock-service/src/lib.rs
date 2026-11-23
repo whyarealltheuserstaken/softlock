@@ -39,8 +39,10 @@ pub use pincheck::marker_bytes;
 pub use platform::{ArmWait, OsLock, ServicePlatform};
 pub use secrets::PinStore;
 
+#[cfg(windows)]
+pub use config_file::owner_write_denied;
 #[cfg(all(windows, feature = "live-fail-closed"))]
-pub use config_file::{testing_dacl, testing_restore_dacl};
+pub use config_file::{testing_dacl, testing_owner, testing_restore_dacl};
 #[cfg(windows)]
 pub use secrets::{SYSTEM_ONLY_SDDL, dacl_sddl, is_reparse_point, user_read_denied};
 

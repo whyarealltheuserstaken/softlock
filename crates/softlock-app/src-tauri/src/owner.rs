@@ -167,6 +167,16 @@ pub fn lock_from_app() {
     enqueue_lock(LockSource::App);
 }
 
+pub fn decline_config() {
+    CONFIG_OFFER.store(false, Ordering::Release);
+    *PENDING_CONFIG
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = String::new();
+    if let Ok(view) = view_slot().lock() {
+        publish(&view);
+    }
+}
+
 pub fn accept_config() -> bool {
     if current_view().locked() || !CONFIG_OFFER.load(Ordering::Acquire) {
         return false;

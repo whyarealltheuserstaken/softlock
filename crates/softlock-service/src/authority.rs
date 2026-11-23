@@ -137,6 +137,10 @@ impl Authority {
         response
     }
 
+    pub fn decline_config_offer(&mut self) {
+        self.offer.decline();
+    }
+
     pub fn platform_mut(&mut self) -> &mut ServicePlatform {
         self.controller.platform_mut()
     }

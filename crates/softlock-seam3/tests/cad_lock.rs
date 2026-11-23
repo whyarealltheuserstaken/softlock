@@ -366,7 +366,7 @@ fn full_with(target: &str, previous: SettingValue) -> Vec<(&str, SettingValue)> 
         .iter()
         .map(|policy| {
             let value = if policy.target == target {
-                previous
+                previous.clone()
             } else {
                 SettingValue::Absent
             };

@@ -14,5 +14,6 @@
   "confirmationNeeded": "Confirmation needed",
   "autostartFailed": "autostart failed",
   "applyConfig": "Apply changes made to the config file?",
+  "keepConfig": "Keep the current settings",
   "configErrors": "The settings file was not applied"
 }

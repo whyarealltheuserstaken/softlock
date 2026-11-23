@@ -588,6 +588,10 @@ impl ConfigOffer {
         self.pending.take()
     }
 
+    pub fn decline(&mut self) {
+        self.pending = None;
+    }
+
     pub fn replace_effective(&mut self, document: &str) {
         self.effective = document.to_string();
         if self.pending.as_deref() == Some(document) {

@@ -28,6 +28,7 @@ export interface OwnerView {
   configErrors: string;
   configOffer: boolean;
   configHotkey: string;
+  configResult: string;
   editing: boolean;
 }
 
@@ -46,6 +47,7 @@ export interface IpcBridge {
   quit(): OwnerView;
   current(): OwnerView;
   acceptConfig(): OwnerView;
+  declineConfig(): OwnerView;
 }
 
 declare global {
@@ -108,6 +110,7 @@ function emptyView(): OwnerView {
     configErrors: "",
     configOffer: false,
     configHotkey: "Ctrl+Alt+Shift+L",
+    configResult: "",
     editing: true,
   };
 }
@@ -256,6 +259,11 @@ class FakeBridge implements IpcBridge {
     return this.view;
   }
 
+  declineConfig(): OwnerView {
+    this.declineOnService();
+    return this.view;
+  }
+
   private noteDisk(document: string) {
     if (this.view.locked || this.view.configOffer) {
       this.pending = document;
@@ -283,13 +291,36 @@ class FakeBridge implements IpcBridge {
       this.emit();
       return;
     }
-    this.effective = this.pending;
+    const applied = serviceApply(this.pending);
+    if (applied.kind !== "Applied") {
+      this.emit();
+      return;
+    }
+    this.effective = applied.document;
     this.pending = null;
     this.view = {
       ...this.view,
       configOffer: false,
       editing: true,
       configHotkey: hotkeyOf(this.effective),
+      configResult: applied.kind,
+    };
+    this.emit();
+  }
+
+  private declineOnService() {
+    if (this.view.locked || !this.view.configOffer) {
+      this.emit();
+      return;
+    }
+    const kept = serviceKeep();
+    this.pending = null;
+    this.view = {
+      ...this.view,
+      configOffer: false,
+      editing: !this.view.locked,
+      configHotkey: hotkeyOf(this.effective),
+      configResult: kept.kind,
     };
     this.emit();
   }
@@ -389,11 +420,37 @@ class TauriBridge implements IpcBridge {
     return this.view;
   }
 
+  declineConfig(): OwnerView {
+    if (this.view.locked || !this.view.configOffer) {
+      this.emit();
+      return this.view;
+    }
+    void this.declineOnService();
+    return this.view;
+  }
+
   private async acceptOnService() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       const dto = await invoke<ViewDto>("accept_config");
       this.apply(dto);
+      if (!this.view.locked && !this.view.configOffer) {
+        this.view = { ...this.view, configResult: "Applied" };
+        this.emit();
+      }
+    } catch {
+      this.view = failClosed(this.view);
+      this.emit();
+    }
+  }
+
+  private async declineOnService() {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const dto = await invoke<ViewDto>("decline_config");
+      this.apply(dto);
+      this.view = { ...this.view, configResult: "Kept" };
+      this.emit();
     } catch {
       this.view = failClosed(this.view);
       this.emit();
@@ -473,6 +530,16 @@ interface ViewDto {
   config_errors?: string;
   config_offer?: boolean;
   config_hotkey?: string;
+}
+
+/** The seam-2 accept path: the service applies the pending document and says Applied. */
+function serviceApply(document: string): { kind: "Applied"; document: string } {
+  return { kind: "Applied", document };
+}
+
+/** Decline does not call PutConfig. The service keeps the document that was already active. */
+function serviceKeep(): { kind: "Kept" } {
+  return { kind: "Kept" };
 }
 
 function hotkeyOf(document: string): string {

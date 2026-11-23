@@ -21,7 +21,7 @@ pub struct Hotkey {
 
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn default_hotkey() -> Hotkey {
-    hotkey_from_document(&softlock_core::Config::initial().document()).unwrap_or(Hotkey {
+    hotkey_from_document(softlock_core::Config::initial().document()).unwrap_or(Hotkey {
         control: true,
         alt: true,
         shift: true,
@@ -41,6 +41,7 @@ pub fn hotkey_from_document(document: &str) -> Option<Hotkey> {
 
 /// What the file watcher does with bytes that differ from the effective config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum ConfigDisk {
     Unchanged,
     /// Unlocked: send the bytes with `PutConfig`.
@@ -49,6 +50,7 @@ pub enum ConfigDisk {
     Offer,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn config_disk_action(locked: bool, effective: &str, disk: &str) -> ConfigDisk {
     if disk == effective {
         ConfigDisk::Unchanged
@@ -59,6 +61,7 @@ pub fn config_disk_action(locked: bool, effective: &str, disk: &str) -> ConfigDi
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn hotkey_label(document: &str) -> String {
     softlock_core::hotkey_in_document(document)
         .map(|chord| chord.label)
@@ -421,6 +424,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn default_hotkey_is_ctrl_alt_shift_l() {
         let hotkey = default_hotkey();
         assert!(hotkey.control);

@@ -66,6 +66,7 @@ fn live_settings_journal() {
         reported: false,
         config_path: None,
         config_dacl: None,
+        config_bytes: None,
     };
     let outcome = match case.as_str() {
         "restore" => restore(&mut guard),
@@ -105,7 +106,7 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
     #[cfg(not(feature = "live-fail-closed"))]
     {
         let _ = guard;
-        return Err("the config ACL proof needs live-fail-closed".to_string());
+        Err("the config ACL proof needs live-fail-closed".to_string())
     }
     #[cfg(feature = "live-fail-closed")]
     {
@@ -113,22 +114,46 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|_| "config dir".to_string())?;
         }
-        if !path.exists() {
-            fs::write(
-                &path,
-                "schema_version = 1\n\n[lock]\nhotkey = \"Ctrl+Alt+Shift+L\"\n",
-            )
-            .map_err(|_| "config write".to_string())?;
+        // The Service has to create this file. A copy the console user already
+        // had is put back when the guard drops.
+        if path.exists() {
+            guard.config_bytes = Some(fs::read(&path).map_err(|_| "config read".to_string())?);
+            let _ = fs::remove_file(&path);
+        }
+        let pause = guard_dir().join("pause-config");
+        let _ = fs::remove_file(&pause);
+        spawn_service(guard, Some("before"), &pause)?;
+        wait_pipe()?;
+        lock_in_background();
+        let created = wait_until(Duration::from_secs(20), || {
+            path.is_file() && owner_can_write(&path) && journal_ready(&journal_file())
+        });
+        if !created {
+            return Err(
+                "the service did not create a writable config file before the ACL change"
+                    .to_string(),
+            );
+        }
+        guard.config_path = Some(path.clone());
+        let body = fs::read_to_string(&path).map_err(|_| "config read".to_string())?;
+        if !body.contains("schema_version") {
+            return Err("the service did not write the config file".to_string());
+        }
+        let owner = softlock_service::testing_owner(&path).map_err(|_| "owner".to_string())?;
+        let mine = console_user_sid()?;
+        if !owner.eq_ignore_ascii_case(&mine) {
+            return Err(format!(
+                "config owner {owner} is not the console user {mine}"
+            ));
         }
         let original = softlock_service::testing_dacl(&path).map_err(|_| "dacl".to_string())?;
-        guard.config_path = Some(path.clone());
         guard.config_dacl = Some(original.clone());
-        let pause = guard_dir().join("pause-config");
-        spawn_service(guard, None, &pause)?;
-        wait_pipe()?;
-        transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+        fs::write(&pause, "go").map_err(|_| "pause".to_string())?;
         if !wait_until(Duration::from_secs(20), || !owner_can_write(&path)) {
-            return Err("the owner could still write the config file while locked".to_string());
+            return Err(
+                "the console user could still write the service-created file while locked"
+                    .to_string(),
+            );
         }
         softlock_service::testing_restore_dacl(&path, &original)
             .map_err(|_| "reassert".to_string())?;
@@ -154,7 +179,28 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
 
 #[cfg(feature = "live-fail-closed")]
 fn owner_can_write(path: &Path) -> bool {
-    std::fs::OpenOptions::new().write(true).open(path).is_ok()
+    matches!(softlock_service::owner_write_denied(path), Ok(false))
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn console_user_sid() -> Result<String, String> {
+    let output = Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .map_err(|_| "whoami".to_string())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let sid = text
+        .split(',')
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    if sid.starts_with("S-1-") {
+        Ok(sid)
+    } else {
+        Err(format!("whoami did not name a SID: {text}"))
+    }
 }
 
 fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
@@ -334,6 +380,7 @@ struct Guard {
     reported: bool,
     config_path: Option<PathBuf>,
     config_dacl: Option<String>,
+    config_bytes: Option<Vec<u8>>,
 }
 
 impl Drop for Guard {
@@ -346,10 +393,18 @@ impl Drop for Guard {
         for row in &self.rows {
             let _ = set_value(row.key, row.name, &row.value);
         }
-        let _ = (&self.config_path, &self.config_dacl);
+        let _ = (&self.config_path, &self.config_dacl, &self.config_bytes);
         #[cfg(feature = "live-fail-closed")]
         if let (Some(path), Some(dacl)) = (&self.config_path, &self.config_dacl) {
             let _ = softlock_service::testing_restore_dacl(path, dacl);
+        }
+        #[cfg(feature = "live-fail-closed")]
+        if let Some(path) = &self.config_path {
+            if let Some(bytes) = &self.config_bytes {
+                let _ = fs::write(path, bytes);
+            } else {
+                let _ = fs::remove_file(path);
+            }
         }
         if !self.reported {
             capture();

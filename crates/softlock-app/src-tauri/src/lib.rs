@@ -209,6 +209,15 @@ fn accept_config() -> OwnerViewDto {
 }
 
 #[tauri::command]
+fn decline_config() -> OwnerViewDto {
+    #[cfg(windows)]
+    {
+        owner::decline_config();
+    }
+    view_dto(&shown_view())
+}
+
+#[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     #[cfg(windows)]
     if owner::request_quit() {
@@ -250,6 +259,7 @@ pub fn run() {
             lock_for_real,
             set_pin,
             accept_config,
+            decline_config,
             quit_app
         ])
         .run(tauri::generate_context!())

@@ -509,36 +509,39 @@ pub fn with_config_acl(
 
 const GROUP_WRITE_SIDS: &[&str] = &["S-1-1-0", "S-1-5-11", "S-1-5-32-545"];
 
-/// Replace the owner's allow ACE with read rights, and inherited write ACEs
-/// for Users, Everyone, and Authenticated Users.
-pub fn dacl_without_owner_write(dacl: &str, owner: &str) -> Result<String, JournalFault> {
-    if !sddl_allowed(dacl) || !sid_is_safe(owner) {
+/// Remove write for `console_sid` and for Users, Everyone, and Authenticated
+/// Users, including inherited allow ACEs. The result is a protected DACL so
+/// the parent cannot grant that write back. The caller journals the original.
+pub fn dacl_without_owner_write(dacl: &str, console_sid: &str) -> Result<String, JournalFault> {
+    if !sddl_allowed(dacl) || !sid_is_safe(console_sid) {
         return Err(JournalFault::Value);
     }
     let mut out = String::new();
     let mut rest = dacl;
-    let mut matches = 0usize;
     while let Some(start) = rest.find('(') {
         out.push_str(&rest[..start]);
         let Some(end) = rest[start..].find(')') else {
             return Err(JournalFault::Value);
         };
         let ace = &rest[start..=start + end];
-        let (rewritten, hit) = rewrite_owner_ace(ace, owner)?;
-        if hit {
-            matches += 1;
-        }
+        let (rewritten, _) = rewrite_owner_ace(ace, console_sid)?;
         out.push_str(&rewritten);
         rest = &rest[start + end + 1..];
     }
     out.push_str(rest);
-    if matches == 0 {
+    let protected = if let Some(rest) = out.strip_prefix("D:") {
+        if rest.starts_with('P') {
+            out
+        } else {
+            format!("D:P{rest}")
+        }
+    } else {
+        return Err(JournalFault::Value);
+    };
+    if !sddl_allowed(&protected) {
         return Err(JournalFault::Value);
     }
-    if !sddl_allowed(&out) {
-        return Err(JournalFault::Value);
-    }
-    Ok(out)
+    Ok(protected)
 }
 
 fn rewrite_owner_ace(ace: &str, owner: &str) -> Result<(String, bool), JournalFault> {
@@ -550,12 +553,11 @@ fn rewrite_owner_ace(ace: &str, owner: &str) -> Result<(String, bool), JournalFa
     if parts.len() != 6 {
         return Err(JournalFault::Value);
     }
-    let owner_ace = parts[0] == "A" && sid_eq(parts[5], owner);
-    let inherited_group = parts[0] == "A"
-        && parts[1].contains("ID")
+    let console_write = parts[0] == "A" && sid_eq(parts[5], owner) && ace_grants_write(parts[2]);
+    let group_write = parts[0] == "A"
         && GROUP_WRITE_SIDS.iter().any(|sid| sid_eq(parts[5], sid))
         && ace_grants_write(parts[2]);
-    if owner_ace || inherited_group {
+    if console_write || group_write {
         Ok((
             format!("(A;{};FR;{};{};{})", parts[1], parts[3], parts[4], parts[5]),
             true,
@@ -1477,11 +1479,23 @@ mod tests {
             "D:(A;OICIID;FA;;;S-1-1-0)(A;ID;0x1301bf;;;S-1-5-32-545)(A;ID;FA;;;S-1-5-11)(A;;FA;;;{owner})"
         );
         let locked = dacl_without_owner_write(&dacl, owner).expect("rewrite");
+        assert!(locked.starts_with("D:P"), "{locked}");
         assert!(locked.contains("(A;OICIID;FR;;;S-1-1-0)"), "{locked}");
         assert!(locked.contains("(A;ID;FR;;;S-1-5-32-545)"), "{locked}");
         assert!(locked.contains("(A;ID;FR;;;S-1-5-11)"), "{locked}");
         assert!(locked.contains(&format!("(A;;FR;;;{owner})")), "{locked}");
         assert!(!locked.contains("FA"), "{locked}");
+    }
+
+    #[test]
+    fn an_inherited_console_user_ace_loses_write_when_system_owns_the_file() {
+        let user = "S-1-5-21-1-2-3-1001";
+        let dacl = format!("D:AI(A;;FA;;;SY)(A;ID;FA;;;{user})");
+        let locked = dacl_without_owner_write(&dacl, user).expect("rewrite");
+        assert!(locked.starts_with("D:P"), "{locked}");
+        assert!(locked.contains("(A;;FA;;;SY)"), "{locked}");
+        assert!(locked.contains(&format!("(A;ID;FR;;;{user})")), "{locked}");
+        assert!(!locked.contains(&format!("FA;;;{user}")), "{locked}");
     }
 
     #[test]

@@ -708,6 +708,41 @@ fn a_file_edit_while_locked_is_not_applied_until_accepted() {
 }
 
 #[test]
+fn a_declined_file_edit_keeps_the_last_good_config() {
+    let mut authority = fresh();
+    authority.install_pin_hash(hash_pin(PIN));
+    let ResponseKind::Config {
+        toml: before,
+        revision: _,
+    } = authority.handle_public(Role::App, RequestKind::GetConfig)
+    else {
+        panic!("config");
+    };
+    let nonce = lock(&mut authority, LockSource::Hotkey);
+    let edited = "[lock]\nhotkey = \"Ctrl+Alt+Shift+K\"\n".to_string();
+    authority.note_config_on_disk(&edited);
+    let ResponseKind::Config { toml, .. } =
+        authority.handle_public(Role::App, RequestKind::GetConfig)
+    else {
+        panic!("config");
+    };
+    assert_eq!(toml, before);
+    authority
+        .accept_host(secret_message(&nonce, PIN))
+        .expect("unlock");
+    assert_eq!(authority.config_offer(), Some(edited.as_str()));
+    authority.decline_config_offer();
+    assert!(authority.config_offer().is_none());
+    let ResponseKind::Config { toml, .. } =
+        authority.handle_public(Role::App, RequestKind::GetConfig)
+    else {
+        panic!("config");
+    };
+    assert_eq!(toml, before);
+    assert!(!toml.contains("Ctrl+Alt+Shift+K"));
+}
+
+#[test]
 fn get_config_and_validate_config_work_for_lock_client() {
     let mut authority = fresh();
     let ResponseKind::Config { toml, revision } =

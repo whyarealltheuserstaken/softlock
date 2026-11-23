@@ -60,6 +60,7 @@
   data-editing={view.editing ? "on" : "off"}
   data-config-offer={view.configOffer ? "pending" : "none"}
   data-config-hotkey={view.configHotkey}
+  data-config-result={view.configResult}
   data-hard-lock={view.hardLockCount}
 >
   {#if platformMessage}
@@ -84,6 +85,15 @@
       }}
     >
       {ui.applyConfig}
+    </button>
+    <button
+      type="button"
+      data-testid="decline-config"
+      onclick={() => {
+        view = bridge.declineConfig();
+      }}
+    >
+      {ui.keepConfig}
     </button>
   {/if}
 

@@ -136,6 +136,8 @@ test("a file edit made while locked waits for the apply prompt", async ({ page }
   await page.evaluate(() =>
     window.__SOFTLOCK_CONFIG_DISK__?.('hotkey = "Ctrl+Alt+Shift+K"\n'),
   );
+  await expect(page.locator("main")).toHaveAttribute("data-config-hotkey", "Ctrl+Alt+Shift+L");
+  await expect(page.locator("main")).toHaveAttribute("data-config-result", "");
   await page.evaluate(() => window.__SOFTLOCK_PUSH_STATE__?.("Unlocked"));
   await expect(page.getByTestId("config-offer")).toHaveText(
     "Apply changes made to the config file?",
@@ -143,10 +145,26 @@ test("a file edit made while locked waits for the apply prompt", async ({ page }
   await expect(page.locator("main")).toHaveAttribute("data-config-offer", "pending");
   await expect(page.locator("main")).toHaveAttribute("data-config-hotkey", "Ctrl+Alt+Shift+L");
   await page.getByTestId("accept-config").click();
+  await expect(page.locator("main")).toHaveAttribute("data-config-result", "Applied");
   await expect(page.locator("main")).toHaveAttribute("data-config-offer", "none");
   await expect(page.locator("main")).toHaveAttribute("data-config-hotkey", "Ctrl+Alt+Shift+K");
   await expect(page.locator("main")).toHaveAttribute("data-editing", "on");
   await expect(page.locator("main")).toHaveAttribute("data-locked", "off");
+});
+
+test("declining a locked file edit keeps the previous hotkey", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => window.__SOFTLOCK_PUSH_STATE__?.("Locked"));
+  await page.evaluate(() =>
+    window.__SOFTLOCK_CONFIG_DISK__?.('hotkey = "Ctrl+Alt+Shift+K"\n'),
+  );
+  await expect(page.locator("main")).toHaveAttribute("data-config-hotkey", "Ctrl+Alt+Shift+L");
+  await page.evaluate(() => window.__SOFTLOCK_PUSH_STATE__?.("Unlocked"));
+  await expect(page.getByTestId("config-offer")).toBeVisible();
+  await page.getByTestId("decline-config").click();
+  await expect(page.locator("main")).toHaveAttribute("data-config-result", "Kept");
+  await expect(page.locator("main")).toHaveAttribute("data-config-offer", "none");
+  await expect(page.locator("main")).toHaveAttribute("data-config-hotkey", "Ctrl+Alt+Shift+L");
 });
 
 async function expectUnsupported(browser: Browser) {

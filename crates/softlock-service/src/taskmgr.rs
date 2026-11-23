@@ -1,7 +1,7 @@
 //! DisableTaskMgr for the console user. Reads keep the registry type.
 //! An allow-listed previous value is the only one that is written back.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -415,7 +415,6 @@ fn win32(status: windows::Win32::Foundation::WIN32_ERROR) -> Result<(), &'static
 }
 
 pub fn owner_config_file() -> Result<PathBuf, &'static str> {
-    use std::path::PathBuf;
     let sid = console_sid()?;
     let raw = profile_path(&sid)?;
     let root = windows_directory()?;

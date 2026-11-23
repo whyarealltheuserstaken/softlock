@@ -36,10 +36,11 @@ pub(crate) fn set_message(message: Option<&str>) {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     slot.clear();
-    if let Some(message) = message {
-        if message.chars().count() <= 200 && !message.chars().any(|c| c.is_control()) {
-            slot.push_str(message);
-        }
+    if let Some(message) = message
+        && message.chars().count() <= 200
+        && !message.chars().any(|c| c.is_control())
+    {
+        slot.push_str(message);
     }
 }
 
