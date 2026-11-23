@@ -526,8 +526,10 @@ fn serve(probe: Option<PathBuf>) -> i32 {
     let mut authority = Authority::new(ServicePlatform::new(mode), dev_pin_allowed());
     // A directory that fails verification is fatal for the PIN store. Locking
     // still runs. No hash is installed, so a planted pin.phc cannot unlock.
-    let loaded = if store.is_err() && pin_directory() == data_dir {
-        "refused".to_string()
+    let loaded = if let Err(error) = &store
+        && pin_directory() == data_dir
+    {
+        pin_load_note(error)
     } else {
         match PinStore::in_dir(&pin_directory()).load() {
             Ok(Some(hash)) => {
@@ -535,7 +537,7 @@ fn serve(probe: Option<PathBuf>) -> i32 {
                 "verified".to_string()
             }
             Ok(None) => "none".to_string(),
-            Err(_) => "refused".to_string(),
+            Err(error) => pin_load_note(&error),
         }
     };
     *PIN_LOADED
@@ -599,6 +601,17 @@ fn serve(probe: Option<PathBuf>) -> i32 {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = None;
     0
+}
+
+fn pin_load_note(error: &std::io::Error) -> String {
+    let mut reason = error.to_string();
+    reason.retain(|c| c.is_ascii_graphic() || c == ' ');
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join("_");
+    let mut note = format!("refused_{reason}");
+    if note.len() > 96 {
+        note.truncate(96);
+    }
+    note
 }
 
 fn remember_pin_status() {

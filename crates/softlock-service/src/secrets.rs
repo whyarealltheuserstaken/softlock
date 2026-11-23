@@ -1157,7 +1157,33 @@ pub(crate) fn dacl_sddl_handle(handle: windows::Win32::Foundation::HANDLE) -> io
 
 #[cfg(windows)]
 fn canonical_dacl(text: &str) -> String {
-    text.trim().replace("S-1-5-18", "SY")
+    let text = text.trim().replace("S-1-5-18", "SY");
+    let Some(body) = text.strip_prefix("D:") else {
+        return text;
+    };
+    let (flags, aces) = match body.split_once('(') {
+        Some((flags, rest)) => (flags, format!("({rest}")),
+        None => (body, String::new()),
+    };
+    // Windows reads a protected DACL back as `D:PAI`. The auto-inherit
+    // markers are not ACEs. `D:P(A;;FA;;;SY)` is still system-only.
+    let flags = if flags.contains('P') {
+        flags.replace("AI", "").replace("AR", "")
+    } else {
+        flags.to_string()
+    };
+    format!("D:{flags}{aces}")
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn a_protected_dacl_reprinted_with_auto_inherit_is_system_only() {
+    assert_eq!(canonical_dacl("D:PAI(A;;FA;;;SY)"), SYSTEM_ONLY_SDDL);
+    assert_eq!(canonical_dacl("D:PAI(A;;FA;;;S-1-5-18)"), SYSTEM_ONLY_SDDL);
+    assert_ne!(
+        canonical_dacl("D:PAI(A;;FA;;;SY)(A;;FA;;;WD)"),
+        SYSTEM_ONLY_SDDL
+    );
 }
 
 #[cfg(windows)]
