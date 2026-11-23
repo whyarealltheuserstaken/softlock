@@ -496,17 +496,19 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     // instead of restoring. Attach the session first; the host is already gone.
     #[cfg(feature = "live-fail-closed")]
     align_console()?;
+    // Sign-in recovery runs as LocalSystem. The console user no longer has
+    // file write, and on some runners cannot set the DACL either.
     let mut first = (1, String::new());
     let mut restored = false;
     for _ in 0..8 {
-        first = repair_settings()?;
+        first = repair_as_system()?;
         if first.0 == 0 {
             restored = true;
             break;
         }
         thread::sleep(Duration::from_millis(500));
     }
-    let second = repair_settings()?;
+    let second = repair_as_system()?;
     if !restored || second.0 != 0 {
         return Err(format!(
             "repair after the kill returned {} ({}) then {} ({})",
@@ -892,6 +894,75 @@ fn capture() {
         })
         .unwrap_or_else(|_| "missing".to_string());
     let _ = fs::write(artifact_dir().join("journal-dir.txt"), text);
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn repair_as_system() -> Result<(i32, String), String> {
+    let script = guard_dir().join("repair.cmd");
+    let code_path = guard_dir().join("repair-code.txt");
+    let log_path = guard_dir().join("repair-out.txt");
+    let _ = fs::remove_file(&code_path);
+    let body = format!(
+        "@echo off\r\n\"{}\" --repair-settings > \"{}\" 2>&1\r\necho %ERRORLEVEL%> \"{}\"\r\n",
+        service_exe().display(),
+        log_path.display(),
+        code_path.display()
+    );
+    fs::write(&script, body).map_err(|_| "repair script".to_string())?;
+    let bin = script.display().to_string();
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-repair", "/F"])
+        .status();
+    let created = Command::new("schtasks")
+        .args([
+            "/Create",
+            "/TN",
+            "sl-repair",
+            "/TR",
+            &bin,
+            "/SC",
+            "ONCE",
+            "/ST",
+            "00:00",
+            "/RU",
+            "SYSTEM",
+            "/RL",
+            "HIGHEST",
+            "/F",
+        ])
+        .status()
+        .map_err(|_| "repair task".to_string())?;
+    if !created.success() {
+        return Err("repair task was not created".to_string());
+    }
+    let started = Command::new("schtasks")
+        .args(["/Run", "/TN", "sl-repair"])
+        .status()
+        .map_err(|_| "repair task".to_string())?;
+    let ready = started.success() && wait_until(Duration::from_secs(20), || code_path.is_file());
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-repair", "/F"])
+        .status();
+    if !ready {
+        return Err("repair task did not finish".to_string());
+    }
+    let code = fs::read_to_string(&code_path).unwrap_or_default();
+    let code = code.trim().parse::<i32>().unwrap_or(1);
+    let mut note = fs::read_to_string(&log_path).unwrap_or_default();
+    note = note
+        .chars()
+        .map(|c| if c.is_control() || c == '"' { ' ' } else { c })
+        .collect();
+    note = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    if note.len() > 160 {
+        note.truncate(160);
+    }
+    Ok((code, note))
+}
+
+#[cfg(not(feature = "live-fail-closed"))]
+fn repair_as_system() -> Result<(i32, String), String> {
+    repair_settings()
 }
 
 fn repair_settings() -> Result<(i32, String), String> {
