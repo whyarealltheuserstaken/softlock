@@ -351,10 +351,8 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
 fn open_for_acl(path: &Path) -> io::Result<HANDLE> {
     match open_config(path, false) {
         Ok(handle) => Ok(handle),
-        // The locked DACL still grants read. SeRestorePrivilege, enabled
-        // while the DACL is written, lets the service put the original
-        // descriptor back without write-DAC on this handle.
-        Err(_) => open_with_access(path, READ_CONTROL | SYNCHRONIZE),
+        // The locked descriptor keeps read and WRITE_DAC, not file write.
+        Err(_) => open_with_access(path, READ_CONTROL | WRITE_DAC | SYNCHRONIZE),
     }
 }
 
