@@ -516,6 +516,10 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
         return Err("repair changed DisableTaskMgr while locked".to_string());
     }
     hard_stop(guard)?;
+    // The disconnect can leave no console session. Repair then fail-closes
+    // instead of restoring. Attach the session first; the host is already gone.
+    #[cfg(feature = "live-fail-closed")]
+    align_console()?;
     let first = repair_settings()?;
     let second = repair_settings()?;
     if first != 0 || second != 0 {
