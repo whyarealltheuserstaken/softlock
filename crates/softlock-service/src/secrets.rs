@@ -77,14 +77,33 @@ impl PinStore {
 
     #[cfg(not(windows))]
     fn write_hash(&self, parent: &Path, hash: &str) -> io::Result<()> {
-        fs::create_dir_all(parent)?;
-        let tmp = self.path.with_extension("tmp");
-        fs::write(&tmp, hash.as_bytes())?;
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&tmp)?.permissions();
-        permissions.set_mode(0o600);
-        fs::set_permissions(&tmp, permissions)?;
-        fs::rename(&tmp, &self.path)
+        ensure_pin_directory(parent)?;
+        let mut last_exists = None;
+        for _ in 0..PIN_TMP_ATTEMPTS {
+            let tmp = parent.join(pin_tmp_name()?);
+            let mut file = match create_pin_temp(&tmp) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    last_exists = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let outcome = (|| {
+                use std::io::Write;
+                file.write_all(hash.as_bytes())?;
+                file.sync_all()?;
+                drop(file);
+                fs::rename(&tmp, &self.path)?;
+                fsync_directory(parent)
+            })();
+            if let Err(error) = outcome {
+                let _ = fs::remove_file(&tmp);
+                return Err(error);
+            }
+            return Ok(());
+        }
+        Err(last_exists.unwrap_or_else(|| io::Error::other("pin temp name collided")))
     }
 
     pub fn load(&self) -> io::Result<Option<String>> {
@@ -101,6 +120,106 @@ impl PinStore {
             }
         }
     }
+}
+
+#[cfg(not(windows))]
+const PIN_TMP_ATTEMPTS: usize = 8;
+
+#[cfg(not(windows))]
+fn ensure_pin_directory(path: &Path) -> io::Result<()> {
+    match pin_directory_ok(path) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut built = PathBuf::new();
+    let parts: Vec<_> = path.components().collect();
+    for (index, component) in parts.iter().enumerate() {
+        built.push(component);
+        if index + 1 != parts.len() && fs::symlink_metadata(&built).is_ok() {
+            continue;
+        }
+        let mut builder = fs::DirBuilder::new();
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+        match builder.create(&built) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    pin_directory_ok(path)
+}
+
+/// `lstat` the pin directory. A symlink is not a directory. Group and other
+/// write, or an owner other than this process, is refused. Nothing is deleted.
+#[cfg(not(windows))]
+fn pin_directory_ok(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_dir() {
+        return Err(io::Error::other("pin directory is not a real directory"));
+    }
+    if meta.uid() != current_euid() {
+        return Err(io::Error::other(
+            "pin directory owner is not the service user",
+        ));
+    }
+    if meta.permissions().mode() & 0o022 != 0 {
+        return Err(io::Error::other(
+            "pin directory is writable by group or other",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn current_euid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(windows))]
+fn create_pin_temp(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn fsync_directory(path: &Path) -> io::Result<()> {
+    let directory = fs::File::open(path)?;
+    directory.sync_all()
+}
+
+#[cfg(not(windows))]
+fn pin_tmp_name() -> io::Result<String> {
+    #[cfg(test)]
+    if let Some(name) = forced_pin_tmp_name() {
+        return Ok(name);
+    }
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut name = String::from(".pin.");
+    for byte in bytes {
+        name.push(char::from(b"0123456789abcdef"[(byte >> 4) as usize]));
+        name.push(char::from(b"0123456789abcdef"[(byte & 0xf) as usize]));
+    }
+    name.push_str(".tmp");
+    Ok(name)
+}
+
+#[cfg(all(test, not(windows)))]
+fn forced_pin_tmp_name() -> Option<String> {
+    PIN_TMP_NAMES.with(|names| names.borrow_mut().pop())
+}
+
+#[cfg(all(test, not(windows)))]
+thread_local! {
+    static PIN_TMP_NAMES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Save, read back, save a second value, read that back.
@@ -1583,3 +1702,146 @@ pub(crate) fn list_directory_names(
 const STATUS_NO_MORE_FILES: i32 = 0x8000_0006_u32 as i32;
 #[cfg(windows)]
 const STATUS_NO_SUCH_FILE: i32 = 0xC000_000F_u32 as i32;
+
+#[cfg(all(test, not(windows)))]
+mod unix_pin_store {
+    use std::fs;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{PIN_TMP_NAMES, PinStore};
+
+    fn scratch() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("softlock-pin-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(&path).expect("scratch");
+        path
+    }
+
+    fn push_names(names: &[&str]) {
+        PIN_TMP_NAMES.with(|slot| {
+            slot.borrow_mut().clear();
+            for name in names.iter().rev() {
+                slot.borrow_mut().push((*name).to_string());
+            }
+        });
+    }
+
+    struct Umask(libc::mode_t);
+    impl Umask {
+        fn set(mode: libc::mode_t) -> Self {
+            Self(unsafe { libc::umask(mode) })
+        }
+    }
+    impl Drop for Umask {
+        fn drop(&mut self) {
+            unsafe { libc::umask(self.0) };
+        }
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path)
+            .expect("lstat")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn a_preplanted_symlink_temp_is_not_followed() {
+        let dir = scratch();
+        let target = dir.join("target");
+        fs::write(&target, b"planted").unwrap();
+        let link = dir.join("planted.tmp");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        push_names(&["planted.tmp"; 8]);
+        let error = PinStore::in_dir(&dir).save("hash-must-not-land");
+        assert!(error.is_err(), "a symlinked temp name was opened");
+        assert_eq!(fs::read(&target).unwrap(), b"planted");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!dir.join("pin.phc").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hash_file_is_created_0600_under_umask_022() {
+        let dir = scratch();
+        let _umask = Umask::set(0o022);
+        PinStore::in_dir(&dir).save("hash").expect("save");
+        assert_eq!(mode_of(&dir.join("pin.phc")), 0o600);
+        assert_eq!(fs::read(dir.join("pin.phc")).unwrap(), b"hash");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_existing_temp_name_is_retried() {
+        let dir = scratch();
+        fs::write(dir.join("taken-a.tmp"), b"a").unwrap();
+        fs::write(dir.join("taken-b.tmp"), b"b").unwrap();
+        push_names(&["taken-a.tmp", "taken-b.tmp", "fresh.tmp"]);
+        PinStore::in_dir(&dir).save("hash").expect("save");
+        assert_eq!(fs::read(dir.join("pin.phc")).unwrap(), b"hash");
+        assert_eq!(fs::read(dir.join("taken-a.tmp")).unwrap(), b"a");
+        assert_eq!(fs::read(dir.join("taken-b.tmp")).unwrap(), b"b");
+        assert!(!dir.join("fresh.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_rename_leaves_no_temp_file() {
+        let dir = scratch();
+        fs::create_dir(dir.join("pin.phc")).unwrap();
+        let error = PinStore::in_dir(&dir).save("hash");
+        assert!(error.is_err(), "renaming onto a directory succeeded");
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".pin.") || name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp left behind: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlinked_pin_directory_is_refused() {
+        let root = scratch();
+        let real = root.join("real");
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(&real).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = PinStore::in_dir(&link).save("hash");
+        assert!(error.is_err(), "a symlinked pin directory was used");
+        assert!(!real.join("pin.phc").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_group_writable_pin_directory_is_refused() {
+        let dir = scratch();
+        let mut permissions = fs::metadata(&dir).unwrap().permissions();
+        permissions.set_mode(0o777);
+        fs::set_permissions(&dir, permissions).unwrap();
+        assert_eq!(mode_of(&dir), 0o777);
+        let error = PinStore::in_dir(&dir).save("hash");
+        assert!(error.is_err(), "mode 0777 was accepted");
+        assert!(!dir.join("pin.phc").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pin_directory_owned_by_someone_else_is_refused() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let error = PinStore::in_dir(Path::new("/")).save("hash");
+        assert!(error.is_err(), "a root-owned directory was accepted");
+        assert!(!Path::new("/pin.phc").exists());
+    }
+}

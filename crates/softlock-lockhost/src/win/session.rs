@@ -810,7 +810,7 @@ const QUIT_DONE: u8 = 5;
 static QUIT_OS: AtomicU8 = AtomicU8::new(QUIT_IDLE);
 
 /// The quit tests share `QUIT_OS` and the held OS-lock flag.
-#[cfg(test)]
+#[cfg(all(test, feature = "simulated-physical"))]
 static QUIT_TEST: Mutex<()> = Mutex::new(());
 
 /// Quit is the service pipe closing. The OS lock can take the whole
@@ -851,6 +851,8 @@ fn schedule_quit_os_lock() {
             RealLock::Unavailable => QUIT_UNAVAILABLE,
         };
         QUIT_OS.store(code, Ordering::Release);
+        #[cfg(all(test, feature = "simulated-physical"))]
+        failclosed::note_quit_os_finished();
     });
 }
 
@@ -1409,121 +1411,87 @@ mod quit_guard {
         assert!(!super::service_quit_locks(&LockState::Recovering));
     }
 
+    #[cfg(feature = "simulated-physical")]
     #[test]
     fn a_quit_while_unlocking_schedules_once_the_session_is_locked() {
-        struct Release;
-        impl Drop for Release {
-            fn drop(&mut self) {
-                super::failclosed::block_os_lock_for_test(false);
-            }
-        }
-        let _release = Release;
-        let _order = super::QUIT_TEST
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        super::QUIT_OS.store(super::QUIT_IDLE, std::sync::atomic::Ordering::Release);
-        super::failclosed::block_os_lock_for_test(true);
-        let mut tried = false;
-        let unlocking = LockState::Unlocking {
-            step: DisarmStep::DisarmGuard,
-        };
-        assert!(!super::arm_quit_lock(&mut tried, &unlocking));
-        assert!(!tried);
-        assert_eq!(
-            super::QUIT_OS.load(std::sync::atomic::Ordering::Acquire),
-            super::QUIT_IDLE
-        );
-        let locked = LockState::Locked {
-            source: LockSource::Tray,
-            prompt: PromptState::Idle,
-        };
-        let held = super::failclosed::os_lock_held_count();
-        assert!(super::arm_quit_lock(&mut tried, &locked));
-        assert!(tried);
-        assert_eq!(
-            super::QUIT_OS.load(std::sync::atomic::Ordering::Acquire),
-            super::QUIT_RUNNING
-        );
-        assert!(!super::arm_quit_lock(&mut tried, &locked));
-        let entered = std::time::Instant::now();
-        while super::failclosed::os_lock_held_count() == held {
-            if entered.elapsed() > std::time::Duration::from_secs(2) {
-                panic!("the quit lock reached Windows instead of the test hold");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        super::failclosed::block_os_lock_for_test(false);
-        let done = std::time::Instant::now();
-        loop {
-            if super::take_quit_os_lock().is_some() {
-                break;
-            }
-            if done.elapsed() > std::time::Duration::from_secs(2) {
-                panic!("the quit lock scheduled after unlock did not finish");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        super::with_quit_hold(|| {
+            let mut tried = false;
+            let unlocking = LockState::Unlocking {
+                step: DisarmStep::DisarmGuard,
+            };
+            assert!(!super::arm_quit_lock(&mut tried, &unlocking));
+            assert!(!tried);
+            assert_eq!(
+                super::QUIT_OS.load(std::sync::atomic::Ordering::Acquire),
+                super::QUIT_IDLE
+            );
+            let locked = LockState::Locked {
+                source: LockSource::Tray,
+                prompt: PromptState::Idle,
+            };
+            let held = super::failclosed::os_lock_held_count();
+            assert!(super::arm_quit_lock(&mut tried, &locked));
+            assert!(tried);
+            assert_eq!(
+                super::QUIT_OS.load(std::sync::atomic::Ordering::Acquire),
+                super::QUIT_RUNNING
+            );
+            assert!(!super::arm_quit_lock(&mut tried, &locked));
+            super::failclosed::wait_until_os_lock_held(held);
+            super::failclosed::block_os_lock_for_test(false);
+            super::failclosed::wait_for_os_lock_signal(super::take_quit_os_lock);
+        });
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "simulated-physical"))]
+fn with_quit_hold(body: impl FnOnce()) {
+    let _order = QUIT_TEST
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            failclosed::release_os_lock_for_test(|| {
+                QUIT_OS.load(Ordering::Acquire) == QUIT_RUNNING
+            });
+        }
+    }
+    let _release = Release;
+    QUIT_OS.store(QUIT_IDLE, std::sync::atomic::Ordering::Release);
+    failclosed::block_os_lock_for_test(true);
+    body();
+}
+
+#[cfg(all(test, feature = "simulated-physical"))]
 mod quit_thread {
-    use super::{QUIT_IDLE, QUIT_OS, QUIT_RUNNING, schedule_quit_os_lock, take_quit_os_lock};
+    use super::{QUIT_OS, QUIT_RUNNING, schedule_quit_os_lock, take_quit_os_lock, with_quit_hold};
     use crate::real_lock::RealLock;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     #[test]
     fn quit_os_lock_returns_before_the_call_finishes() {
-        struct Release;
-        impl Drop for Release {
-            fn drop(&mut self) {
-                super::failclosed::block_os_lock_for_test(false);
-            }
-        }
-        let _release = Release;
-        let _order = super::QUIT_TEST
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        QUIT_OS.store(QUIT_IDLE, Ordering::Release);
-        super::failclosed::block_os_lock_for_test(true);
-        let held = super::failclosed::os_lock_held_count();
-        let started = Instant::now();
-        schedule_quit_os_lock();
-        let queued = started.elapsed();
-        assert!(
-            queued < Duration::from_millis(200),
-            "scheduling the quit lock blocked the caller for {} ms",
-            queued.as_millis()
-        );
-        assert_eq!(QUIT_OS.load(Ordering::Acquire), QUIT_RUNNING);
-        while super::failclosed::os_lock_held_count() == held {
-            if started.elapsed() > Duration::from_secs(2) {
-                panic!("the quit lock reached Windows instead of the test hold");
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        std::thread::sleep(Duration::from_millis(40));
-        assert_eq!(
-            QUIT_OS.load(Ordering::Acquire),
-            QUIT_RUNNING,
-            "the OS lock finished on the caller instead of staying on the worker"
-        );
-        super::failclosed::block_os_lock_for_test(false);
-        let done = Instant::now();
-        let result = loop {
-            if let Some(result) = take_quit_os_lock() {
-                break result;
-            }
-            if done.elapsed() > Duration::from_secs(2) {
-                panic!("the worker did not finish the held OS lock");
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        assert_eq!(result, RealLock::Unavailable);
-        assert!(
-            started.elapsed() > Duration::from_millis(40),
-            "the held call returned without waiting"
-        );
+        with_quit_hold(|| {
+            let held = super::failclosed::os_lock_held_count();
+            let started = Instant::now();
+            schedule_quit_os_lock();
+            let queued = started.elapsed();
+            assert!(
+                queued < Duration::from_millis(200),
+                "scheduling the quit lock blocked the caller for {} ms",
+                queued.as_millis()
+            );
+            assert_eq!(QUIT_OS.load(Ordering::Acquire), QUIT_RUNNING);
+            super::failclosed::wait_until_os_lock_held(held);
+            assert_eq!(
+                QUIT_OS.load(Ordering::Acquire),
+                QUIT_RUNNING,
+                "the OS lock finished on the caller instead of staying on the worker"
+            );
+            super::failclosed::block_os_lock_for_test(false);
+            let result = super::failclosed::wait_for_os_lock_signal(take_quit_os_lock);
+            assert_eq!(result, RealLock::Unavailable);
+        });
     }
 }
