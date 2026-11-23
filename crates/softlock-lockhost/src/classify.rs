@@ -68,17 +68,13 @@ const PRESENT_PHYSICAL_EXTRA: u64 = 0x5048_5953_5049_4E31;
 #[cfg(feature = "live-fail-closed")]
 static PRESENT_INJECTED: AtomicBool = AtomicBool::new(false);
 
-/// The journal service sets `SOFTLOCK_PRESENT_PHYSICAL=1` for the sign-in
-/// case. `SendInput` from the test process does not land in the console
-/// session's hook as a tagged physical key. The host, built with
-/// `live-fail-closed` and started on a hosted runner, then counts injected
-/// keys as physical. A release build does not compile this.
+/// The journal service passes `--present-physical` for the sign-in case.
+/// `SendInput` reaches the console hook with `dwExtraInfo` cleared, so the
+/// tag alone never counts. A release build does not compile this.
 #[cfg(all(feature = "live-fail-closed", windows))]
 pub fn arm_present_physical() {
-    if std::env::var("SOFTLOCK_PRESENT_PHYSICAL").ok().as_deref() == Some("1") {
-        PRESENT_INJECTED.store(true, Ordering::SeqCst);
-        let _ = present_physical_marker();
-    }
+    PRESENT_INJECTED.store(true, Ordering::SeqCst);
+    let _ = present_physical_marker();
 }
 
 #[cfg(feature = "live-fail-closed")]

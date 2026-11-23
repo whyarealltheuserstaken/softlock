@@ -1300,8 +1300,12 @@ fn apply_simulated_environment(shared: &Shared) {
 
 pub fn run_service_host() -> i32 {
     use std::os::windows::io::FromRawHandle;
+    // The service passes this only for the journal sign-in case. Checking
+    // `runner_may_lock` here fails: the host's token cannot read the BIOS
+    // identity, so the PIN stayed injected and `last_physical_input_ms`
+    // stayed null. The flag exists only in a `live-fail-closed` build.
     #[cfg(feature = "live-fail-closed")]
-    if softlock_windows::runner_may_lock().is_ok() {
+    if std::env::args().any(|arg| arg == "--present-physical") {
         crate::classify::arm_present_physical();
     }
 

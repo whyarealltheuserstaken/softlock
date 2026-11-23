@@ -1330,6 +1330,7 @@ mod owner_file_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
     fn an_oversized_config_file_is_not_read() {
         let dir = temp_dir("sl-over");
         let path = dir.join("config.toml");

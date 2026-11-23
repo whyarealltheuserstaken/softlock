@@ -1113,6 +1113,12 @@ fn launch_host(read: HANDLE, write: HANDLE, allow_panic: bool) -> std::io::Resul
         read.0 as usize,
         write.0 as usize
     );
+    #[cfg(feature = "live-fail-closed")]
+    let command = if std::env::var("SOFTLOCK_PRESENT_PHYSICAL").ok().as_deref() == Some("1") {
+        format!("{command} --present-physical")
+    } else {
+        command
+    };
     let mut command_wide = wide(&command);
     let mut desktop = wide(r"winsta0\default");
     let startup = STARTUPINFOW {
