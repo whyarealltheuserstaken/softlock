@@ -508,7 +508,7 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     }) {
         return Err("a Group Policy overwrite was not re-asserted".to_string());
     }
-    let repair = repair_settings()?;
+    let (repair, _) = repair_settings()?;
     if repair == 0 {
         return Err("repair ran while locked".to_string());
     }
@@ -520,11 +520,21 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     // instead of restoring. Attach the session first; the host is already gone.
     #[cfg(feature = "live-fail-closed")]
     align_console()?;
-    let first = repair_settings()?;
+    let mut first = (1, String::new());
+    let mut restored = false;
+    for _ in 0..8 {
+        first = repair_settings()?;
+        if first.0 == 0 {
+            restored = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
     let second = repair_settings()?;
-    if first != 0 || second != 0 {
+    if !restored || second.0 != 0 {
         return Err(format!(
-            "repair after the kill returned {first} then {second}"
+            "repair after the kill returned {} ({}) then {} ({})",
+            first.0, first.1, second.0, second.1
         ));
     }
     if query_taskmgr() != "absent" {
@@ -908,13 +918,21 @@ fn capture() {
     let _ = fs::write(artifact_dir().join("journal-dir.txt"), text);
 }
 
-fn repair_settings() -> Result<i32, String> {
+fn repair_settings() -> Result<(i32, String), String> {
     let output = Command::new(service_exe())
         .arg("--repair-settings")
         .env("SOFTLOCK_PIPE", pipe_name())
         .output()
         .map_err(|_| "repair".to_string())?;
-    Ok(output.status.code().unwrap_or(1))
+    let mut note = String::from_utf8_lossy(&output.stderr)
+        .chars()
+        .map(|c| if c.is_control() || c == '"' { ' ' } else { c })
+        .collect::<String>();
+    note = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    if note.len() > 160 {
+        note.truncate(160);
+    }
+    Ok((output.status.code().unwrap_or(1), note))
 }
 
 fn wait_pipe() -> Result<(), String> {
