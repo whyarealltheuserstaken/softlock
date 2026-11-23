@@ -1231,6 +1231,14 @@ fn network_logon_lockout_count() {
         after.locked_out,
         "the account did not lock at the threshold"
     );
+    println!(
+        "lockout-measure threshold=3 before_bad={} after_bad={} before_locked={} after_locked={} wrong_logons_accepted={}",
+        before.bad_password_count,
+        after.bad_password_count,
+        before.locked_out,
+        after.locked_out,
+        accepted
+    );
 }
 
 #[test]
