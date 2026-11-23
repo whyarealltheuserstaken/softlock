@@ -1117,13 +1117,14 @@ fn on_key(
             shared.pin_chars.store(entry.chars, Ordering::Release);
             overlay::invalidate(shared);
         }
-        crate::key_decode::DecodedKey::Dead => {
-            entry.dead_pending = true;
+        other if password && crate::key_decode::password_key_failed(event.vk, &other) => {
+            if matches!(other, crate::key_decode::DecodedKey::Dead) {
+                entry.dead_pending = true;
+            } else {
+                entry.untranslated = true;
+            }
         }
-        crate::key_decode::DecodedKey::Untranslated if password => {
-            entry.untranslated = true;
-        }
-        crate::key_decode::DecodedKey::Untranslated => {}
+        _ => {}
     }
 }
 

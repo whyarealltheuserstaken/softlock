@@ -27,6 +27,18 @@ pub(crate) fn password_may_submit(untranslated: bool, dead_pending: bool) -> boo
     !untranslated && !dead_pending
 }
 
+/// A key that is supposed to produce a character. Function keys, arrows, and
+/// the wake key do not. `ToUnicodeEx` returns nothing for those, and that
+/// must not throw away a password the owner then submits.
+pub(crate) fn character_key(vk: u16) -> bool {
+    matches!(vk, 0x20 | 0x30..=0x39 | 0x41..=0x5A | 0x60..=0x6F | 0xBA..=0xC0 | 0xDB..=0xDF | 0xE2 | 0xE7)
+}
+
+/// True when this key was a character the layout did not finish.
+pub(crate) fn password_key_failed(vk: u16, decoded: &DecodedKey) -> bool {
+    character_key(vk) && matches!(decoded, DecodedKey::Dead | DecodedKey::Untranslated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,5 +55,8 @@ mod tests {
         assert!(!password_may_submit(true, false));
         assert!(!password_may_submit(false, true));
         assert!(password_may_submit(false, false));
+        assert!(!password_key_failed(0x7C, &DecodedKey::Untranslated));
+        assert!(password_key_failed(b'A' as u16, &DecodedKey::Untranslated));
+        assert!(password_key_failed(b'E' as u16, &DecodedKey::Dead));
     }
 }
