@@ -553,9 +553,12 @@ fn rewrite_owner_ace(ace: &str, owner: &str) -> Result<(String, bool), JournalFa
     if parts.len() != 6 {
         return Err(JournalFault::Value);
     }
-    let console_write = parts[0] == "A" && sid_eq(parts[5], owner) && ace_grants_write(parts[2]);
+    let console_write =
+        parts[0] == "A" && trustee_matches(parts[5], owner) && ace_grants_write(parts[2]);
     let group_write = parts[0] == "A"
-        && GROUP_WRITE_SIDS.iter().any(|sid| sid_eq(parts[5], sid))
+        && GROUP_WRITE_SIDS
+            .iter()
+            .any(|sid| trustee_matches(parts[5], sid))
         && ace_grants_write(parts[2]);
     if console_write || group_write {
         Ok((
@@ -596,6 +599,46 @@ fn ace_grants_write(rights: &str) -> bool {
 
 fn sid_eq(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
+}
+
+/// Windows prints a well-known SID as a two-letter alias. `LA` is the local
+/// administrator, the account whose RID is 500.
+fn trustee_matches(ace_sid: &str, wanted: &str) -> bool {
+    if sid_eq(ace_sid, wanted) {
+        return true;
+    }
+    match (sddl_alias(ace_sid), sddl_alias(wanted)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn sddl_alias(sid: &str) -> Option<&'static str> {
+    if sid.eq_ignore_ascii_case("LA") || local_administrator(sid) {
+        return Some("LA");
+    }
+    if sid.eq_ignore_ascii_case("WD") || sid.eq_ignore_ascii_case("S-1-1-0") {
+        return Some("WD");
+    }
+    if sid.eq_ignore_ascii_case("AU") || sid.eq_ignore_ascii_case("S-1-5-11") {
+        return Some("AU");
+    }
+    if sid.eq_ignore_ascii_case("BU") || sid.eq_ignore_ascii_case("S-1-5-32-545") {
+        return Some("BU");
+    }
+    None
+}
+
+fn local_administrator(sid: &str) -> bool {
+    let Some(rest) = sid.strip_prefix("S-1-5-21-") else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    let domain = parts
+        .by_ref()
+        .take(3)
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    domain && parts.next() == Some("500") && parts.next().is_none()
 }
 
 pub fn sddl_allowed(text: &str) -> bool {
@@ -1496,6 +1539,18 @@ mod tests {
         assert!(locked.contains("(A;;FA;;;SY)"), "{locked}");
         assert!(locked.contains(&format!("(A;ID;FR;;;{user})")), "{locked}");
         assert!(!locked.contains(&format!("FA;;;{user}")), "{locked}");
+    }
+
+    #[test]
+    fn a_local_administrator_alias_loses_write() {
+        let user = "S-1-5-21-1-2-3-500";
+        let dacl = "D:P(A;;FA;;;SY)(A;;FA;;;LA)(A;;FA;;;WD)";
+        let locked = dacl_without_owner_write(dacl, user).expect("rewrite");
+        assert!(locked.starts_with("D:P"), "{locked}");
+        assert!(locked.contains("(A;;FA;;;SY)"), "{locked}");
+        assert!(locked.contains("(A;;FR;;;LA)"), "{locked}");
+        assert!(locked.contains("(A;;FR;;;WD)"), "{locked}");
+        assert!(!locked.contains("FA;;;LA"), "{locked}");
     }
 
     #[test]

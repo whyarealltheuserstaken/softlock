@@ -322,10 +322,15 @@ fn write_state(path: &Path) -> String {
 
 #[cfg(feature = "live-fail-closed")]
 fn explicit_user_dacl(dacl: &str, sid: &str) -> bool {
-    dacl.starts_with("D:P")
-        && dacl
-            .to_ascii_uppercase()
-            .contains(&sid.to_ascii_uppercase())
+    if !dacl.starts_with("D:P") {
+        return false;
+    }
+    let upper = dacl.to_ascii_uppercase();
+    if upper.contains(&sid.to_ascii_uppercase()) {
+        return true;
+    }
+    // The built-in administrator is printed as LA.
+    sid.rsplit('-').next() == Some("500") && upper.contains(";;;LA)")
 }
 
 #[cfg(feature = "live-fail-closed")]

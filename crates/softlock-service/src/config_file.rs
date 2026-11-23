@@ -49,8 +49,6 @@ const FILE_ACCESS: u32 = FILE_READ_DATA
     | WRITE_DAC
     | DELETE
     | SYNCHRONIZE;
-const OWNER_WRITE: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES;
-
 pub fn configured_path() -> Result<PathBuf, &'static str> {
     let path = if let Some(dir) = test_config_dir() {
         dir.join(CONFIG_FILE_NAME)
@@ -370,14 +368,10 @@ fn open_for_owner_write(path: &Path) -> io::Result<HANDLE> {
         }
         directory = next;
     }
-    // Synchronous opens are rejected unless SYNCHRONIZE is requested as well.
-    let file = open_child(
-        directory,
-        &parts[last],
-        OWNER_WRITE | SYNCHRONIZE,
-        false,
-        false,
-    );
+    // The same rights a config open asks for. A narrower mask is denied on
+    // this file even when full access is granted, so the probe would say the
+    // console user cannot write a file they can open.
+    let file = open_child(directory, &parts[last], FILE_ACCESS, false, false);
     drop_handle(directory);
     let file = file?;
     if refuse_reparse(file)? {
