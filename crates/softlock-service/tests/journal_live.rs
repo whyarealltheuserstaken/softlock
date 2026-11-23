@@ -236,30 +236,37 @@ fn align_console() -> Result<(), String> {
         powershell.display(),
         script.display()
     );
-    let _ = Command::new("sc")
-        .args(["delete", "SoftLockAlign"])
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "SoftLockAlign", "/F"])
         .status();
-    thread::sleep(Duration::from_millis(300));
-    let created = Command::new("sc")
+    let created = Command::new("schtasks")
         .args([
-            "create",
+            "/Create",
+            "/TN",
             "SoftLockAlign",
-            "binPath=",
+            "/TR",
             &bin,
-            "start=",
-            "demand",
-            "obj=",
-            "LocalSystem",
+            "/SC",
+            "ONCE",
+            "/ST",
+            "00:00",
+            "/RU",
+            "SYSTEM",
+            "/RL",
+            "HIGHEST",
+            "/F",
         ])
         .status()
-        .map_err(|_| "align service".to_string())?;
+        .map_err(|_| "align task".to_string())?;
     if !created.success() {
-        return Err("align service was not created".to_string());
+        return Err("align task was not created".to_string());
     }
-    let _ = Command::new("sc").args(["start", "SoftLockAlign"]).status();
+    let _ = Command::new("schtasks")
+        .args(["/Run", "/TN", "SoftLockAlign"])
+        .status();
     let aligned = wait_until(Duration::from_secs(20), session_aligned);
-    let _ = Command::new("sc")
-        .args(["delete", "SoftLockAlign"])
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "SoftLockAlign", "/F"])
         .status();
     if aligned {
         Ok(())
@@ -587,6 +594,10 @@ fn spawn_service(_guard: &mut Guard, pause: Option<&str>, pause_file: &Path) -> 
     if !wait_until(Duration::from_secs(20), service_stopped) {
         return Err(format!("service did not stop: {}", service_state()));
     }
+    // A disconnect leaves no console session. Startup then fail-closes a
+    // durable journal instead of restoring it. Attach this session first.
+    #[cfg(feature = "live-fail-closed")]
+    align_console()?;
     match start_service() {
         Ok(()) => Ok(()),
         Err(first) => {
