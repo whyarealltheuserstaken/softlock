@@ -24,8 +24,8 @@ mod state;
 
 pub use backoff::delay_after_failure;
 pub use config::{
-    CONFIG_ERRORS_NAME, CONFIG_FILE_NAME, Config, ConfigOffer, HotkeyChord, MAX_CONFIG_BYTES,
-    UserConfig, hotkey_in_document, parse_hotkey, published_schema_json, schema_accepts_document,
+    CONFIG_ERRORS_NAME, CONFIG_FILE_NAME, Config, HotkeyChord, MAX_CONFIG_BYTES, UserConfig,
+    hotkey_in_document, parse_hotkey, published_schema_json, schema_accepts_document,
 };
 pub use controller::Event;
 pub use controller::{LockController, Rejection};

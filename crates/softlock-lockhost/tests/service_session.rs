@@ -40,6 +40,7 @@ struct Session {
     pipe: String,
     log: PathBuf,
     pin_dir: PathBuf,
+    config_dir: PathBuf,
     extra: u64,
 }
 
@@ -117,6 +118,7 @@ impl Session {
             pipe,
             log,
             pin_dir,
+            config_dir,
             extra,
         };
         session.wait_until(|session| session.hello().is_ok(), Duration::from_secs(15));
@@ -139,6 +141,10 @@ impl Session {
 
     fn status(&self) -> Result<String, String> {
         self.transact(r#"{"v":1,"id":3,"kind":"GetStatus"}"#)
+    }
+
+    fn config(&self) -> Result<String, String> {
+        self.transact(r#"{"v":1,"id":5,"kind":"GetConfig"}"#)
     }
 
     fn set_pin(&self) -> Result<String, String> {
@@ -2444,6 +2450,102 @@ fn create_junction(link: &Path, target: &Path) -> std::io::Result<()> {
     }
     set.map_err(|error| std::io::Error::from_raw_os_error(error.code().0))?;
     Ok(())
+}
+
+#[test]
+fn a_locked_file_edit_is_offered_and_applied_on_accept() {
+    softlock_windows::runner_may_lock().expect("refusing the config edit off a hosted runner");
+    let _guard = gate();
+    let session = Session::start(None, true);
+    arm_owner(&session);
+    let stored = session.set_pin().expect("set pin");
+    assert!(stored.contains("Ok"), "pin was not stored: {stored}");
+    let locked = session.lock().expect("lock");
+    assert!(
+        locked.contains("Accepted"),
+        "lock was not accepted: {locked}"
+    );
+    assert!(softlock_app_lib::refresh_from_service());
+    let path = session.config_dir.join("config.toml");
+    let original = wait_for_file(&path, Duration::from_secs(10)).expect("config file");
+    let edited = original.replace("Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+K");
+    assert_ne!(edited, original, "the default hotkey was not in the file");
+    fs::write(&path, &edited).expect("write");
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            softlock_app_lib::poll_config_once();
+            softlock_app_lib::config_offer()
+        }),
+        "the locked edit did not raise the offer"
+    );
+    let during = session.config().expect("config");
+    assert!(
+        during.contains("Ctrl+Alt+Shift+L") && !during.contains("Ctrl+Alt+Shift+K"),
+        "the new value was in effect while locked: {during}"
+    );
+    type_pin(session.extra);
+    assert!(
+        wait_for(Duration::from_secs(30), || {
+            session
+                .status()
+                .ok()
+                .is_some_and(|status| status.contains("Unlocked"))
+        }),
+        "the pin did not unlock"
+    );
+    assert!(softlock_app_lib::refresh_from_service());
+    assert!(
+        softlock_app_lib::accept_config(),
+        "PutConfig did not return Applied"
+    );
+    let after = session.config().expect("config");
+    assert!(
+        after.contains("Ctrl+Alt+Shift+K"),
+        "the accepted value is not effective: {after}"
+    );
+}
+
+#[test]
+fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
+    softlock_windows::runner_may_lock().expect("refusing the config edit off a hosted runner");
+    let _guard = gate();
+    let session = Session::start(None, true);
+    arm_owner(&session);
+    let locked = session.lock().expect("lock");
+    assert!(
+        locked.contains("Accepted"),
+        "lock was not accepted: {locked}"
+    );
+    assert!(softlock_app_lib::refresh_from_service());
+    let path = session.config_dir.join("config.toml");
+    let original = wait_for_file(&path, Duration::from_secs(10)).expect("config file");
+    let edited = original.replace("Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+K");
+    fs::write(&path, &edited).expect("write");
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            softlock_app_lib::poll_config_once();
+            softlock_app_lib::config_offer()
+        }),
+        "the locked edit did not raise the offer"
+    );
+    softlock_app_lib::decline_config();
+    assert!(!softlock_app_lib::config_offer());
+    let disk = fs::read_to_string(&path).expect("restored file");
+    assert!(
+        disk.contains("Ctrl+Alt+Shift+L") && !disk.contains("Ctrl+Alt+Shift+K"),
+        "decline did not restore the file: {disk}"
+    );
+    let after = session.config().expect("config");
+    assert!(
+        after.contains("Ctrl+Alt+Shift+L") && !after.contains("Ctrl+Alt+Shift+K"),
+        "decline changed the effective config: {after}"
+    );
+}
+
+fn arm_owner(session: &Session) {
+    std::env::set_var("SOFTLOCK_PIPE", session.pipe());
+    std::env::set_var("SOFTLOCK_CONFIG_DIR", &session.config_dir);
+    std::env::set_var("SOFTLOCK_NO_AUTOSTART", "1");
 }
 
 fn wait_for_file(path: &Path, timeout: Duration) -> Option<String> {

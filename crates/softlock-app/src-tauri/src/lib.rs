@@ -3,6 +3,14 @@ mod client;
 #[cfg(windows)]
 mod owner;
 
+#[cfg(all(
+    windows,
+    any(feature = "simulated-physical", feature = "live-fail-closed")
+))]
+pub use owner::{
+    accept_config, config_offer, decline_config, poll_config_once, refresh_from_service,
+};
+
 use tauri::Manager;
 use zeroize::Zeroize;
 

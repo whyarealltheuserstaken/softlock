@@ -528,8 +528,6 @@ jobs:
           grep -F "an_invalid_edit_keeps_the_last_good_config ... ok" target/seam2-service.txt
           grep -F "put_config_returns_locked_while_soft_locked_and_while_windows_is_locked ... ok" target/seam2-service.txt
           grep -F "a_stale_base_revision_returns_conflict ... ok" target/seam2-service.txt
-          grep -F "a_file_edit_while_locked_is_not_applied_until_accepted ... ok" target/seam2-service.txt
-          grep -F "a_declined_file_edit_keeps_the_last_good_config ... ok" target/seam2-service.txt
           grep -F "get_config_and_validate_config_work_for_lock_client ... ok" target/seam2-service.txt
           cargo build --locked -p softlock-service -p softlock-lockhost \
             --features softlock-service/simulated-physical,softlock-lockhost/simulated-physical \
@@ -574,6 +572,8 @@ jobs:
           grep -F "hotkey_unavailable_is_shown_when_registration_fails ... ok" target/seam3-service.txt
           grep -F "changing_the_hotkey_makes_the_new_hotkey_lock ... ok" target/seam3-service.txt
           grep -F "a_closed_subscriber_frees_its_stream_slot ... ok" target/seam3-service.txt
+          grep -F "a_locked_file_edit_is_offered_and_applied_on_accept ... ok" target/seam3-service.txt
+          grep -F "a_declined_file_edit_restores_the_file_and_keeps_the_old_value ... ok" target/seam3-service.txt
       - name: Service race loops
         shell: bash
         run: |

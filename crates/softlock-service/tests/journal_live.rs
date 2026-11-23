@@ -162,23 +162,27 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
         }
         guard.config_dacl = Some(original.clone());
         fs::write(&pause, "go").map_err(|_| "pause".to_string())?;
-        if !wait_until(Duration::from_secs(20), || !owner_can_write(&path)) {
-            return Err(
-                "the console user could still write the service-created file while locked"
-                    .to_string(),
-            );
+        if !wait_until(Duration::from_secs(20), || owner_rights_denied(&path)) {
+            return Err(format!(
+                "the console user kept a write right while locked: {}",
+                owner_rights(&path)
+            ));
         }
         // The locked DACL no longer lets the console user write it. The
         // external change has to come from LocalSystem, which still has full
         // control.
         restore_dacl_as_system(&path, &original)?;
-        if !wait_until(Duration::from_secs(15), || owner_can_write(&path)) {
-            return Err(
-                "the external DACL restore did not grant the console user write".to_string(),
-            );
+        if !wait_until(Duration::from_secs(15), || owner_rights_allowed(&path)) {
+            return Err(format!(
+                "the external DACL restore did not grant the console user write: {}",
+                owner_rights(&path)
+            ));
         }
-        if !wait_until(Duration::from_secs(12), || !owner_can_write(&path)) {
-            return Err("an external DACL change was not re-asserted".to_string());
+        if !wait_until(Duration::from_secs(12), || owner_rights_denied(&path)) {
+            return Err(format!(
+                "an external DACL change was not re-asserted: {}",
+                owner_rights(&path)
+            ));
         }
         hard_stop(guard)?;
         let _ = wait_until(Duration::from_secs(5), || !host_running());
@@ -187,7 +191,7 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
             softlock_service::testing_dacl(&path)
                 .ok()
                 .is_some_and(|current| current == original)
-                && owner_can_write(&path)
+                && owner_rights_allowed(&path)
         });
         hard_stop(guard)?;
         if !restored {
@@ -202,7 +206,7 @@ fn wait_for_config(path: &Path) -> bool {
     let started = Instant::now();
     let mut next_lock = Instant::now();
     while started.elapsed() < Duration::from_secs(40) {
-        if path.is_file() && owner_can_write(path) && journal_ready(&journal_file()) {
+        if path.is_file() && owner_rights_allowed(path) && journal_ready(&journal_file()) {
             return true;
         }
         // A paused lock already saved the journal. Asking again would block
@@ -213,7 +217,7 @@ fn wait_for_config(path: &Path) -> bool {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    path.is_file() && owner_can_write(path) && journal_ready(&journal_file())
+    path.is_file() && owner_rights_allowed(path) && journal_ready(&journal_file())
 }
 
 #[cfg(feature = "live-fail-closed")]
@@ -309,7 +313,7 @@ fn restore_dacl_as_system(path: &Path, sddl: &str) -> Result<(), String> {
         .status()
         .map_err(|_| "dacl task".to_string())?;
     let granted =
-        started.success() && wait_until(Duration::from_secs(15), || owner_can_write(path));
+        started.success() && wait_until(Duration::from_secs(15), || owner_rights_allowed(path));
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "sl-dacl", "/F"])
         .status();
@@ -340,8 +344,39 @@ fn session_aligned() -> bool {
 }
 
 #[cfg(feature = "live-fail-closed")]
-fn owner_can_write(path: &Path) -> bool {
-    matches!(softlock_service::owner_write_denied(path), Ok(false))
+fn owner_rights(path: &Path) -> String {
+    softlock_service::owner_lock_rights()
+        .iter()
+        .map(|right| {
+            let state = match softlock_service::owner_right_denied(path, right.access) {
+                Ok(true) => "denied",
+                Ok(false) => "allowed",
+                Err(error) => return format!("{}={error}", right.name),
+            };
+            format!("{}={state}", right.name)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn owner_rights_denied(path: &Path) -> bool {
+    softlock_service::owner_lock_rights().iter().all(|right| {
+        matches!(
+            softlock_service::owner_right_denied(path, right.access),
+            Ok(true)
+        )
+    })
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn owner_rights_allowed(path: &Path) -> bool {
+    softlock_service::owner_lock_rights().iter().all(|right| {
+        matches!(
+            softlock_service::owner_right_denied(path, right.access),
+            Ok(false)
+        )
+    })
 }
 
 #[cfg(feature = "live-fail-closed")]

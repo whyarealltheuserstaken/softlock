@@ -1482,9 +1482,8 @@ pub(crate) fn open_child(
     open_child_at(directory, name, access, directory_file, create, true)
 }
 
-/// `reparse` asks for `FILE_OPEN_REPARSE_POINT`. Creating a new object passes
-/// false: that flag with a create disposition is rejected, and the caller
-/// checks the new handle is not a reparse point.
+/// `reparse` asks for `FILE_OPEN_REPARSE_POINT`. A create uses `FILE_CREATE`,
+/// which fails when the name is already a junction or a symlink.
 #[cfg(windows)]
 pub(crate) fn open_child_at(
     directory: windows::Win32::Foundation::HANDLE,
@@ -1526,7 +1525,7 @@ pub(crate) fn open_child_at(
     if reparse {
         options |= FILE_OPEN_REPARSE_POINT_OPTION;
     }
-    let disposition = if create { 3 } else { FILE_OPEN };
+    let disposition = if create { FILE_CREATE } else { FILE_OPEN };
     let status = unsafe {
         NtCreateFile(
             &mut raw,

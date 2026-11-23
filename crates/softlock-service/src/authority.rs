@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 use softlock_core::{
-    CONFIG_ERRORS_NAME, ConfigOffer, Event, GuardHealth, HeartbeatReport, HostToService,
-    LaunchNonce, LockController, LockSource, LockState, MethodId, OverlayHealth, RequestKind,
-    ResponseKind, Role, Secret, ServiceToHost, StateName, Verdict, decode_request_frame,
-    hash_softlock_pin, verify_softlock_pin,
+    CONFIG_ERRORS_NAME, Event, GuardHealth, HeartbeatReport, HostToService, LaunchNonce,
+    LockController, LockSource, LockState, MethodId, OverlayHealth, RequestKind, ResponseKind,
+    Role, Secret, ServiceToHost, StateName, Verdict, decode_request_frame, hash_softlock_pin,
+    verify_softlock_pin,
 };
 
 use crate::log::{audit, source_name};
@@ -71,7 +71,6 @@ pub struct Authority {
     /// The hung host is still alive and has to be replaced.
     arm_replace: bool,
     config_dir: Option<PathBuf>,
-    offer: ConfigOffer,
 }
 
 impl Authority {
@@ -88,7 +87,26 @@ impl Authority {
             arm_deadline: None,
             arm_replace: false,
             config_dir: None,
-            offer: ConfigOffer::new(""),
+        }
+    }
+
+    /// Loads a file that already exists when the service starts. A document
+    /// that does not parse leaves the built-in config in place and is reported.
+    pub fn load_existing_config(&mut self, text: &str) {
+        match softlock_core::Config::parse(text) {
+            Ok(_) => {
+                let revision = self.controller.config_revision();
+                let _ = self.handle_public(
+                    Role::App,
+                    RequestKind::PutConfig {
+                        toml: text.to_string(),
+                        base_revision: revision,
+                    },
+                );
+            }
+            Err(errors) => {
+                self.record_config_result(&ResponseKind::Invalid { errors });
+            }
         }
     }
 
@@ -103,42 +121,6 @@ impl Authority {
         } else {
             Some(message.to_string())
         }
-    }
-
-    pub fn note_config_on_disk(&mut self, disk: &str) {
-        if self.offer.pending().is_none() {
-            self.offer = ConfigOffer::new(self.controller.config_toml());
-        }
-        let locked = !matches!(self.controller.state(), LockState::Unlocked)
-            || self.controller.session_os_locked();
-        self.offer.note_disk(locked, disk);
-    }
-
-    pub fn config_offer(&self) -> Option<&str> {
-        self.offer.pending()
-    }
-
-    pub fn accept_config_offer(&mut self) -> ResponseKind {
-        let Some(toml) = self.offer.pending().map(str::to_string) else {
-            return ResponseKind::Conflict;
-        };
-        let revision = self.controller.config_revision();
-        let response = self.handle_public(
-            Role::App,
-            RequestKind::PutConfig {
-                toml,
-                base_revision: revision,
-            },
-        );
-        if matches!(response, ResponseKind::Applied) {
-            self.offer.accept();
-            self.offer.replace_effective(self.controller.config_toml());
-        }
-        response
-    }
-
-    pub fn decline_config_offer(&mut self) {
-        self.offer.decline();
     }
 
     pub fn platform_mut(&mut self) -> &mut ServicePlatform {
@@ -1039,5 +1021,55 @@ mod host_ready_tests {
         );
         assert!(!wait.is_waiting(), "the arm slot stayed waiting");
         assert_eq!(action, HostAction::Respawn { arm: true });
+    }
+}
+
+#[cfg(test)]
+mod startup_config_tests {
+    use super::Authority;
+    use crate::platform::{OsLock, ServicePlatform};
+    use softlock_core::{RequestKind, ResponseKind, Role};
+
+    fn authority_in(dir: &std::path::Path) -> Authority {
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), true);
+        authority.set_config_dir(dir.to_path_buf());
+        authority
+    }
+
+    #[test]
+    fn a_valid_startup_file_becomes_the_effective_config() {
+        let dir = std::env::temp_dir().join(format!("sl-start-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut authority = authority_in(&dir);
+        authority
+            .load_existing_config("schema_version = 1\n[lock]\nhotkey = \"Ctrl+Alt+Shift+K\"\n");
+        let ResponseKind::Config { toml, .. } =
+            authority.handle_public(Role::App, RequestKind::GetConfig)
+        else {
+            panic!("config");
+        };
+        assert!(toml.contains("Ctrl+Alt+Shift+K"), "{toml}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_invalid_startup_file_keeps_the_defaults_and_is_reported() {
+        let dir = std::env::temp_dir().join(format!("sl-start-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut authority = authority_in(&dir);
+        authority.load_existing_config("schema_version = 1\n[lock]\nhotkey = \"nope\"\n");
+        let ResponseKind::Config { toml, .. } =
+            authority.handle_public(Role::App, RequestKind::GetConfig)
+        else {
+            panic!("config");
+        };
+        assert!(toml.contains("Ctrl+Alt+Shift+L"), "{toml}");
+        assert!(!toml.contains("nope"), "{toml}");
+        let errors = std::fs::read_to_string(dir.join(softlock_core::CONFIG_ERRORS_NAME))
+            .expect("errors file");
+        assert!(errors.contains("hotkey"), "{errors}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

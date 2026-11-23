@@ -40,7 +40,7 @@ pub use platform::{ArmWait, OsLock, ServicePlatform};
 pub use secrets::PinStore;
 
 #[cfg(windows)]
-pub use config_file::owner_write_denied;
+pub use config_file::{owner_lock_rights, owner_right_denied, owner_write_denied};
 #[cfg(all(windows, feature = "live-fail-closed"))]
 pub use config_file::{testing_dacl, testing_owner, testing_restore_dacl};
 #[cfg(windows)]

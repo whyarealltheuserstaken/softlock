@@ -10,7 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use softlock_core::{LockSource, RequestKind, ResponseKind, Secret};
+use softlock_core::{LockSource, MAX_CONFIG_BYTES, RequestKind, ResponseKind, Secret};
 use tauri::{AppHandle, Emitter};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Storage::FileSystem::{
@@ -22,7 +22,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
 use windows::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_TERMINATE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey,
+    HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, UnregisterHotKey,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -168,10 +168,16 @@ pub fn lock_from_app() {
 }
 
 pub fn decline_config() {
+    let effective = current_config();
     CONFIG_OFFER.store(false, Ordering::Release);
     *PENDING_CONFIG
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = String::new();
+    if let Some(document) = effective
+        && let Some(path) = profile_config_path()
+    {
+        let _ = write_user_file(&path, &document);
+    }
     if let Ok(view) = view_slot().lock() {
         publish(&view);
     }
@@ -188,14 +194,22 @@ pub fn accept_config() -> bool {
     if pending.is_empty() {
         return false;
     }
+    let previous = current_config();
+    let previous_hotkey = registered_hotkey();
     let Some(revision) = config_revision() else {
         return false;
     };
     match transact(RequestKind::PutConfig {
-        toml: pending,
+        toml: pending.clone(),
         base_revision: revision,
     }) {
         Ok(ResponseKind::Applied) => {
+            if !keep_hotkey_registered(&previous_hotkey, &pending, previous) {
+                if let Ok(view) = view_slot().lock() {
+                    publish(&view);
+                }
+                return false;
+            }
             CONFIG_OFFER.store(false, Ordering::Release);
             *PENDING_CONFIG
                 .lock()
@@ -439,72 +453,192 @@ fn refresh_hotkey() {
         .unwrap_or_else(|poison| poison.into_inner()) = label;
 }
 
+/// After `PutConfig` returns Applied, register the new chord. A failure puts
+/// the previous document back and leaves the old chord registered.
+fn keep_hotkey_registered(
+    previous_hotkey: &actions::Hotkey,
+    applied: &str,
+    previous_document: Option<String>,
+) -> bool {
+    let new_hotkey = actions::hotkey_from_document(applied).unwrap_or_else(actions::default_hotkey);
+    if replace_registered_hotkey(previous_hotkey, &new_hotkey) {
+        return true;
+    }
+    if let Some(document) = previous_document
+        && let Some(revision) = config_revision()
+    {
+        let _ = transact(RequestKind::PutConfig {
+            toml: document,
+            base_revision: revision,
+        });
+    }
+    *CONFIG_ERRORS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) =
+        "the new hotkey could not be registered".to_string();
+    false
+}
+
+fn replace_registered_hotkey(previous: &actions::Hotkey, next: &actions::Hotkey) -> bool {
+    if same_hotkey(previous, next) {
+        return true;
+    }
+    let raw = WINDOW.load(Ordering::Acquire);
+    if raw == 0 {
+        return true;
+    }
+    let hwnd = HWND(raw as *mut core::ffi::c_void);
+    unsafe {
+        let _ = UnregisterHotKey(Some(hwnd), 1);
+    }
+    if register_hotkey(hwnd, next) {
+        HOTKEY_OK.store(true, Ordering::Release);
+        return true;
+    }
+    *CONFIG_ERRORS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) =
+        "the new hotkey could not be registered".to_string();
+    let restored = register_hotkey(hwnd, previous);
+    HOTKEY_OK.store(
+        restored || register_hotkey(hwnd, previous),
+        Ordering::Release,
+    );
+    false
+}
+
+fn register_hotkey(hwnd: HWND, hotkey: &actions::Hotkey) -> bool {
+    unsafe {
+        RegisterHotKey(
+            Some(hwnd),
+            1,
+            hotkey_modifiers(hotkey),
+            u32::from(hotkey.virtual_key),
+        )
+        .is_ok()
+    }
+}
+
+fn hotkey_modifiers(hotkey: &actions::Hotkey) -> HOT_KEY_MODIFIERS {
+    let mut modifiers = HOT_KEY_MODIFIERS(0);
+    if hotkey.control {
+        modifiers |= MOD_CONTROL;
+    }
+    if hotkey.alt {
+        modifiers |= MOD_ALT;
+    }
+    if hotkey.shift {
+        modifiers |= MOD_SHIFT;
+    }
+    modifiers
+}
+
+fn same_hotkey(left: &actions::Hotkey, right: &actions::Hotkey) -> bool {
+    left.control == right.control
+        && left.alt == right.alt
+        && left.shift == right.shift
+        && left.virtual_key == right.virtual_key
+}
+
+#[cfg(any(test, feature = "simulated-physical", feature = "live-fail-closed"))]
+pub fn poll_config_once() {
+    static SEEN: Mutex<String> = Mutex::new(String::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|poison| poison.into_inner());
+    observe_config(&mut seen);
+}
+
+#[cfg(any(test, feature = "simulated-physical", feature = "live-fail-closed"))]
+pub fn refresh_from_service() -> bool {
+    match transact(RequestKind::GetStatus) {
+        Ok(response) => {
+            publish(&client::view_from_status(&response));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn watch_config_file() {
     let mut seen = String::new();
     while !QUIT.load(Ordering::Acquire) {
         thread::sleep(Duration::from_millis(400));
-        let Some(path) = profile_config_path() else {
-            continue;
+        observe_config(&mut seen);
+    }
+}
+
+fn config_watch_ready(view: &OwnerView) -> bool {
+    view.service_running && view.state.is_some()
+}
+
+fn observe_config(seen: &mut String) {
+    if !config_watch_ready(&current_view()) {
+        return;
+    }
+    let Some(path) = profile_config_path() else {
+        return;
+    };
+    let Some(disk) = read_user_file(&path) else {
+        return;
+    };
+    if disk != *seen {
+        *seen = disk.clone();
+        let locked = current_view().locked();
+        let Some(effective) = current_config() else {
+            return;
         };
-        let Some(disk) = read_user_file(&path) else {
-            continue;
-        };
-        if disk != seen {
-            seen = disk.clone();
-            let locked = current_view().locked();
-            let effective = current_config().unwrap_or_default();
-            match actions::config_disk_action(locked, &effective, &disk) {
-                actions::ConfigDisk::Save => {
-                    if let Some(revision) = config_revision() {
-                        match transact(RequestKind::PutConfig {
-                            toml: disk,
-                            base_revision: revision,
-                        }) {
-                            Ok(ResponseKind::Invalid { errors }) => {
-                                *CONFIG_ERRORS
-                                    .lock()
-                                    .unwrap_or_else(|poison| poison.into_inner()) =
-                                    errors.join("\n");
-                                if let Ok(view) = view_slot().lock() {
-                                    publish(&view);
-                                }
+        match actions::config_disk_action(locked, &effective, &disk) {
+            actions::ConfigDisk::Save => {
+                let previous_hotkey = registered_hotkey();
+                if let Some(revision) = config_revision() {
+                    match transact(RequestKind::PutConfig {
+                        toml: disk,
+                        base_revision: revision,
+                    }) {
+                        Ok(ResponseKind::Invalid { errors }) => {
+                            *CONFIG_ERRORS
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner()) = errors.join("\n");
+                            if let Ok(view) = view_slot().lock() {
+                                publish(&view);
                             }
-                            Ok(ResponseKind::Applied) => {
+                        }
+                        Ok(ResponseKind::Applied) => {
+                            if keep_hotkey_registered(&previous_hotkey, seen, Some(effective)) {
                                 *CONFIG_ERRORS
                                     .lock()
                                     .unwrap_or_else(|poison| poison.into_inner()) = String::new();
-                                refresh_hotkey();
-                                if let Ok(view) = view_slot().lock() {
-                                    publish(&view);
-                                }
                             }
-                            _ => {}
+                            refresh_hotkey();
+                            if let Ok(view) = view_slot().lock() {
+                                publish(&view);
+                            }
                         }
+                        _ => {}
                     }
                 }
-                actions::ConfigDisk::Offer => {
-                    CONFIG_OFFER.store(true, Ordering::Release);
-                    *PENDING_CONFIG
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner()) = disk;
-                    if let Ok(view) = view_slot().lock() {
-                        publish(&view);
-                    }
-                }
-                actions::ConfigDisk::Unchanged => {}
             }
-        }
-        let errors_path = path.with_file_name(softlock_core::CONFIG_ERRORS_NAME);
-        if let Some(errors) = read_user_file(&errors_path) {
-            let mut slot = CONFIG_ERRORS
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            if *slot != errors {
-                *slot = errors;
-                drop(slot);
+            actions::ConfigDisk::Offer => {
+                CONFIG_OFFER.store(true, Ordering::Release);
+                *PENDING_CONFIG
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = disk;
                 if let Ok(view) = view_slot().lock() {
                     publish(&view);
                 }
+            }
+            actions::ConfigDisk::Unchanged => {}
+        }
+    }
+    let errors_path = path.with_file_name(softlock_core::CONFIG_ERRORS_NAME);
+    if let Some(errors) = read_user_file(&errors_path) {
+        let mut slot = CONFIG_ERRORS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *slot != errors {
+            *slot = errors;
+            drop(slot);
+            if let Ok(view) = view_slot().lock() {
+                publish(&view);
             }
         }
     }
@@ -549,55 +683,83 @@ fn roaming_config() -> Option<std::path::PathBuf> {
 }
 
 fn read_user_file(path: &std::path::Path) -> Option<String> {
-    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use std::io::Read;
+    let file = open_user_file(path, false)?;
+    let mut limited = file.take(MAX_CONFIG_BYTES as u64 + 1);
+    let mut body = String::new();
+    limited.read_to_string(&mut body).ok()?;
+    if body.len() > MAX_CONFIG_BYTES {
+        return None;
+    }
+    Some(body)
+}
+
+fn write_user_file(path: &std::path::Path, body: &str) -> bool {
+    use std::io::Write;
+    if body.len() > MAX_CONFIG_BYTES {
+        return false;
+    }
+    let mut file = match open_user_file(path, true) {
+        Some(file) => file,
+        None => return false,
+    };
+    if file.write_all(body.as_bytes()).is_err() {
+        return false;
+    }
+    file.set_len(body.len() as u64).is_ok()
+}
+
+fn open_user_file(path: &std::path::Path, write: bool) -> Option<File> {
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_SHARE_READ, GetFileAttributesW, OPEN_EXISTING,
+        CreateFileW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     let text = path.to_string_lossy().replace('/', "\\");
     if text.contains("..") {
         return None;
     }
-    let mut prefix = String::new();
-    for (index, part) in text.split('\\').enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if index == 0 {
-            prefix = format!("{part}\\");
-        } else {
-            if !prefix.ends_with('\\') {
-                prefix.push('\\');
-            }
-            prefix.push_str(part);
-        }
-        let wide = wide(&prefix);
-        let attrs = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
-        if attrs == u32::MAX {
-            return None;
-        }
-        if attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-            return None;
-        }
-    }
     let wide = wide(&text);
+    let access = if write {
+        FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0
+    } else {
+        FILE_GENERIC_READ.0
+    };
     let handle = unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
-            FILE_GENERIC_READ.0,
-            FILE_SHARE_READ,
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
         .ok()?
     };
-    let mut file = unsafe { File::from_raw_handle(handle.0) };
-    let mut body = String::new();
-    use std::io::Read;
-    file.read_to_string(&mut body).ok()?;
-    Some(body)
+    if handle_is_reparse(handle) {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return None;
+    }
+    Some(unsafe { File::from_raw_handle(handle.0) })
+}
+
+fn handle_is_reparse(handle: windows::Win32::Foundation::HANDLE) -> bool {
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo,
+        GetFileInformationByHandleEx,
+    };
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            &mut info as *mut FILE_ATTRIBUTE_TAG_INFO as *mut core::ffi::c_void,
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    ok.is_err() || info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
 }
 
 fn notice_text() -> String {
@@ -736,19 +898,12 @@ fn window_loop() -> i32 {
     WINDOW.store(hwnd.0 as isize, Ordering::Release);
     publish_owner_hwnd(hwnd);
     let hotkey = registered_hotkey();
-    let registered = unsafe {
-        RegisterHotKey(
-            Some(hwnd),
-            1,
-            MOD_CONTROL | MOD_ALT | MOD_SHIFT,
-            u32::from(hotkey.virtual_key),
-        )
-    };
+    let registered = register_hotkey(hwnd, &hotkey);
     let label = current_hotkey_label().unwrap_or_else(|| "Ctrl+Alt+Shift+L".to_string());
     *HOTKEY_LABEL
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = label;
-    HOTKEY_OK.store(registered.is_ok(), Ordering::Release);
+    HOTKEY_OK.store(registered, Ordering::Release);
     add_tray(hwnd);
     publish(&current_view());
     let mut message = MSG::default();
@@ -964,4 +1119,188 @@ fn connect() -> Result<File, String> {
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod owner_file_tests {
+    use super::{
+        CONFIG_ERRORS, CONFIG_OFFER, WINDOW, config_errors, config_offer, config_watch_ready,
+        poll_config_once, publish, read_user_file, register_hotkey, replace_registered_hotkey,
+    };
+    use crate::actions::Hotkey;
+    use crate::client::OwnerView;
+    use softlock_core::{MAX_CONFIG_BYTES, StateName};
+    use std::sync::atomic::Ordering;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, UnregisterHotKey,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, HWND_MESSAGE, RegisterClassW, WNDCLASSW,
+    };
+    use windows::core::PCWSTR;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    #[test]
+    fn an_oversized_config_file_is_not_read() {
+        let dir = temp_dir("sl-over");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, vec![b'a'; MAX_CONFIG_BYTES + 1]).expect("write");
+        assert!(read_user_file(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlinked_config_file_is_not_read() {
+        let dir = temp_dir("sl-owner-link");
+        let target = dir.join("target.toml");
+        std::fs::write(&target, "secret").expect("target");
+        let link = dir.join("config.toml");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                &link.display().to_string(),
+                &target.display().to_string(),
+            ])
+            .status()
+            .expect("mklink");
+        assert!(status.success(), "mklink did not plant the symlink");
+        assert!(read_user_file(&link).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unknown_view_does_not_offer_a_changed_config_file() {
+        let dir = temp_dir("sl-offer");
+        std::env::set_var("SOFTLOCK_CONFIG_DIR", &dir);
+        std::fs::write(
+            dir.join(softlock_core::CONFIG_FILE_NAME),
+            "schema_version = 1\n[lock]\nhotkey = \"Ctrl+Alt+Shift+K\"\n",
+        )
+        .expect("write");
+        publish(&OwnerView::unknown());
+        CONFIG_OFFER.store(false, Ordering::Release);
+        assert!(!config_watch_ready(&OwnerView::unknown()));
+        let live = OwnerView {
+            service_running: true,
+            state: Some(StateName::Unlocked),
+            lock_source: None,
+        };
+        assert!(config_watch_ready(&live));
+        poll_config_once();
+        assert!(!config_offer());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_hotkey_registration_keeps_the_old_hotkey() {
+        let class_name = super::wide(&format!("sl-hk-{}", std::process::id()));
+        let instance = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) }
+            .expect("module");
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(DefWindowProcW),
+            hInstance: instance.into(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+        assert!(unsafe { RegisterClassW(&class) } != 0, "class");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(class_name.as_ptr()),
+                Default::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                Some(instance.into()),
+                None,
+            )
+        }
+        .expect("window");
+        let blocker = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(class_name.as_ptr()),
+                Default::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                Some(instance.into()),
+                None,
+            )
+        }
+        .expect("blocker");
+        WINDOW.store(hwnd.0 as isize, Ordering::Release);
+        let old = Hotkey {
+            control: true,
+            alt: true,
+            shift: true,
+            virtual_key: u16::from(b'8'),
+        };
+        let new = Hotkey {
+            control: true,
+            alt: true,
+            shift: true,
+            virtual_key: u16::from(b'9'),
+        };
+        assert!(
+            register_hotkey(hwnd, &old),
+            "the old hotkey did not register"
+        );
+        assert!(
+            unsafe {
+                RegisterHotKey(
+                    Some(blocker),
+                    2,
+                    MOD_CONTROL | MOD_ALT | MOD_SHIFT,
+                    u32::from(new.virtual_key),
+                )
+            }
+            .is_ok(),
+            "the blocker did not take the new hotkey"
+        );
+        *CONFIG_ERRORS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = String::new();
+        assert!(!replace_registered_hotkey(&old, &new));
+        unsafe {
+            let _ = UnregisterHotKey(Some(blocker), 2);
+        }
+        assert!(
+            unsafe {
+                RegisterHotKey(
+                    Some(blocker),
+                    2,
+                    MOD_CONTROL | MOD_ALT | MOD_SHIFT,
+                    u32::from(old.virtual_key),
+                )
+            }
+            .is_err(),
+            "the old hotkey was no longer registered"
+        );
+        assert!(
+            config_errors().contains("could not be registered"),
+            "{}",
+            config_errors()
+        );
+        unsafe {
+            let _ = UnregisterHotKey(Some(hwnd), 1);
+            let _ = UnregisterHotKey(Some(blocker), 2);
+        }
+        WINDOW.store(0, Ordering::Release);
+    }
 }

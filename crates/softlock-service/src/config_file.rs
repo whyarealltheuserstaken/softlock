@@ -15,8 +15,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use crate::secrets::{
-    dacl_sddl_handle, delete_by_handle, drop_handle, handle_is_reparse, not_found, open_child,
-    open_child_at, open_root, os_error,
+    already_exists_io, dacl_sddl_handle, delete_by_handle, drop_handle, handle_is_reparse,
+    not_found, open_child, open_child_at, open_root, os_error,
 };
 
 const FILE_LIST_DIRECTORY: u32 = 0x0001;
@@ -25,6 +25,7 @@ const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
 const FILE_TRAVERSE: u32 = 0x0020;
 const READ_CONTROL: u32 = 0x0002_0000;
 const WRITE_DAC: u32 = 0x0004_0000;
+const WRITE_OWNER: u32 = 0x0008_0000;
 const DELETE: u32 = 0x0001_0000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const FILE_READ_DATA: u32 = 0x0001;
@@ -149,6 +150,64 @@ pub fn remove_file(path: &Path) -> io::Result<()> {
     let deleted = delete_by_handle(handle);
     drop_handle(handle);
     deleted
+}
+
+pub fn read_config(path: &Path) -> io::Result<String> {
+    let handle = open_config(path, false)?;
+    let text = read_handle(handle);
+    drop_handle(handle);
+    text
+}
+
+/// One of the rights a locked config file must refuse the console user.
+pub struct OwnerRight {
+    pub name: &'static str,
+    pub access: u32,
+}
+
+pub fn owner_lock_rights() -> &'static [OwnerRight] {
+    &[
+        OwnerRight {
+            name: "FILE_WRITE_DATA",
+            access: FILE_WRITE_DATA,
+        },
+        OwnerRight {
+            name: "FILE_APPEND_DATA",
+            access: FILE_APPEND_DATA,
+        },
+        OwnerRight {
+            name: "WRITE_DAC",
+            access: WRITE_DAC,
+        },
+        OwnerRight {
+            name: "WRITE_OWNER",
+            access: WRITE_OWNER,
+        },
+        OwnerRight {
+            name: "DELETE",
+            access: DELETE,
+        },
+        OwnerRight {
+            name: "FILE_WRITE_ATTRIBUTES",
+            access: FILE_WRITE_ATTRIBUTES,
+        },
+    ]
+}
+
+pub fn owner_right_denied(path: &Path, access: u32) -> io::Result<bool> {
+    match open_with_access(path, access | SYNCHRONIZE) {
+        Ok(handle) => {
+            let reparse = handle_is_reparse(handle)?;
+            drop_handle(handle);
+            if reparse {
+                Err(io::Error::other("reparse"))
+            } else {
+                Ok(false)
+            }
+        }
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn owner_write_denied(path: &Path) -> io::Result<bool> {
@@ -305,8 +364,17 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
         let next = match open_child(directory, name, DIR_OPEN, true, false) {
             Ok(handle) => handle,
             Err(error) if not_found(&error) && create => {
-                open_child_at(directory, name, DIR_CREATE, true, true, false)
-                    .map_err(|error| annotate("create", error))?
+                match open_child_at(directory, name, DIR_CREATE, true, true, true) {
+                    Ok(handle) => handle,
+                    Err(error) if already_exists_io(&error) => {
+                        open_child(directory, name, DIR_OPEN, true, false)
+                            .map_err(|error| annotate("open", error))?
+                    }
+                    Err(error) => {
+                        drop_handle(directory);
+                        return Err(annotate("create", error));
+                    }
+                }
             }
             Err(error) if not_found(&error) => {
                 drop_handle(directory);
@@ -328,8 +396,17 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
     let file = match open_child(directory, name, FILE_ACCESS, false, false) {
         Ok(handle) => handle,
         Err(error) if not_found(&error) && create => {
-            open_child_at(directory, name, FILE_ACCESS, false, true, false)
-                .map_err(|error| annotate("create", error))?
+            match open_child_at(directory, name, FILE_ACCESS, false, true, true) {
+                Ok(handle) => handle,
+                Err(error) if already_exists_io(&error) => {
+                    open_child(directory, name, FILE_ACCESS, false, false)
+                        .map_err(|error| annotate("open", error))?
+                }
+                Err(error) => {
+                    drop_handle(directory);
+                    return Err(annotate("create", error));
+                }
+            }
         }
         Err(error) if not_found(&error) => {
             drop_handle(directory);
@@ -351,7 +428,7 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
 fn open_for_acl(path: &Path) -> io::Result<HANDLE> {
     match open_config(path, false) {
         Ok(handle) => Ok(handle),
-        // The locked descriptor keeps read and WRITE_DAC, not file write.
+        // SYSTEM still has full control. The console user's locked ACE is read.
         Err(_) => open_with_access(path, READ_CONTROL | WRITE_DAC | SYNCHRONIZE),
     }
 }
@@ -584,4 +661,51 @@ fn set_security_handle(
         }
     }
     kernel
+}
+
+#[cfg(test)]
+mod create_tests {
+    use std::fs;
+    use std::process::Command;
+
+    use super::open_config;
+    use crate::secrets::drop_handle;
+
+    #[test]
+    fn a_missing_config_file_is_created_with_file_create() {
+        let dir = std::env::temp_dir().join(format!("sl-create-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+        let handle = open_config(&path, true).expect("create");
+        drop_handle(handle);
+        assert!(path.is_file(), "the create did not leave a file");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlink_at_the_config_name_is_not_created_through() {
+        let dir = std::env::temp_dir().join(format!("sl-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let target = dir.join("target.toml");
+        fs::write(&target, "secret").expect("target");
+        let link = dir.join("config.toml");
+        let status = Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                &link.display().to_string(),
+                &target.display().to_string(),
+            ])
+            .status()
+            .expect("mklink");
+        assert!(status.success(), "mklink did not plant the symlink");
+        assert!(
+            open_config(&link, true).is_err(),
+            "create opened the symlink target"
+        );
+        assert_eq!(fs::read_to_string(&target).expect("target"), "secret");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
