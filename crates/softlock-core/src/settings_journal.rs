@@ -157,7 +157,9 @@ pub struct SettingsJournal {
 /// SYSTEM and Administrators only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockIdentity {
-    /// `BootTime` from `SystemTimeOfDayInformation`, in FILETIME units.
+    /// Unbiased interrupt time at lock, in 100 ns units. This counter does
+    /// not move when the wall clock changes. A smaller reading at the next
+    /// start is a new boot. Equality of `BootTime` is not used.
     pub boot: u64,
     /// Console session id at lock time.
     pub session: u32,
@@ -913,7 +915,7 @@ pub fn commit_then_change<E>(
 pub enum SessionFact {
     /// Same boot, and the same logon still holds the recorded session id.
     SameLogon,
-    /// The boot time changed. This is a reboot or a power loss.
+    /// Monotonic uptime went backwards. That is a reboot, not a clock change.
     DifferentBoot,
     /// That session id is not in the current session list.
     SessionGone,
@@ -922,6 +924,25 @@ pub enum SessionFact {
     /// A query failed, or the journal has no identity. That is not proof
     /// the lock ended.
     Unknown,
+}
+
+/// Decide whether uptime proves a new boot.
+///
+/// `saved` and `now` are the same monotonic counter (unbiased interrupt
+/// time). A smaller `now` is a reboot or a power loss. A wall-clock change,
+/// including a large forward or backward jump, does not move this counter,
+/// so it is not a reboot. `now == None` means the uptime query failed. That
+/// is not proof of a new boot either: the session fact stands, and
+/// [`SessionFact::Unknown`] fails closed.
+///
+/// SPEC Decision 5: only `NoActiveLock` reverts. A clock change is not that.
+pub fn fact_after_boot(saved: u64, now: Option<u64>, session: SessionFact) -> SessionFact {
+    if let Some(now) = now
+        && now < saved
+    {
+        return SessionFact::DifferentBoot;
+    }
+    session
 }
 
 /// Startup with a locked journal.
@@ -1438,6 +1459,68 @@ mod tests {
         );
         assert_ne!(previous, SettingValue::Dword { value: 0 });
         assert_ne!(previous, live);
+    }
+
+    #[test]
+    fn a_wall_clock_change_on_the_same_boot_fails_closed() {
+        let doc = task_manager_document(ALICE, SettingValue::Absent, 0).expect("journal");
+        let saved = 86_400_000_000_000u64;
+        // `wall` is the jump a clock change would apply to BootTime. It is
+        // not an input. Unbiased uptime stays put or moves forward.
+        let jumps = [
+            ("forward", 36_000_000_000_i64, saved + 1),
+            ("backward", -36_000_000_000_i64, saved),
+            ("large forward", i64::MAX, saved.saturating_add(1 << 54)),
+            ("large backward", i64::MIN, saved),
+        ];
+        for (label, wall, now) in jumps {
+            let _ = wall;
+            let fact = fact_after_boot(saved, Some(now), SessionFact::SameLogon);
+            assert_eq!(fact, SessionFact::SameLogon, "{label}");
+            assert_eq!(
+                recovery_action(&doc, fact, true, HostPresence::Dead),
+                StartAction::FailClosed,
+                "{label}"
+            );
+        }
+        // The uptime query failed. That is not a reboot. The same logon, and
+        // an unknown session, both stay fail-closed.
+        assert_eq!(
+            fact_after_boot(saved, None, SessionFact::SameLogon),
+            SessionFact::SameLogon
+        );
+        assert_eq!(
+            recovery_action(
+                &doc,
+                fact_after_boot(saved, None, SessionFact::Unknown),
+                false,
+                HostPresence::Dead
+            ),
+            StartAction::FailClosed
+        );
+    }
+
+    #[test]
+    fn a_real_reboot_reverts_to_unlocked() {
+        let doc = task_manager_document(ALICE, SettingValue::Absent, 0).expect("journal");
+        let fact = fact_after_boot(50_000_000_000, Some(10), SessionFact::SameLogon);
+        assert_eq!(fact, SessionFact::DifferentBoot);
+        assert_eq!(
+            recovery_action(&doc, fact, true, HostPresence::Alive),
+            StartAction::Revert
+        );
+        // Uptime that did not go backwards is not a reboot. A missing session
+        // still reverts, through the session fact.
+        let gone = fact_after_boot(
+            50_000_000_000,
+            Some(80_000_000_000),
+            SessionFact::SessionGone,
+        );
+        assert_eq!(gone, SessionFact::SessionGone);
+        assert_eq!(
+            recovery_action(&doc, gone, false, HostPresence::Dead),
+            StartAction::Revert
+        );
     }
 
     #[test]

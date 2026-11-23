@@ -71,6 +71,7 @@ fn live_settings_journal() {
     let outcome = match case.as_str() {
         "restore" => restore(&mut guard),
         "recover-active" => recover_active(&mut guard),
+        "clock" => clock_shift_stays_locked(&mut guard),
         other => Err(format!("unknown case {other}")),
     };
     match outcome {
@@ -572,9 +573,8 @@ fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
             query_taskmgr()
         ));
     }
-    // The owner coming back is a console reconnect in this test. The product
-    // never calls WTSConnectSession. The restored value has to still be the
-    // absent original after that.
+    // The owner coming back attaches the console again. The product never
+    // reconnects a session. The restored value has to still be absent.
     realign()?;
     let still = wait_until(Duration::from_secs(10), || query_taskmgr() == "absent");
     let status = transact(&pipe_name(), status_body()).unwrap_or_default();
@@ -585,10 +585,83 @@ fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
             "settings were not the absent original after the owner returned (state {state})"
         ));
     }
-    if state == "Unlocked" && query_taskmgr() != "absent" {
-        return Err("unlock left DisableTaskMgr set".to_string());
+    Ok(())
+}
+
+fn clock_shift_stays_locked(guard: &mut Guard) -> Result<(), String> {
+    realign()?;
+    set_taskmgr("absent")?;
+    let pause = guard_dir().join("pause-clock");
+    let _ = fs::remove_file(&pause);
+    spawn_service(guard, None, &pause)?;
+    wait_pipe()?;
+    lock_in_background();
+    if !wait_until(Duration::from_secs(20), || query_taskmgr() == "1") {
+        return Err("the clock case did not set DisableTaskMgr".to_string());
+    }
+    let original = powershell("(Get-Date).ToString('o')")?;
+    let _restore = ClockRestore {
+        original: original.clone(),
+    };
+    // A large forward jump. BootTime moves with the wall clock. Unbiased
+    // uptime does not, so the restart must not end Unlocked.
+    powershell("[void](Set-Date -Date (Get-Date).AddDays(3))")?;
+    hard_stop(guard)?;
+    let _ = wait_until(Duration::from_secs(5), || !host_running());
+    spawn_service(guard, None, &pause)?;
+    let mut ended_unlocked = false;
+    let mut last_state = String::new();
+    let held = wait_until(Duration::from_secs(25), || {
+        let status = transact(&pipe_name(), status_body()).unwrap_or_default();
+        let state = status_state(&status).unwrap_or_default();
+        last_state = state.clone();
+        if state == "Unlocked" {
+            ended_unlocked = true;
+            return true;
+        }
+        let os_held = state == "OsLocked" || session_os_held();
+        os_held && query_taskmgr() == "absent"
+    });
+    hard_stop(guard)?;
+    if ended_unlocked {
+        return Err("a clock change ended Unlocked with no OS lock".to_string());
+    }
+    if !held || query_taskmgr() != "absent" {
+        return Err(format!(
+            "a clock change did not keep the lock and restore (state {last_state}, value {})",
+            query_taskmgr()
+        ));
     }
     Ok(())
+}
+
+struct ClockRestore {
+    original: String,
+}
+
+impl Drop for ClockRestore {
+    fn drop(&mut self) {
+        let script = format!(
+            "[void](Set-Date -Date '{}')",
+            self.original.replace('\'', "")
+        );
+        let _ = powershell(&script);
+    }
+}
+
+fn powershell(script: &str) -> Result<String, String> {
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|_| "powershell".to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "powershell failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
@@ -941,12 +1014,10 @@ fn hard_stop(_guard: &mut Guard) -> Result<(), String> {
     // A live host OS-locks the console when its service pipe closes, and the
     // service OS-locks when it sees the host die. Freeze the host first so
     // neither side locks the session during the kill. The next boot of the
-    // same logon fails closed and requests the OS lock. A host that is already
-    // gone has nothing to freeze. A host that is still running and cannot be
-    // suspended fails the test.
-    if host_running() {
-        suspend_host()?;
-    }
+    // same logon fails closed and requests the OS lock. A host that exits
+    // between the snapshot and the open is already stopped. A host that is
+    // still listed and cannot be suspended fails the test.
+    settle_host()?;
     kill_service_process();
     let _ = Command::new("taskkill")
         .args(["/F", "/IM", "softlock-service.exe"])
@@ -963,18 +1034,46 @@ fn hard_stop(_guard: &mut Guard) -> Result<(), String> {
     Ok(())
 }
 
-fn suspend_host() -> Result<(), String> {
-    let pid = host_pid().ok_or_else(|| "lock host pid".to_string())?;
+fn settle_host() -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(pid) = host_pid() {
+            return suspend_pid(pid);
+        }
+        if !host_running() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if let Some(pid) = host_pid() {
+        suspend_pid(pid)
+    } else if host_running() {
+        Err("lock host pid".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn suspend_pid(pid: u32) -> Result<(), String> {
     unsafe {
-        let process = windows::Win32::System::Threading::OpenProcess(
+        let opened = windows::Win32::System::Threading::OpenProcess(
             windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS(0x0800),
             false,
             pid,
-        )
-        .map_err(|_| "open host".to_string())?;
+        );
+        let Ok(process) = opened else {
+            return if host_pid() == Some(pid) {
+                Err("open host".to_string())
+            } else {
+                Ok(())
+            };
+        };
         let status = NtSuspendProcess(process.0);
         let _ = windows::Win32::Foundation::CloseHandle(process);
-        if status == 0 {
+        if status == 0 || host_pid() != Some(pid) {
             Ok(())
         } else {
             Err(format!("suspend host returned {status}"))

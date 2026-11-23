@@ -717,103 +717,166 @@ fn write_user_file(path: &std::path::Path, body: &str) -> bool {
 }
 
 fn open_user_file(path: &std::path::Path, write: bool) -> Option<File> {
-    use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
+    use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
     let text = path.to_string_lossy().replace('/', "\\");
     if text.contains("..") {
         return None;
     }
-    let Some(parent) = path.parent() else {
-        return None;
-    };
-    if !parents_are_plain(parent) {
+    let mut names = text.split('\\').filter(|part| !part.is_empty());
+    let drive = names.next()?;
+    let bytes = drive.as_bytes();
+    if bytes.len() != 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
         return None;
     }
-    let wide = wide(&text);
-    let access = if write {
+    let names: Vec<&str> = names.collect();
+    if names.is_empty() {
+        return None;
+    }
+    let file_access = if write {
         FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0
     } else {
         FILE_GENERIC_READ.0
     };
-    let handle = unsafe {
-        CreateFileW(
-            PCWSTR(wide.as_ptr()),
-            access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
-        )
-        .ok()?
-    };
-    if handle_is_reparse(handle) {
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
+    // Each component is opened from the parent handle, with the reparse
+    // option, so a junction swapped in between checks is not followed.
+    let mut current = open_relative(None, &format!(r"\??\{drive}\"), DIR_OPEN, true)?;
+    if handle_is_reparse(current) {
+        close_user_handle(current);
         return None;
     }
-    Some(unsafe { File::from_raw_handle(handle.0) })
-}
-
-/// Every parent is opened with `FILE_FLAG_OPEN_REPARSE_POINT`. A junction
-/// or mount point on the way to the file is refused, not followed.
-fn parents_are_plain(path: &std::path::Path) -> bool {
-    use std::path::{Component, PathBuf};
-    let mut current = PathBuf::new();
-    let mut saw_root = false;
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) => {
-                current.push(component);
+    for (index, name) in names.iter().enumerate() {
+        let last = index + 1 == names.len();
+        let access = if last { file_access } else { DIR_OPEN };
+        let child = match open_relative(Some(current), name, access, !last) {
+            Some(child) => child,
+            None => {
+                close_user_handle(current);
+                return None;
             }
-            Component::RootDir => {
-                current.push(component);
-                saw_root = true;
-                if !directory_is_plain(&current) {
-                    return false;
-                }
-            }
-            Component::Normal(_) | Component::CurDir | Component::ParentDir => {
-                current.push(component);
-                if saw_root && !directory_is_plain(&current) {
-                    return false;
-                }
-            }
+        };
+        close_user_handle(current);
+        if handle_is_reparse(child) {
+            close_user_handle(child);
+            return None;
         }
+        if last {
+            return Some(unsafe { File::from_raw_handle(child.0) });
+        }
+        current = child;
     }
-    saw_root
+    close_user_handle(current);
+    None
 }
 
-fn directory_is_plain(path: &std::path::Path) -> bool {
-    use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-    let text = path.to_string_lossy().replace('/', "\\");
-    let wide = wide(&text);
-    let handle = unsafe {
-        CreateFileW(
-            PCWSTR(wide.as_ptr()),
-            FILE_READ_ATTRIBUTES.0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
-        )
-        .ok()
-    };
-    let Some(handle) = handle else {
-        return false;
-    };
-    let reparse = handle_is_reparse(handle);
+const DIR_OPEN: u32 = 0x0001 | 0x0020 | 0x0080 | 0x0010_0000;
+
+fn close_user_handle(handle: windows::Win32::Foundation::HANDLE) {
     unsafe {
         let _ = CloseHandle(handle);
     }
-    !reparse
+}
+
+fn open_relative(
+    parent: Option<windows::Win32::Foundation::HANDLE>,
+    name: &str,
+    access: u32,
+    directory: bool,
+) -> Option<windows::Win32::Foundation::HANDLE> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    if name.is_empty() || name.contains('\\') || name.contains('/') || name.contains("..") {
+        return None;
+    }
+    let mut wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut unicode = UserUnicodeString {
+        length: ((wide.len() - 1) * 2) as u16,
+        maximum_length: (wide.len() * 2) as u16,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attributes = UserObjectAttributes {
+        length: std::mem::size_of::<UserObjectAttributes>() as u32,
+        root_directory: parent
+            .map(|handle| handle.0)
+            .unwrap_or(std::ptr::null_mut()),
+        object_name: &mut unicode,
+        attributes: 0x0000_0040,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut iosb = UserIoStatus {
+        status: 0,
+        information: 0,
+    };
+    let mut raw = std::ptr::null_mut();
+    let mut options = if directory {
+        0x0000_0001 | 0x0000_0020
+    } else {
+        0x0000_0040 | 0x0000_0020
+    };
+    options |= 0x0020_0000;
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw,
+            access,
+            &mut attributes,
+            &mut iosb,
+            std::ptr::null_mut(),
+            FILE_ATTRIBUTE_NORMAL.0,
+            0x0000_0007,
+            1,
+            options,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status < 0 || raw.is_null() {
+        None
+    } else {
+        Some(HANDLE(raw))
+    }
+}
+
+#[repr(C)]
+struct UserUnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[repr(C)]
+struct UserObjectAttributes {
+    length: u32,
+    root_directory: *mut core::ffi::c_void,
+    object_name: *mut UserUnicodeString,
+    attributes: u32,
+    security_descriptor: *mut core::ffi::c_void,
+    security_quality_of_service: *mut core::ffi::c_void,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<UserObjectAttributes>() == 48);
+
+#[repr(C)]
+struct UserIoStatus {
+    status: isize,
+    information: usize,
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtCreateFile(
+        file_handle: *mut *mut core::ffi::c_void,
+        desired_access: u32,
+        object_attributes: *mut UserObjectAttributes,
+        io_status_block: *mut UserIoStatus,
+        allocation_size: *mut i64,
+        file_attributes: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        ea_buffer: *mut core::ffi::c_void,
+        ea_length: u32,
+    ) -> i32;
 }
 
 fn handle_is_reparse(handle: windows::Win32::Foundation::HANDLE) -> bool {
