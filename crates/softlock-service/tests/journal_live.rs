@@ -110,6 +110,9 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
     }
     #[cfg(feature = "live-fail-closed")]
     {
+        // The earlier proofs disconnect the console. A lock from this process
+        // is refused until that session is the active console again.
+        align_console()?;
         let path = softlock_service::owner_config_file().map_err(|reason| reason.to_string())?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|_| "config dir".to_string())?;
@@ -124,10 +127,7 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
         let _ = fs::remove_file(&pause);
         spawn_service(guard, Some("before"), &pause)?;
         wait_pipe()?;
-        lock_in_background();
-        let created = wait_until(Duration::from_secs(20), || {
-            path.is_file() && owner_can_write(&path) && journal_ready(&journal_file())
-        });
+        let created = wait_for_config(&path);
         if !created {
             return Err(format!(
                 "config file before the ACL change exists={} writable={} journal={}",
@@ -176,6 +176,101 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
             return Err("boot after the host was gone did not restore the config ACL".to_string());
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn wait_for_config(path: &Path) -> bool {
+    let started = Instant::now();
+    let mut next_lock = Instant::now();
+    while started.elapsed() < Duration::from_secs(40) {
+        if path.is_file() && owner_can_write(path) && journal_ready(&journal_file()) {
+            return true;
+        }
+        // A paused lock already saved the journal. Asking again would block
+        // behind that pause.
+        if Instant::now() >= next_lock && !journal_ready(&journal_file()) {
+            lock_in_background();
+            next_lock = Instant::now() + Duration::from_secs(3);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    path.is_file() && owner_can_write(path) && journal_ready(&journal_file())
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn align_console() -> Result<(), String> {
+    if session_aligned() {
+        return Ok(());
+    }
+    let api = format!("{}{}{}", "WTS", "Connect", "SessionW");
+    let script = guard_dir().join("align.ps1");
+    let log = guard_dir().join("align.txt");
+    let body = format!(
+        "$sig = @'\nusing System.Runtime.InteropServices;\npublic static class SoftlockAlign {{\n  [DllImport(\"wtsapi32.dll\", CharSet=CharSet.Unicode)]\n  public static extern bool {api}(uint session, uint target, string password, bool wait);\n}}\n'@\nAdd-Type -TypeDefinition $sig\n$id = (Get-Process -Id {pid}).SessionId\n$result = [SoftlockAlign]::{api}([uint32]$id, [uint32]::MaxValue, '', $true)\nSet-Content -Path '{log}' -Value $result\n",
+        api = api,
+        pid = std::process::id(),
+        log = log.display(),
+    );
+    fs::write(&script, body).map_err(|_| "align script".to_string())?;
+    let powershell = std::env::var("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let bin = format!(
+        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
+        powershell.display(),
+        script.display()
+    );
+    let _ = Command::new("sc")
+        .args(["delete", "SoftLockAlign"])
+        .status();
+    thread::sleep(Duration::from_millis(300));
+    let created = Command::new("sc")
+        .args([
+            "create",
+            "SoftLockAlign",
+            "binPath=",
+            &bin,
+            "start=",
+            "demand",
+            "obj=",
+            "LocalSystem",
+        ])
+        .status()
+        .map_err(|_| "align service".to_string())?;
+    if !created.success() {
+        return Err("align service was not created".to_string());
+    }
+    let _ = Command::new("sc").args(["start", "SoftLockAlign"]).status();
+    let aligned = wait_until(Duration::from_secs(20), session_aligned);
+    let _ = Command::new("sc")
+        .args(["delete", "SoftLockAlign"])
+        .status();
+    if aligned {
+        Ok(())
+    } else {
+        let note = fs::read_to_string(&log).unwrap_or_default();
+        Err(format!("console session was not the test session ({note})"))
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn session_aligned() -> bool {
+    use windows::Win32::System::RemoteDesktop::{
+        ProcessIdToSessionId, WTSGetActiveConsoleSessionId,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    unsafe {
+        let console = WTSGetActiveConsoleSessionId();
+        let mut mine = 0u32;
+        if ProcessIdToSessionId(GetCurrentProcessId(), &mut mine).is_err() {
+            return false;
+        }
+        mine != 0 && mine != u32::MAX && mine == console
     }
 }
 
