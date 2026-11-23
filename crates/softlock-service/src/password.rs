@@ -24,9 +24,11 @@ use windows::Win32::NetworkManagement::NetManagement::{
     NetApiBufferFree, NetUserGetInfo, USER_INFO_3,
 };
 use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
+#[cfg(feature = "simulated-physical")]
+use windows::Win32::Security::LookupAccountNameW;
 use windows::Win32::Security::{
     GetTokenInformation, LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, LogonUserW,
-    LookupAccountNameW, LookupAccountSidW, PSID, SID_NAME_USE, TOKEN_USER, TokenUser,
+    LookupAccountSidW, PSID, SID_NAME_USE, TOKEN_USER, TokenUser,
 };
 use windows::core::{PCWSTR, PWSTR};
 use zeroize::Zeroize;

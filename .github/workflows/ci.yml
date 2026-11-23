@@ -688,7 +688,17 @@ jobs:
           grep -F "another_accounts_password_does_not_unlock ... ok" target/seam3-service.txt
           grep -F "tab_switches_from_pin_to_password ... ok" target/seam3-service.txt
           grep -F "backoff_survives_a_service_restart ... ok" target/seam3-service.txt
-          grep -F "network_logon_lockout_count ... ok" target/seam3-service.txt
+          grep -F "lockout-measure threshold=3" target/seam3-service.txt
+          awk '{ gsub(/\r/, "") }
+               /^test network_logon_lockout_count \.\.\./ {
+                 found = 1
+                 if ($0 ~ / ok$/) { exit 0 }
+                 pending = 1
+                 next
+               }
+               pending && /^test / { exit 1 }
+               pending && /^ok$/ { pending = 0; exit 0 }
+               END { exit (found && !pending ? 0 : 1) }' target/seam3-service.txt
           grep -F "panic_while_os_lock_is_down_is_closed_by_the_service ... ok" target/seam3-service.txt
           grep -F "emergency_after_both_os_locks_fail_is_closed_by_the_service ... ok" target/seam3-service.txt
           grep -F "installed_service_runs_as_local_system_and_rejects_session_zero ... ok" target/seam3-service.txt
