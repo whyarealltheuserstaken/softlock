@@ -300,9 +300,13 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
         }
         let next = match open_child(directory, name, DIR_OPEN, true, false) {
             Ok(handle) => handle,
-            Err(error) if create && not_found(&error) => {
+            Err(error) if not_found(&error) && create => {
                 open_child_at(directory, name, DIR_CREATE, true, true, false)
                     .map_err(|error| annotate("create", error))?
+            }
+            Err(error) if not_found(&error) => {
+                drop_handle(directory);
+                return Err(error);
             }
             Err(error) => {
                 drop_handle(directory);
@@ -319,9 +323,13 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
     let name = &parts[last];
     let file = match open_child(directory, name, FILE_ACCESS, false, false) {
         Ok(handle) => handle,
-        Err(error) if create && not_found(&error) => {
+        Err(error) if not_found(&error) && create => {
             open_child_at(directory, name, FILE_ACCESS, false, true, false)
                 .map_err(|error| annotate("create", error))?
+        }
+        Err(error) if not_found(&error) => {
+            drop_handle(directory);
+            return Err(error);
         }
         Err(error) => {
             drop_handle(directory);
