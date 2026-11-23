@@ -454,7 +454,14 @@ unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         note_physical(shared);
         let down = !info.flags.contains(LLKHF_UP)
             && (wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize);
+        if vk == 0x10 || vk == 0xA0 || vk == 0xA1 {
+            shared
+                .shift_down
+                .store(down, std::sync::atomic::Ordering::Release);
+            return LRESULT(1);
+        }
         if down {
+            let mods = u8::from(shared.shift_down.load(std::sync::atomic::Ordering::Acquire));
             shared
                 .wake
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -462,6 +469,7 @@ unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 kind: KIND_KEY,
                 vk,
                 scan: info.scanCode as u16,
+                mods,
             });
         }
         LRESULT(1)
@@ -526,6 +534,7 @@ unsafe fn mouse_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 kind: KIND_CLICK,
                 vk: 0,
                 scan: 0,
+                mods: 0,
             });
         } else if message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL {
             shared
@@ -535,6 +544,7 @@ unsafe fn mouse_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 kind: KIND_WHEEL,
                 vk: 0,
                 scan: 0,
+                mods: 0,
             });
         }
         LRESULT(1)

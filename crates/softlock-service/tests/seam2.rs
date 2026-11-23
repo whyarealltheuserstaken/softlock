@@ -737,6 +737,34 @@ fn an_absent_value_is_deleted_after_a_restart_mid_lock() {
     );
 }
 
+#[cfg(not(windows))]
+#[test]
+fn password_attempt_stays_locked_and_is_not_logged() {
+    let capture = Capture::new();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let mut authority = authority();
+        let nonce = lock(&mut authority, LockSource::LocalApi);
+        let password = "p@ss-seam2-9f3c";
+        let frame =
+            host_secret_frame(4, "os_password", &Secret::new(password), &nonce).expect("frame");
+        let message = softlock_core::decode_host_frame(&frame).expect("decode");
+        let reply = authority.accept_host(message).expect("reply");
+        assert!(matches!(
+            reply,
+            Some(softlock_core::ServiceToHost::PromptResult {
+                accepted: false,
+                ..
+            })
+        ));
+        assert!(
+            !matches!(authority.state(), LockState::Unlocked),
+            "a password checked outside Windows unlocked"
+        );
+        let log = capture.text();
+        assert!(!log.contains(password), "password reached the log: {log}");
+    });
+}
+
 fn hash_pin(pin: &str) -> String {
     softlock_core::hash_softlock_pin(&Secret::new(pin)).expect("hash")
 }

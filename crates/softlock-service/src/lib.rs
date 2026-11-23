@@ -12,6 +12,9 @@ mod journal_store;
 #[cfg(feature = "live-fail-closed")]
 mod live_marker;
 mod log;
+#[cfg(windows)]
+mod password;
+mod password_shape;
 #[cfg(feature = "simulated-physical")]
 mod pincheck;
 mod platform;
@@ -34,6 +37,7 @@ pub use authority::{
 #[cfg(feature = "live-fail-closed")]
 pub use live_marker::marker_bytes as live_fail_closed_marker_bytes;
 pub use log::{Capture, FileLog, allowed_field, audit};
+pub use password_shape::{PASSWORD_MAX_BYTES, PASSWORD_MAX_CHARS, password_accepted_shape};
 #[cfg(feature = "simulated-physical")]
 pub use pincheck::PinChecker;
 #[cfg(feature = "simulated-physical")]
@@ -58,6 +62,8 @@ pub use settings::{
     clear_disable_lock_workstation_for_os_lock, reapply_disable_lock_workstation, repair_main,
 };
 
+#[cfg(windows)]
+pub use password::{AccountLockout, account_lockout, network_logon};
 #[cfg(windows)]
 pub use windows::{
     run_foreground, run_service, run_session_probe, server_image_is_agent, server_is_system_agent,

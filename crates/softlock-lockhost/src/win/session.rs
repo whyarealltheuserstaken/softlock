@@ -32,6 +32,9 @@ pub const OVERLAY_MARKER: (u8, u8, u8) = (1, 255, 2);
 pub(crate) static SESSION: AtomicPtr<Shared> = AtomicPtr::new(std::ptr::null_mut());
 
 const PIN_CHAR_LIMIT: u32 = 128;
+const PASSWORD_CHAR_LIMIT: u32 = 127;
+const METHOD_PIN: u8 = 0;
+const METHOD_PASSWORD: u8 = 1;
 
 pub struct DevConfig {
     /// Decides a PIN. The host does not hash it and does not draw the nonce.
@@ -45,6 +48,8 @@ pub(crate) enum PipeCommand {
     Disarm,
     OsLock,
     Quit,
+    Methods { pin: bool, password: bool },
+    Backoff { ms: u64 },
 }
 
 pub(crate) enum PipeReport {
@@ -56,7 +61,10 @@ pub(crate) enum PipeReport {
         guard: GuardHealth,
         overlay: OverlayHealth,
     },
-    Secret(Secret),
+    Secret {
+        method: u8,
+        secret: Secret,
+    },
     GuardDown,
 }
 
@@ -323,6 +331,11 @@ pub(crate) struct Shared {
     pub wake: AtomicU64,
     pub prompt_open: AtomicBool,
     pub pin_chars: AtomicU32,
+    pub prompt_method: AtomicU8,
+    pub offer_pin: AtomicBool,
+    pub offer_password: AtomicBool,
+    pub shift_down: AtomicBool,
+    pub backoff_until: AtomicU64,
     pub locked: AtomicBool,
     pub stop: AtomicBool,
     pub fail: AtomicBool,
@@ -390,6 +403,11 @@ impl Shared {
             wake: AtomicU64::new(0),
             prompt_open: AtomicBool::new(false),
             pin_chars: AtomicU32::new(0),
+            prompt_method: AtomicU8::new(METHOD_PIN),
+            offer_pin: AtomicBool::new(true),
+            offer_password: AtomicBool::new(true),
+            shift_down: AtomicBool::new(false),
+            backoff_until: AtomicU64::new(0),
             locked: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             fail: AtomicBool::new(false),
@@ -549,6 +567,8 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             Some(PipeCommand::Quit) => service_gone = true,
             Some(PipeCommand::Arm { message }) => overlay::set_message(message.as_deref()),
+            Some(PipeCommand::Methods { pin, password }) => apply_methods(&shared, pin, password),
+            Some(PipeCommand::Backoff { ms }) => set_backoff(&shared, ms),
             None => {}
         }
         if service_gone {
@@ -1017,7 +1037,7 @@ fn open_prompt(
     }
     entry.layout = owner_layout();
     controller.handle(Event::PromptOpened {
-        method: MethodId::softlock_pin(),
+        method: current_method(shared),
     });
     overlay::invalidate(shared);
 }
@@ -1033,7 +1053,15 @@ fn on_key(
         return;
     }
     const VK_BACK: u16 = 0x08;
+    const VK_TAB: u16 = 0x09;
     const VK_RETURN: u16 = 0x0D;
+    if in_backoff(shared) {
+        return;
+    }
+    if event.vk == VK_TAB {
+        switch_method(shared, entry);
+        return;
+    }
     if event.vk == VK_RETURN {
         submit(controller, shared, entry);
         return;
@@ -1044,10 +1072,16 @@ fn on_key(
         overlay::invalidate(shared);
         return;
     }
-    if entry.chars >= PIN_CHAR_LIMIT {
+    let limit = if shared.prompt_method.load(Ordering::Acquire) == METHOD_PASSWORD {
+        PASSWORD_CHAR_LIMIT
+    } else {
+        PIN_CHAR_LIMIT
+    };
+    if entry.chars >= limit {
         return;
     }
-    if let Some(mut encoded) = translate(entry.layout, event) {
+    let honor_shift = shared.prompt_method.load(Ordering::Acquire) == METHOD_PASSWORD;
+    if let Some(mut encoded) = translate(entry.layout, event, honor_shift) {
         entry.bytes.extend_from_slice(&encoded);
         encoded.zeroize();
         entry.chars = entry.chars.saturating_add(1);
@@ -1071,8 +1105,22 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
         shared.pin_chars.store(0, Ordering::Release);
         overlay::invalidate(shared);
     };
+    let method = current_method(shared);
     if shared.pipe_mode.load(Ordering::Acquire) {
-        publish(shared, PipeReport::Secret(secret));
+        publish(
+            shared,
+            PipeReport::Secret {
+                method: shared.prompt_method.load(Ordering::Acquire),
+                secret,
+            },
+        );
+        finish(shared);
+        return;
+    }
+    // The host never checks an account password. The Service is the only
+    // process that may call the logon API, and this path has no pipe to it.
+    if method.as_str() == MethodId::os_password().as_str() {
+        controller.handle(Event::SubmitSecret { method, secret });
         finish(shared);
         return;
     }
@@ -1161,6 +1209,7 @@ fn pop_char(entry: &mut PinEntry) {
 fn translate(
     layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
     event: RawEvent,
+    honor_shift: bool,
 ) -> Option<Vec<u8>> {
     let mut state = [0u8; 256];
     unsafe {
@@ -1168,8 +1217,13 @@ fn translate(
     }
     // Ambient Shift or Alt would turn a digit into a symbol. The forwarded
     // key is the one the hook stored, without whatever else is latched.
+    // Password entry is the exception: Shift captured with that key is set.
     for modifier in [0x10usize, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5] {
         state[modifier] = 0;
+    }
+    if honor_shift && event.mods & 1 != 0 {
+        state[0x10] = 0x80;
+        state[0xA0] = 0x80;
     }
     let index = event.vk as usize;
     if index < state.len() {
@@ -1258,6 +1312,64 @@ fn note_test_pin(len: usize) {
     );
 }
 
+fn current_method(shared: &Shared) -> MethodId {
+    if shared.prompt_method.load(Ordering::Acquire) == METHOD_PASSWORD {
+        MethodId::os_password()
+    } else {
+        MethodId::softlock_pin()
+    }
+}
+
+fn apply_methods(shared: &Shared, pin: bool, password: bool) {
+    shared.offer_pin.store(pin, Ordering::Release);
+    shared.offer_password.store(password, Ordering::Release);
+    if password && !pin {
+        shared
+            .prompt_method
+            .store(METHOD_PASSWORD, Ordering::Release);
+    } else if pin {
+        shared.prompt_method.store(METHOD_PIN, Ordering::Release);
+    }
+}
+
+fn switch_method(shared: &Shared, entry: &mut PinEntry) {
+    let pin = shared.offer_pin.load(Ordering::Acquire);
+    let password = shared.offer_password.load(Ordering::Acquire);
+    if !(pin && password) {
+        return;
+    }
+    let next = if shared.prompt_method.load(Ordering::Acquire) == METHOD_PASSWORD {
+        METHOD_PIN
+    } else {
+        METHOD_PASSWORD
+    };
+    entry.bytes.zeroize();
+    entry.chars = 0;
+    shared.prompt_method.store(next, Ordering::Release);
+    shared.pin_chars.store(0, Ordering::Release);
+    overlay::invalidate(shared);
+}
+
+fn in_backoff(shared: &Shared) -> bool {
+    let until = shared.backoff_until.load(Ordering::Acquire);
+    until != 0 && monotonic_tick() < until
+}
+
+fn set_backoff(shared: &Shared, ms: u64) {
+    if ms == 0 {
+        shared.backoff_until.store(0, Ordering::Release);
+        return;
+    }
+    shared
+        .backoff_until
+        .store(monotonic_tick().saturating_add(ms), Ordering::Release);
+    overlay::invalidate(shared);
+}
+
+fn monotonic_tick() -> u64 {
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+}
+
 fn publish(shared: &Shared, report: PipeReport) {
     if let Some(sender) = shared
         .reports
@@ -1289,6 +1401,8 @@ fn wait_for_arm(shared: &Shared) -> bool {
                 return true;
             }
             Some(PipeCommand::Disarm) => return false,
+            Some(PipeCommand::Methods { pin, password }) => apply_methods(shared, pin, password),
+            Some(PipeCommand::Backoff { ms }) => set_backoff(shared, ms),
             Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             // Hooks are installed only after Arm. Quit before that is not
             // Locked, Arming, or FailingClosed, so it must not call the OS lock.
@@ -1398,7 +1512,12 @@ fn host_read_loop(mut file: std::fs::File, commands: std::sync::mpsc::Sender<Pip
             Ok(softlock_core::ServiceToHost::Arm { message }) => Some(PipeCommand::Arm { message }),
             Ok(softlock_core::ServiceToHost::Disarm) => Some(PipeCommand::Disarm),
             Ok(softlock_core::ServiceToHost::OsLock) => Some(PipeCommand::OsLock),
-            Ok(softlock_core::ServiceToHost::PromptResult { .. }) => None,
+            Ok(softlock_core::ServiceToHost::Methods { pin, password }) => {
+                Some(PipeCommand::Methods { pin, password })
+            }
+            Ok(softlock_core::ServiceToHost::PromptResult { backoff_ms, .. }) => {
+                Some(PipeCommand::Backoff { ms: backoff_ms })
+            }
             _ => None,
         };
         if let Some(command) = command
@@ -1433,8 +1552,13 @@ fn host_write_loop(
                 guard,
                 overlay,
             } => host_heartbeat_frame(id, *seq, *guard, *overlay, &nonce).ok(),
-            PipeReport::Secret(secret) => {
-                host_secret_frame(id, MethodId::softlock_pin().as_str(), secret, &nonce).ok()
+            PipeReport::Secret { method, secret } => {
+                let name = if *method == METHOD_PASSWORD {
+                    MethodId::os_password()
+                } else {
+                    MethodId::softlock_pin()
+                };
+                host_secret_frame(id, name.as_str(), secret, &nonce).ok()
             }
             PipeReport::GuardDown => host_guard_down_frame(id, &nonce).ok(),
         };

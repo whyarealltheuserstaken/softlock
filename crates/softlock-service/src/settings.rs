@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 
 use softlock_core::PRODUCT_DISPLAY_NAME;
 use softlock_core::{
-    CONFIG_DIR, CONFIG_FILE, CommitFault, HardenError, HeldStart, Journal, JournalEntry,
-    JournalFault, LOCKDOWN, ProductState, RepairAction, SERVICE_NAME, SettingValue,
-    SettingsJournal, StartAction, allowed_previous_for, commit_then_change, encode_document,
-    executable_may_run_as_system, fault_log, held_start, lockdown_document, lockdown_policy,
-    mark_workstation_clear, original_previous, parse_document, reassert_write, recovery_action,
-    release_os_hold, repair_action, repair_entry_name, restore_action_for, restore_sid,
-    with_config_acl, workstation_value_after_attempt,
+    BackoffRecord, BackoffRestore, CONFIG_DIR, CONFIG_FILE, ClockSample, CommitFault, HardenError,
+    HeldStart, Journal, JournalEntry, JournalFault, LOCKDOWN, ProductState, RepairAction,
+    SERVICE_NAME, SettingValue, SettingsJournal, StartAction, allowed_previous_for,
+    commit_then_change, encode_document, executable_may_run_as_system, fault_log, held_start,
+    lockdown_document, lockdown_policy, mark_workstation_clear, original_previous, parse_document,
+    reassert_write, recovery_action, release_os_hold, repair_action, repair_entry_name,
+    restore_action_for, restore_backoff, restore_sid, service_start_action, with_config_acl,
+    workstation_value_after_attempt,
 };
 
 use crate::journal_store::{load_journal, save_journal};
@@ -79,11 +80,11 @@ impl SettingsEngine {
     }
 
     pub fn boot(&mut self) -> Result<Boot, &'static str> {
-        let loaded = load_journal().map_err(|_| "journal")?;
+        let loaded = load_journal().map_err(|_| "unreadable")?;
         let Some(text) = loaded else {
             return Ok(Boot::Idle);
         };
-        let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
+        let doc = parse_document(text.as_bytes()).map_err(|_| "malformed")?;
         if doc.is_empty() {
             return Ok(Boot::Idle);
         }
@@ -443,6 +444,28 @@ impl SettingsEngine {
         Ok(())
     }
 
+    /// Rewrite the failure count and the backoff deadline. The lockdown rows
+    /// stay. A failed write leaves the in-memory count in place.
+    pub fn store_backoff(
+        &mut self,
+        failures: u32,
+        until_tick: u64,
+        written_tick: u64,
+        written_wall_ms: u64,
+    ) -> Result<(), &'static str> {
+        let Some(text) = load_journal().map_err(|_| "unreadable")? else {
+            return Err("unreadable");
+        };
+        let mut doc = parse_document(text.as_bytes()).map_err(|_| "malformed")?;
+        doc.failures = failures;
+        doc.backoff_until_tick = until_tick;
+        doc.written_tick = written_tick;
+        doc.written_wall_ms = written_wall_ms;
+        let bytes = encode_document(&doc).map_err(|_| "malformed")?;
+        save_journal(&bytes).map_err(|_| "not-durable")?;
+        Ok(())
+    }
+
     fn hold(&mut self) {
         self.holding.store(true, Ordering::Release);
         self.last = Instant::now();
@@ -499,11 +522,38 @@ fn memory_journal(doc: &SettingsJournal) -> Journal {
         });
     }
     journal.set_failures(doc.failures());
+    let sample = clock_sample();
+    let wait = match restore_backoff(
+        BackoffRecord {
+            failures: doc.failures(),
+            written_tick: doc.written_tick,
+            until_tick: doc.backoff_until_tick,
+            written_wall_ms: doc.written_wall_ms,
+        },
+        sample,
+    ) {
+        BackoffRestore::Clear => 0,
+        BackoffRestore::Wait(delay) => u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+    };
+    journal.set_wait_ms(wait);
     if doc.says_locked() {
         journal.mark_locked();
     }
     journal.flush();
     journal
+}
+
+fn clock_sample() -> ClockSample {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use windows::Win32::System::SystemInformation::GetTickCount64;
+    let wall_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    ClockSample {
+        tick: unsafe { GetTickCount64() },
+        wall_ms,
+    }
 }
 
 /// Journal the clear, then delete `DisableLockWorkstation`. A failed save

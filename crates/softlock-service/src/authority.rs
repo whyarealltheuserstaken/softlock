@@ -71,6 +71,9 @@ pub struct Authority {
     /// The hung host is still alive and has to be replaced.
     arm_replace: bool,
     config_dir: Option<PathBuf>,
+    /// Monotonic deadline for the unlock backoff. Wall-clock changes do not
+    /// move `Instant`, so they cannot expire this early.
+    backoff_deadline: Option<Instant>,
 }
 
 impl Authority {
@@ -87,6 +90,7 @@ impl Authority {
             arm_deadline: None,
             arm_replace: false,
             config_dir: None,
+            backoff_deadline: None,
         }
     }
 
@@ -112,6 +116,19 @@ impl Authority {
         } else {
             Some(message.to_string())
         }
+    }
+
+    pub fn unlock_offers(&self) -> (bool, bool) {
+        (self.pin_hash.is_some(), true)
+    }
+
+    pub fn arm_backoff_from_controller(&mut self, now: Instant) {
+        let delay = self.controller.backoff_delay();
+        self.backoff_deadline = if delay.is_zero() {
+            None
+        } else {
+            Some(now + delay)
+        };
     }
 
     pub fn platform_mut(&mut self) -> &mut ServicePlatform {
@@ -420,6 +437,11 @@ impl Authority {
     /// Respawns when the host is gone. Retries the OS lock while it is down.
     /// Neither result is Unlocked.
     pub fn poll_host(&mut self, now: Instant, process_alive: bool) -> HostAction {
+        self.expire_backoff(now);
+        #[cfg(windows)]
+        if crate::windows::chain_running() {
+            return HostAction::Hold;
+        }
         let stale = self
             .last_beat
             .is_some_and(|last| now.saturating_duration_since(last) >= SILENCE);
@@ -523,6 +545,7 @@ impl Authority {
     }
 
     fn decide_secret(&mut self, method: &str, secret: Secret) -> ServiceToHost {
+        self.expire_backoff(Instant::now());
         let method_id = MethodId::new(method);
         let backoff = self.controller.backoff_delay();
         if !backoff.is_zero() {
@@ -530,10 +553,13 @@ impl Authority {
                 method: method_id,
                 secret,
             });
-            return ServiceToHost::PromptResult {
-                accepted: false,
-                backoff_ms: u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
-            };
+            return self.prompt_refused();
+        }
+        if method == MethodId::os_password().as_str() {
+            return self.decide_password(secret);
+        }
+        if method != MethodId::softlock_pin().as_str() {
+            return self.note_rejected(method_id, secret);
         }
         let matched = self
             .pin_hash
@@ -561,6 +587,7 @@ impl Authority {
                 nonce: LaunchNonce::from_bytes(bytes),
             });
             bytes.zeroize();
+            self.backoff_deadline = None;
             audit("unlock", &[("method", "softlock_pin")]);
             // The host is still up until it reads Disarm and removes its hooks.
             // Clearing the launch flag here must not look like a lost host, or
@@ -576,14 +603,122 @@ impl Authority {
                 backoff_ms: 0,
             };
         }
-        self.controller.handle(Event::SubmitSecret {
-            method: method_id,
-            secret,
-        });
-        let backoff = self.controller.backoff_delay();
+        self.note_rejected(method_id, secret)
+    }
+
+    fn decide_password(&mut self, secret: Secret) -> ServiceToHost {
+        let verdict = {
+            #[cfg(windows)]
+            {
+                crate::password::verify_session_password(&secret)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = &secret;
+                Verdict::Rejected
+            }
+        };
+        if verdict == Verdict::Verified && self.grant_allowed() {
+            drop(secret);
+            let Some(stored) = self.launch.take() else {
+                audit(
+                    "unlock",
+                    &[("method", "os_password"), ("result", "rejected")],
+                );
+                return self.prompt_refused();
+            };
+            let mut bytes = *stored.as_bytes();
+            self.controller.handle(Event::AdoptLaunchNonce {
+                nonce: LaunchNonce::from_bytes(bytes),
+            });
+            self.controller.handle(Event::Verified {
+                nonce: LaunchNonce::from_bytes(bytes),
+            });
+            bytes.zeroize();
+            self.backoff_deadline = None;
+            audit("unlock", &[("method", "os_password"), ("result", "ok")]);
+            self.controller.acknowledge_recovery();
+            self.host_ready = false;
+            return ServiceToHost::Disarm;
+        }
+        drop(secret);
+        if verdict == Verdict::Verified {
+            audit(
+                "unlock",
+                &[("method", "os_password"), ("result", "rejected")],
+            );
+            return self.prompt_refused();
+        }
+        // The secret was already dropped. Count the failure with an empty
+        // secret so a log of the event cannot carry the password.
+        self.note_rejected(MethodId::os_password(), Secret::new([]))
+    }
+
+    fn note_rejected(&mut self, method: MethodId, secret: Secret) -> ServiceToHost {
+        self.controller
+            .handle(Event::SubmitSecret { method, secret });
+        self.remember_backoff();
+        self.prompt_refused()
+    }
+
+    fn prompt_refused(&self) -> ServiceToHost {
         ServiceToHost::PromptResult {
             accepted: false,
-            backoff_ms: u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+            backoff_ms: self.backoff_remaining_ms(),
+        }
+    }
+
+    /// The controller clock does not advance, so its delay stays at the full
+    /// wait. The host is told the time left on the monotonic deadline.
+    fn backoff_remaining_ms(&self) -> u64 {
+        let left = match self.backoff_deadline {
+            Some(due) => due.saturating_duration_since(Instant::now()),
+            None => self.controller.backoff_delay(),
+        };
+        u64::try_from(left.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn remember_backoff(&mut self) {
+        let delay = self.controller.backoff_delay();
+        self.backoff_deadline = if delay.is_zero() {
+            None
+        } else {
+            Some(Instant::now() + delay)
+        };
+        self.persist_backoff();
+    }
+
+    fn persist_backoff(&mut self) {
+        #[cfg(windows)]
+        {
+            let failures = self.controller.failure_count();
+            let delay_ms = u64::try_from(self.controller.backoff_delay().as_millis()).unwrap_or(0);
+            let written = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+            let until = written.saturating_add(delay_ms);
+            let wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            let Some(engine) = self.controller.platform_mut().settings_mut() else {
+                return;
+            };
+            if engine
+                .store_backoff(failures, until, written, wall)
+                .is_err()
+            {
+                audit("backoff", &[("result", "kept"), ("reason", "journal")]);
+            }
+        }
+    }
+
+    fn expire_backoff(&mut self, now: Instant) {
+        if self.controller.backoff_delay().is_zero() {
+            self.backoff_deadline = None;
+            return;
+        }
+        if self.backoff_deadline.is_some_and(|due| now >= due) {
+            self.backoff_deadline = None;
+            self.controller.handle(Event::BackoffElapsed);
         }
     }
 

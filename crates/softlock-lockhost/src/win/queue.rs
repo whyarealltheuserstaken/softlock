@@ -15,6 +15,9 @@ pub(crate) struct RawEvent {
     pub kind: u8,
     pub vk: u16,
     pub scan: u16,
+    /// Bit 0 is Shift, captured in the hook because a swallowed key does not
+    /// update the keyboard state the window thread reads later.
+    pub mods: u8,
 }
 
 pub(crate) struct EventQueue {

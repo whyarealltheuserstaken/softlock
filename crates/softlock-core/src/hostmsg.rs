@@ -21,6 +21,12 @@ pub enum ServiceToHost {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// Which secret fields the prompt may offer. Password is the account
+    /// password. PIN is this product's PIN, and only when a hash is stored.
+    Methods {
+        pin: bool,
+        password: bool,
+    },
     Disarm,
     /// Lock the signed-in session. The Service confirms it and disconnects
     /// the console itself when this does not. The host must not disconnect.

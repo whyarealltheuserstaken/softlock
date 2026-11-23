@@ -347,7 +347,29 @@ fn caption() -> Vec<u16> {
     };
     let text = if prompt {
         let dots = "\u{25cf}".repeat(chars as usize);
-        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nEnter PIN\n{dots}{notice}{custom}")
+        let (label, switch) = shared
+            .map(|shared| {
+                let pin = shared.offer_pin.load(std::sync::atomic::Ordering::Acquire);
+                let password = shared
+                    .offer_password
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let method = shared
+                    .prompt_method
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let label = if method == 1 {
+                    "Enter password"
+                } else {
+                    "Enter PIN"
+                };
+                let switch = if pin && password {
+                    "\nTab switches"
+                } else {
+                    ""
+                };
+                (label, switch)
+            })
+            .unwrap_or(("Enter PIN", ""));
+        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\n{label}{switch}\n{dots}{notice}{custom}")
     } else {
         format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nPress any key to unlock{notice}{custom}")
     };
