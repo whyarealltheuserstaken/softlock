@@ -6,8 +6,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use softlock_core::{
-    CONFIG_FILE_NAME, JournalFault, MAX_CONFIG_BYTES, SettingEntry, SettingValue, config_acl_entry,
-    config_path_allowed, dacl_without_owner_write, restore_action,
+    CONFIG_DIR, CONFIG_FILE_NAME, JournalFault, MAX_CONFIG_BYTES, SettingEntry, SettingValue,
+    config_acl_entry, config_dir_entry, config_path_allowed, dacl_without_owner_write,
+    restore_action,
 };
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE};
 use windows::Win32::Storage::FileSystem::{
@@ -86,18 +87,32 @@ pub fn prepare_entry(path: &Path) -> Result<SettingEntry, &'static str> {
     config_acl_entry(&path_text, &previous, &locked).map_err(fault)
 }
 
+pub fn prepare_dir_entry(path: &Path) -> Result<SettingEntry, &'static str> {
+    let Some(dir) = path.parent() else {
+        return Err("acl");
+    };
+    let handle = open_acl(dir, true).map_err(|_| "acl")?;
+    let previous = dacl_sddl_handle(handle);
+    drop_handle(handle);
+    let previous = previous.map_err(|_| "acl")?;
+    let console = crate::taskmgr::console_sid().map_err(|_| "sid")?;
+    let locked = dacl_without_owner_write(&previous, &console).map_err(|_| "acl")?;
+    let text = dir.to_string_lossy().replace('/', "\\");
+    config_dir_entry(&text, &previous, &locked).map_err(fault)
+}
+
 pub fn apply_entry(entry: &SettingEntry) -> Result<(), &'static str> {
     let SettingValue::Sddl { value } = &entry.new_value else {
         return Err("value");
     };
-    let handle = open_for_acl(Path::new(&entry.path)).map_err(|_| "acl")?;
+    let handle = open_entry(entry).map_err(|_| "acl")?;
     let result = set_dacl_handle(handle, value);
     drop_handle(handle);
     result
 }
 
 pub fn restore_entry(entry: &SettingEntry) -> Result<(), &'static str> {
-    let handle = open_for_acl(Path::new(&entry.path)).map_err(|_| "acl")?;
+    let handle = open_entry(entry).map_err(|_| "acl")?;
     let current = dacl_sddl_handle(handle).map_err(|_| "acl");
     let result = match current {
         Ok(current) => {
@@ -120,7 +135,7 @@ pub fn reassert_entry(entry: &SettingEntry) -> Result<(), &'static str> {
     let SettingValue::Sddl { value: locked } = &entry.new_value else {
         return Err("value");
     };
-    let handle = open_for_acl(Path::new(&entry.path)).map_err(|_| "acl")?;
+    let handle = open_entry(entry).map_err(|_| "acl")?;
     let current = dacl_sddl_handle(handle).map_err(|_| "acl");
     let result = match current {
         Ok(current) if current == *locked => Ok(()),
@@ -427,11 +442,20 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
     Ok(file)
 }
 
-fn open_for_acl(path: &Path) -> io::Result<HANDLE> {
-    match open_config(path, false) {
+fn open_entry(entry: &SettingEntry) -> io::Result<HANDLE> {
+    open_acl(Path::new(&entry.path), entry.target == CONFIG_DIR)
+}
+
+fn open_acl(path: &Path, directory: bool) -> io::Result<HANDLE> {
+    let access = if directory {
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | SYNCHRONIZE
+    } else {
+        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    };
+    match open_with_access_kind(path, access, directory) {
         Ok(handle) => Ok(handle),
-        // SYSTEM still has full control. The console user's locked ACE is read.
-        Err(_) => open_with_access(path, READ_CONTROL | WRITE_DAC | SYNCHRONIZE),
+        Err(_) if !directory => open_config(path, false),
+        Err(error) => Err(error),
     }
 }
 
@@ -440,6 +464,10 @@ fn open_for_owner_write(path: &Path) -> io::Result<HANDLE> {
 }
 
 fn open_with_access(path: &Path, access: u32) -> io::Result<HANDLE> {
+    open_with_access_kind(path, access, false)
+}
+
+fn open_with_access_kind(path: &Path, access: u32, as_directory: bool) -> io::Result<HANDLE> {
     let (drive, parts) = components(path)?;
     if parts.is_empty() {
         return Err(io::Error::other("config"));
@@ -459,7 +487,7 @@ fn open_with_access(path: &Path, access: u32) -> io::Result<HANDLE> {
         }
         directory = next;
     }
-    let file = open_child(directory, &parts[last], access, false, false);
+    let file = open_child(directory, &parts[last], access, as_directory, false);
     drop_handle(directory);
     let file = file?;
     if refuse_reparse(file)? {

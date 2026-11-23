@@ -22,6 +22,9 @@ pub const TASK_MANAGER: &str = "DisableTaskMgr";
 
 /// The user-editable config file's DACL. The path is the entry's `path`.
 pub const CONFIG_FILE: &str = "ConfigFileAcl";
+/// The config directory DACL. The file can stay read-only and still be
+/// deleted while the parent grants `FILE_DELETE_CHILD`.
+pub const CONFIG_DIR: &str = "ConfigDirAcl";
 
 pub const JOURNAL_VERSION: u32 = 1;
 
@@ -423,8 +426,13 @@ fn validate(doc: &SettingsJournal) -> Result<(), JournalFault> {
         if !seen.insert(entry.target.clone()) {
             return Err(JournalFault::Duplicate);
         }
-        if entry.target == CONFIG_FILE {
-            if !config_path_allowed(&entry.path) {
+        if entry.target == CONFIG_FILE || entry.target == CONFIG_DIR {
+            let path_ok = if entry.target == CONFIG_FILE {
+                config_path_allowed(&entry.path)
+            } else {
+                config_dir_allowed(&entry.path)
+            };
+            if !path_ok {
                 return Err(JournalFault::Target);
             }
             let SettingValue::Sddl { value: previous } = &entry.previous else {
@@ -470,8 +478,32 @@ pub fn config_acl_entry(
     previous: &str,
     locked: &str,
 ) -> Result<SettingEntry, JournalFault> {
+    acl_entry(
+        CONFIG_FILE,
+        path,
+        config_path_allowed(path),
+        previous,
+        locked,
+    )
+}
+
+pub fn config_dir_entry(
+    path: &str,
+    previous: &str,
+    locked: &str,
+) -> Result<SettingEntry, JournalFault> {
+    acl_entry(CONFIG_DIR, path, config_dir_allowed(path), previous, locked)
+}
+
+fn acl_entry(
+    target: &str,
+    path: &str,
+    path_ok: bool,
+    previous: &str,
+    locked: &str,
+) -> Result<SettingEntry, JournalFault> {
     let entry = SettingEntry {
-        target: CONFIG_FILE.to_string(),
+        target: target.to_string(),
         path: path.to_string(),
         previous: SettingValue::Sddl {
             value: previous.to_string(),
@@ -480,7 +512,7 @@ pub fn config_acl_entry(
             value: locked.to_string(),
         },
     };
-    if !config_path_allowed(&entry.path) {
+    if !path_ok {
         return Err(JournalFault::Target);
     }
     let SettingValue::Sddl { value: previous } = &entry.previous else {
@@ -499,7 +531,7 @@ pub fn with_config_acl(
     mut doc: SettingsJournal,
     entry: SettingEntry,
 ) -> Result<SettingsJournal, JournalFault> {
-    if entry.target != CONFIG_FILE {
+    if entry.target != CONFIG_FILE && entry.target != CONFIG_DIR {
         return Err(JournalFault::Target);
     }
     doc.entries.push(entry);
@@ -507,7 +539,14 @@ pub fn with_config_acl(
     Ok(doc)
 }
 
-const GROUP_WRITE_SIDS: &[&str] = &["S-1-1-0", "S-1-5-11", "S-1-5-32-545"];
+const GROUP_WRITE_SIDS: &[&str] = &[
+    "S-1-1-0",
+    "S-1-5-11",
+    "S-1-5-32-545",
+    // The console user on a hosted runner is a member of Administrators.
+    // That group's allow ACE is `FILE_DELETE_CHILD` on the parent directory.
+    "S-1-5-32-544",
+];
 
 /// Remove write for `console_sid` and for Users, Everyone, and Authenticated
 /// Users, including inherited allow ACEs. The result is a protected DACL so
@@ -529,6 +568,10 @@ pub fn dacl_without_owner_write(dacl: &str, console_sid: &str) -> Result<String,
         rest = &rest[start + end + 1..];
     }
     out.push_str(rest);
+    // Without an Owner Rights ACE, Windows still grants the owner WRITE_DAC.
+    if !out.contains(";;;OW)") && !out.to_ascii_uppercase().contains(";;;S-1-3-4)") {
+        out.push_str("(A;;FR;;;OW)");
+    }
     let protected = if let Some(rest) = out.strip_prefix("D:") {
         if rest.starts_with('P') {
             out
@@ -553,6 +596,8 @@ fn rewrite_owner_ace(ace: &str, owner: &str) -> Result<(String, bool), JournalFa
     if parts.len() != 6 {
         return Err(JournalFault::Value);
     }
+    let owner_rights =
+        parts[5].eq_ignore_ascii_case("OW") || parts[5].eq_ignore_ascii_case("S-1-3-4");
     let console_write =
         parts[0] == "A" && trustee_matches(parts[5], owner) && ace_grants_write(parts[2]);
     let group_write = parts[0] == "A"
@@ -560,7 +605,7 @@ fn rewrite_owner_ace(ace: &str, owner: &str) -> Result<(String, bool), JournalFa
             .iter()
             .any(|sid| trustee_matches(parts[5], sid))
         && ace_grants_write(parts[2]);
-    if console_write {
+    if console_write || (owner_rights && ace_grants_write(parts[2])) {
         // Read only. SYSTEM keeps full control and puts the original
         // descriptor back. DC is FILE_WRITE_DATA, and WRITE_DAC is WD.
         Ok((
@@ -590,7 +635,8 @@ fn ace_grants_write(rights: &str) -> bool {
         };
         // FILE_WRITE_DATA, FILE_APPEND_DATA, FILE_WRITE_EA, FILE_WRITE_ATTRIBUTES,
         // DELETE, WRITE_DAC, WRITE_OWNER, and the generic write bit.
-        return mask & (0x0000_0116 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000) != 0;
+        // 0x40 is FILE_DELETE_CHILD, the parent right that deletes the file.
+        return mask & (0x0000_0156 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000) != 0;
     }
     let upper = rights.to_ascii_uppercase();
     upper.contains("FA")
@@ -602,6 +648,7 @@ fn ace_grants_write(rights: &str) -> bool {
         || upper.contains("WE")
         || upper.contains("WO")
         || upper.contains("SD")
+        || upper.contains("DT")
 }
 
 fn sid_eq(left: &str, right: &str) -> bool {
@@ -632,6 +679,9 @@ fn sddl_alias(sid: &str) -> Option<&'static str> {
     }
     if sid.eq_ignore_ascii_case("BU") || sid.eq_ignore_ascii_case("S-1-5-32-545") {
         return Some("BU");
+    }
+    if sid.eq_ignore_ascii_case("BA") || sid.eq_ignore_ascii_case("S-1-5-32-544") {
+        return Some("BA");
     }
     None
 }
@@ -677,6 +727,16 @@ pub fn config_path_allowed(path: &str) -> bool {
     let Some(profile) = path.strip_suffix(&suffix) else {
         return false;
     };
+    profile_root_allowed(profile)
+}
+
+/// The directory that contains [`config_path_allowed`]'s file.
+pub fn config_dir_allowed(path: &str) -> bool {
+    let file = format!("{path}\\{}", crate::config::CONFIG_FILE_NAME);
+    config_path_allowed(&file)
+}
+
+fn profile_root_allowed(profile: &str) -> bool {
     let mut parts = profile.split('\\');
     let drive = parts.next();
     let users = parts.next();
@@ -1623,9 +1683,20 @@ mod tests {
         assert!(locked.contains("(A;;FA;;;SY)"), "{locked}");
         assert!(locked.contains("(A;;FR;;;LA)"), "{locked}");
         assert!(locked.contains("(A;;FR;;;WD)"), "{locked}");
+        assert!(locked.contains("(A;;FR;;;OW)"), "{locked}");
         assert!(!locked.contains("FA;;;LA"), "{locked}");
         assert!(!locked.contains(";DC;"), "{locked}");
         assert!(!locked.contains(";WD;"), "{locked}");
+        let admins = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-21-1-2-3-1001)";
+        let directory = dacl_without_owner_write(admins, "S-1-5-21-1-2-3-1001").expect("directory");
+        assert!(directory.contains("(A;;FA;;;SY)"), "{directory}");
+        assert!(directory.contains("(A;;FR;;;BA)"), "{directory}");
+        assert!(
+            directory.contains("(A;;FR;;;S-1-5-21-1-2-3-1001)"),
+            "{directory}"
+        );
+        assert!(directory.contains("(A;;FR;;;OW)"), "{directory}");
+        assert!(!directory.contains("FA;;;BA"), "{directory}");
     }
 
     #[test]

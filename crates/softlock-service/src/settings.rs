@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use softlock_core::PRODUCT_DISPLAY_NAME;
 use softlock_core::{
-    CONFIG_FILE, CommitFault, HardenError, Journal, JournalEntry, JournalFault, LOCKDOWN,
-    ProductState, RepairAction, SERVICE_NAME, SettingValue, SettingsJournal, StartAction,
+    CONFIG_DIR, CONFIG_FILE, CommitFault, HardenError, Journal, JournalEntry, JournalFault,
+    LOCKDOWN, ProductState, RepairAction, SERVICE_NAME, SettingValue, SettingsJournal, StartAction,
     allowed_previous_for, commit_then_change, encode_document, executable_may_run_as_system,
     fault_log, lockdown_document, lockdown_policy, mark_workstation_clear, original_previous,
     parse_document, reassert_write, recovery_action, repair_action, repair_entry_name,
@@ -159,7 +159,18 @@ impl SettingsEngine {
                 crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
                 HardenError::Failed
             })?;
+            let directory = crate::config_file::prepare_dir_entry(&path).map_err(|reason| {
+                crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+                HardenError::Failed
+            })?;
             doc = with_config_acl(doc, entry.clone()).map_err(|fault| {
+                crate::audit(
+                    "settings",
+                    &[("result", "failed"), ("reason", fault_log(fault))],
+                );
+                HardenError::Failed
+            })?;
+            doc = with_config_acl(doc, directory).map_err(|fault| {
                 crate::audit(
                     "settings",
                     &[("result", "failed"), ("reason", fault_log(fault))],
@@ -196,7 +207,6 @@ impl SettingsEngine {
         })?;
         let sid = self.sid.clone();
         RESTORED.store(false, Ordering::Release);
-        let config = self.config.clone();
         let saved = commit_then_change(
             || save_journal(&bytes).map_err(|_| JournalFault::NotDurable),
             || {
@@ -206,7 +216,7 @@ impl SettingsEngine {
                 // journal until unlock.
                 pause_for("before");
                 for entry in doc.entries() {
-                    if entry.target == CONFIG_FILE {
+                    if entry.target == CONFIG_FILE || entry.target == CONFIG_DIR {
                         continue;
                     }
                     let Some(policy) = lockdown_policy(&entry.target) else {
@@ -214,8 +224,10 @@ impl SettingsEngine {
                     };
                     write_lockdown(&sid, policy, entry.new_value.clone())?;
                 }
-                if let Some(entry) = &config {
-                    crate::config_file::apply_entry(entry)?;
+                for entry in doc.entries() {
+                    if entry.target == CONFIG_FILE || entry.target == CONFIG_DIR {
+                        crate::config_file::apply_entry(entry)?;
+                    }
                 }
                 pause_for("after");
                 Ok(())
@@ -294,7 +306,8 @@ impl SettingsEngine {
         let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
         let skip_workstation = SKIP_WORKSTATION.load(Ordering::Acquire) || doc.workstation_clear;
         for entry in doc.entries() {
-            if entry.target == CONFIG_FILE {
+            if entry.target == CONFIG_FILE || entry.target == CONFIG_DIR {
+                crate::config_file::reassert_entry(entry)?;
                 continue;
             }
             let Some(policy) = lockdown_policy(&entry.target) else {
@@ -309,9 +322,6 @@ impl SettingsEngine {
                     &[("result", "reasserted"), ("target", policy.target)],
                 );
             }
-        }
-        if let Some(entry) = self.config.clone() {
-            crate::config_file::reassert_entry(&entry)?;
         }
         self.last = Instant::now();
         Ok(())
@@ -343,7 +353,7 @@ impl SettingsEngine {
     fn revert_document(&mut self, doc: &SettingsJournal) -> Result<(), &'static str> {
         RESTORED.store(true, Ordering::Release);
         for entry in doc.entries() {
-            if entry.target == CONFIG_FILE {
+            if entry.target == CONFIG_FILE || entry.target == CONFIG_DIR {
                 crate::config_file::restore_entry(entry)?;
                 continue;
             }
