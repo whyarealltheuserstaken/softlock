@@ -89,14 +89,14 @@ pub fn apply_entry(entry: &SettingEntry) -> Result<(), &'static str> {
     let SettingValue::Sddl { value } = &entry.new_value else {
         return Err("value");
     };
-    let handle = open_config(Path::new(&entry.path), false).map_err(|_| "acl")?;
+    let handle = open_for_acl(Path::new(&entry.path)).map_err(|_| "acl")?;
     let result = set_dacl_handle(handle, value);
     drop_handle(handle);
     result
 }
 
 pub fn restore_entry(entry: &SettingEntry) -> Result<(), &'static str> {
-    let handle = open_config(Path::new(&entry.path), false).map_err(|_| "acl")?;
+    let handle = open_for_acl(Path::new(&entry.path)).map_err(|_| "acl")?;
     let current = dacl_sddl_handle(handle).map_err(|_| "acl");
     let result = match current {
         Ok(current) => {
@@ -119,7 +119,7 @@ pub fn reassert_entry(entry: &SettingEntry) -> Result<(), &'static str> {
     let SettingValue::Sddl { value: locked } = &entry.new_value else {
         return Err("value");
     };
-    let handle = open_config(Path::new(&entry.path), false).map_err(|_| "acl")?;
+    let handle = open_for_acl(Path::new(&entry.path)).map_err(|_| "acl")?;
     let current = dacl_sddl_handle(handle).map_err(|_| "acl");
     let result = match current {
         Ok(current) if current == *locked => Ok(()),
@@ -348,7 +348,21 @@ fn open_config(path: &Path, create: bool) -> io::Result<HANDLE> {
     Ok(file)
 }
 
+fn open_for_acl(path: &Path) -> io::Result<HANDLE> {
+    match open_config(path, false) {
+        Ok(handle) => Ok(handle),
+        // The locked DACL still grants read. SeRestorePrivilege, enabled
+        // while the DACL is written, lets the service put the original
+        // descriptor back without write-DAC on this handle.
+        Err(_) => open_with_access(path, READ_CONTROL | SYNCHRONIZE),
+    }
+}
+
 fn open_for_owner_write(path: &Path) -> io::Result<HANDLE> {
+    open_with_access(path, FILE_ACCESS)
+}
+
+fn open_with_access(path: &Path, access: u32) -> io::Result<HANDLE> {
     let (drive, parts) = components(path)?;
     if parts.is_empty() {
         return Err(io::Error::other("config"));
@@ -368,10 +382,7 @@ fn open_for_owner_write(path: &Path) -> io::Result<HANDLE> {
         }
         directory = next;
     }
-    // The same rights a config open asks for. A narrower mask is denied on
-    // this file even when full access is granted, so the probe would say the
-    // console user cannot write a file they can open.
-    let file = open_child(directory, &parts[last], FILE_ACCESS, false, false);
+    let file = open_child(directory, &parts[last], access, false, false);
     drop_handle(directory);
     let file = file?;
     if refuse_reparse(file)? {
@@ -510,9 +521,16 @@ fn set_security_handle(
     information: windows::Win32::Security::OBJECT_SECURITY_INFORMATION,
 ) -> Result<(), &'static str> {
     use windows::Win32::Foundation::LocalFree;
-    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SetKernelObjectSecurity};
-    use windows::core::PCWSTR;
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_RESTORE_NAME,
+        SetKernelObjectSecurity,
+    };
+    use windows::core::{BOOL, PCWSTR};
+    let _restore = crate::secrets::enable_privilege_scoped(SE_RESTORE_NAME).ok();
     let wide = sddl
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -527,11 +545,45 @@ fn set_security_handle(
         )
         .map_err(|_| "acl")?;
     }
-    let applied = unsafe { SetKernelObjectSecurity(handle, information, descriptor) };
+    let mut owner = PSID::default();
+    let mut owner_defaulted = BOOL::default();
+    let owner_requested = (information.0 & OWNER_SECURITY_INFORMATION.0) != 0;
+    if owner_requested {
+        unsafe {
+            GetSecurityDescriptorOwner(descriptor, &mut owner, &mut owner_defaulted)
+                .map_err(|_| "acl")?;
+        }
+    }
+    let mut dacl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
+    let mut present = BOOL::default();
+    let mut dacl_defaulted = BOOL::default();
+    let dacl_requested = (information.0 & DACL_SECURITY_INFORMATION.0) != 0;
+    if dacl_requested {
+        unsafe {
+            GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut dacl_defaulted)
+                .map_err(|_| "acl")?;
+        }
+    }
+    let status = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            information,
+            owner_requested.then_some(owner),
+            None,
+            (dacl_requested && present.as_bool() && !dacl.is_null()).then_some(dacl.cast_const()),
+            None,
+        )
+    };
+    let kernel = if status.0 == 0 {
+        Ok(())
+    } else {
+        unsafe { SetKernelObjectSecurity(handle, information, descriptor) }.map_err(|_| "acl")
+    };
     unsafe {
         if !descriptor.0.is_null() {
             let _ = LocalFree(Some(windows::Win32::Foundation::HLOCAL(descriptor.0)));
         }
     }
-    applied.map_err(|_| "acl")
+    kernel
 }

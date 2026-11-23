@@ -244,24 +244,12 @@ fn align_console() -> Result<(), String> {
         script.display()
     );
     let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", "SoftLockAlign", "/F"])
+        .args(["/Delete", "/TN", "sl-align", "/F"])
         .status();
     let created = Command::new("schtasks")
         .args([
-            "/Create",
-            "/TN",
-            "SoftLockAlign",
-            "/TR",
-            &bin,
-            "/SC",
-            "ONCE",
-            "/ST",
-            "00:00",
-            "/RU",
-            "SYSTEM",
-            "/RL",
-            "HIGHEST",
-            "/F",
+            "/Create", "/TN", "sl-align", "/TR", &bin, "/SC", "ONCE", "/ST", "00:00", "/RU",
+            "SYSTEM", "/RL", "HIGHEST", "/F",
         ])
         .status()
         .map_err(|_| "align task".to_string())?;
@@ -269,11 +257,11 @@ fn align_console() -> Result<(), String> {
         return Err("align task was not created".to_string());
     }
     let _ = Command::new("schtasks")
-        .args(["/Run", "/TN", "SoftLockAlign"])
+        .args(["/Run", "/TN", "sl-align"])
         .status();
     let aligned = wait_until(Duration::from_secs(20), session_aligned);
     let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", "SoftLockAlign", "/F"])
+        .args(["/Delete", "/TN", "sl-align", "/F"])
         .status();
     if aligned {
         Ok(())
@@ -304,24 +292,12 @@ fn restore_dacl_as_system(path: &Path, sddl: &str) -> Result<(), String> {
         script.display()
     );
     let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", "SoftLockDacl", "/F"])
+        .args(["/Delete", "/TN", "sl-dacl", "/F"])
         .status();
     let created = Command::new("schtasks")
         .args([
-            "/Create",
-            "/TN",
-            "SoftLockDacl",
-            "/TR",
-            &bin,
-            "/SC",
-            "ONCE",
-            "/ST",
-            "00:00",
-            "/RU",
-            "SYSTEM",
-            "/RL",
-            "HIGHEST",
-            "/F",
+            "/Create", "/TN", "sl-dacl", "/TR", &bin, "/SC", "ONCE", "/ST", "00:00", "/RU",
+            "SYSTEM", "/RL", "HIGHEST", "/F",
         ])
         .status()
         .map_err(|_| "dacl task".to_string())?;
@@ -329,13 +305,13 @@ fn restore_dacl_as_system(path: &Path, sddl: &str) -> Result<(), String> {
         return Err("dacl task was not created".to_string());
     }
     let started = Command::new("schtasks")
-        .args(["/Run", "/TN", "SoftLockDacl"])
+        .args(["/Run", "/TN", "sl-dacl"])
         .status()
         .map_err(|_| "dacl task".to_string())?;
     let granted =
         started.success() && wait_until(Duration::from_secs(15), || owner_can_write(path));
     let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", "SoftLockDacl", "/F"])
+        .args(["/Delete", "/TN", "sl-dacl", "/F"])
         .status();
     if granted {
         Ok(())
