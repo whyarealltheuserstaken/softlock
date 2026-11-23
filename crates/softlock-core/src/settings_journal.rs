@@ -795,6 +795,52 @@ pub fn commit_then_change<E>(
 
 /// A live Lock Host in an active console session is still locked.
 /// A dead host is not an active lock, so startup reverts the journal.
+///
+/// `session_known` is false when the console query failed. That failure
+/// used to fail closed before looking at the host, so a restart after the
+/// host was killed left the locked dword in place. A dead host still reverts.
+pub fn recovery_action(
+    doc: &SettingsJournal,
+    session_known: bool,
+    console_active: bool,
+    host: HostPresence,
+) -> StartAction {
+    if doc.is_empty() {
+        return StartAction::Idle;
+    }
+    if !session_known {
+        return if host == HostPresence::Dead || !doc.says_locked() {
+            StartAction::Revert
+        } else {
+            StartAction::FailClosed
+        };
+    }
+    service_start_action(doc, console_active, host)
+}
+
+/// The value a restart writes back. The journaled previous wins, so a
+/// mid-lock read of the locked dword cannot replace an absent original,
+/// and the restore deletes the value instead of writing zero.
+pub fn original_previous<'a>(
+    journaled: Option<&'a SettingValue>,
+    current: &'a SettingValue,
+) -> &'a SettingValue {
+    journaled.unwrap_or(current)
+}
+
+/// Service startup order. Journal recovery runs before the config file is
+/// created or applied, so that apply cannot rebuild the journal from the
+/// live lockdown values.
+pub fn startup_steps() -> [StartupStep; 2] {
+    [StartupStep::RecoverJournal, StartupStep::LoadConfig]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupStep {
+    RecoverJournal,
+    LoadConfig,
+}
+
 pub fn service_start_action(
     doc: &SettingsJournal,
     console_active: bool,
@@ -1239,6 +1285,26 @@ mod tests {
         );
         assert!(saved);
         assert_eq!(result, Err(CommitFault::Change("apply")));
+    }
+
+    #[test]
+    fn an_absent_value_is_deleted_after_a_restart_mid_lock() {
+        let doc = task_manager_document(ALICE, SettingValue::Absent, 0).expect("journal");
+        let live = SettingValue::Dword { value: 1 };
+        assert_eq!(
+            recovery_action(&doc, false, true, HostPresence::Dead),
+            StartAction::Revert
+        );
+        assert_eq!(startup_steps()[0], StartupStep::RecoverJournal);
+        assert_eq!(startup_steps()[1], StartupStep::LoadConfig);
+        let previous = original_previous(Some(&doc.entries()[0].previous), &live).clone();
+        assert_eq!(previous, SettingValue::Absent);
+        assert_eq!(
+            restore_action(&previous, &live).expect("restore"),
+            Some(SettingValue::Absent)
+        );
+        assert_ne!(previous, SettingValue::Dword { value: 0 });
+        assert_ne!(previous, live);
     }
 
     #[test]

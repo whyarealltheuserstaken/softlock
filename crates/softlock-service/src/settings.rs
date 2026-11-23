@@ -12,9 +12,9 @@ use softlock_core::{
     CONFIG_FILE, CommitFault, HardenError, Journal, JournalEntry, JournalFault, LOCKDOWN,
     ProductState, RepairAction, SERVICE_NAME, SettingValue, SettingsJournal, StartAction,
     allowed_previous_for, commit_then_change, encode_document, executable_may_run_as_system,
-    fault_log, lockdown_document, lockdown_policy, mark_workstation_clear, parse_document,
-    reassert_write, repair_action, repair_entry_name, restore_action_for, restore_sid,
-    service_start_action, with_config_acl, workstation_value_after_attempt,
+    fault_log, lockdown_document, lockdown_policy, mark_workstation_clear, original_previous,
+    parse_document, reassert_write, recovery_action, repair_action, repair_entry_name,
+    restore_action_for, restore_sid, with_config_acl, workstation_value_after_attempt,
 };
 
 use crate::journal_store::{load_journal, save_journal};
@@ -88,19 +88,11 @@ impl SettingsEngine {
             .iter()
             .find(|entry| entry.target == CONFIG_FILE)
             .cloned();
-        let console = match console_is_active() {
-            Ok(active) => active,
-            Err(_) if doc.says_locked() => {
-                self.preserve = true;
-                self.hold();
-                if doc.workstation_clear {
-                    reapply_disable_lock_workstation()?;
-                }
-                return Ok(Boot::FailClosed(memory_journal(&doc)));
-            }
-            Err(_) => false,
+        let (session_known, console_active) = match console_is_active() {
+            Ok(active) => (true, active),
+            Err(_) => (false, false),
         };
-        match service_start_action(&doc, console, lock_host_running()) {
+        match recovery_action(&doc, session_known, console_active, lock_host_running()) {
             StartAction::Idle => Ok(Boot::Idle),
             StartAction::Revert => {
                 self.revert_document(&doc)?;
@@ -123,13 +115,27 @@ impl SettingsEngine {
             HardenError::Failed
         })?;
         self.sid = sid;
+        // A journal that already says locked has the originals. The live
+        // dword is the lockdown itself. Re-reading it would store that dword
+        // as the value to restore, and an absent value would never be deleted.
+        let durable = load_journal().ok().flatten().and_then(|text| {
+            parse_document(text.as_bytes())
+                .ok()
+                .filter(|doc| doc.says_locked())
+        });
         let mut previous = Vec::with_capacity(LOCKDOWN.len());
         for policy in LOCKDOWN {
-            let value = read_lockdown(&self.sid, policy).map_err(|reason| {
+            let live = read_lockdown(&self.sid, policy).map_err(|reason| {
                 crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
                 HardenError::Failed
             })?;
-            previous.push((policy.target, value));
+            let journaled = durable.as_ref().and_then(|doc| {
+                doc.entries()
+                    .iter()
+                    .find(|entry| entry.target == policy.target)
+                    .map(|entry| &entry.previous)
+            });
+            previous.push((policy.target, original_previous(journaled, &live).clone()));
         }
         let mut doc =
             lockdown_document(&self.sid, &previous, journal.failures()).map_err(|fault| {

@@ -93,6 +93,7 @@ jobs:
             2>&1 | tee target/seam1.txt
           grep -F "published_schema_accepts_the_default_and_rejects_an_unknown_field ... ok" target/seam1.txt
           grep -F "the_config_path_is_only_the_owner_profile_file ... ok" target/seam1.txt
+          grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam1.txt
           grep -F "inherited_group_write_aces_lose_write_with_the_owner ... ok" target/seam1.txt
           grep -F "a_locked_file_edit_is_offered_and_an_unlocked_edit_is_saved ... ok" target/seam1.txt
       - name: test-support stays out of product builds
@@ -184,6 +185,7 @@ jobs:
             2>&1 | tee target/seam1.txt
           grep -F "published_schema_accepts_the_default_and_rejects_an_unknown_field ... ok" target/seam1.txt
           grep -F "the_config_path_is_only_the_owner_profile_file ... ok" target/seam1.txt
+          grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam1.txt
           grep -F "inherited_group_write_aces_lose_write_with_the_owner ... ok" target/seam1.txt
           grep -F "a_locked_file_edit_is_offered_and_an_unlocked_edit_is_saved ... ok" target/seam1.txt
       - name: test-support stays out of product builds
@@ -299,6 +301,7 @@ jobs:
             2>&1 | tee target/seam1.txt
           grep -F "published_schema_accepts_the_default_and_rejects_an_unknown_field ... ok" target/seam1.txt
           grep -F "the_config_path_is_only_the_owner_profile_file ... ok" target/seam1.txt
+          grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam1.txt
           grep -F "inherited_group_write_aces_lose_write_with_the_owner ... ok" target/seam1.txt
           grep -F "a_locked_file_edit_is_offered_and_an_unlocked_edit_is_saved ... ok" target/seam1.txt
       - name: test-support stays out of product builds
@@ -528,6 +531,7 @@ jobs:
           grep -F "an_invalid_edit_keeps_the_last_good_config ... ok" target/seam2-service.txt
           grep -F "put_config_returns_locked_while_soft_locked_and_while_windows_is_locked ... ok" target/seam2-service.txt
           grep -F "a_stale_base_revision_returns_conflict ... ok" target/seam2-service.txt
+          grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam2-service.txt
           grep -F "get_config_and_validate_config_work_for_lock_client ... ok" target/seam2-service.txt
           cargo build --locked -p softlock-service -p softlock-lockhost \
             --features softlock-service/simulated-physical,softlock-lockhost/simulated-physical \

@@ -381,15 +381,9 @@ fn session_event(
 }
 
 fn install_journal(authority: &mut Authority) {
-    if let Ok(path) = crate::config_file::configured_path() {
-        if let Some(dir) = path.parent() {
-            authority.set_config_dir(dir.to_path_buf());
-        }
-        match crate::config_file::read_config(&path) {
-            Ok(text) => authority.load_existing_config(&text),
-            Err(_) => authority.load_existing_config(""),
-        }
-    }
+    // Recover the journal before creating or applying config.toml.
+    // `startup_steps` is RecoverJournal, then LoadConfig. Applying the file
+    // first can rebuild the journal from the live lockdown values.
     match crate::settings::SettingsEngine::open() {
         Ok(mut engine) => match engine.boot() {
             Ok(crate::settings::Boot::FailClosed(journal)) => {
@@ -422,6 +416,15 @@ fn install_journal(authority: &mut Authority) {
                 journal,
                 session_active: true,
             });
+        }
+    }
+    if let Ok(path) = crate::config_file::configured_path() {
+        if let Some(dir) = path.parent() {
+            authority.set_config_dir(dir.to_path_buf());
+        }
+        match crate::config_file::read_config(&path) {
+            Ok(text) => authority.load_existing_config(&text),
+            Err(_) => authority.load_existing_config(""),
         }
     }
     crate::settings::register_sign_in_recovery();
