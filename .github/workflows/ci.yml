@@ -687,49 +687,6 @@ jobs:
           print("ci suite ok", report["summary"])
           PY
 
-  # Temporary. Repeat the two flakes that passed on their PRs and failed on main.
-  # Removed once the repeats are green.
-  flake-repeat:
-    name: flake repeat (${{ matrix.os }})
-    needs: changes
-    if: |
-      always() &&
-      needs.changes.result == 'success'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2022, macos-latest]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
-        with:
-          toolchain: 1.100.0
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: flake-repeat-${{ matrix.os }}
-      - name: Repeat the settings reparse tests
-        if: matrix.os == 'windows-2022'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          cargo test --locked -p softlock-service --lib --target x86_64-pc-windows-msvc -- path_and_menu --test-threads=8
-          1..20 | ForEach-Object {
-            Write-Host "settings repeat $_"
-            cargo test --locked -p softlock-service --lib --target x86_64-pc-windows-msvc -- path_and_menu --test-threads=8
-          }
-      - name: Repeat the dev pin clear test beside SetPin
-        if: matrix.os == 'macos-latest'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p softlock-service --test seam2 -- dev_clear_pin_removes_the_on_disk_hash correct_pin_consumes_the_service_nonce --test-threads=8
-          for i in $(seq 1 20); do
-            echo "pin repeat $i"
-            cargo test --locked -p softlock-service --test seam2 -- dev_clear_pin_removes_the_on_disk_hash correct_pin_consumes_the_service_nonce --test-threads=8
-          done
-
   ci-ok:
     name: ci ok
     runs-on: ubuntu-latest
@@ -742,7 +699,6 @@ jobs:
       - seam4
       - seam3
       - linux-hardware
-      - flake-repeat
     if: always()
     steps:
       - name: Required checks
@@ -768,4 +724,3 @@ jobs:
           check seam4 "${{ needs.seam4.result }}"
           check seam3 "${{ needs.seam3.result }}"
           check linux-hardware "${{ needs.linux-hardware.result }}"
-          check flake-repeat "${{ needs.flake-repeat.result }}"
