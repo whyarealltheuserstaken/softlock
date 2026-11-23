@@ -655,11 +655,44 @@ mod path_and_menu {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{command_path_allowed, menu_directory_is_plain, write_menu_new};
 
-    fn temp_root() -> PathBuf {
-        std::env::temp_dir().join(format!("softlock-menu-{}", std::process::id()))
+    /// Both tests used to share `softlock-menu-<pid>` and delete it while the
+    /// other was still creating children. Each call gets its own directory.
+    fn scratch(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("softlock-{label}-{}-{n}", std::process::id()))
+    }
+
+    fn system32_name(label: &str, n: u64) -> PathBuf {
+        PathBuf::from(format!(
+            r"C:\Windows\System32\softlock-{label}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    struct Remove<'a> {
+        files: &'a [PathBuf],
+        junctions: &'a [PathBuf],
+        trees: &'a [PathBuf],
+    }
+
+    impl Drop for Remove<'_> {
+        fn drop(&mut self) {
+            for path in self.files {
+                let _ = fs::remove_file(path);
+            }
+            // `remove_dir` on a junction does not follow it into the target.
+            for path in self.junctions {
+                let _ = fs::remove_dir(path);
+            }
+            for path in self.trees {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
     }
 
     fn junction(link: &Path, target: &Path) {
@@ -729,17 +762,22 @@ mod path_and_menu {
 
     #[test]
     fn a_junction_or_symlink_under_the_trusted_prefix_is_refused() {
-        let id = std::process::id();
-        let root = temp_root();
-        let _ = fs::remove_dir_all(&root);
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let root = scratch("junction");
         let real = root.join("real");
         fs::create_dir_all(&real).expect("temp");
         let payload = real.join("softlock-service.exe");
         fs::write(&payload, b"exe").expect("exe");
-        let plain = PathBuf::from(format!(r"C:\Windows\System32\softlock-plain-{id}"));
-        let via_junction = PathBuf::from(format!(r"C:\Windows\System32\softlock-junction-{id}"));
+        let plain = system32_name("plain", n);
+        let via_junction = system32_name("junction", n);
         let _ = fs::remove_dir_all(&plain);
         let _ = fs::remove_dir(&via_junction);
+        let _cleanup = Remove {
+            files: &[],
+            junctions: std::slice::from_ref(&via_junction),
+            trees: &[plain.clone(), root.clone()],
+        };
         fs::create_dir(&plain).expect("plain dir");
         let plain_exe = plain.join("softlock-service.exe");
         fs::write(&plain_exe, b"exe").expect("plain exe");
@@ -752,10 +790,6 @@ mod path_and_menu {
         let allowed_junction = command_path_allowed(&linked);
         let allowed_symlink = command_path_allowed(&symlink);
         let allowed_meta = command_path_allowed(metachar);
-        let _ = fs::remove_file(&symlink);
-        let _ = fs::remove_dir(&via_junction);
-        let _ = fs::remove_dir_all(&plain);
-        let _ = fs::remove_dir_all(&root);
         assert!(allowed_plain, "a plain image under System32 was refused");
         assert!(!allowed_junction, "a junction under System32 was accepted");
         assert!(!allowed_symlink, "a symlink image was accepted");
@@ -767,8 +801,9 @@ mod path_and_menu {
 
     #[test]
     fn an_existing_menu_command_is_rewritten_and_a_reparse_folder_is_refused() {
-        let root = temp_root().join("menu");
-        let _ = fs::remove_dir_all(&root);
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let root = scratch("menu");
         let programs = root.join("programs");
         fs::create_dir_all(&programs).expect("programs");
         let link = root.join("programs-link");
@@ -788,16 +823,15 @@ mod path_and_menu {
         let body = fs::read(&cmd).expect("read");
         let other = root.join("other.cmd");
         fs::write(&other, b"other").expect("other");
-        let linked_cmd = PathBuf::from(format!(
-            r"C:\Windows\System32\softlock-menu-link-{}.cmd",
-            std::process::id()
-        ));
+        let linked_cmd = system32_name(&format!("menu-link-{n}"), n).with_extension("cmd");
         let _ = fs::remove_file(&linked_cmd);
+        let _cleanup = Remove {
+            files: std::slice::from_ref(&linked_cmd),
+            junctions: std::slice::from_ref(&link),
+            trees: std::slice::from_ref(&root),
+        };
         symlink_file(&linked_cmd, &other);
         let reparse_file = write_menu_new(&linked_cmd, b"nope\r\n");
-        let _ = fs::remove_file(&linked_cmd);
-        let _ = fs::remove_dir(&link);
-        let _ = fs::remove_dir_all(&root);
         assert_eq!(body, b"@echo off\r\nnew\r\n");
         assert!(reparse_file.is_err(), "a symlink command was rewritten");
     }

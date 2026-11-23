@@ -78,13 +78,22 @@ impl PinStore {
     #[cfg(not(windows))]
     fn write_hash(&self, parent: &Path, hash: &str) -> io::Result<()> {
         fs::create_dir_all(parent)?;
-        let tmp = self.path.with_extension("tmp");
+        // Parallel tests and overlapping saves share this directory. A fixed
+        // `pin.tmp` name makes the second rename fail with ENOENT after the
+        // first rename already took the file.
+        let tmp = unique_pin_tmp(parent);
         fs::write(&tmp, hash.as_bytes())?;
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&tmp)?.permissions();
-        permissions.set_mode(0o600);
-        fs::set_permissions(&tmp, permissions)?;
-        fs::rename(&tmp, &self.path)
+        let outcome = (|| {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&tmp)?.permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&tmp, permissions)?;
+            fs::rename(&tmp, &self.path)
+        })();
+        if outcome.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        outcome
     }
 
     pub fn load(&self) -> io::Result<Option<String>> {
@@ -101,6 +110,14 @@ impl PinStore {
             }
         }
     }
+}
+
+#[cfg(not(windows))]
+fn unique_pin_tmp(parent: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".pin.{}.{n}.tmp", std::process::id()))
 }
 
 /// Save, read back, save a second value, read that back.

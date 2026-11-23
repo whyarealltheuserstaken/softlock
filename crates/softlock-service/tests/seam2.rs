@@ -17,6 +17,14 @@ use softlock_service::{PinStore, pin_directory};
 const PIN: &str = "z9-pin-4e7c1b";
 const NOTE: &str = "Quarterly Report - Notepad";
 
+/// Unix pin saves share `/tmp/<service>/pin.phc`. Hold this across a save and
+/// the later assertion so a parallel `SetPin` cannot recreate the file.
+#[cfg(not(windows))]
+fn pin_disk_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn authority() -> Authority {
     Authority::new(ServicePlatform::new(OsLock::Fails), true)
 }
@@ -191,6 +199,8 @@ fn get_status_snapshots_source_and_health() {
 
 #[test]
 fn correct_pin_consumes_the_service_nonce() {
+    #[cfg(not(windows))]
+    let _pin_disk = pin_disk_lock();
     let capture = Capture::new();
     tracing::subscriber::with_default(capture.clone(), || {
         let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), true);
@@ -485,6 +495,7 @@ fn public_kind(index: u8) -> RequestKind {
 #[cfg(not(windows))]
 #[test]
 fn dev_clear_pin_removes_the_on_disk_hash() {
+    let _pin_disk = pin_disk_lock();
     let dir = pin_directory();
     std::fs::create_dir_all(&dir).expect("pin dir");
     let store = PinStore::in_dir(&dir);
