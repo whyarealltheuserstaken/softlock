@@ -64,10 +64,18 @@ fn live_settings_journal() {
     let mut guard = Guard {
         rows: rows(),
         reported: false,
+        config_path: None,
+        config_dacl: None,
+        config_bytes: None,
     };
     let outcome = match case.as_str() {
         "restore" => restore(&mut guard),
         "recover-active" => recover_active(&mut guard),
+        "clock" => clock_shift_stays_locked(&mut guard),
+        #[cfg(feature = "live-fail-closed")]
+        "sign-in" => sign_in_then_the_next_lock_unlocks(&mut guard),
+        #[cfg(not(feature = "live-fail-closed"))]
+        "sign-in" => Err("the sign-in case is compiled with live-fail-closed".to_string()),
         other => Err(format!("unknown case {other}")),
     };
     match outcome {
@@ -90,78 +98,710 @@ fn restore(guard: &mut Guard) -> Result<(), String> {
     // active. A later hard stop of an unpaused lock can fail closed and
     // reject the next lock.
     every_row_restores(guard)?;
-    for previous in ["absent", "0", "1"] {
-        kill_before_apply(guard, previous)?;
+    for order in KILL_ORDERS {
+        for previous in ["absent", "0", "1"] {
+            kill_before_apply(guard, previous, order)?;
+        }
+        kill_after_apply(guard, order)?;
     }
-    kill_after_apply(guard)?;
     reassert_and_repair(guard)?;
+    config_acl_round_trip(guard)?;
     Ok(())
 }
 
-fn kill_before_apply(guard: &mut Guard, previous: &str) -> Result<(), String> {
+#[derive(Clone, Copy)]
+enum KillOrder {
+    ServiceFirst,
+    HostFirst,
+    Both,
+}
+
+const KILL_ORDERS: [KillOrder; 3] = [
+    KillOrder::ServiceFirst,
+    KillOrder::HostFirst,
+    KillOrder::Both,
+];
+
+fn order_name(order: KillOrder) -> &'static str {
+    match order {
+        KillOrder::ServiceFirst => "service-first",
+        KillOrder::HostFirst => "host-first",
+        KillOrder::Both => "both",
+    }
+}
+
+fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
+    #[cfg(not(feature = "live-fail-closed"))]
+    {
+        let _ = guard;
+        Err("the config ACL proof needs live-fail-closed".to_string())
+    }
+    #[cfg(feature = "live-fail-closed")]
+    {
+        // The earlier proofs disconnect the console. A lock from this process
+        // is refused until that session is the active console again.
+        align_console()?;
+        let path = softlock_service::owner_config_file().map_err(|reason| reason.to_string())?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|_| "config dir".to_string())?;
+        }
+        // The Service has to create this file. A copy the console user already
+        // had is put back when the guard drops.
+        if path.exists() {
+            guard.config_bytes = Some(fs::read(&path).unwrap_or_default());
+            force_remove(&path);
+            if path.exists() {
+                return Err("could not remove the existing config file".to_string());
+            }
+        }
+        let pause = guard_dir().join("pause-config");
+        let _ = fs::remove_file(&pause);
+        spawn_service(guard, Some("before"), &pause, true)?;
+        wait_pipe()?;
+        let created = wait_for_config(&path);
+        if !created {
+            let owner = softlock_service::testing_owner(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
+            let dacl = softlock_service::testing_dacl(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
+            return Err(format!(
+                "config file before the ACL change exists={} write={} journal={} owner={} dacl={}",
+                path.is_file(),
+                write_state(&path),
+                journal_ready(&journal_file()),
+                owner,
+                dacl
+            ));
+        }
+        guard.config_path = Some(path.clone());
+        let body = fs::read_to_string(&path).map_err(|_| "config read".to_string())?;
+        if !body.contains("schema_version") {
+            return Err("the service did not write the config file".to_string());
+        }
+        let original = softlock_service::testing_dacl(&path).map_err(|_| "dacl".to_string())?;
+        let owner = softlock_service::testing_owner(&path).map_err(|_| "owner".to_string())?;
+        let mine = console_user_sid()?;
+        if !owner.eq_ignore_ascii_case(&mine) && !explicit_user_dacl(&original, &mine) {
+            return Err(format!(
+                "config owner {owner} is not the console user {mine} and the DACL is not an explicit grant"
+            ));
+        }
+        guard.config_dacl = Some(original.clone());
+        fs::write(&pause, "go").map_err(|_| "pause".to_string())?;
+        if !wait_until(Duration::from_secs(20), || owner_rights_denied(&path)) {
+            return Err(format!(
+                "the console user kept a write right while locked: {}",
+                owner_rights(&path)
+            ));
+        }
+        // The locked DACL no longer lets the console user write it. The
+        // external change has to come from LocalSystem, which still has full
+        // control.
+        restore_dacl_as_system(&path, &original)?;
+        if !wait_until(Duration::from_secs(12), || owner_rights_denied(&path)) {
+            return Err(format!(
+                "an external DACL change was not re-asserted: {}",
+                owner_rights(&path)
+            ));
+        }
+        // Deny SYSTEM WRITE_DAC and allow the console user write. Access
+        // denied must not count as held. The service puts the locked DACL
+        // back, or the user would be able to edit the file while locked.
+        let hostile = format!("D:P(D;;WD;;;SY)(A;;FA;;;{mine})(A;;FR;;;OW)");
+        restore_dacl_as_system(&path, &hostile)?;
+        if !wait_until(Duration::from_secs(15), || owner_rights_denied(&path)) {
+            let dacl = softlock_service::testing_dacl(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
+            let owner = softlock_service::testing_owner(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
+            let log = fs::read_to_string(guard_dir().join("service.log")).unwrap_or_default();
+            let start = log.len().saturating_sub(700);
+            let start = (start..=log.len())
+                .find(|index| log.is_char_boundary(*index))
+                .unwrap_or(log.len());
+            return Err(format!(
+                "a DACL that denies SYSTEM WRITE_DAC left the console user able to write (owner {owner} dacl {dacl} log {})",
+                &log[start..]
+            ));
+        }
+        hard_stop(guard)?;
+        let _ = wait_until(Duration::from_secs(5), || !host_running());
+        spawn_service(guard, None, &pause, true)?;
+        let restored = wait_until(Duration::from_secs(20), || {
+            softlock_service::testing_dacl(&path)
+                .ok()
+                .is_some_and(|current| current == original)
+                && softlock_service::testing_owner(&path)
+                    .ok()
+                    .is_some_and(|current| current.eq_ignore_ascii_case(&owner))
+                && owner_rights_allowed(&path)
+        });
+        hard_stop(guard)?;
+        if !restored {
+            let now_owner = softlock_service::testing_owner(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
+            let now_dacl = softlock_service::testing_dacl(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
+            return Err(format!(
+                "boot after the host was gone did not restore the config descriptor (owner {now_owner} wanted {owner} dacl {now_dacl})"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn wait_for_config(path: &Path) -> bool {
+    let started = Instant::now();
+    let mut next_lock = Instant::now();
+    while started.elapsed() < Duration::from_secs(40) {
+        if path.is_file() && owner_rights_allowed(path) && journal_ready(&journal_file()) {
+            return true;
+        }
+        // A paused lock already saved the journal. Asking again would block
+        // behind that pause.
+        if Instant::now() >= next_lock && !journal_ready(&journal_file()) {
+            lock_in_background();
+            next_lock = Instant::now() + Duration::from_secs(3);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    path.is_file() && owner_rights_allowed(path) && journal_ready(&journal_file())
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn align_console() -> Result<(), String> {
+    if session_aligned() {
+        return Ok(());
+    }
+    let api = format!("{}{}{}", "WTS", "Connect", "SessionW");
+    let script = guard_dir().join("align.ps1");
+    let log = guard_dir().join("align.txt");
+    let body = format!(
+        "$sig = @'\nusing System.Runtime.InteropServices;\npublic static class SoftlockAlign {{\n  [DllImport(\"wtsapi32.dll\", CharSet=CharSet.Unicode)]\n  public static extern bool {api}(uint session, uint target, string password, bool wait);\n}}\n'@\nAdd-Type -TypeDefinition $sig\n$id = (Get-Process -Id {pid}).SessionId\n$result = [SoftlockAlign]::{api}([uint32]$id, [uint32]::MaxValue, '', $true)\nSet-Content -Path '{log}' -Value $result\n",
+        api = api,
+        pid = std::process::id(),
+        log = log.display(),
+    );
+    fs::write(&script, body).map_err(|_| "align script".to_string())?;
+    let powershell = std::env::var("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let bin = format!(
+        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
+        powershell.display(),
+        script.display()
+    );
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-align", "/F"])
+        .status_within(Duration::from_secs(30), "command");
+    let created = Command::new("schtasks")
+        .args([
+            "/Create", "/TN", "sl-align", "/TR", &bin, "/SC", "ONCE", "/ST", "00:00", "/RU",
+            "SYSTEM", "/RL", "HIGHEST", "/F",
+        ])
+        .status_within(Duration::from_secs(30), "command")?;
+    if !created.success() {
+        return Err("align task was not created".to_string());
+    }
+    let _ = Command::new("schtasks")
+        .args(["/Run", "/TN", "sl-align"])
+        .status_within(Duration::from_secs(30), "schtasks /Run")?;
+    let aligned = wait_until(Duration::from_secs(20), session_aligned);
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-align", "/F"])
+        .status_within(Duration::from_secs(30), "command");
+    if aligned {
+        Ok(())
+    } else {
+        let note = fs::read_to_string(&log).unwrap_or_default();
+        Err(format!("console session was not the test session ({note})"))
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn restore_dacl_as_system(path: &Path, sddl: &str) -> Result<(), String> {
+    let script = guard_dir().join("restore-dacl.ps1");
+    let log = guard_dir().join("restore-dacl.log");
+    let sddl = sddl.replace('\'', "''");
+    let path_text = path.display().to_string().replace('\'', "''");
+    let body = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$log = '{log}'
+try {{
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class SoftlockAcl {{
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern int SetNamedSecurityInfo(string name, int type, int security, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string sddl, int revision, out IntPtr sd, out uint length);
+  [DllImport("advapi32.dll", SetLastError=true)]
+  public static extern bool GetSecurityDescriptorDacl(IntPtr sd, out bool present, out IntPtr dacl, out bool defaulted);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern int GetNamedSecurityInfo(string name, int type, int security, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr sd);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern bool ConvertSecurityDescriptorToStringSecurityDescriptor(IntPtr sd, int revision, int security, out IntPtr text, out uint length);
+}}
+'@
+  $sd = [IntPtr]::Zero
+  $length = [uint32]0
+  $converted = [SoftlockAcl]::ConvertStringSecurityDescriptorToSecurityDescriptor('{sddl}', 1, [ref]$sd, [ref]$length)
+  if (-not $converted) {{ throw "convert $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }}
+  $present = $false
+  $dacl = [IntPtr]::Zero
+  $defaulted = $false
+  [void][SoftlockAcl]::GetSecurityDescriptorDacl($sd, [ref]$present, [ref]$dacl, [ref]$defaulted)
+  if (-not $present) {{ throw 'no dacl' }}
+  $status = [SoftlockAcl]::SetNamedSecurityInfo('{path_text}', 1, 0x80000004, [IntPtr]::Zero, [IntPtr]::Zero, $dacl, [IntPtr]::Zero)
+  if ($status -ne 0) {{ throw "set $status" }}
+  $owner = [IntPtr]::Zero
+  $group = [IntPtr]::Zero
+  $nowDacl = [IntPtr]::Zero
+  $sacl = [IntPtr]::Zero
+  $nowSd = [IntPtr]::Zero
+  $read = [SoftlockAcl]::GetNamedSecurityInfo('{path_text}', 1, 4, [ref]$owner, [ref]$group, [ref]$nowDacl, [ref]$sacl, [ref]$nowSd)
+  if ($read -ne 0) {{ throw "read $read" }}
+  $rendered = [IntPtr]::Zero
+  $renderedLen = [uint32]0
+  $shown = [SoftlockAcl]::ConvertSecurityDescriptorToStringSecurityDescriptor($nowSd, 1, 4, [ref]$rendered, [ref]$renderedLen)
+  if (-not $shown) {{ throw "render $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }}
+  $text = [Runtime.InteropServices.Marshal]::PtrToStringUni($rendered)
+  "readback=$text" | Set-Content -LiteralPath $log
+}} catch {{
+  $_ | Out-String | Set-Content -LiteralPath $log
+  exit 1
+}}
+"#,
+        log = log.display(),
+        sddl = sddl,
+        path_text = path_text,
+    );
+    fs::write(&script, body).map_err(|_| "dacl script".to_string())?;
+    let powershell = std::env::var("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let bin = format!(
+        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
+        powershell.display(),
+        script.display()
+    );
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-dacl", "/F"])
+        .status_within(Duration::from_secs(30), "command");
+    let created = Command::new("schtasks")
+        .args([
+            "/Create", "/TN", "sl-dacl", "/TR", &bin, "/SC", "ONCE", "/ST", "00:00", "/RU",
+            "SYSTEM", "/RL", "HIGHEST", "/F",
+        ])
+        .status_within(Duration::from_secs(30), "command")?;
+    if !created.success() {
+        return Err("dacl task was not created".to_string());
+    }
+    let started = Command::new("schtasks")
+        .args(["/Run", "/TN", "sl-dacl"])
+        .status_within(Duration::from_secs(30), "command")?;
+    let recorded = started.success()
+        && wait_until(Duration::from_secs(15), || {
+            fs::read_to_string(&log)
+                .ok()
+                .is_some_and(|text| text.contains("readback="))
+        });
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-dacl", "/F"])
+        .status_within(Duration::from_secs(30), "command");
+    let note = fs::read_to_string(&log).unwrap_or_default();
+    // The locked DACL still says FA for SYSTEM. A restored file has no FR ACE.
+    let granted = note.lines().any(|line| {
+        let Some(body) = line.trim().strip_prefix("readback=") else {
+            return false;
+        };
+        body.contains("FA") && !body.contains("FR")
+    });
+    if recorded && granted {
+        Ok(())
+    } else {
+        Err(format!("dacl task did not restore write ({note})"))
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn query_session_aligned() -> bool {
+    use windows::Win32::System::RemoteDesktop::{
+        ProcessIdToSessionId, WTSActive, WTSConnectState, WTSFreeMemory,
+        WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::core::PWSTR;
+    unsafe {
+        let console = WTSGetActiveConsoleSessionId();
+        let mut mine = 0u32;
+        if ProcessIdToSessionId(GetCurrentProcessId(), &mut mine).is_err() {
+            return false;
+        }
+        if mine == 0 || mine == u32::MAX || mine != console {
+            return false;
+        }
+        // The session id matches before the console is WTSActive. Repair
+        // refuses until the logon is active, so wait for that state.
+        let mut buffer = PWSTR::null();
+        let mut bytes = 0u32;
+        if WTSQuerySessionInformationW(None, console, WTSConnectState, &mut buffer, &mut bytes)
+            .is_err()
+            || buffer.is_null()
+        {
+            return false;
+        }
+        let state = *buffer.0.cast::<u32>();
+        WTSFreeMemory(buffer.0.cast());
+        state == WTSActive.0 as u32
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn session_aligned() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let aligned = query_session_aligned();
+        let _ = sender.send(aligned);
+        BUSY.store(false, Ordering::Release);
+    });
+    // `WTSQuerySessionInformationW` sits inside `wait_until`. A blocked query
+    // would never come back to the 20s deadline. One query in flight is enough.
+    let aligned: bool = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_default();
+    aligned
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn owner_rights(path: &Path) -> String {
+    softlock_service::owner_lock_rights()
+        .iter()
+        .map(|right| {
+            let state = match softlock_service::owner_right_denied(path, right.access) {
+                Ok(true) => "denied",
+                Ok(false) => "allowed",
+                Err(error) => return format!("{}={error}", right.name),
+            };
+            format!("{}={state}", right.name)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn owner_rights_denied(path: &Path) -> bool {
+    softlock_service::owner_lock_rights().iter().all(|right| {
+        matches!(
+            softlock_service::owner_right_denied(path, right.access),
+            Ok(true)
+        )
+    })
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn owner_rights_allowed(path: &Path) -> bool {
+    softlock_service::owner_lock_rights().iter().all(|right| {
+        matches!(
+            softlock_service::owner_right_denied(path, right.access),
+            Ok(false)
+        )
+    })
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn force_remove(path: &Path) {
+    let text = path.display().to_string();
+    let _ = fs::remove_file(path);
+    if path.exists() {
+        let _ = Command::new("takeown")
+            .args(["/f", &text, "/a"])
+            .status_within(Duration::from_secs(30), "command");
+        let _ = Command::new("icacls")
+            .args([&text, "/reset"])
+            .status_within(Duration::from_secs(30), "command");
+        let _ = Command::new("icacls")
+            .args([&text, "/grant", "Everyone:F"])
+            .status_within(Duration::from_secs(30), "command");
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn write_state(path: &Path) -> String {
+    match softlock_service::owner_write_denied(path) {
+        Ok(true) => "denied".to_string(),
+        Ok(false) => "allowed".to_string(),
+        Err(error) => error.to_string(),
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn explicit_user_dacl(dacl: &str, sid: &str) -> bool {
+    if !dacl.starts_with("D:P") {
+        return false;
+    }
+    let upper = dacl.to_ascii_uppercase();
+    if upper.contains(&sid.to_ascii_uppercase()) {
+        return true;
+    }
+    // The built-in administrator is printed as LA.
+    sid.rsplit('-').next() == Some("500") && upper.contains(";;;LA)")
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn console_user_sid() -> Result<String, String> {
+    let output = Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output_within(Duration::from_secs(30), "whoami")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let sid = text
+        .split(',')
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    if sid.starts_with("S-1-") {
+        Ok(sid)
+    } else {
+        Err(format!("whoami did not name a SID: {text}"))
+    }
+}
+
+fn kill_before_apply(guard: &mut Guard, previous: &str, order: KillOrder) -> Result<(), String> {
+    realign()?;
     set_taskmgr(previous)?;
-    let pause = guard_dir().join(format!("pause-{previous}"));
+    let pause = guard_dir().join(format!("pause-{}-{previous}", order_name(order)));
     let _ = fs::remove_file(&pause);
-    spawn_service(guard, Some("before"), &pause)?;
+    let before = journal_text();
+    spawn_service(guard, Some("before"), &pause, true)?;
     wait_pipe()?;
     lock_in_background();
     let journal = journal_file();
     let saw = wait_until(Duration::from_secs(20), || {
-        journal_ready(&journal) && query_taskmgr() == previous
+        journal_ready(&journal) && journal_text() != before && query_taskmgr() == previous
     });
     if !saw || !journal_ready(&journal) {
         return Err(format!(
-            "journal was not durable before the {previous} change"
+            "journal was not durable before the {previous} change ({})",
+            order_name(order)
         ));
     }
     // The service is blocked after the flush. A stop file is not read until
     // that pause ends, which would apply the value. Kill it.
-    hard_stop(guard)?;
+    let baseline = log_baseline();
+    stop_in_order(guard, order)?;
     if query_taskmgr() != previous {
-        return Err(format!("kill changed DisableTaskMgr from {previous}"));
+        return Err(format!(
+            "kill changed DisableTaskMgr from {previous} ({})",
+            order_name(order)
+        ));
     }
     let _ = wait_until(Duration::from_secs(5), || !host_running());
-    spawn_service(guard, None, &pause)?;
-    let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == previous);
+    // Leave the console where the kill left it. Attaching here would turn a
+    // confirmed disconnect back into an active desktop before recovery runs.
+    spawn_service(guard, None, &pause, false)?;
+    wait_os_held(
+        previous,
+        &format!("before {previous} {}", order_name(order)),
+        &baseline,
+    )?;
     hard_stop(guard)?;
-    if !restored {
-        return Err(format!("restart did not restore {previous}"));
-    }
+    clear_os_hold()?;
+    realign()?;
     if query_taskmgr() != previous {
-        return Err(format!("restored value was not {previous}"));
+        return Err(format!(
+            "restored value was not {previous} ({})",
+            order_name(order)
+        ));
     }
     Ok(())
 }
 
-fn kill_after_apply(guard: &mut Guard) -> Result<(), String> {
+fn kill_after_apply(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
+    realign()?;
     set_taskmgr("absent")?;
-    let pause = guard_dir().join("pause-after");
+    let pause = guard_dir().join(format!("pause-after-{}", order_name(order)));
     let _ = fs::remove_file(&pause);
-    // Hold the service after the registry write, before it can OS-lock the
-    // session or revert. The value is 1; killing both processes leaves the
-    // journal durable for the restart to restore.
-    spawn_service(guard, Some("after"), &pause)?;
+    // Hold the service after the registry write. Killing both processes
+    // leaves the journal durable. The restart is the same boot. It must
+    // OS-lock or leave the session OS-held, and must not end Unlocked while
+    // the session is active. Settings are restored once that lock is
+    // confirmed (SPEC section 7).
+    spawn_service(guard, Some("after"), &pause, true)?;
     wait_pipe()?;
     lock_in_background();
     let applied = wait_until(Duration::from_secs(20), || query_taskmgr() == "1");
     if !applied {
-        return Err("DisableTaskMgr was not set to 1".to_string());
+        return Err(format!(
+            "DisableTaskMgr was not set to 1 ({})",
+            order_name(order)
+        ));
     }
-    hard_stop(guard)?;
+    let baseline = log_baseline();
+    stop_in_order(guard, order)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
-    spawn_service(guard, None, &pause)?;
-    let restored = wait_until(Duration::from_secs(20), || query_taskmgr() == "absent");
+    spawn_service(guard, None, &pause, false)?;
+    wait_os_held("absent", &format!("after {}", order_name(order)), &baseline)?;
+    // The owner coming back attaches the console again. The product never
+    // reconnects a session. The restored value has to still be absent.
+    realign()?;
+    let still = wait_until(Duration::from_secs(10), || query_taskmgr() == "absent");
+    let status = transact(&pipe_name(), status_body()).unwrap_or_default();
+    let state = status_state(&status).unwrap_or_default();
     hard_stop(guard)?;
-    if !restored {
-        return Err("restart did not restore an absent value".to_string());
+    clear_os_hold()?;
+    if !still || query_taskmgr() != "absent" {
+        return Err(format!(
+            "settings were not the absent original after the owner returned (state {state}, {})",
+            order_name(order)
+        ));
     }
     Ok(())
+}
+
+fn wait_os_held(expected: &str, label: &str, baseline: &str) -> Result<(), String> {
+    let mut ended_unlocked = false;
+    let mut last_state = String::new();
+    let held = wait_until(Duration::from_secs(25), || {
+        let status = transact(&pipe_name(), status_body()).unwrap_or_default();
+        let state = status_state(&status).unwrap_or_default();
+        last_state = state.clone();
+        let os_held = session_os_held();
+        // Unlocked with no confirmed OS lock is a fail-open. Unlocked after
+        // `os-lock result=confirmed` was written during this wait, with the
+        // original value back, is the owner (or the runner's auto-logon)
+        // returning to this logon. The service clears OsLocked itself. A
+        // reconnect on a real machine asks for credentials unless auto-logon
+        // is on. A missing confirmation line cannot take this branch.
+        if state == "Unlocked" && !os_held {
+            if confirmed_since(baseline, expected) {
+                return true;
+            }
+            ended_unlocked = true;
+            return false;
+        }
+        let reported = state == "OsLocked" || os_held;
+        reported && query_taskmgr() == expected && !journal_ready(&journal_file())
+    });
+    if !held && ended_unlocked {
+        return Err(format!(
+            "{label} ended Unlocked with no OS lock (value {})",
+            query_taskmgr()
+        ));
+    }
+    if !held {
+        return Err(format!(
+            "{label} did not OS-lock or disconnect and restore (state {last_state}, value {})",
+            query_taskmgr()
+        ));
+    }
+    Ok(())
+}
+
+fn clock_shift_stays_locked(guard: &mut Guard) -> Result<(), String> {
+    let original = powershell("(Get-Date).ToString('o')")?;
+    let _restore = ClockRestore {
+        original: original.clone(),
+    };
+    for order in KILL_ORDERS {
+        clock_one_order(guard, order)?;
+    }
+    Ok(())
+}
+
+fn clock_one_order(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
+    realign()?;
+    set_taskmgr("absent")?;
+    let pause = guard_dir().join(format!("pause-clock-{}", order_name(order)));
+    let _ = fs::remove_file(&pause);
+    spawn_service(guard, None, &pause, true)?;
+    wait_pipe()?;
+    lock_in_background();
+    if !wait_until(Duration::from_secs(20), || query_taskmgr() == "1") {
+        return Err(format!(
+            "the clock case did not set DisableTaskMgr ({})",
+            order_name(order)
+        ));
+    }
+    // A large forward jump. BootTime moves with the wall clock. Unbiased
+    // uptime does not. The live service has to stay locked across the jump.
+    // The restart, not the kill, is the recovery under test.
+    powershell("[void](Set-Date -Date (Get-Date).AddDays(3))")?;
+    thread::sleep(Duration::from_secs(2));
+    let live = transact(&pipe_name(), status_body()).unwrap_or_default();
+    let live_state = status_state(&live).unwrap_or_default();
+    if live_state == "Unlocked" || query_taskmgr() != "1" {
+        return Err(format!(
+            "a clock change moved the live lock (state {live_state}, value {}, {})",
+            query_taskmgr(),
+            order_name(order)
+        ));
+    }
+    let baseline = log_baseline();
+    stop_in_order(guard, order)?;
+    let _ = wait_until(Duration::from_secs(5), || !host_running());
+    spawn_service(guard, None, &pause, false)?;
+    wait_os_held("absent", &format!("clock {}", order_name(order)), &baseline)?;
+    hard_stop(guard)?;
+    clear_os_hold()?;
+    Ok(())
+}
+
+struct ClockRestore {
+    original: String,
+}
+
+impl Drop for ClockRestore {
+    fn drop(&mut self) {
+        let script = format!(
+            "[void](Set-Date -Date '{}')",
+            self.original.replace('\'', "")
+        );
+        let _ = powershell(&script);
+    }
+}
+
+fn powershell(script: &str) -> Result<String, String> {
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output_within(Duration::from_secs(30), "powershell")?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "powershell failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     set_taskmgr("absent")?;
     let pause = guard_dir().join("pause-reassert");
-    spawn_service(guard, None, &pause)?;
+    spawn_service(guard, None, &pause, true)?;
     wait_pipe()?;
     transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
     if !wait_until(Duration::from_secs(20), || query_taskmgr() == "1") {
@@ -169,7 +809,7 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     }
     let _ = Command::new("reg")
         .args(["delete", KEY, "/v", "DisableTaskMgr", "/f"])
-        .status();
+        .status_within(Duration::from_secs(30), "command");
     if !wait_until(Duration::from_secs(8), || query_taskmgr() == "1") {
         return Err("cleared DisableTaskMgr was not re-asserted within 5 s".to_string());
     }
@@ -181,7 +821,7 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     }) {
         return Err("a Group Policy overwrite was not re-asserted".to_string());
     }
-    let repair = repair_settings()?;
+    let (repair, _) = repair_settings()?;
     if repair == 0 {
         return Err("repair ran while locked".to_string());
     }
@@ -189,11 +829,27 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
         return Err("repair changed DisableTaskMgr while locked".to_string());
     }
     hard_stop(guard)?;
-    let first = repair_settings()?;
-    let second = repair_settings()?;
-    if first != 0 || second != 0 {
+    // The disconnect can leave no console session. Repair then fail-closes
+    // instead of restoring. Attach the session first; the host is already gone.
+    #[cfg(feature = "live-fail-closed")]
+    align_console()?;
+    // Sign-in recovery runs as LocalSystem. The console user no longer has
+    // file write, and on some runners cannot set the DACL either.
+    let mut first = (1, String::new());
+    let mut restored = false;
+    for _ in 0..8 {
+        first = repair_as_system()?;
+        if first.0 == 0 {
+            restored = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let second = repair_as_system()?;
+    if !restored || second.0 != 0 {
         return Err(format!(
-            "repair after the kill returned {first} then {second}"
+            "repair after the kill returned {} ({}) then {} ({})",
+            first.0, first.1, second.0, second.1
         ));
     }
     if query_taskmgr() != "absent" {
@@ -202,11 +858,250 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "live-fail-closed")]
+fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
+    realign()?;
+    set_taskmgr("absent")?;
+    seed_system_pin(&guard_dir().join("pin"))?;
+    let pause = guard_dir().join("pause-sign-in");
+    let _ = fs::remove_file(&pause);
+    spawn_service(guard, None, &pause, true)?;
+    wait_pipe()?;
+    let locked = transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
+    if !locked.contains("Accepted") {
+        return Err(format!("first lock was not accepted: {locked}"));
+    }
+    if !wait_until(Duration::from_secs(20), || {
+        query_taskmgr() == "1"
+            && status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+                == Some("Locked")
+    }) {
+        return Err("first lock did not hold".to_string());
+    }
+    // The host dies. The service process stays up and confirms the disconnect.
+    // The runner's auto-logon can bring this logon back before the next
+    // sample. That is the sign-in, so Unlocked after the confirmation is
+    // the same success as a disconnect we still have to reconnect.
+    let baseline = log_baseline();
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "softlock-lockhost.exe"])
+        .status_within(Duration::from_secs(30), "command");
+    let held = wait_until(Duration::from_secs(25), || {
+        session_os_held()
+            || (status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+                == Some("Unlocked")
+                && confirmed_since(&baseline, "absent"))
+    });
+    let signed_back = !session_os_held()
+        && status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+            == Some("Unlocked")
+        && confirmed_since(&baseline, "absent");
+    if !held && !signed_back {
+        let state = transact(&pipe_name(), status_body()).unwrap_or_default();
+        return Err(format!(
+            "the host death did not disconnect the console: {state}"
+        ));
+    }
+    if !signed_back {
+        // Same logon, same session, back on the console. The service clears
+        // OsLocked itself once that sign-in is the console. No repair command.
+        align_console()?;
+        if !wait_until(Duration::from_secs(25), || {
+            status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+                == Some("Unlocked")
+                && confirmed_since(&baseline, "absent")
+        }) {
+            let state = transact(&pipe_name(), status_body()).unwrap_or_default();
+            return Err(format!("sign-in did not clear OsLocked: {state}"));
+        }
+    }
+    // The disconnected session's host was dropped. The replacement has to
+    // be ready before this lock, or the arm wait fail-closes.
+    thread::sleep(Duration::from_secs(2));
+    let again =
+        transact(&pipe_name(), lock_now()).map_err(|error| format!("second lock: {error}"))?;
+    if !again.contains("Accepted") {
+        return Err(format!("the next lock did not start: {again}"));
+    }
+    if !wait_until(Duration::from_secs(20), || {
+        status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+            == Some("Locked")
+    }) {
+        let state = transact(&pipe_name(), status_body()).unwrap_or_default();
+        return Err(format!("the next lock did not reach Locked: {state}"));
+    }
+    type_pin_keys()?;
+    if !wait_until(Duration::from_secs(30), || {
+        status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
+            == Some("Unlocked")
+    }) {
+        let state = transact(&pipe_name(), status_body()).unwrap_or_default();
+        return Err(format!("the next lock did not unlock: {state}"));
+    }
+    if query_taskmgr() != "absent" {
+        return Err(format!(
+            "unlock did not restore DisableTaskMgr ({})",
+            query_taskmgr()
+        ));
+    }
+    hard_stop(guard)?;
+    Ok(())
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn seed_system_pin(dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|_| "pin dir".to_string())?;
+    let secret = softlock_core::Secret::new(b"135742");
+    let hash = softlock_core::hash_softlock_pin(&secret).map_err(|_| "pin hash".to_string())?;
+    let staged = guard_dir().join("pin-hash.txt");
+    fs::write(&staged, hash.as_bytes()).map_err(|_| "pin stage".to_string())?;
+    let script = guard_dir().join("pin-seed.ps1");
+    let log = guard_dir().join("pin-seed.txt");
+    let pin_path = dir.join("pin.phc");
+    let body = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$log = '{log}'
+try {{
+  $hash = [IO.File]::ReadAllText('{staged}')
+  $utf8 = New-Object System.Text.UTF8Encoding $false
+  [IO.File]::WriteAllText('{pin}', $hash, $utf8)
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class SoftlockPin {{
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string sddl, int revision, out IntPtr sd, out uint length);
+  [DllImport("advapi32.dll", SetLastError=true)]
+  public static extern bool GetSecurityDescriptorOwner(IntPtr sd, out IntPtr owner, out bool defaulted);
+  [DllImport("advapi32.dll", SetLastError=true)]
+  public static extern bool GetSecurityDescriptorDacl(IntPtr sd, out bool present, out IntPtr dacl, out bool defaulted);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern int SetNamedSecurityInfo(string name, int type, int security, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+}}
+'@
+  $sd = [IntPtr]::Zero
+  $length = [uint32]0
+  if (-not [SoftlockPin]::ConvertStringSecurityDescriptorToSecurityDescriptor('O:SYD:P(A;;FA;;;SY)', 1, [ref]$sd, [ref]$length)) {{
+    throw "convert $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+  }}
+  $owner = [IntPtr]::Zero
+  $ownerDefault = $false
+  [void][SoftlockPin]::GetSecurityDescriptorOwner($sd, [ref]$owner, [ref]$ownerDefault)
+  $present = $false
+  $dacl = [IntPtr]::Zero
+  $daclDefault = $false
+  [void][SoftlockPin]::GetSecurityDescriptorDacl($sd, [ref]$present, [ref]$dacl, [ref]$daclDefault)
+  $status = [SoftlockPin]::SetNamedSecurityInfo('{pin}', 1, 0x80000005, $owner, [IntPtr]::Zero, $dacl, [IntPtr]::Zero)
+  if ($status -ne 0) {{ throw "set $status" }}
+  'ok' | Set-Content -LiteralPath $log
+}} catch {{
+  $_ | Out-String | Set-Content -LiteralPath $log
+  exit 1
+}}
+"#,
+        log = log.display(),
+        staged = staged.display(),
+        pin = pin_path.display(),
+    );
+    fs::write(&script, body).map_err(|_| "pin script".to_string())?;
+    run_system_task("sl-pin", &script)?;
+    let _ = wait_until(Duration::from_secs(20), || log.is_file());
+    let note = fs::read_to_string(&log).unwrap_or_default();
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-pin", "/F"])
+        .status_within(Duration::from_secs(30), "command");
+    if note.trim() == "ok" {
+        Ok(())
+    } else {
+        Err(format!("pin seed failed ({note})"))
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn run_system_task(name: &str, script: &Path) -> Result<(), String> {
+    let powershell = std::env::var("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let bin = format!(
+        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
+        powershell.display(),
+        script.display()
+    );
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", name, "/F"])
+        .status_within(Duration::from_secs(30), "command");
+    let created = Command::new("schtasks")
+        .args([
+            "/Create", "/TN", name, "/TR", &bin, "/SC", "ONCE", "/ST", "00:00", "/RU", "SYSTEM",
+            "/RL", "HIGHEST", "/F",
+        ])
+        .status_within(Duration::from_secs(30), "command")?;
+    if !created.success() {
+        return Err(format!("{name} was not created"));
+    }
+    let _ = Command::new("schtasks")
+        .args(["/Run", "/TN", name])
+        .status_within(Duration::from_secs(30), "schtasks /Run")?;
+    Ok(())
+}
+
+fn log_baseline() -> String {
+    match fs::read_to_string(guard_dir().join("service.log")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // An unread snapshot must not treat the whole file as new. A sentinel
+        // that cannot prefix a real log keeps the suffix empty.
+        Err(_) => "\u{0}unreadable".to_string(),
+    }
+}
+
+fn confirmed_since(baseline: &str, expected: &str) -> bool {
+    let log = fs::read_to_string(guard_dir().join("service.log")).unwrap_or_default();
+    softlock_core::confirmed_during_wait(
+        baseline,
+        &log,
+        &query_taskmgr(),
+        expected,
+        journal_ready(&journal_file()),
+    )
+}
+
+#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+#[cfg_attr(not(feature = "live-fail-closed"), allow(dead_code))]
+fn type_pin_keys() -> Result<(), String> {
+    // Keeps the release-scan marker on the only build that can compile this
+    // path. A product binary does not enable either feature. The lock host
+    // watches this file from the thread that already injects its liveness
+    // key, which is the thread whose SendInput the hook actually sees.
+    let _ = softlock_service::present_physical_marker_bytes();
+    let path = guard_dir().join("type-pin.request");
+    let _ = fs::remove_file(&path);
+    fs::write(&path, b"1").map_err(|_| "pin request".to_string())?;
+    if !wait_until(Duration::from_secs(10), || !path.exists()) {
+        return Err("the lock host did not type the pin".to_string());
+    }
+    let result = path.with_extension("result");
+    if !wait_until(Duration::from_secs(10), || result.is_file()) {
+        return Err("the lock host typed but did not submit a pin".to_string());
+    }
+    let count = fs::read_to_string(&result).unwrap_or_default();
+    let count = count.trim();
+    if count == "6" {
+        Ok(())
+    } else {
+        Err(format!("the submitted pin was {count} bytes"))
+    }
+}
+
 fn recover_active(guard: &mut Guard) -> Result<(), String> {
     set_taskmgr("0")?;
     let pause = guard_dir().join("pause-active");
     let _ = fs::remove_file(&pause);
-    spawn_service(guard, Some("after"), &pause)?;
+    spawn_service(guard, Some("after"), &pause, true)?;
     wait_pipe()?;
     lock_in_background();
     if !wait_until(Duration::from_secs(20), || {
@@ -242,24 +1137,65 @@ fn recover_active(guard: &mut Guard) -> Result<(), String> {
             saw_unlocked = true;
         }
         last = status;
-        let fail_closed = matches!(
-            state.as_deref(),
-            Some("FailingClosed" | "Locked" | "OsLocked")
-        );
-        query_taskmgr() == "1" && fail_closed
+        match state.as_deref() {
+            // Still guarded: the locked dword stays.
+            Some("FailingClosed" | "Locked" | "Recovering") => query_taskmgr() == "1",
+            // OS lock confirmed: section 7 reverts the journal.
+            Some("OsLocked") => query_taskmgr() == "0",
+            _ => false,
+        }
     });
     if saw_unlocked {
+        let _ = boot.kill();
+        wait_child(&mut boot, Duration::from_secs(5));
         return Err("an active lock returned to Unlocked".to_string());
     }
     let _ = boot.kill();
-    let _ = boot.wait();
-    if !closed || query_taskmgr() != "1" {
+    wait_child(&mut boot, Duration::from_secs(5));
+    let value = query_taskmgr();
+    if !closed || (value != "1" && value != "0") {
         return Err(format!(
-            "an active journal did not keep DisableTaskMgr: {last} value {}",
-            query_taskmgr()
+            "an active journal did not stay fail-closed: {last} value {value}"
         ));
     }
     Ok(())
+}
+
+fn session_os_held() -> bool {
+    use windows::Win32::System::RemoteDesktop::{
+        WTSConnectState, WTSDisconnected, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+        WTSQuerySessionInformationW,
+    };
+    use windows::core::PWSTR;
+    let session = unsafe { WTSGetActiveConsoleSessionId() };
+    if session == u32::MAX {
+        return true;
+    }
+    let mut buffer = PWSTR::null();
+    let mut bytes = 0u32;
+    let state = unsafe {
+        if WTSQuerySessionInformationW(None, session, WTSConnectState, &mut buffer, &mut bytes)
+            .is_err()
+            || buffer.is_null()
+        {
+            return false;
+        }
+        let state = *buffer.0.cast::<u32>();
+        WTSFreeMemory(buffer.0.cast());
+        state
+    };
+    state == WTSDisconnected.0 as u32
+}
+
+fn realign() -> Result<(), String> {
+    #[cfg(feature = "live-fail-closed")]
+    {
+        align_console()
+    }
+    #[cfg(not(feature = "live-fail-closed"))]
+    {
+        Ok(())
+    }
 }
 
 fn status_state(json: &str) -> Option<String> {
@@ -273,17 +1209,35 @@ fn status_state(json: &str) -> Option<String> {
 struct Guard {
     rows: Vec<Saved>,
     reported: bool,
+    config_path: Option<PathBuf>,
+    config_dacl: Option<String>,
+    config_bytes: Option<Vec<u8>>,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = Command::new("taskkill")
             .args(["/F", "/IM", "softlock-lockhost.exe"])
-            .status();
+            .status_within(Duration::from_secs(30), "command");
         kill_service_process();
-        let _ = Command::new("sc").args(["delete", SERVICE_NAME]).status();
+        let _ = Command::new("sc")
+            .args(["delete", SERVICE_NAME])
+            .status_within(Duration::from_secs(30), "command");
         for row in &self.rows {
             let _ = set_value(row.key, row.name, &row.value);
+        }
+        let _ = (&self.config_path, &self.config_dacl, &self.config_bytes);
+        #[cfg(feature = "live-fail-closed")]
+        if let (Some(path), Some(dacl)) = (&self.config_path, &self.config_dacl) {
+            let _ = softlock_service::testing_restore_dacl(path, dacl);
+        }
+        #[cfg(feature = "live-fail-closed")]
+        if let Some(path) = &self.config_path {
+            if let Some(bytes) = &self.config_bytes {
+                let _ = fs::write(path, bytes);
+            } else {
+                let _ = fs::remove_file(path);
+            }
         }
         if !self.reported {
             capture();
@@ -293,8 +1247,12 @@ impl Drop for Guard {
 }
 
 fn ensure_service() -> Result<(), String> {
-    let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
-    let _ = Command::new("sc").args(["delete", SERVICE_NAME]).status();
+    let _ = Command::new("sc")
+        .args(["stop", SERVICE_NAME])
+        .status_within(Duration::from_secs(30), "command");
+    let _ = Command::new("sc")
+        .args(["delete", SERVICE_NAME])
+        .status_within(Duration::from_secs(30), "command");
     thread::sleep(Duration::from_millis(400));
     let bin = service_exe().display().to_string();
     let status = Command::new("sc")
@@ -308,8 +1266,7 @@ fn ensure_service() -> Result<(), String> {
             "obj=",
             "LocalSystem",
         ])
-        .status()
-        .map_err(|_| "sc create".to_string())?;
+        .status_within(Duration::from_secs(30), "command")?;
     if status.success() {
         Ok(())
     } else {
@@ -317,7 +1274,12 @@ fn ensure_service() -> Result<(), String> {
     }
 }
 
-fn spawn_service(_guard: &mut Guard, pause: Option<&str>, pause_file: &Path) -> Result<(), String> {
+fn spawn_service(
+    _guard: &mut Guard,
+    pause: Option<&str>,
+    pause_file: &Path,
+    attach: bool,
+) -> Result<(), String> {
     fs::create_dir_all(guard_dir()).map_err(|_| "temp".to_string())?;
     fs::create_dir_all(guard_dir().join("pin")).map_err(|_| "temp".to_string())?;
     // The environment is read when the service starts. Stop anything that
@@ -326,6 +1288,17 @@ fn spawn_service(_guard: &mut Guard, pause: Option<&str>, pause_file: &Path) -> 
     kill_service_process();
     if !wait_until(Duration::from_secs(20), service_stopped) {
         return Err(format!("service did not stop: {}", service_state()));
+    }
+    // A recovery start leaves the console where the kill left it. Attaching
+    // first would turn a confirmed disconnect back into an active desktop,
+    // and an empty journal would then report Unlocked. SPEC section 7.
+    #[cfg(feature = "live-fail-closed")]
+    if attach {
+        align_console()?;
+    }
+    #[cfg(not(feature = "live-fail-closed"))]
+    {
+        let _ = attach;
     }
     match start_service() {
         Ok(()) => Ok(()),
@@ -343,8 +1316,7 @@ fn spawn_service(_guard: &mut Guard, pause: Option<&str>, pause_file: &Path) -> 
 fn start_service() -> Result<(), String> {
     let output = Command::new("sc")
         .args(["start", SERVICE_NAME])
-        .output()
-        .map_err(|_| "sc start".to_string())?;
+        .output_within(Duration::from_secs(45), "sc start")?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -362,7 +1334,10 @@ fn start_service() -> Result<(), String> {
 }
 
 fn service_state() -> String {
-    let Ok(output) = Command::new("sc").args(["query", SERVICE_NAME]).output() else {
+    let Ok(output) = Command::new("sc")
+        .args(["query", SERVICE_NAME])
+        .output_within(Duration::from_secs(30), "command")
+    else {
         return "unreadable".to_string();
     };
     let text = format!(
@@ -397,6 +1372,17 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
         format!("SOFTLOCK_PIN_DIR={}", guard_dir().join("pin").display()),
         format!("SOFTLOCK_STOP_FILE={}", guard_dir().join("stop").display()),
     ];
+    if std::env::var("SOFTLOCK_JOURNAL_LIVE").ok().as_deref() == Some("sign-in") {
+        // The lock host is in the console session. The sign-in PIN is
+        // injected on the input desktop. The host counts those keys as
+        // physical only when it was built with live-fail-closed and this
+        // variable is set.
+        pairs.push("SOFTLOCK_PRESENT_PHYSICAL=1".to_string());
+        pairs.push(format!(
+            "SOFTLOCK_TYPE_PIN={}",
+            guard_dir().join("type-pin.request").display()
+        ));
+    }
     if let Some(phase) = pause {
         pairs.push(format!("SOFTLOCK_JOURNAL_PAUSE={phase}"));
         pairs.push(format!(
@@ -418,8 +1404,7 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
             &data,
             "/f",
         ])
-        .status()
-        .map_err(|_| "env".to_string())?;
+        .status_within(Duration::from_secs(30), "command")?;
     if status.success() {
         Ok(())
     } else {
@@ -427,66 +1412,147 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
     }
 }
 
-fn hard_stop(_guard: &mut Guard) -> Result<(), String> {
-    // A live host OS-locks the console when its service pipe closes, and the
-    // service OS-locks when it sees the host die. Freeze the host first so
-    // neither side can lock the session, then kill the service and the host.
-    // The next boot must see the host gone and revert. A host that is already
-    // gone has nothing to freeze. A host that is still running and cannot be
-    // suspended fails the test.
-    if host_running() {
-        suspend_host()?;
-    }
-    kill_service_process();
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", "softlock-service.exe"])
-        .status();
-    for _ in 0..10 {
-        let _ = Command::new("taskkill")
-            .args(["/F", "/IM", "softlock-lockhost.exe"])
-            .status();
-        if !host_running() {
-            break;
+fn hard_stop(guard: &mut Guard) -> Result<(), String> {
+    stop_in_order(guard, KillOrder::Both)
+}
+
+fn stop_in_order(_guard: &mut Guard, order: KillOrder) -> Result<(), String> {
+    // Freeze both, then kill in the order under test. A process that exits
+    // between the snapshot and the open is already stopped. One that is still
+    // listed and cannot be suspended fails the test. The product has to end
+    // OsLocked or session-held for every order.
+    freeze("softlock-service.exe")?;
+    freeze("softlock-lockhost.exe")?;
+    match order {
+        KillOrder::ServiceFirst => {
+            kill_image("softlock-service.exe", "service did not exit")?;
+            let _ = Command::new("sc")
+                .args(["stop", SERVICE_NAME])
+                .status_within(Duration::from_secs(30), "command");
+            kill_image("softlock-lockhost.exe", "lock host did not exit")?;
         }
-        thread::sleep(Duration::from_millis(100));
+        KillOrder::HostFirst => {
+            kill_image("softlock-lockhost.exe", "lock host did not exit")?;
+            kill_image("softlock-service.exe", "service did not exit")?;
+            let _ = Command::new("sc")
+                .args(["stop", SERVICE_NAME])
+                .status_within(Duration::from_secs(30), "command");
+        }
+        KillOrder::Both => {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/IM", "softlock-service.exe"])
+                    .status_within(Duration::from_secs(30), "command");
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/IM", "softlock-lockhost.exe"])
+                    .status_within(Duration::from_secs(30), "command");
+                if !image_running("softlock-service.exe") && !host_running() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err("service and host did not exit together".to_string());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            let _ = Command::new("sc")
+                .args(["stop", SERVICE_NAME])
+                .status_within(Duration::from_secs(30), "command");
+        }
     }
     Ok(())
 }
 
-fn suspend_host() -> Result<(), String> {
-    let pid = host_pid().ok_or_else(|| "lock host pid".to_string())?;
+fn kill_image(image: &str, error: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", image])
+            .status_within(Duration::from_secs(30), "command");
+        let gone = if image == "softlock-lockhost.exe" {
+            !host_running()
+        } else {
+            !image_running(image)
+        };
+        if gone {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(error.to_string());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn freeze(image: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(pid) = image_pid(image) {
+            return suspend_pid(image, pid);
+        }
+        if !image_running(image) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if let Some(pid) = image_pid(image) {
+        suspend_pid(image, pid)
+    } else if image_running(image) {
+        Err(format!("{image} pid"))
+    } else {
+        Ok(())
+    }
+}
+
+fn suspend_pid(image: &str, pid: u32) -> Result<(), String> {
     unsafe {
-        let process = windows::Win32::System::Threading::OpenProcess(
+        let opened = windows::Win32::System::Threading::OpenProcess(
             windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS(0x0800),
             false,
             pid,
-        )
-        .map_err(|_| "open host".to_string())?;
+        );
+        let Ok(process) = opened else {
+            return if image_pid(image) == Some(pid) {
+                Err(format!("open {image}"))
+            } else {
+                Ok(())
+            };
+        };
         let status = NtSuspendProcess(process.0);
         let _ = windows::Win32::Foundation::CloseHandle(process);
-        if status == 0 {
+        if status == 0 || image_pid(image) != Some(pid) {
             Ok(())
         } else {
-            Err(format!("suspend host returned {status}"))
+            Err(format!("suspend {image} returned {status}"))
         }
     }
 }
 
-fn host_pid() -> Option<u32> {
+fn image_running(image: &str) -> bool {
+    let Ok(output) = Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
+        .output_within(Duration::from_secs(30), "command")
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .to_ascii_lowercase()
+        .contains(&image.to_ascii_lowercase())
+}
+
+fn image_pid(image: &str) -> Option<u32> {
     let output = Command::new("tasklist")
-        .args([
-            "/FI",
-            "IMAGENAME eq softlock-lockhost.exe",
-            "/FO",
-            "CSV",
-            "/NH",
-        ])
-        .output()
+        .args(["/FI", &format!("IMAGENAME eq {image}"), "/FO", "CSV", "/NH"])
+        .output_within(Duration::from_secs(30), "command")
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let line = text
-        .lines()
-        .find(|line| line.to_ascii_lowercase().contains("softlock-lockhost.exe"))?;
+    let line = text.lines().find(|line| {
+        line.to_ascii_lowercase()
+            .contains(&image.to_ascii_lowercase())
+    })?;
     let pid = line.split(',').nth(1)?.trim().trim_matches('"');
     pid.parse().ok()
 }
@@ -500,15 +1566,17 @@ fn kill_service_process() {
     if let Some(pid) = service_pid() {
         let _ = Command::new("taskkill")
             .args(["/F", "/PID", &pid.to_string()])
-            .status();
+            .status_within(Duration::from_secs(30), "command");
     }
-    let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
+    let _ = Command::new("sc")
+        .args(["stop", SERVICE_NAME])
+        .status_within(Duration::from_secs(30), "command");
 }
 
 fn service_pid() -> Option<u32> {
     let output = Command::new("sc")
         .args(["queryex", SERVICE_NAME])
-        .output()
+        .output_within(Duration::from_secs(30), "command")
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines() {
@@ -527,7 +1595,10 @@ fn service_pid() -> Option<u32> {
 }
 
 fn service_running() -> bool {
-    let Ok(output) = Command::new("sc").args(["query", SERVICE_NAME]).output() else {
+    let Ok(output) = Command::new("sc")
+        .args(["query", SERVICE_NAME])
+        .output_within(Duration::from_secs(30), "command")
+    else {
         return false;
     };
     String::from_utf8_lossy(&output.stdout).contains("RUNNING")
@@ -546,7 +1617,7 @@ fn capture() {
     let parent = dir.parent().unwrap_or(dir.as_path());
     let listing = Command::new("cmd")
         .args(["/c", "dir", "/a", &parent.display().to_string()])
-        .output();
+        .output_within(Duration::from_secs(30), "command");
     let text = listing
         .map(|output| {
             let mut body = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -557,13 +1628,137 @@ fn capture() {
     let _ = fs::write(artifact_dir().join("journal-dir.txt"), text);
 }
 
-fn repair_settings() -> Result<i32, String> {
+#[cfg(feature = "live-fail-closed")]
+fn repair_as_system() -> Result<(i32, String), String> {
+    let script = guard_dir().join("repair.ps1");
+    let code_path = guard_dir().join("repair-code.txt");
+    let log_path = guard_dir().join("repair-out.txt");
+    let out_path = guard_dir().join("repair-stdout.txt");
+    let _ = fs::remove_file(&code_path);
+    let body = format!(
+        "$ErrorActionPreference = 'Stop'\ntry {{\n  $p = Start-Process -FilePath '{exe}' -ArgumentList '--repair-settings' -Wait -PassThru -WindowStyle Hidden -RedirectStandardError '{log}' -RedirectStandardOutput '{out}'\n  Set-Content -LiteralPath '{code}' -Value $p.ExitCode -NoNewline\n}} catch {{\n  Set-Content -LiteralPath '{log}' -Value $_.Exception.Message\n  Set-Content -LiteralPath '{code}' -Value '1' -NoNewline\n}}\n",
+        exe = service_exe().display(),
+        log = log_path.display(),
+        out = out_path.display(),
+        code = code_path.display(),
+    );
+    fs::write(&script, body).map_err(|_| "repair script".to_string())?;
+    let powershell = std::env::var("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let bin = format!(
+        "{} -NoProfile -ExecutionPolicy Bypass -File {}",
+        powershell.display(),
+        script.display()
+    );
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-repair", "/F"])
+        .status_within(Duration::from_secs(30), "command");
+    let created = Command::new("schtasks")
+        .args([
+            "/Create",
+            "/TN",
+            "sl-repair",
+            "/TR",
+            &bin,
+            "/SC",
+            "ONCE",
+            "/ST",
+            "00:00",
+            "/RU",
+            "SYSTEM",
+            "/RL",
+            "HIGHEST",
+            "/F",
+        ])
+        .status_within(Duration::from_secs(30), "command")?;
+    if !created.success() {
+        return Err("repair task was not created".to_string());
+    }
+    // A jumped clock can make the first /Run return before the script starts.
+    // Ask again once before treating that as a failure.
+    let mut ready = false;
+    for _ in 0..2 {
+        let started = Command::new("schtasks")
+            .args(["/Run", "/TN", "sl-repair"])
+            .status_within(Duration::from_secs(30), "schtasks /Run")?;
+        if started.success() && wait_until(Duration::from_secs(20), || code_path.is_file()) {
+            ready = true;
+            break;
+        }
+    }
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", "sl-repair", "/F"])
+        .status_within(Duration::from_secs(30), "command");
+    if !ready {
+        return Err("repair task did not finish".to_string());
+    }
+    let code = fs::read_to_string(&code_path).unwrap_or_default();
+    let code = code.trim().parse::<i32>().unwrap_or(1);
+    let mut note = fs::read_to_string(&log_path).unwrap_or_default();
+    note.push(' ');
+    note.push_str(&fs::read_to_string(&out_path).unwrap_or_default());
+    note = note
+        .chars()
+        .map(|c| if c.is_control() || c == '"' { ' ' } else { c })
+        .collect();
+    note = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    if note.len() > 160 {
+        note.truncate(160);
+    }
+    Ok((code, note))
+}
+
+#[cfg(not(feature = "live-fail-closed"))]
+fn repair_as_system() -> Result<(i32, String), String> {
+    repair_settings()
+}
+
+fn clear_os_hold() -> Result<(), String> {
+    // The confirmed disconnect stays OsLocked for this logon. Repair drops
+    // the marker only once this logon is the console again, which is the
+    // sign-in the next check starts from.
+    realign()?;
+    let (code, _note) = repair_settings()?;
+    if code == 0 {
+        return Ok(());
+    }
+    // The console session id can match while the logon is not active yet.
+    // Repair refuses that. Ask again once the session has had time to settle.
+    let mut code = 1;
+    let mut note = String::new();
+    for attempt in 0..3 {
+        (code, note) = repair_as_system()?;
+        if code == 0 {
+            return Ok(());
+        }
+        if attempt + 1 < 3 {
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
+    Err(format!(
+        "repair did not clear the OS lock marker ({code} {note})"
+    ))
+}
+
+fn repair_settings() -> Result<(i32, String), String> {
     let output = Command::new(service_exe())
         .arg("--repair-settings")
         .env("SOFTLOCK_PIPE", pipe_name())
-        .output()
-        .map_err(|_| "repair".to_string())?;
-    Ok(output.status.code().unwrap_or(1))
+        .output_within(Duration::from_secs(30), "repair")?;
+    let mut note = String::from_utf8_lossy(&output.stderr)
+        .chars()
+        .map(|c| if c.is_control() || c == '"' { ' ' } else { c })
+        .collect::<String>();
+    note = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    if note.len() > 160 {
+        note.truncate(160);
+    }
+    Ok((output.status.code().unwrap_or(1), note))
 }
 
 fn wait_pipe() -> Result<(), String> {
@@ -575,6 +1770,10 @@ fn wait_pipe() -> Result<(), String> {
     } else {
         Err("pipe did not open".to_string())
     }
+}
+
+fn journal_text() -> String {
+    fs::read_to_string(journal_file()).unwrap_or_default()
 }
 
 fn journal_ready(path: &Path) -> bool {
@@ -616,7 +1815,7 @@ fn query_taskmgr() -> String {
 fn query_value(key: &str, name: &str) -> String {
     let output = Command::new("reg")
         .args(["query", key, "/v", name])
-        .output();
+        .output_within(Duration::from_secs(30), "command");
     let Ok(output) = output else {
         return "absent".to_string();
     };
@@ -641,7 +1840,7 @@ fn set_value(key: &str, name: &str, value: &str) -> Result<(), String> {
     if value == "absent" {
         let _ = Command::new("reg")
             .args(["delete", key, "/v", name, "/f"])
-            .status();
+            .status_within(Duration::from_secs(30), "command");
         if query_value(key, name) != "absent" {
             return Err(format!("could not delete {name}"));
         }
@@ -649,8 +1848,7 @@ fn set_value(key: &str, name: &str, value: &str) -> Result<(), String> {
     }
     let status = Command::new("reg")
         .args(["add", key, "/v", name, "/t", "REG_DWORD", "/d", value, "/f"])
-        .status()
-        .map_err(|_| "reg add".to_string())?;
+        .status_within(Duration::from_secs(30), "command")?;
     if status.success() && query_value(key, name) == value {
         Ok(())
     } else {
@@ -673,7 +1871,7 @@ fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
         set_value(key, name, previous)?;
     }
     let pause = guard_dir().join("pause-rows");
-    spawn_service(guard, None, &pause)?;
+    spawn_service(guard, None, &pause, true)?;
     wait_pipe()?;
     transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
     if !wait_until(Duration::from_secs(20), || {
@@ -688,13 +1886,15 @@ fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
     }
     hard_stop(guard)?;
     let _ = wait_until(Duration::from_secs(5), || !host_running());
-    spawn_service(guard, None, &pause)?;
-    let restored = wait_until(Duration::from_secs(20), || {
+    spawn_service(guard, None, &pause, true)?;
+    let restored = wait_until(Duration::from_secs(25), || {
         chosen
             .iter()
             .all(|(key, name, previous, _)| query_value(key, name) == *previous)
     });
     hard_stop(guard)?;
+    clear_os_hold()?;
+    realign()?;
     if !restored {
         return Err(format!(
             "restart did not restore every row: {}",
@@ -718,7 +1918,10 @@ fn row_report(chosen: &[(&str, &str, &str, &str)]) -> String {
 }
 
 fn installed_service_running() -> bool {
-    let Ok(output) = Command::new("sc").args(["query", SERVICE_NAME]).output() else {
+    let Ok(output) = Command::new("sc")
+        .args(["query", SERVICE_NAME])
+        .output_within(Duration::from_secs(30), "command")
+    else {
         return false;
     };
     String::from_utf8_lossy(&output.stdout).contains("RUNNING")
@@ -733,7 +1936,7 @@ fn host_running() -> bool {
             "CSV",
             "/NH",
         ])
-        .output()
+        .output_within(Duration::from_secs(30), "command")
     else {
         return false;
     };
@@ -778,6 +1981,87 @@ fn status_body() -> &'static str {
     r#"{"v":1,"id":3,"kind":"GetStatus"}"#
 }
 
+trait BoundedCommand {
+    fn status_within(
+        &mut self,
+        limit: Duration,
+        what: &str,
+    ) -> Result<std::process::ExitStatus, String>;
+    fn output_within(
+        &mut self,
+        limit: Duration,
+        what: &str,
+    ) -> Result<std::process::Output, String>;
+}
+
+impl BoundedCommand for Command {
+    fn status_within(
+        &mut self,
+        limit: Duration,
+        what: &str,
+    ) -> Result<std::process::ExitStatus, String> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        finish_command(self, limit, what).map(|output| output.status)
+    }
+
+    fn output_within(
+        &mut self,
+        limit: Duration,
+        what: &str,
+    ) -> Result<std::process::Output, String> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        finish_command(self, limit, what)
+    }
+}
+
+fn finish_command(
+    command: &mut Command,
+    limit: Duration,
+    what: &str,
+) -> Result<std::process::Output, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{what} did not start: {error}"))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("{what} wait failed: {error}"));
+            }
+            Ok(None) if started.elapsed() < limit => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let kill_deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < kill_deadline {
+                    if child.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                return Err(format!("{what} timed out after {}s", limit.as_secs()));
+            }
+            Err(error) => return Err(format!("{what} wait failed: {error}")),
+        }
+    }
+}
+
+fn wait_child(child: &mut std::process::Child, limit: Duration) {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if started.elapsed() < limit => thread::sleep(Duration::from_millis(50)),
+            _ => return,
+        }
+    }
+}
+
 fn wait_until(limit: Duration, mut probe: impl FnMut() -> bool) -> bool {
     let started = Instant::now();
     while started.elapsed() < limit {
@@ -796,36 +2080,107 @@ fn write_result(body: &str) {
 }
 
 fn transact(pipe: &str, json: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::os::windows::io::FromRawHandle;
     let mut frame = (json.len() as u32).to_le_bytes().to_vec();
     frame.extend_from_slice(json.as_bytes());
-    let wide: Vec<u16> = pipe.encode_utf16().chain(std::iter::once(0)).collect();
-    let handle = unsafe {
-        windows::Win32::Storage::FileSystem::CreateFileW(
-            windows::core::PCWSTR(wide.as_ptr()),
-            0xC000_0000,
-            windows::Win32::Storage::FileSystem::FILE_SHARE_READ
-                | windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
-            None,
-            windows::Win32::Storage::FileSystem::OPEN_EXISTING,
-            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
-            None,
-        )
-        .map_err(|error| format!("open: {error}"))?
-    };
+    let handle = open_pipe_timed(pipe)?;
     let mut file = unsafe { std::fs::File::from_raw_handle(handle.0) };
-    file.write_all(&frame)
-        .map_err(|error| format!("write: {error}"))?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let result = file
+            .write_all(&frame)
+            .map_err(|error| format!("write: {error}"));
+        let _ = sender.send((file, result));
+    });
+    // A server that never reads fills the pipe and `write_all` does not return.
+    let (file, wrote) = receiver
+        .recv_timeout(Duration::from_secs(15))
+        .map_err(|_| "timed out writing to the service".to_string())?;
+    wrote?;
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut prefix = [0u8; 4];
-    file.read_exact(&mut prefix)
-        .map_err(|error| format!("read: {error}"))?;
+    read_pipe_until(&file, &mut prefix, deadline)?;
     let length = u32::from_le_bytes(prefix) as usize;
     if length > 64 * 1024 {
         return Err("frame".to_string());
     }
     let mut body = vec![0u8; length];
-    file.read_exact(&mut body)
-        .map_err(|error| format!("body: {error}"))?;
+    read_pipe_until(&file, &mut body, deadline)?;
     String::from_utf8(body).map_err(|_| "utf8".to_string())
+}
+
+fn open_pipe_timed(pipe: &str) -> Result<windows::Win32::Foundation::HANDLE, String> {
+    let pipe = pipe.to_string();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let wide: Vec<u16> = pipe.encode_utf16().chain(std::iter::once(0)).collect();
+        let opened = unsafe {
+            windows::Win32::Storage::FileSystem::CreateFileW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                0xC000_0000,
+                windows::Win32::Storage::FileSystem::FILE_SHARE_READ
+                    | windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+                None,
+                windows::Win32::Storage::FileSystem::OPEN_EXISTING,
+                windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        };
+        let _ = sender.send(
+            opened
+                .map(|handle| handle.0 as isize)
+                .map_err(|error| format!("open: {error}")),
+        );
+    });
+    match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(raw)) => Ok(windows::Win32::Foundation::HANDLE(
+            raw as *mut core::ffi::c_void,
+        )),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err("timed out opening the service pipe".to_string()),
+    }
+}
+
+fn read_pipe_until(file: &std::fs::File, buf: &mut [u8], deadline: Instant) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = windows::Win32::Foundation::HANDLE(file.as_raw_handle());
+    let mut offset = 0;
+    while offset < buf.len() {
+        let mut available = 0u32;
+        unsafe {
+            windows::Win32::System::Pipes::PeekNamedPipe(
+                handle,
+                None,
+                0,
+                None,
+                Some(&mut available),
+                None,
+            )
+        }
+        .map_err(|error| format!("read: {error}"))?;
+        if available == 0 {
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for the service to answer".to_string());
+            }
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let want = (buf.len() - offset).min(available as usize);
+        let mut read = 0u32;
+        unsafe {
+            windows::Win32::Storage::FileSystem::ReadFile(
+                handle,
+                Some(&mut buf[offset..offset + want]),
+                Some(&mut read),
+                None,
+            )
+        }
+        .map_err(|error| format!("read: {error}"))?;
+        if read == 0 {
+            return Err("eof".to_string());
+        }
+        offset += read as usize;
+    }
+    Ok(())
 }

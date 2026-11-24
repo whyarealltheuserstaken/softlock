@@ -1,9 +1,11 @@
 name: Settings journal
 
 # Hosted runners only. The restore case kills the Lock Host and the Service
-# during the change and checks DisableTaskMgr, then one more lock checks every
-# Ctrl+Alt+Del and UAC row. recover-active leaves the Lock Host running, so
-# that case may lock the console. Nothing here runs unless
+# during the change, service-first, host-first, and both together, and checks
+# DisableTaskMgr. One more lock checks every Ctrl+Alt+Del and UAC row.
+# recover-active leaves the Lock Host running, so that case may lock the
+# console. clock moves the wall clock forward three days while locked, then
+# restores it, for the same three kill orders. Nothing here runs unless
 # GITHUB_ACTIONS=true and RUNNER_ENVIRONMENT=github-hosted, and the test
 # refuses the school workstation before it changes a setting.
 on:
@@ -36,6 +38,8 @@ jobs:
         case:
           - restore
           - recover-active
+          - clock
+          - sign-in
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15

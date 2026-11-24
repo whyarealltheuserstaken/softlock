@@ -12,5 +12,8 @@
   "statusOff": "is off",
   "hotkeyUnavailable": "hotkey unavailable",
   "confirmationNeeded": "Confirmation needed",
-  "autostartFailed": "autostart failed"
+  "autostartFailed": "autostart failed",
+  "applyConfig": "Apply changes made to the config file?",
+  "keepConfig": "Keep the current settings",
+  "configErrors": "The settings file was not applied"
 }

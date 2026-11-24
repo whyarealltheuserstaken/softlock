@@ -1157,7 +1157,33 @@ pub(crate) fn dacl_sddl_handle(handle: windows::Win32::Foundation::HANDLE) -> io
 
 #[cfg(windows)]
 fn canonical_dacl(text: &str) -> String {
-    text.trim().replace("S-1-5-18", "SY")
+    let text = text.trim().replace("S-1-5-18", "SY");
+    let Some(body) = text.strip_prefix("D:") else {
+        return text;
+    };
+    let (flags, aces) = match body.split_once('(') {
+        Some((flags, rest)) => (flags, format!("({rest}")),
+        None => (body, String::new()),
+    };
+    // Windows reads a protected DACL back as `D:PAI`. The auto-inherit
+    // markers are not ACEs. `D:P(A;;FA;;;SY)` is still system-only.
+    let flags = if flags.contains('P') {
+        flags.replace("AI", "").replace("AR", "")
+    } else {
+        flags.to_string()
+    };
+    format!("D:{flags}{aces}")
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn a_protected_dacl_reprinted_with_auto_inherit_is_system_only() {
+    assert_eq!(canonical_dacl("D:PAI(A;;FA;;;SY)"), SYSTEM_ONLY_SDDL);
+    assert_eq!(canonical_dacl("D:PAI(A;;FA;;;S-1-5-18)"), SYSTEM_ONLY_SDDL);
+    assert_ne!(
+        canonical_dacl("D:PAI(A;;FA;;;SY)(A;;FA;;;WD)"),
+        SYSTEM_ONLY_SDDL
+    );
 }
 
 #[cfg(windows)]
@@ -1463,6 +1489,89 @@ pub(crate) fn create_directory_relative(
 }
 
 #[cfg(windows)]
+pub(crate) fn open_root(drive: &str) -> io::Result<windows::Win32::Foundation::HANDLE> {
+    if drive.len() != 2 || !drive.as_bytes()[0].is_ascii_alphabetic() || drive.as_bytes()[1] != b':'
+    {
+        return Err(io::Error::other("drive"));
+    }
+    open_directory(Path::new(&format!("{drive}\\")), false)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_child(
+    directory: windows::Win32::Foundation::HANDLE,
+    name: &str,
+    access: u32,
+    directory_file: bool,
+    create: bool,
+) -> io::Result<windows::Win32::Foundation::HANDLE> {
+    open_child_at(directory, name, access, directory_file, create, true)
+}
+
+/// `reparse` asks for `FILE_OPEN_REPARSE_POINT`. A create uses `FILE_CREATE`,
+/// which fails when the name is already a junction or a symlink.
+#[cfg(windows)]
+pub(crate) fn open_child_at(
+    directory: windows::Win32::Foundation::HANDLE,
+    name: &str,
+    access: u32,
+    directory_file: bool,
+    create: bool,
+    reparse: bool,
+) -> io::Result<windows::Win32::Foundation::HANDLE> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    if name.is_empty() || name.contains('\\') || name.contains('/') || name.contains("..") {
+        return Err(io::Error::other("name"));
+    }
+    let mut wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut unicode = UnicodeString {
+        length: ((wide_name.len() - 1) * 2) as u16,
+        maximum_length: (wide_name.len() * 2) as u16,
+        buffer: wide_name.as_mut_ptr(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: directory.0,
+        object_name: &mut unicode,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut iosb = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut raw = std::ptr::null_mut();
+    let mut options = if directory_file {
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
+    } else {
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
+    };
+    if reparse {
+        options |= FILE_OPEN_REPARSE_POINT_OPTION;
+    }
+    let disposition = if create { FILE_CREATE } else { FILE_OPEN };
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw,
+            access,
+            &mut attributes,
+            &mut iosb,
+            std::ptr::null_mut(),
+            if create { FILE_ATTRIBUTE_NORMAL.0 } else { 0 },
+            0x0000_0001 | 0x0000_0002 | 0x0000_0004,
+            disposition,
+            options,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    nt_result(status)?;
+    Ok(HANDLE(raw))
+}
+
+#[cfg(windows)]
 pub(crate) fn open_relative(
     directory: windows::Win32::Foundation::HANDLE,
     name: &str,
@@ -1631,7 +1740,12 @@ pub(crate) fn list_directory_names(
 ) -> io::Result<Vec<String>> {
     let mut names = Vec::new();
     let mut restart = 1u8;
+    let mut rounds = 0u32;
     loop {
+        rounds += 1;
+        if rounds > 1024 {
+            return Err(io::Error::other("directory listing did not finish"));
+        }
         let mut buffer = vec![0u8; 16 * 1024];
         let mut iosb = IoStatusBlock {
             status: 0,
@@ -1657,6 +1771,11 @@ pub(crate) fn list_directory_names(
             break;
         }
         nt_result(status)?;
+        // A success with nothing in the buffer does not advance the scan.
+        // Calling again repeats the same result and never returns.
+        if iosb.information == 0 {
+            break;
+        }
         let mut offset = 0usize;
         loop {
             if offset + 12 > buffer.len() {

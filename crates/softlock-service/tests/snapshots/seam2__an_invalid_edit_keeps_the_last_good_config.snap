@@ -1,0 +1,7 @@
+---
+source: crates/softlock-service/tests/seam2.rs
+expression: errors
+---
+[
+  "lock.hotkey: unsupported chord"
+]

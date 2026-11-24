@@ -55,7 +55,9 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, STARTUPINFOW,
     THREAD_QUERY_LIMITED_INFORMATION, TerminateProcess, WaitForSingleObject,
 };
-use windows::Win32::UI::WindowsAndMessaging::{WTS_SESSION_LOCK, WTS_SESSION_UNLOCK};
+use windows::Win32::UI::WindowsAndMessaging::{
+    WTS_SESSION_LOCK, WTS_SESSION_LOGON, WTS_SESSION_UNLOCK,
+};
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::authority::{Authority, HostAction, HostLoss};
@@ -74,6 +76,10 @@ static HOST_SESSION: AtomicU64 = AtomicU64::new(u64::MAX);
 static PIN_STATUS: Mutex<String> = Mutex::new(String::new());
 static PIN_LOADED: Mutex<String> = Mutex::new(String::new());
 static SESSION_TX: Mutex<Option<Sender<SessionEvent>>> = Mutex::new(None);
+/// Set when the confirmed OS lock was a disconnect. The unlock notification
+/// that follows is not the owner signing back in until this logon is the
+/// console again. SPEC section 7.
+static DISCONNECT_HELD: AtomicBool = AtomicBool::new(false);
 
 const ACCEPT_CONTROLS: u32 = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SESSIONCHANGE;
 
@@ -213,6 +219,14 @@ fn run_os_lock(session: u32, caller: softlock_core::Caller) -> Result<(), OsLock
                     ("elapsed_us", &elapsed_us),
                     ("policy", softlock_core::policy_seam()),
                 ],
+            );
+            DISCONNECT_HELD.store(
+                matches!(
+                    method,
+                    softlock_core::Method::DisconnectConsole
+                        | softlock_core::Method::DisconnectOwnSession
+                ),
+                Ordering::Release,
             );
             Ok(())
         }
@@ -376,11 +390,15 @@ fn session_event(
     match event_type {
         WTS_SESSION_LOCK => Some(SessionEvent::OsLocked),
         WTS_SESSION_UNLOCK => Some(SessionEvent::OsUnlocked),
+        WTS_SESSION_LOGON => Some(SessionEvent::Logon),
         _ => None,
     }
 }
 
 fn install_journal(authority: &mut Authority) {
+    // Recover the journal before creating or applying config.toml.
+    // `startup_steps` is RecoverJournal, then LoadConfig. Applying the file
+    // first can rebuild the journal from the live lockdown values.
     match crate::settings::SettingsEngine::open() {
         Ok(mut engine) => match engine.boot() {
             Ok(crate::settings::Boot::FailClosed(journal)) => {
@@ -388,6 +406,24 @@ fn install_journal(authority: &mut Authority) {
                 authority.notify(Event::ServiceStarted {
                     journal,
                     session_active: true,
+                });
+            }
+            Ok(crate::settings::Boot::StayOsLocked) => {
+                let owner_back = engine.owner_back();
+                authority.platform_mut().install_engine(engine);
+                // A restart does not see the disconnect that confirmed the
+                // lock. Hold that disconnect anyway, and remember the owner
+                // was away when this boot did not find them on the console.
+                // OsLocked then clears only through the sign-in repair.
+                DISCONNECT_HELD.store(true, Ordering::Release);
+                if !owner_back {
+                    OWNER_WAS_AWAY.store(true, Ordering::Release);
+                }
+                let mut journal = softlock_core::Journal::empty();
+                journal.mark_os_held();
+                authority.notify(Event::ServiceStarted {
+                    journal,
+                    session_active: false,
                 });
             }
             Ok(_) => authority.platform_mut().install_engine(engine),
@@ -413,6 +449,15 @@ fn install_journal(authority: &mut Authority) {
                 journal,
                 session_active: true,
             });
+        }
+    }
+    if let Ok(path) = crate::config_file::configured_path() {
+        if let Some(dir) = path.parent() {
+            authority.set_config_dir(dir.to_path_buf());
+        }
+        match crate::config_file::read_config(&path) {
+            Ok(text) => authority.load_existing_config(&text),
+            Err(_) => authority.load_existing_config(""),
         }
     }
     crate::settings::register_sign_in_recovery();
@@ -490,8 +535,10 @@ fn serve(probe: Option<PathBuf>) -> i32 {
     let mut authority = Authority::new(ServicePlatform::new(mode), dev_pin_allowed());
     // A directory that fails verification is fatal for the PIN store. Locking
     // still runs. No hash is installed, so a planted pin.phc cannot unlock.
-    let loaded = if store.is_err() && pin_directory() == data_dir {
-        "refused".to_string()
+    let loaded = if let Err(error) = &store
+        && pin_directory() == data_dir
+    {
+        pin_load_note(error)
     } else {
         match PinStore::in_dir(&pin_directory()).load() {
             Ok(Some(hash)) => {
@@ -499,12 +546,13 @@ fn serve(probe: Option<PathBuf>) -> i32 {
                 "verified".to_string()
             }
             Ok(None) => "none".to_string(),
-            Err(_) => "refused".to_string(),
+            Err(error) => pin_load_note(&error),
         }
     };
     *PIN_LOADED
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner()) = loaded;
+        .unwrap_or_else(|poison| poison.into_inner()) = loaded.clone();
+    crate::log::audit("pin", &[("result", &loaded)]);
     remember_pin_status();
     install_journal(&mut authority);
     let arm = ArmWait::new();
@@ -564,6 +612,17 @@ fn serve(probe: Option<PathBuf>) -> i32 {
     0
 }
 
+fn pin_load_note(error: &std::io::Error) -> String {
+    let mut reason = error.to_string();
+    reason.retain(|c| c.is_ascii_graphic() || c == ' ');
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join("_");
+    let mut note = format!("refused_{reason}");
+    if note.len() > 96 {
+        note.truncate(96);
+    }
+    note
+}
+
 fn remember_pin_status() {
     #[cfg(feature = "simulated-physical")]
     {
@@ -582,11 +641,71 @@ fn remember_pin_status() {
 
 fn apply_session_events(authority: &Arc<Mutex<Authority>>, events: &Receiver<SessionEvent>) {
     while let Ok(event) = events.try_recv() {
+        let sign_in = matches!(event, SessionEvent::OsUnlocked | SessionEvent::Logon);
+        if sign_in {
+            let mut guard = authority
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if owner_authenticated(&mut guard, event) {
+                continue;
+            }
+        }
+        // OsLocked does not end on the session notification. The owner
+        // coming back is owner_authenticated above, release_returned_owner,
+        // or repair_leftover. Forwarding OsUnlocked here reverts and reports
+        // Unlocked for a different logon, and for the unlock Windows sends
+        // with the disconnect itself.
+        if matches!(event, SessionEvent::OsUnlocked) {
+            let locked = matches!(
+                authority
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .state(),
+                LockState::OsLocked { .. }
+            );
+            if locked {
+                continue;
+            }
+        }
+        if matches!(event, SessionEvent::Logon) {
+            continue;
+        }
         let mut guard = authority
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         guard.notify(Event::Session(event));
     }
+}
+
+/// A console unlock after this process saw the owner leave, or a logon onto
+/// the console, when the journal still says this same logon. The service
+/// runs the repair itself. The owner does not.
+fn owner_authenticated(guard: &mut Authority, event: SessionEvent) -> bool {
+    if !matches!(guard.state(), LockState::OsLocked { .. }) {
+        return false;
+    }
+    // The disconnect's own unlock is the proof this logon left. A later
+    // return is the sign-in. An unlock while this logon is still the console
+    // is not that proof.
+    if matches!(event, SessionEvent::OsUnlocked)
+        && DISCONNECT_HELD.load(Ordering::Acquire)
+        && !guard.platform_mut().owner_back()
+    {
+        OWNER_WAS_AWAY.store(true, Ordering::Release);
+        return false;
+    }
+    let unlock_after_away = matches!(event, SessionEvent::OsUnlocked)
+        && DISCONNECT_HELD.load(Ordering::Acquire)
+        && OWNER_WAS_AWAY.load(Ordering::Acquire);
+    let logon = matches!(event, SessionEvent::Logon);
+    if !unlock_after_away && !logon {
+        return false;
+    }
+    if guard.platform_mut().repair_leftover().is_err() {
+        return false;
+    }
+    finish_sign_in(guard);
+    true
 }
 
 /// Stop is accepted only from `Unlocked` or after the OS lock is confirmed.
@@ -638,7 +757,7 @@ fn supervise(
     while !STOP.load(Ordering::Acquire) {
         if arm.is_waiting() && !arm_sent {
             next_id = next_id.saturating_add(1);
-            if let Ok(frame) = encode_service(next_id, &ServiceToHost::Arm)
+            if let Some(frame) = arm_frame(&authority, next_id)
                 && let Some(tx) = writer
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
@@ -666,8 +785,24 @@ fn supervise(
             .try_lock()
             .map(|mut guard| guard.poll_host(Instant::now(), alive))
             .unwrap_or(HostAction::Hold);
+        let signed_in =
+            release_returned_owner(&authority) || REPLACE_HOST.swap(false, Ordering::AcqRel);
+        if signed_in {
+            // The host that was spawned for the disconnected session is not
+            // the next lock's host. The following iteration starts a new one.
+            arm.failed();
+            arm_sent = false;
+            if let Some(child) = host
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+            {
+                let _ = child.stop();
+            }
+            *writer.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+        }
         drain_os_lock(&authority);
-        if let HostAction::Respawn { arm: arm_again } = action {
+        if !signed_in && let HostAction::Respawn { arm: arm_again } = action {
             // The previous wait must not stay Waiting across this process.
             arm.failed();
             arm_sent = false;
@@ -683,7 +818,7 @@ fn supervise(
                     Some(child.writer.clone());
                 if arm_again {
                     next_id = next_id.saturating_add(1);
-                    if let Ok(frame) = encode_service(next_id, &ServiceToHost::Arm) {
+                    if let Some(frame) = arm_frame(&authority, next_id) {
                         let _ = child.writer.send(frame);
                         arm_sent = true;
                     }
@@ -693,6 +828,69 @@ fn supervise(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Set once this process has seen the marker its own disconnect wrote.
+/// A later empty journal is the repair task, not a journal that was never
+/// written.
+static MARKER_SEEN: AtomicBool = AtomicBool::new(false);
+/// This process saw the console leave after its own confirmed disconnect.
+static OWNER_WAS_AWAY: AtomicBool = AtomicBool::new(false);
+/// The session handler already repaired. The supervisor drops the host
+/// that was started in the disconnected session.
+static REPLACE_HOST: AtomicBool = AtomicBool::new(false);
+
+fn release_returned_owner(authority: &Arc<Mutex<Authority>>) -> bool {
+    let mut guard = authority
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !matches!(guard.state(), LockState::OsLocked { .. }) {
+        return false;
+    }
+    match guard.platform_mut().os_confirmed_marker() {
+        Some(true) => MARKER_SEEN.store(true, Ordering::Release),
+        // The ONLOGON task removed a marker this process had seen.
+        Some(false) if MARKER_SEEN.load(Ordering::Acquire) => {
+            finish_sign_in(&mut guard);
+            return true;
+        }
+        _ => return false,
+    }
+    // A process that booted into OsLocked stays there until a logon or the
+    // sign-in task. Watching the console from the first poll would open the
+    // lock on a restart whose session never left.
+    if !DISCONNECT_HELD.load(Ordering::Acquire) || !MARKER_SEEN.load(Ordering::Acquire) {
+        return false;
+    }
+    if !guard.platform_mut().owner_back() {
+        OWNER_WAS_AWAY.store(true, Ordering::Release);
+        return false;
+    }
+    if !OWNER_WAS_AWAY.load(Ordering::Acquire) {
+        return false;
+    }
+    if guard.platform_mut().repair_leftover().is_err() {
+        return false;
+    }
+    finish_sign_in(&mut guard);
+    true
+}
+
+fn finish_sign_in(guard: &mut Authority) {
+    MARKER_SEEN.store(false, Ordering::Release);
+    OWNER_WAS_AWAY.store(false, Ordering::Release);
+    DISCONNECT_HELD.store(false, Ordering::Release);
+    guard.release_after_repair();
+    REPLACE_HOST.store(true, Ordering::Release);
+    crate::audit("settings", &[("result", "restored"), ("reason", "sign-in")]);
+}
+
+fn arm_frame(authority: &Arc<Mutex<Authority>>, id: u64) -> Option<Vec<u8>> {
+    let message = authority
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .lock_screen_message();
+    encode_service(id, &ServiceToHost::Arm { message }).ok()
 }
 
 fn thread_is_suspended(thread: HANDLE) -> bool {
@@ -950,6 +1148,14 @@ fn launch_host(read: HANDLE, write: HANDLE, allow_panic: bool) -> std::io::Resul
         read.0 as usize,
         write.0 as usize
     );
+    #[cfg(feature = "live-fail-closed")]
+    let command = if live_hooks_allowed()
+        && std::env::var("SOFTLOCK_PRESENT_PHYSICAL").ok().as_deref() == Some("1")
+    {
+        format!("{command} --present-physical")
+    } else {
+        command
+    };
     let mut command_wide = wide(&command);
     let mut desktop = wide(r"winsta0\default");
     let startup = STARTUPINFOW {
@@ -1249,6 +1455,12 @@ fn host_test_env(key: &str) -> bool {
     #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
     if key.eq_ignore_ascii_case("SOFTLOCK_OS_LOCK_MARK") {
         return true;
+    }
+    #[cfg(feature = "live-fail-closed")]
+    if key.eq_ignore_ascii_case("SOFTLOCK_PRESENT_PHYSICAL")
+        || key.eq_ignore_ascii_case("SOFTLOCK_TYPE_PIN")
+    {
+        return live_hooks_allowed();
     }
     #[cfg(feature = "live-fail-closed")]
     if key.eq_ignore_ascii_case("SOFTLOCK_FORCE_GUARD_DOWN")
@@ -1710,8 +1922,15 @@ fn dev_app_role_allowed() -> bool {
     live_hooks_allowed()
 }
 
+#[cfg(all(test, feature = "live-fail-closed"))]
+static DENY_LIVE_HOOKS: AtomicBool = AtomicBool::new(false);
+
 #[cfg(feature = "live-fail-closed")]
 pub fn live_hooks_allowed() -> bool {
+    #[cfg(test)]
+    if DENY_LIVE_HOOKS.load(Ordering::SeqCst) {
+        return false;
+    }
     softlock_windows::runner_may_lock().is_ok()
 }
 
@@ -2039,6 +2258,22 @@ fn set_status(
     }
 }
 
+#[cfg(all(test, feature = "live-fail-closed"))]
+mod hook_forward {
+    use super::{DENY_LIVE_HOOKS, host_test_env};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut() {
+        DENY_LIVE_HOOKS.store(true, Ordering::SeqCst);
+        let present = host_test_env("SOFTLOCK_PRESENT_PHYSICAL");
+        let pin = host_test_env("SOFTLOCK_TYPE_PIN");
+        DENY_LIVE_HOOKS.store(false, Ordering::SeqCst);
+        assert!(!present, "SOFTLOCK_PRESENT_PHYSICAL was forwarded");
+        assert!(!pin, "SOFTLOCK_TYPE_PIN was forwarded");
+    }
+}
+
 #[cfg(test)]
 mod settings_boot {
     use super::install_journal;
@@ -2075,6 +2310,124 @@ mod settings_boot {
         );
         assert!(authority.platform_mut().settings_are_required());
     }
+
+    #[test]
+    fn an_unlock_from_an_absent_logon_stays_os_locked() {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+        super::DISCONNECT_HELD.store(false, Ordering::Release);
+        super::OWNER_WAS_AWAY.store(false, Ordering::Release);
+        super::REPLACE_HOST.store(false, Ordering::Release);
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), false);
+        let mut journal = softlock_core::Journal::empty();
+        journal.mark_os_held();
+        authority.notify(softlock_core::Event::ServiceStarted {
+            journal,
+            session_active: false,
+        });
+        let authority = Arc::new(Mutex::new(authority));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(softlock_core::SessionEvent::OsUnlocked).unwrap();
+        super::apply_session_events(&authority, &rx);
+        let state = authority
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .state()
+            .clone();
+        assert!(
+            matches!(state, LockState::OsLocked { .. }),
+            "an unlock with no sign-in left {state:?}"
+        );
+        assert!(!super::REPLACE_HOST.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "live-fail-closed")]
+    #[test]
+    fn the_same_logon_on_the_console_clears_os_locked() {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+        let dir = std::env::temp_dir().join(format!("sl-stay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("journal dir");
+        struct Env;
+        impl Drop for Env {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("SOFTLOCK_JOURNAL_DIR") };
+            }
+        }
+        let _env = Env;
+        unsafe { std::env::set_var("SOFTLOCK_JOURNAL_DIR", &dir) };
+        assert!(
+            crate::authority::test_path("SOFTLOCK_JOURNAL_DIR").is_some(),
+            "the journal override is refused"
+        );
+        let session = super::console_session();
+        assert_ne!(session, u32::MAX, "there is no console session");
+        // The runner user cannot call WTSQueryUserToken. The seam names
+        // this logon and an active console. The service binary does not
+        // compile the override.
+        const LOGON: u64 = 0x1001;
+        crate::taskmgr::force_console_for_test(true, LOGON);
+        struct ClearConsole;
+        impl Drop for ClearConsole {
+            fn drop(&mut self) {
+                crate::taskmgr::clear_forced_console();
+            }
+        }
+        let _console = ClearConsole;
+        let logon = crate::taskmgr::logon_luid(session).expect("console logon");
+        let doc = softlock_core::SettingsJournal {
+            v: 1,
+            sid: "S-1-5-21-1-2-3-1001".to_string(),
+            workstation_clear: false,
+            says_locked: false,
+            os_confirmed: true,
+            failures: 0,
+            entries: Vec::new(),
+            lock: Some(softlock_core::LockIdentity {
+                boot: 1,
+                session,
+                logon,
+            }),
+        };
+        let bytes = softlock_core::encode_document(&doc).expect("journal");
+        crate::journal_store::save_journal(&bytes).expect("save");
+        super::DISCONNECT_HELD.store(false, Ordering::Release);
+        super::OWNER_WAS_AWAY.store(false, Ordering::Release);
+        super::REPLACE_HOST.store(false, Ordering::Release);
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), false);
+        install_journal(&mut authority);
+        assert!(
+            matches!(authority.state(), LockState::OsLocked { .. }),
+            "restart left {:?}",
+            authority.state()
+        );
+        assert!(
+            super::DISCONNECT_HELD.load(Ordering::Acquire),
+            "StayOsLocked did not hold the disconnect"
+        );
+        // This boot found the owner already on the console, so it does not
+        // record that they had left. The clear below is the later moment
+        // they come back: the same logon, active, after a boot that saw them
+        // away.
+        assert!(!super::OWNER_WAS_AWAY.load(Ordering::Acquire));
+        super::OWNER_WAS_AWAY.store(true, Ordering::Release);
+        let authority = Arc::new(Mutex::new(authority));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(softlock_core::SessionEvent::OsUnlocked).unwrap();
+        super::apply_session_events(&authority, &rx);
+        let state = authority
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .state()
+            .clone();
+        assert!(
+            matches!(state, LockState::Unlocked),
+            "the same logon on the console left {state:?}"
+        );
+        assert!(super::REPLACE_HOST.load(Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -2083,7 +2436,9 @@ mod session_filter {
     use softlock_core::SessionEvent;
     use windows::Win32::System::RemoteDesktop::WTSSESSION_NOTIFICATION;
     use windows::Win32::System::Services::SERVICE_CONTROL_SESSIONCHANGE;
-    use windows::Win32::UI::WindowsAndMessaging::{WTS_SESSION_LOCK, WTS_SESSION_UNLOCK};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WTS_SESSION_LOCK, WTS_SESSION_LOGON, WTS_SESSION_UNLOCK,
+    };
 
     #[test]
     fn another_sessions_lock_does_not_move_the_console() {
@@ -2133,6 +2488,15 @@ mod session_filter {
                 console
             ),
             Some(SessionEvent::OsUnlocked)
+        );
+        assert_eq!(
+            session_event(
+                SERVICE_CONTROL_SESSIONCHANGE,
+                WTS_SESSION_LOGON,
+                same_ptr,
+                console
+            ),
+            Some(SessionEvent::Logon)
         );
         assert!(session_event(SERVICE_CONTROL_SESSIONCHANGE, 1, same_ptr, console).is_none());
         assert!(

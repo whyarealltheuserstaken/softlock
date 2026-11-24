@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 use softlock_core::{
-    Event, GuardHealth, HeartbeatReport, HostToService, LaunchNonce, LockController, LockSource,
-    LockState, MethodId, OverlayHealth, RequestKind, ResponseKind, Role, Secret, ServiceToHost,
-    StateName, Verdict, decode_request_frame, hash_softlock_pin, verify_softlock_pin,
+    CONFIG_ERRORS_NAME, Event, GuardHealth, HeartbeatReport, HostToService, LaunchNonce,
+    LockController, LockSource, LockState, MethodId, OverlayHealth, RequestKind, ResponseKind,
+    Role, Secret, ServiceToHost, StateName, Verdict, decode_request_frame, hash_softlock_pin,
+    verify_softlock_pin,
 };
 
 use crate::log::{audit, source_name};
@@ -69,6 +70,7 @@ pub struct Authority {
     arm_deadline: Option<Instant>,
     /// The hung host is still alive and has to be replaced.
     arm_replace: bool,
+    config_dir: Option<PathBuf>,
 }
 
 impl Authority {
@@ -84,6 +86,31 @@ impl Authority {
             next_os_retry: None,
             arm_deadline: None,
             arm_replace: false,
+            config_dir: None,
+        }
+    }
+
+    /// Loads a file that already exists when the service starts. A document
+    /// that does not parse leaves the built-in config in place and is reported.
+    pub fn load_existing_config(&mut self, text: &str) {
+        match self.controller.install_startup_config(text) {
+            Ok(()) => {}
+            Err(errors) => {
+                self.record_config_result(&ResponseKind::Invalid { errors });
+            }
+        }
+    }
+
+    pub fn set_config_dir(&mut self, dir: PathBuf) {
+        self.config_dir = Some(dir);
+    }
+
+    pub fn lock_screen_message(&self) -> Option<String> {
+        let message = self.controller.config_message();
+        if message.is_empty() {
+            None
+        } else {
+            Some(message.to_string())
         }
     }
 
@@ -97,6 +124,14 @@ impl Authority {
 
     pub fn notify(&mut self, event: Event) {
         self.controller.handle(event);
+    }
+
+    pub fn release_after_repair(&mut self) {
+        self.controller.release_after_repair();
+    }
+
+    pub fn session_os_locked(&self) -> bool {
+        self.controller.session_os_locked()
     }
 
     pub fn state(&self) -> &LockState {
@@ -204,8 +239,60 @@ impl Authority {
             }
             other => {
                 self.controller.handle(Event::Public { role, kind: other });
-                self.response()
+                let response = self.response();
+                self.record_config_result(&response);
+                response
             }
+        }
+    }
+}
+
+fn write_errors(path: &Path, errors: &[String]) -> std::io::Result<()> {
+    let body = errors.join("\n");
+    #[cfg(windows)]
+    {
+        crate::config_file::write_bytes(path, body.as_bytes())
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && meta.file_type().is_symlink()
+        {
+            return Err(std::io::Error::other("reparse"));
+        }
+        std::fs::write(path, body)
+    }
+}
+
+impl Authority {
+    fn record_config_result(&self, response: &ResponseKind) {
+        let Some(dir) = &self.config_dir else {
+            return;
+        };
+        let path = dir.join(CONFIG_ERRORS_NAME);
+        match response {
+            ResponseKind::Invalid { errors } => {
+                let _ = write_errors(&path, errors);
+            }
+            ResponseKind::Applied => {
+                #[cfg(windows)]
+                {
+                    let _ = crate::config_file::remove_file(&path);
+                }
+                #[cfg(not(windows))]
+                {
+                    if let Ok(meta) = std::fs::symlink_metadata(&path)
+                        && meta.file_type().is_symlink()
+                    {
+                        return;
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -333,10 +420,6 @@ impl Authority {
     /// Respawns when the host is gone. Retries the OS lock while it is down.
     /// Neither result is Unlocked.
     pub fn poll_host(&mut self, now: Instant, process_alive: bool) -> HostAction {
-        #[cfg(windows)]
-        if crate::windows::chain_running() {
-            return HostAction::Hold;
-        }
         let stale = self
             .last_beat
             .is_some_and(|last| now.saturating_duration_since(last) >= SILENCE);
@@ -363,6 +446,12 @@ impl Authority {
         {
             self.arm_replace = true;
             self.note_host_lost(HostLoss::Silent);
+        }
+        // A live host waits out the OS-lock chain. A dead host, and a host that
+        // missed HostReady, still fail closed.
+        #[cfg(windows)]
+        if process_alive && !self.arm_replace && crate::windows::chain_running() {
+            return HostAction::Hold;
         }
         // A dead Lock Host is replaced. While the session is still locked this
         // is the emergency recovery. After a normal unlock the replacement
@@ -706,7 +795,7 @@ pub fn pipe_path() -> String {
     softlock_core::pipe_name()
 }
 
-fn test_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn test_path(name: &str) -> Option<PathBuf> {
     #[cfg(feature = "simulated-physical")]
     {
         if let Ok(path) = std::env::var(name) {
@@ -927,5 +1016,56 @@ mod host_ready_tests {
         );
         assert!(!wait.is_waiting(), "the arm slot stayed waiting");
         assert_eq!(action, HostAction::Respawn { arm: true });
+    }
+}
+
+#[cfg(test)]
+mod startup_config_tests {
+    use super::Authority;
+    use crate::platform::{OsLock, ServicePlatform};
+    use softlock_core::{RequestKind, ResponseKind, Role};
+
+    fn authority_in(dir: &std::path::Path) -> Authority {
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), true);
+        authority.set_config_dir(dir.to_path_buf());
+        authority
+    }
+
+    #[test]
+    fn a_valid_startup_file_becomes_the_effective_config() {
+        let dir = std::env::temp_dir().join(format!("sl-start-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut authority = authority_in(&dir);
+        authority
+            .load_existing_config("schema_version = 1\n[lock]\nhotkey = \"Ctrl+Alt+Shift+K\"\n");
+        let ResponseKind::Config { toml, revision } =
+            authority.handle_public(Role::App, RequestKind::GetConfig)
+        else {
+            panic!("config");
+        };
+        assert!(toml.contains("Ctrl+Alt+Shift+K"), "{toml}");
+        assert_eq!(revision, 1, "startup load consumed the base revision");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_invalid_startup_file_keeps_the_defaults_and_is_reported() {
+        let dir = std::env::temp_dir().join(format!("sl-start-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut authority = authority_in(&dir);
+        authority.load_existing_config("schema_version = 1\n[lock]\nhotkey = \"nope\"\n");
+        let ResponseKind::Config { toml, .. } =
+            authority.handle_public(Role::App, RequestKind::GetConfig)
+        else {
+            panic!("config");
+        };
+        assert!(toml.contains("Ctrl+Alt+Shift+L"), "{toml}");
+        assert!(!toml.contains("nope"), "{toml}");
+        let errors = std::fs::read_to_string(dir.join(softlock_core::CONFIG_ERRORS_NAME))
+            .expect("errors file");
+        assert!(errors.contains("hotkey"), "{errors}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

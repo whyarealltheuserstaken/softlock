@@ -23,7 +23,10 @@ mod settings_journal;
 mod state;
 
 pub use backoff::delay_after_failure;
-pub use config::Config;
+pub use config::{
+    CONFIG_ERRORS_NAME, CONFIG_FILE_NAME, Config, HotkeyChord, MAX_CONFIG_BYTES, UserConfig,
+    hotkey_in_document, parse_hotkey, published_schema_json, schema_accepts_document,
+};
 pub use controller::Event;
 pub use controller::{LockController, Rejection};
 pub use decision::{PinAuthority, PinDecision};
@@ -66,15 +69,20 @@ pub use platform::{
     UNSUPPORTED_PLATFORM_MESSAGE, UnsupportedPlatform, UserId, Verdict,
 };
 pub use settings_journal::{
-    CommitFault, DirFacts, DirFault, DirOwner, HostPresence, JournalFault, LOCKDOWN,
-    LockdownPolicy, PolicyHive, ProductState, REASSERT_AFTER, RepairAction, SettingEntry,
-    SettingValue, SettingsJournal, StartAction, TASK_MANAGER, admit_directory, allowed_previous,
-    allowed_previous_for, blocks_owner_sign_in, commit_then_change, console_user_from,
-    dir_fault_log, encode_document, executable_may_run_as_system, expand_profile_image, fault_log,
-    hive_target_allowed, host_identity, journal_dacl_exact, lockdown_document, lockdown_policy,
-    lockdown_target, mark_workstation_clear, parent_dacl_trusted, parse_document, reassert_due,
-    reassert_write, repair_action, repair_entry_name, restore_action, restore_action_for,
-    restore_sid, same_exe_path, service_start_action, sid_is_safe, task_manager_document,
+    CONFIG_DIR, CONFIG_FILE, CommitFault, DirFacts, DirFault, DirOwner, HeldStart, HostPresence,
+    JournalFault, LOCKDOWN, LockIdentity, LockdownPolicy, PolicyHive, ProductState, REASSERT_AFTER,
+    RepairAction, SessionFact, SettingEntry, SettingValue, SettingsJournal, StartAction,
+    StartupStep, TASK_MANAGER, admit_directory, allowed_previous, allowed_previous_for,
+    blocks_owner_sign_in, commit_then_change, config_acl_entry, config_dir_allowed,
+    config_dir_entry, config_lock_held, config_path_allowed, confirmed_during_wait,
+    console_user_from, dacl_without_owner_write, dir_fault_log, encode_document,
+    executable_may_run_as_system, expand_profile_image, fact_after_boot, fact_for_session,
+    fault_log, fresh_log, held_start, hive_target_allowed, host_identity, journal_dacl_exact,
+    lockdown_document, lockdown_policy, lockdown_target, mark_workstation_clear, original_previous,
+    owner_reconnected, parent_dacl_trusted, parse_document, reassert_due, reassert_write,
+    recovery_action, release_os_hold, repair_action, repair_entry_name, restore_action,
+    restore_action_for, restore_sid, same_exe_path, sddl_allowed, service_start_action,
+    sid_is_safe, sign_in_release, startup_steps, task_manager_document, with_config_acl,
     workstation_value_after_attempt,
 };
 pub use state::{

@@ -17,6 +17,10 @@ pub struct Journal {
     durable_failures: u32,
     says_locked: bool,
     durable_says_locked: bool,
+    /// Policies were reverted after a confirmed OS lock. A restart stays
+    /// `OsLocked` until the owner is back on the console.
+    os_held: bool,
+    durable_os_held: bool,
     flushed: bool,
 }
 
@@ -29,8 +33,14 @@ impl Journal {
             durable_failures: 0,
             says_locked: false,
             durable_says_locked: false,
+            os_held: false,
+            durable_os_held: false,
             flushed: true,
         }
+    }
+
+    pub fn mark_os_held(&mut self) {
+        self.os_held = true;
     }
 
     pub fn record(&mut self, entry: JournalEntry) {
@@ -52,6 +62,7 @@ impl Journal {
         self.durable.clone_from(&self.entries);
         self.durable_failures = self.failures;
         self.durable_says_locked = self.says_locked;
+        self.durable_os_held = self.os_held;
         self.flushed = true;
     }
 
@@ -65,6 +76,8 @@ impl Journal {
             durable_failures: self.durable_failures,
             says_locked: self.durable_says_locked,
             durable_says_locked: self.durable_says_locked,
+            os_held: self.durable_os_held,
+            durable_os_held: self.durable_os_held,
             flushed: true,
         }
     }
@@ -76,11 +89,17 @@ impl Journal {
         self.durable_failures = 0;
         self.says_locked = false;
         self.durable_says_locked = false;
+        self.os_held = false;
+        self.durable_os_held = false;
         self.flushed = true;
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.failures == 0 && !self.says_locked
+        self.entries.is_empty() && self.failures == 0 && !self.says_locked && !self.os_held
+    }
+
+    pub fn os_held(&self) -> bool {
+        self.os_held
     }
 
     pub fn failures(&self) -> u32 {

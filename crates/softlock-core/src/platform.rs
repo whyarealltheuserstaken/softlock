@@ -235,6 +235,12 @@ pub trait Hardening {
     fn apply(&mut self, plan: &HardeningPlan, journal: &mut Journal) -> Result<(), HardenError>;
     fn revert(&mut self, journal: &Journal) -> Result<(), HardenError>;
 
+    /// The next revert is an OS-lock confirmation. Policies go back, and the
+    /// journal stays `OsLocked` across a service restart. SPEC section 7.
+    fn keep_os_lock_after_revert(&mut self, keep: bool) {
+        let _ = keep;
+    }
+
     /// Put journaled settings back to their locked values. A failure is returned.
     fn reassert(&mut self, journal: &Journal) -> Result<(), HardenError> {
         let _ = journal;

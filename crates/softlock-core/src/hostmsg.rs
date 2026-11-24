@@ -17,7 +17,10 @@ pub enum ServiceToHost {
     Welcome {
         nonce: NonceBytes,
     },
-    Arm,
+    Arm {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     Disarm,
     /// Lock the signed-in session. The Service confirms it and disconnects
     /// the console itself when this does not. The host must not disconnect.

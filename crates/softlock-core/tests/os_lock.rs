@@ -726,6 +726,7 @@ fn release_universal_and_product_builds_leave_live_fail_closed_off() {
     let scan = std::fs::read_to_string(root.join(".github/universal-scan.sh")).expect("scan");
     assert!(scan.contains("softlock-live-fail-closed-marker"));
     assert!(scan.contains("softlock_live_fail_closed_marker"));
+    assert!(scan.contains("softlock-present-physical-pin"));
     let windows = std::fs::read_to_string(root.join("crates/softlock-service/src/windows.rs"))
         .expect("windows");
     let authority = std::fs::read_to_string(root.join("crates/softlock-service/src/authority.rs"))

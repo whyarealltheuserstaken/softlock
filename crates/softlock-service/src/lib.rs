@@ -6,6 +6,8 @@
 
 mod authority;
 #[cfg(windows)]
+mod config_file;
+#[cfg(windows)]
 mod journal_store;
 #[cfg(feature = "live-fail-closed")]
 mod live_marker;
@@ -13,6 +15,8 @@ mod log;
 #[cfg(feature = "simulated-physical")]
 mod pincheck;
 mod platform;
+#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+mod present_physical;
 mod secrets;
 #[cfg(windows)]
 mod settings;
@@ -35,10 +39,19 @@ pub use pincheck::PinChecker;
 #[cfg(feature = "simulated-physical")]
 pub use pincheck::marker_bytes;
 pub use platform::{ArmWait, OsLock, ServicePlatform};
+#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+pub use present_physical::marker_bytes as present_physical_marker_bytes;
 pub use secrets::PinStore;
 
 #[cfg(windows)]
+pub use config_file::{owner_lock_rights, owner_right_denied, owner_write_denied};
+#[cfg(all(windows, feature = "live-fail-closed"))]
+pub use config_file::{testing_dacl, testing_owner, testing_restore_dacl};
+#[cfg(windows)]
 pub use secrets::{SYSTEM_ONLY_SDDL, dacl_sddl, is_reparse_point, user_read_denied};
+
+#[cfg(windows)]
+pub use taskmgr::owner_config_file;
 
 #[cfg(windows)]
 pub use settings::{

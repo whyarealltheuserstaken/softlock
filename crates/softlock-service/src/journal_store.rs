@@ -35,6 +35,9 @@ pub fn journal_directory() -> PathBuf {
 }
 
 pub fn save_journal(bytes: &[u8]) -> io::Result<()> {
+    if let Some(dir) = crate::authority::test_path("SOFTLOCK_JOURNAL_DIR") {
+        return save_plain(&dir, bytes);
+    }
     let dir = verified_directory()?;
     let name = temp_name();
     let file = match create_relative(&name, dir, JOURNAL_FILE_SDDL) {
@@ -69,6 +72,9 @@ pub fn save_journal(bytes: &[u8]) -> io::Result<()> {
 }
 
 pub fn load_journal() -> io::Result<Option<String>> {
+    if let Some(dir) = crate::authority::test_path("SOFTLOCK_JOURNAL_DIR") {
+        return load_plain(&dir);
+    }
     let dir = verified_directory()?;
     let opened = open_relative(dir, JOURNAL_FILE);
     let file = match opened {
@@ -229,6 +235,34 @@ fn allowed_name(name: &str) -> bool {
         return false;
     };
     hex.len() == 16 && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn save_plain(dir: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(dir)
+        && meta.file_type().is_symlink()
+    {
+        return Err(io::Error::other("reparse"));
+    }
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(JOURNAL_FILE);
+    if let Ok(meta) = std::fs::symlink_metadata(&path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(io::Error::other("reparse"));
+    }
+    let temp = dir.join(temp_name());
+    std::fs::write(&temp, bytes)?;
+    std::fs::rename(&temp, &path)
+}
+
+fn load_plain(dir: &Path) -> io::Result<Option<String>> {
+    let path = dir.join(JOURNAL_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::other("reparse")),
+        Ok(_) => Ok(Some(std::fs::read_to_string(path)?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn temp_name() -> String {

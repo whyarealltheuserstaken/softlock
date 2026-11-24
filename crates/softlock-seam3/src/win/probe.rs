@@ -260,12 +260,7 @@ pub fn send_left_click(extra_info: u64) -> Result<(), HarnessError> {
 }
 
 fn send_mouse(inputs: &[INPUT]) -> Result<(), HarnessError> {
-    let inserted = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
-    if inserted == 0 {
-        Err(last_error("SendInput"))
-    } else {
-        Ok(())
-    }
+    send_input_bounded(inputs)
 }
 
 fn mouse_event(
@@ -294,11 +289,27 @@ pub fn send_virtual_key(virtual_key: u16, extra_info: u64) -> Result<(), Harness
         key_event(virtual_key, false, extra_info),
         key_event(virtual_key, true, extra_info),
     ];
-    let inserted = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if inserted == 0 {
-        Err(last_error("SendInput"))
-    } else {
-        Ok(())
+    send_input_bounded(&inputs)
+}
+
+fn send_input_bounded(inputs: &[INPUT]) -> Result<(), HarnessError> {
+    let inputs = inputs.to_vec();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let inserted = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        let outcome = if inserted == 0 {
+            Err(last_error("SendInput"))
+        } else {
+            Ok(())
+        };
+        let _ = sender.send(outcome);
+    });
+    // A hook that does not pump never returns from `SendInput`.
+    match receiver.recv_timeout(Duration::from_secs(3)) {
+        Ok(outcome) => outcome,
+        Err(_) => Err(HarnessError::new(
+            "SendInput timed out waiting for the hook to return",
+        )),
     }
 }
 

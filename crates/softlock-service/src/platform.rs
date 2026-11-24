@@ -83,6 +83,29 @@ impl ServicePlatform {
         engine.reassert_if_due()
     }
 
+    /// Whether the journal still records a confirmed OS lock.
+    #[cfg(windows)]
+    pub fn os_confirmed_marker(&mut self) -> Option<bool> {
+        self.settings
+            .as_mut()
+            .and_then(crate::settings::SettingsEngine::os_confirmed_marker)
+    }
+
+    /// The repair `--repair-settings` runs. Refuses unless this logon is the
+    /// console again.
+    #[cfg(windows)]
+    pub fn repair_leftover(&mut self) -> Result<(), &'static str> {
+        self.settings.as_mut().ok_or("settings")?.repair_leftover()
+    }
+
+    /// This logon is the active console again. Does not write the journal.
+    #[cfg(windows)]
+    pub fn owner_back(&mut self) -> bool {
+        self.settings
+            .as_mut()
+            .is_some_and(crate::settings::SettingsEngine::owner_back)
+    }
+
     pub fn set_arm_wait(&mut self, arm: ArmWait) {
         self.arm = Some(arm);
     }
@@ -368,6 +391,17 @@ impl Hardening for ServicePlatform {
             engine.persist_and_apply()?;
         }
         Ok(())
+    }
+
+    fn keep_os_lock_after_revert(&mut self, keep: bool) {
+        #[cfg(windows)]
+        if let Some(engine) = self.settings.as_mut() {
+            engine.keep_os_lock_after_revert(keep);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = keep;
+        }
     }
 
     fn revert(&mut self, journal: &Journal) -> Result<(), HardenError> {

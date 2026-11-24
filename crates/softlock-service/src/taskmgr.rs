@@ -1,14 +1,15 @@
 //! DisableTaskMgr for the console user. Reads keep the registry type.
 //! An allow-listed previous value is the only one that is written back.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use softlock_core::{
-    HostPresence, LockdownPolicy, PolicyHive, SettingValue, console_user_from,
-    expand_profile_image, hive_target_allowed, host_identity, same_exe_path, sid_is_safe,
+    HostPresence, LockIdentity, LockdownPolicy, PolicyHive, SessionFact, SettingValue,
+    console_user_from, expand_profile_image, fact_after_boot, fact_for_session,
+    hive_target_allowed, host_identity, same_exe_path, sid_is_safe,
 };
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE};
 use windows::Win32::System::Registry::{
@@ -56,12 +57,13 @@ pub fn write_lockdown(
     policy: &LockdownPolicy,
     value: SettingValue,
 ) -> Result<(), &'static str> {
-    if !sid_is_safe(sid) || !softlock_core::allowed_previous_for(policy.target, value) {
+    if !sid_is_safe(sid) || !softlock_core::allowed_previous_for(policy.target, &value) {
         return Err("value");
     }
     match value {
         SettingValue::Absent => delete_lockdown(sid, policy),
         SettingValue::Dword { value } => set_lockdown(sid, policy, value),
+        SettingValue::Sddl { .. } => Err("value"),
     }
 }
 
@@ -413,6 +415,60 @@ fn win32(status: windows::Win32::Foundation::WIN32_ERROR) -> Result<(), &'static
     }
 }
 
+pub fn owner_config_file() -> Result<PathBuf, &'static str> {
+    let sid = console_sid()?;
+    let raw = profile_path(&sid)?;
+    let root = windows_directory()?;
+    let drive = system_drive(&root)?;
+    let expanded =
+        softlock_core::expand_profile_image(&raw, &root, &drive).map_err(|_| "profile")?;
+    let path = format!(
+        "{expanded}\\AppData\\Roaming\\{}\\{}",
+        softlock_core::SERVICE_NAME,
+        softlock_core::CONFIG_FILE_NAME
+    );
+    if !softlock_core::config_path_allowed(&path) {
+        return Err("profile");
+    }
+    Ok(PathBuf::from(path))
+}
+
+pub struct ConsoleImpersonation {
+    token: HANDLE,
+}
+
+impl Drop for ConsoleImpersonation {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Security::RevertToSelf();
+            if !self.token.0.is_null() {
+                let _ = windows::Win32::Foundation::CloseHandle(self.token);
+            }
+        }
+    }
+}
+
+/// The profile is the console user's. LocalSystem may be denied on the way
+/// there, so the create runs as that user and then reverts.
+pub fn impersonate_console_user() -> Result<ConsoleImpersonation, &'static str> {
+    use windows::Win32::Security::ImpersonateLoggedOnUser;
+    let session = crate::windows::console_session();
+    if session == 0xFFFF_FFFF {
+        return Err("sid");
+    }
+    let mut token = HANDLE::default();
+    unsafe {
+        windows::Win32::System::RemoteDesktop::WTSQueryUserToken(session, &mut token)
+            .map_err(|_| "sid")?;
+        if let Err(error) = ImpersonateLoggedOnUser(token) {
+            let _ = windows::Win32::Foundation::CloseHandle(token);
+            let _ = error;
+            return Err("sid");
+        }
+    }
+    Ok(ConsoleImpersonation { token })
+}
+
 pub fn console_sid() -> Result<String, &'static str> {
     let session = crate::windows::console_session();
     if session == 0xFFFF_FFFF {
@@ -481,7 +537,46 @@ fn token_sid(token: HANDLE) -> Result<String, &'static str> {
     }
 }
 
+/// The seam test names the console logon. `WTSQueryUserToken` is
+/// LocalSystem-only, so a unit test cannot read it. The override is
+/// compiled out of the service binary.
+#[cfg(all(test, feature = "live-fail-closed"))]
+struct ForcedConsole {
+    active: bool,
+    logon: u64,
+}
+
+#[cfg(all(test, feature = "live-fail-closed"))]
+static FORCED_CONSOLE: std::sync::Mutex<Option<ForcedConsole>> = std::sync::Mutex::new(None);
+
+#[cfg(all(test, feature = "live-fail-closed"))]
+pub(crate) fn force_console_for_test(active: bool, logon: u64) {
+    *FORCED_CONSOLE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(ForcedConsole { active, logon });
+}
+
+#[cfg(all(test, feature = "live-fail-closed"))]
+pub(crate) fn clear_forced_console() {
+    *FORCED_CONSOLE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
+}
+
+#[cfg(all(test, feature = "live-fail-closed"))]
+fn forced_console() -> Option<(bool, u64)> {
+    FORCED_CONSOLE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .map(|forced| (forced.active, forced.logon))
+}
+
 pub fn console_is_active() -> Result<bool, &'static str> {
+    #[cfg(all(test, feature = "live-fail-closed"))]
+    if let Some((active, _)) = forced_console() {
+        return Ok(active);
+    }
     use windows::Win32::System::RemoteDesktop::{
         WTSActive, WTSConnectState, WTSFreeMemory, WTSQuerySessionInformationW,
     };
@@ -502,6 +597,120 @@ pub fn console_is_active() -> Result<bool, &'static str> {
         let state = *buffer.0.cast::<u32>();
         WTSFreeMemory(buffer.0.cast());
         Ok(state == WTSActive.0 as u32)
+    }
+}
+
+/// Boot time and the console logon, recorded into the journal at lock time.
+pub fn current_lock_identity() -> Option<LockIdentity> {
+    let session = crate::windows::console_session();
+    if session == u32::MAX {
+        return None;
+    }
+    let boot = unbiased_uptime().ok()?;
+    let logon = logon_luid(session).ok()?;
+    if boot == 0 || logon == 0 {
+        return None;
+    }
+    Some(LockIdentity {
+        boot,
+        session,
+        logon,
+    })
+}
+
+/// The console session is the one recorded at lock time, it is active, and
+/// the logon LUID matches. Used after this process confirmed a disconnect.
+pub fn owner_session_returned(saved: LockIdentity) -> bool {
+    let console = crate::windows::console_session();
+    let active = console_is_active().unwrap_or(false);
+    let logon = if console == u32::MAX {
+        None
+    } else {
+        logon_luid(console).ok()
+    };
+    softlock_core::owner_reconnected(saved, console, active, logon)
+}
+
+/// Compare the journaled uptime and logon with this boot. A failed query is
+/// [`SessionFact::Unknown`], which startup fails closed on. A wall-clock
+/// change is not a different boot: only a smaller unbiased uptime is.
+///
+/// A session id that is merely absent while the console is not active is a
+/// disconnect, not a new logon. SPEC section 7: that recovery never reports
+/// `Unlocked`.
+pub fn observe_lock(saved: Option<LockIdentity>, console_active: bool) -> SessionFact {
+    let Some(saved) = saved else {
+        return SessionFact::Unknown;
+    };
+    let listed = session_listed(saved.session).ok();
+    let same_logon = match listed {
+        Some(true) => match logon_luid(saved.session) {
+            Err(()) => None,
+            Ok(logon) => Some(logon == saved.logon),
+        },
+        _ => None,
+    };
+    let session = fact_for_session(listed, console_active, same_logon);
+    fact_after_boot(saved.boot, unbiased_uptime().ok(), session)
+}
+
+fn unbiased_uptime() -> Result<u64, ()> {
+    use windows::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime;
+    let mut time = 0u64;
+    let ok = unsafe { QueryUnbiasedInterruptTime(&mut time) };
+    if ok.as_bool() && time != 0 {
+        Ok(time)
+    } else {
+        Err(())
+    }
+}
+
+fn session_listed(session: u32) -> Result<bool, ()> {
+    use windows::Win32::System::RemoteDesktop::{WTSEnumerateSessionsW, WTSFreeMemory};
+    unsafe {
+        let mut info = std::ptr::null_mut();
+        let mut count = 0u32;
+        WTSEnumerateSessionsW(None, 0, 1, &mut info, &mut count).map_err(|_| ())?;
+        if info.is_null() {
+            return Err(());
+        }
+        let rows = std::slice::from_raw_parts(info, count as usize);
+        let found = rows.iter().any(|row| row.SessionId == session);
+        WTSFreeMemory(info.cast());
+        Ok(found)
+    }
+}
+
+pub(crate) fn logon_luid(session: u32) -> Result<u64, ()> {
+    #[cfg(all(test, feature = "live-fail-closed"))]
+    if let Some((_, logon)) = forced_console() {
+        return if session == u32::MAX || logon == 0 {
+            Err(())
+        } else {
+            Ok(logon)
+        };
+    }
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_STATISTICS, TokenStatistics};
+    use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
+    unsafe {
+        let mut token = HANDLE::default();
+        WTSQueryUserToken(session, &mut token).map_err(|_| ())?;
+        let mut stats = TOKEN_STATISTICS::default();
+        let mut needed = 0u32;
+        let read = GetTokenInformation(
+            token,
+            TokenStatistics,
+            Some((&mut stats as *mut TOKEN_STATISTICS).cast()),
+            std::mem::size_of::<TOKEN_STATISTICS>() as u32,
+            &mut needed,
+        );
+        let _ = CloseHandle(token);
+        read.map_err(|_| ())?;
+        let low = stats.AuthenticationId.LowPart as u64;
+        let high = stats.AuthenticationId.HighPart as u32 as u64;
+        let logon = (high << 32) | low;
+        if logon == 0 { Err(()) } else { Ok(logon) }
     }
 }
 

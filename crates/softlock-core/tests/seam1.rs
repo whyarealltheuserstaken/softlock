@@ -1234,6 +1234,19 @@ fn flush_persists_failure_count_and_locked_flag_and_recovery_restores_backoff() 
 }
 
 #[test]
+fn a_confirmed_os_lock_stays_locked_across_a_service_restart() {
+    let mut journal = Journal::empty();
+    journal.mark_os_held();
+    let mut controller = started(FakePlatform::new());
+    controller.handle(Event::ServiceStarted {
+        journal,
+        session_active: false,
+    });
+    assert!(matches!(controller.state(), LockState::OsLocked { .. }));
+    assert!(!controller.returned_to_unlocked());
+}
+
+#[test]
 fn pin_and_confirmation_token_are_redacted_and_unsupported() {
     let pin = "1234";
     let token = "confirm-token";
@@ -1629,6 +1642,38 @@ fn failed_revert_after_sign_in_disarms_and_asks_for_repair() {
             .notifications()
             .iter()
             .any(|notice| notice.reason == FailReason::Repair)
+    );
+}
+
+#[test]
+fn a_sign_in_repair_lets_the_next_lock_start_and_unlock() {
+    let mut controller = locked_started();
+    controller.handle(Event::HostExited);
+    controller.handle(Event::OsLockConfirmed);
+    assert!(
+        matches!(controller.state(), LockState::OsLocked { .. }),
+        "the disconnect did not confirm"
+    );
+    // The service has run repair_leftover. This is the state half of that route.
+    controller.release_after_repair();
+    assert!(
+        matches!(controller.state(), LockState::Unlocked),
+        "repair left {:?}",
+        controller.state()
+    );
+    controller.handle(Event::LockRequested {
+        source: LockSource::App,
+    });
+    assert!(
+        matches!(controller.state(), LockState::Locked { .. }),
+        "the next lock did not start: {:?}",
+        controller.state()
+    );
+    verify(&mut controller);
+    assert!(
+        matches!(controller.state(), LockState::Unlocked),
+        "the next lock did not unlock: {:?}",
+        controller.state()
     );
 }
 
@@ -2559,5 +2604,35 @@ fn host_loss_while_the_os_lock_is_down_retries_and_never_unlocks() {
     assert!(
         !controller.returned_to_unlocked(),
         "host loss while the OS lock is down ended Unlocked"
+    );
+}
+
+#[test]
+fn published_schema_accepts_the_default_and_rejects_an_unknown_field() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/schema/config.schema.json");
+    let published = std::fs::read_to_string(&path).expect("published schema");
+    let generated = softlock_core::published_schema_json();
+    assert_eq!(
+        published.trim(),
+        generated.trim(),
+        "schema drifted from the Rust types"
+    );
+    let defaults = softlock_core::Config::initial().document().to_string();
+    softlock_core::schema_accepts_document(&published, &defaults).expect("default file");
+    assert!(softlock_core::Config::parse(&defaults).is_ok());
+    let unknown = format!("unknown_field = true\n{defaults}");
+    assert!(softlock_core::schema_accepts_document(&published, &unknown).is_err());
+    let nested = format!("{defaults}\nunknown_nested = true\n");
+    assert!(
+        softlock_core::schema_accepts_document(&published, &nested).is_err(),
+        "a nested unknown field must be rejected"
+    );
+    let errors = softlock_core::Config::parse(&unknown).expect_err("unknown field");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error == "unknown field: unknown_field"),
+        "{errors:?}"
     );
 }

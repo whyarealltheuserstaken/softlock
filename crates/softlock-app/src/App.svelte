@@ -57,6 +57,10 @@
   data-service-stop={view.serviceStop ? "true" : "false"}
   data-locked={view.locked ? "on" : "off"}
   data-notice={view.notice}
+  data-editing={view.editing ? "on" : "off"}
+  data-config-offer={view.configOffer ? "pending" : "none"}
+  data-config-hotkey={view.configHotkey}
+  data-config-result={view.configResult}
   data-hard-lock={view.hardLockCount}
 >
   {#if platformMessage}
@@ -67,6 +71,30 @@
   <p class="service-line" data-testid="service-line">{serviceLine(view)}</p>
   {#if view.notice}
     <p data-testid="hotkey-notice">{view.notice}</p>
+  {/if}
+  {#if view.configErrors}
+    <p data-testid="config-errors" role="alert">{view.configErrors}</p>
+  {/if}
+  {#if view.configOffer}
+    <p data-testid="config-offer">{ui.applyConfig}</p>
+    <button
+      type="button"
+      data-testid="accept-config"
+      onclick={() => {
+        view = bridge.acceptConfig();
+      }}
+    >
+      {ui.applyConfig}
+    </button>
+    <button
+      type="button"
+      data-testid="decline-config"
+      onclick={() => {
+        view = bridge.declineConfig();
+      }}
+    >
+      {ui.keepConfig}
+    </button>
   {/if}
 
   {#if bridge.kind === "fake"}

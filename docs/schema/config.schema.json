@@ -1,0 +1,368 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "UserConfig",
+  "description": "The published JSON Schema is generated from this type.",
+  "type": "object",
+  "properties": {
+    "hardening": {
+      "default": {
+        "disable_game_controllers": true,
+        "disable_touch_pen": true,
+        "power_button": "do_nothing",
+        "stop_accessibility_input": true,
+        "suppress_notifications": true,
+        "uac_require_credentials": true
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/HardeningSection"
+        }
+      ]
+    },
+    "keep_awake": {
+      "default": {
+        "battery_floor_percent": 15,
+        "enabled": true,
+        "heat_check": "auto",
+        "keep_display_on": "auto"
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/KeepAwakeSection"
+        }
+      ]
+    },
+    "lock": {
+      "default": {
+        "dim_percent": 50,
+        "display": "opaque",
+        "hotkey": "Ctrl+Alt+Shift+L",
+        "message": "",
+        "show_clock": true
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/LockSection"
+        }
+      ]
+    },
+    "network": {
+      "default": {
+        "keep_online": true,
+        "notify_on_drop": true
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/NetworkSection"
+        }
+      ]
+    },
+    "pause": {
+      "default": {
+        "apps": [],
+        "enabled": false
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/PauseSection"
+        }
+      ]
+    },
+    "schema_version": {
+      "default": 1,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "takeover": {
+      "default": {
+        "idle_lock": false,
+        "idle_minutes": 10,
+        "lid_close": false,
+        "win_l": false
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/TakeoverSection"
+        }
+      ]
+    },
+    "unlock": {
+      "default": {
+        "methods": [
+          "windows_hello"
+        ],
+        "softlock_pin_enabled": false
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/UnlockSection"
+        }
+      ]
+    },
+    "updates": {
+      "default": {
+        "auto_check": true,
+        "channel": "stable"
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/UpdatesSection"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "HardeningSection": {
+      "type": "object",
+      "properties": {
+        "disable_game_controllers": {
+          "default": true,
+          "type": "boolean"
+        },
+        "disable_touch_pen": {
+          "default": true,
+          "type": "boolean"
+        },
+        "power_button": {
+          "default": "do_nothing",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PowerButton"
+            }
+          ]
+        },
+        "stop_accessibility_input": {
+          "default": true,
+          "type": "boolean"
+        },
+        "suppress_notifications": {
+          "default": true,
+          "type": "boolean"
+        },
+        "uac_require_credentials": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "HeatCheck": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "off"
+      ]
+    },
+    "KeepAwakeSection": {
+      "type": "object",
+      "properties": {
+        "battery_floor_percent": {
+          "default": 15,
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "heat_check": {
+          "default": "auto",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HeatCheck"
+            }
+          ]
+        },
+        "keep_display_on": {
+          "default": "auto",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TriState"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "LockSection": {
+      "type": "object",
+      "properties": {
+        "dim_percent": {
+          "default": 50,
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "display": {
+          "default": "opaque",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ScreenDisplay"
+            }
+          ]
+        },
+        "hotkey": {
+          "default": "Ctrl+Alt+Shift+L",
+          "type": "string"
+        },
+        "message": {
+          "default": "",
+          "type": "string"
+        },
+        "show_clock": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "NetworkSection": {
+      "type": "object",
+      "properties": {
+        "keep_online": {
+          "default": true,
+          "type": "boolean"
+        },
+        "notify_on_drop": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PauseMode": {
+      "type": "string",
+      "enum": [
+        "efficiency",
+        "suspend"
+      ]
+    },
+    "PauseSection": {
+      "type": "object",
+      "properties": {
+        "apps": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PausedApp"
+          }
+        },
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PausedApp": {
+      "type": "object",
+      "required": [
+        "mode",
+        "path"
+      ],
+      "properties": {
+        "mode": {
+          "$ref": "#/definitions/PauseMode"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PowerButton": {
+      "type": "string",
+      "enum": [
+        "do_nothing",
+        "default"
+      ]
+    },
+    "ScreenDisplay": {
+      "type": "string",
+      "enum": [
+        "opaque",
+        "dimmed",
+        "transparent"
+      ]
+    },
+    "TakeoverSection": {
+      "type": "object",
+      "properties": {
+        "idle_lock": {
+          "default": false,
+          "type": "boolean"
+        },
+        "idle_minutes": {
+          "default": 10,
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "lid_close": {
+          "default": false,
+          "type": "boolean"
+        },
+        "win_l": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TriState": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "always",
+        "never"
+      ]
+    },
+    "UnlockSection": {
+      "type": "object",
+      "properties": {
+        "methods": {
+          "default": [
+            "windows_hello"
+          ],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "softlock_pin_enabled": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "UpdateChannel": {
+      "type": "string",
+      "enum": [
+        "stable",
+        "dev"
+      ]
+    },
+    "UpdatesSection": {
+      "type": "object",
+      "properties": {
+        "auto_check": {
+          "default": true,
+          "type": "boolean"
+        },
+        "channel": {
+          "default": "stable",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UpdateChannel"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

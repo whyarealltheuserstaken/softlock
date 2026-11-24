@@ -5,8 +5,12 @@
 //! an injected event as simulated-physical when `dwExtraInfo` equals the
 //! per-run nonce. Release builds compile this module without that branch.
 
+#[cfg(feature = "live-fail-closed")]
+use std::sync::atomic::AtomicBool;
 #[cfg(feature = "simulated-physical")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+use std::sync::atomic::Ordering;
 
 /// One low-level keyboard or mouse event, reduced to the fields classification needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,11 +43,84 @@ pub fn classify(input: HookInput) -> InputClass {
             return InputClass::SimulatedPhysical;
         }
     }
+    // The journal test cannot strip `LLKHF_INJECTED` from another process.
+    // Windows hands each hook the original flags. The tag counts only after
+    // this process was armed and the runner gate passed. The magic value
+    // alone is injected.
+    #[cfg(feature = "live-fail-closed")]
+    if PRESENT_INJECTED.load(Ordering::SeqCst)
+        && runner_gate()
+        && (input.extra_info == PRESENT_PHYSICAL_EXTRA
+            || input.extra_info == (PRESENT_PHYSICAL_EXTRA & 0xFFFF_FFFF))
+    {
+        let _ = present_physical_marker();
+        return InputClass::Physical;
+    }
     if input.injected {
         InputClass::Injected
     } else {
         InputClass::Physical
     }
+}
+
+/// `dwExtraInfo` the journal test writes. Same literal as `journal_live`.
+#[cfg(feature = "live-fail-closed")]
+const PRESENT_PHYSICAL_EXTRA: u64 = 0x5048_5953_5049_4E31;
+
+#[cfg(feature = "live-fail-closed")]
+static PRESENT_INJECTED: AtomicBool = AtomicBool::new(false);
+
+/// The journal service passes `--present-physical` for the sign-in case.
+/// The keys are injected, and this build counts them as physical. A release
+/// build does not compile this. Arming does nothing unless the runner gate
+/// passes, and [`classify`] checks that gate again.
+#[cfg(all(feature = "live-fail-closed", windows))]
+pub fn arm_present_physical() {
+    if !runner_gate() {
+        return;
+    }
+    PRESENT_INJECTED.store(true, Ordering::SeqCst);
+    let _ = present_physical_marker();
+}
+
+/// The runner gate for every live-fail-closed test hook. The compile-time
+/// feature is not enough: a binary that has the feature still refuses the
+/// hook when this process is not allowed to lock.
+#[cfg(feature = "live-fail-closed")]
+pub(crate) fn runner_gate() -> bool {
+    #[cfg(test)]
+    if DENY_TEST_HOOKS.load(Ordering::SeqCst) {
+        return false;
+    }
+    runner_allows_test_hooks()
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn runner_allows_test_hooks() -> bool {
+    #[cfg(windows)]
+    {
+        softlock_windows::runner_may_lock().is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(all(test, feature = "live-fail-closed"))]
+static DENY_TEST_HOOKS: AtomicBool = AtomicBool::new(false);
+
+/// Unit tests force the runner gate shut. Production calls
+/// [`runner_allows_test_hooks`].
+#[cfg(all(test, feature = "live-fail-closed"))]
+pub(crate) fn deny_test_hooks(deny: bool) {
+    DENY_TEST_HOOKS.store(deny, Ordering::SeqCst);
+}
+
+#[cfg(feature = "live-fail-closed")]
+#[inline(never)]
+fn present_physical_marker() -> &'static [u8] {
+    std::hint::black_box(b"softlock-present-physical-pin")
 }
 
 /// Per-run nonce written into `dwExtraInfo` by seam tests.
@@ -119,6 +196,42 @@ mod tests {
             extra_info: 0xA5A5_5A5A_1234_5678,
         });
         assert_eq!(hardware, InputClass::Physical);
+    }
+
+    #[cfg(feature = "live-fail-closed")]
+    #[test]
+    fn the_magic_extra_stays_injected_until_the_runner_gate_is_open() {
+        use std::sync::atomic::Ordering;
+        super::PRESENT_INJECTED.store(false, Ordering::SeqCst);
+        let magic = HookInput {
+            injected: true,
+            extra_info: super::PRESENT_PHYSICAL_EXTRA,
+        };
+        let truncated = HookInput {
+            injected: true,
+            extra_info: super::PRESENT_PHYSICAL_EXTRA & 0xFFFF_FFFF,
+        };
+        assert_eq!(classify(magic), InputClass::Injected);
+        assert_eq!(classify(truncated), InputClass::Injected);
+        super::PRESENT_INJECTED.store(true, Ordering::SeqCst);
+        super::deny_test_hooks(true);
+        assert_eq!(
+            classify(magic),
+            InputClass::Injected,
+            "an armed tag is still injected when the runner gate is shut"
+        );
+        super::deny_test_hooks(false);
+        if super::runner_gate() {
+            assert_eq!(classify(magic), InputClass::Physical);
+        } else {
+            assert_eq!(classify(magic), InputClass::Injected);
+        }
+        let other = classify(HookInput {
+            injected: true,
+            extra_info: 1,
+        });
+        assert_eq!(other, InputClass::Injected);
+        super::PRESENT_INJECTED.store(false, Ordering::SeqCst);
     }
 
     #[cfg(feature = "simulated-physical")]

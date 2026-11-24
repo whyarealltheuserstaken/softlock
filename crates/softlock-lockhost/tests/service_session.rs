@@ -3,11 +3,13 @@
 #![cfg(all(windows, feature = "simulated-physical"))]
 
 use std::fs;
+use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,6 +33,19 @@ const PIN: &[u8] = b"135742";
 const NOTE: &str = "Quarterly Report - Notepad";
 
 fn gate() -> MutexGuard<'static, ()> {
+    static WATCHDOG: Once = Once::new();
+    WATCHDOG.call_once(|| {
+        thread::spawn(|| {
+            // The suite finishes in about a minute on main. Anything still
+            // running here is a wait the per-call deadlines did not cover.
+            thread::sleep(Duration::from_secs(8 * 60));
+            eprintln!(
+                "service_session did not finish within 8 minutes, decline at {}",
+                softlock_app_lib::decline_at()
+            );
+            std::process::exit(3);
+        });
+    });
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
 }
@@ -40,6 +55,7 @@ struct Session {
     pipe: String,
     log: PathBuf,
     pin_dir: PathBuf,
+    config_dir: PathBuf,
     extra: u64,
 }
 
@@ -63,12 +79,24 @@ impl Session {
         // A host whose OS lock failed stays guarded after its service dies.
         // Kill any survivor before the next service starts.
         stop_lock_hosts();
-        let root = std::env::temp_dir().join(format!("svc-{}", std::process::id()));
+        // A failed unlock leaves a journal that says locked. The next service
+        // must not boot from that file: recovery fail-closes, and every later
+        // test then looks already locked.
+        static SESSIONS: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "svc-{}-{}",
+            std::process::id(),
+            SESSIONS.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("temp");
         let pin_dir = root.join("pin");
         let log = root.join("service.log");
+        let journal_dir = root.join("journal");
+        let config_dir = root.join("config");
         fs::create_dir_all(&pin_dir).expect("pin dir");
+        fs::create_dir_all(&journal_dir).expect("journal dir");
+        fs::create_dir_all(&config_dir).expect("config dir");
         static PIPES: AtomicU64 = AtomicU64::new(0);
         let pipe = format!(
             r"\\.\pipe\softlock-e689-{}-{}",
@@ -85,6 +113,8 @@ impl Session {
             .env("SOFTLOCK_STUB_OS_LOCK", stub)
             .env("SOFTLOCK_PIN_DIR", &pin_dir)
             .env("SOFTLOCK_LOG", &log)
+            .env("SOFTLOCK_JOURNAL_DIR", &journal_dir)
+            .env("SOFTLOCK_CONFIG_DIR", &config_dir)
             .env("SOFTLOCK_PIPE", &pipe)
             .env("SOFTLOCK_RUN_NONCE", extra.to_string())
             .env("SOFTLOCK_INSTALL_DIR", r"C:\no\such\install")
@@ -111,9 +141,27 @@ impl Session {
             pipe,
             log,
             pin_dir,
+            config_dir,
             extra,
         };
-        session.wait_until(|session| session.hello().is_ok(), Duration::from_secs(15));
+        // `hello` used to block inside `ReadFile`, so this deadline was never
+        // checked and a silent service held the job until the runner killed it.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_error = String::new();
+        while Instant::now() < deadline {
+            match session.hello() {
+                Ok(_) => {
+                    last_error.clear();
+                    break;
+                }
+                Err(error) => last_error = error,
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            last_error.is_empty(),
+            "timed out waiting for the service: {last_error}"
+        );
         session
     }
 
@@ -133,6 +181,10 @@ impl Session {
 
     fn status(&self) -> Result<String, String> {
         self.transact(r#"{"v":1,"id":3,"kind":"GetStatus"}"#)
+    }
+
+    fn config(&self) -> Result<String, String> {
+        self.transact(r#"{"v":1,"id":5,"kind":"GetConfig"}"#)
     }
 
     fn set_pin(&self) -> Result<String, String> {
@@ -159,26 +211,15 @@ impl Session {
         }
         String::from_utf8(response).map_err(|error| error.to_string())
     }
-
-    fn wait_until(&self, mut ready: impl FnMut(&Self) -> bool, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if ready(self) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(ready(self), "timed out waiting for the service");
-    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        wait_child(&mut self.child, Duration::from_secs(5));
         let _ = Command::new("taskkill")
             .args(["/F", "/T", "/PID", &self.child.id().to_string()])
-            .output();
+            .output_bounded();
         // Quit while the OS lock is unavailable does not exit the host. The
         // test process must not leave it holding the runner's stdout pipe.
         stop_lock_hosts();
@@ -191,17 +232,144 @@ impl Drop for KillChild {
     fn drop(&mut self) {
         if let Some(child) = self.0.as_mut() {
             let _ = child.kill();
-            let _ = child.wait();
+            wait_child(child, Duration::from_secs(5));
         }
     }
 }
 
 fn stop_lock_hosts() {
-    let _ = Command::new("taskkill")
+    let mut command = Command::new("taskkill");
+    command
         .args(["/F", "/IM", "softlock-lockhost.exe"])
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if started.elapsed() < Duration::from_secs(5) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.try_wait();
+                return;
+            }
+        }
+    }
+}
+
+fn wait_child(child: &mut std::process::Child, limit: Duration) {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if started.elapsed() < limit => thread::sleep(Duration::from_millis(50)),
+            _ => return,
+        }
+    }
+}
+
+trait BoundedOutput {
+    fn output_bounded(&mut self) -> std::io::Result<std::process::Output>;
+}
+
+impl BoundedOutput for Command {
+    fn output_bounded(&mut self) -> std::io::Result<std::process::Output> {
+        const LIMIT: Duration = Duration::from_secs(30);
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = self.spawn()?;
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(take_output(status, &mut child)),
+                Ok(None) if started.elapsed() < LIMIT => thread::sleep(Duration::from_millis(50)),
+                Ok(None) => {
+                    let _ = child.kill();
+                    let killed = Instant::now();
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => return Ok(take_output(status, &mut child)),
+                            Ok(None) if killed.elapsed() < Duration::from_secs(2) => {
+                                thread::sleep(Duration::from_millis(50));
+                            }
+                            _ => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "command timed out after 30s",
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+fn take_output(
+    status: std::process::ExitStatus,
+    child: &mut std::process::Child,
+) -> std::process::Output {
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            let _ = pipe.read_to_end(&mut stdout);
+        }
+        if let Some(mut pipe) = stderr_pipe.take() {
+            let _ = pipe.read_to_end(&mut stderr);
+        }
+        let _ = sender.send((stdout, stderr));
+    });
+    // A grandchild that inherited the pipe keeps `read_to_end` blocked after
+    // the process itself has already exited.
+    let (stdout, stderr) = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_default();
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+fn cargo_finished(command: &mut Command, what: &str) {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().unwrap_or_else(|error| {
+        panic!("{what} did not start: {error}");
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "{what} failed");
+                return;
+            }
+            Ok(None) if started.elapsed() < Duration::from_secs(180) => {
+                thread::sleep(Duration::from_millis(200));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                wait_child(&mut child, Duration::from_secs(5));
+                panic!("{what} timed out after 180s");
+            }
+            Err(error) => panic!("{what} wait failed: {error}"),
+        }
+    }
 }
 
 fn service_exe() -> PathBuf {
@@ -221,8 +389,7 @@ fn service_exe() -> PathBuf {
     if host.to_string_lossy().contains("x86_64-pc-windows-msvc") {
         command.args(["--target", "x86_64-pc-windows-msvc"]);
     }
-    let status = command.status().expect("cargo build");
-    assert!(status.success(), "service build failed");
+    cargo_finished(&mut command, "cargo build of softlock-service");
     assert!(service.is_file(), "missing {}", service.display());
     service
 }
@@ -245,6 +412,21 @@ fn open_pipe(name: &str) -> Result<HANDLE, String> {
 }
 
 fn open_pipe_once(name: &str) -> Result<HANDLE, String> {
+    let name = name.to_string();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(open_pipe_blocking(&name).map(|handle| handle.0 as isize));
+    });
+    // `PIPE_WAIT` makes `CreateFileW` itself block when every instance is taken.
+    // The retry loop above never gets to check its deadline in that case.
+    match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(raw)) => Ok(HANDLE(raw as *mut core::ffi::c_void)),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err("timed out opening the service pipe".to_string()),
+    }
+}
+
+fn open_pipe_blocking(name: &str) -> Result<HANDLE, String> {
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         CreateFileW(
@@ -261,6 +443,21 @@ fn open_pipe_once(name: &str) -> Result<HANDLE, String> {
 }
 
 fn write_all(handle: HANDLE, bytes: &[u8]) -> Result<(), String> {
+    let bytes = bytes.to_vec();
+    let raw = handle.0 as usize;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let handle = HANDLE(raw as *mut core::ffi::c_void);
+        let _ = sender.send(write_blocking(handle, &bytes));
+    });
+    // A server that never reads fills the pipe and `WriteFile` does not return.
+    match receiver.recv_timeout(Duration::from_secs(15)) {
+        Ok(result) => result,
+        Err(_) => Err("timed out writing to the service".to_string()),
+    }
+}
+
+fn write_blocking(handle: HANDLE, bytes: &[u8]) -> Result<(), String> {
     let mut offset = 0;
     while offset < bytes.len() {
         let mut wrote = 0u32;
@@ -277,24 +474,69 @@ fn write_all(handle: HANDLE, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn read_frame(handle: HANDLE) -> Result<Vec<u8>, String> {
+    read_frame_within(handle, Duration::from_secs(15))
+}
+
+fn read_frame_within(handle: HANDLE, timeout: Duration) -> Result<Vec<u8>, String> {
+    let raw = handle.0 as usize;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let handle = HANDLE(raw as *mut core::ffi::c_void);
+        let _ = sender.send(read_frame_blocking(handle));
+    });
+    // `PeekNamedPipe` and `ReadFile` run on the worker. A stuck call never
+    // gets back to the deadline on this thread.
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err("timed out waiting for the service to answer".to_string()),
+    }
+}
+
+fn read_frame_blocking(handle: HANDLE) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut prefix = [0u8; 4];
-    read_exact(handle, &mut prefix)?;
+    read_until(handle, &mut prefix, deadline)?;
     let length = u32::from_le_bytes(prefix) as usize;
     if length > 64 * 1024 {
         return Err("frame too large".to_string());
     }
     let mut body = vec![0u8; length];
-    read_exact(handle, &mut body)?;
+    read_until(handle, &mut body, deadline)?;
     Ok(body)
 }
 
-fn read_exact(handle: HANDLE, buf: &mut [u8]) -> Result<(), String> {
+fn read_until(handle: HANDLE, buf: &mut [u8], deadline: Instant) -> Result<(), String> {
     let mut offset = 0;
     while offset < buf.len() {
+        let mut available = 0u32;
+        unsafe {
+            windows::Win32::System::Pipes::PeekNamedPipe(
+                handle,
+                None,
+                0,
+                None,
+                Some(&mut available),
+                None,
+            )
+        }
+        .map_err(|error| format!("read: {error}"))?;
+        if available == 0 {
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for the service to answer".to_string());
+            }
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let want = (buf.len() - offset).min(available as usize);
         let mut read = 0u32;
         unsafe {
-            ReadFile(handle, Some(&mut buf[offset..]), Some(&mut read), None)
-                .map_err(|error| format!("read: {error}"))?;
+            ReadFile(
+                handle,
+                Some(&mut buf[offset..offset + want]),
+                Some(&mut read),
+                None,
+            )
+            .map_err(|error| format!("read: {error}"))?;
         }
         if read == 0 {
             return Err("eof".to_string());
@@ -529,7 +771,7 @@ fn kill_while_locked(stub: &str, stay_blocked: bool) {
         "lock did not block physical input"
     );
     session.child.kill().expect("kill service");
-    let _ = session.child.wait();
+    wait_child(&mut session.child, Duration::from_secs(5));
     let mut passed_before_mark = false;
     let marked = wait_for(Duration::from_secs(8), || {
         if !mark.is_file() {
@@ -546,7 +788,7 @@ fn kill_while_locked(stub: &str, stay_blocked: bool) {
     );
     assert!(marked, "Quit did not call the OS lock");
     if stay_blocked {
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(200));
         assert!(
             physical_is_blocked(&probe, session.extra),
             "hooks dropped after the service died without an OS lock"
@@ -575,7 +817,7 @@ fn kill_while_locked(stub: &str, stay_blocked: bool) {
     }
     let _ = Command::new("taskkill")
         .args(["/IM", "softlock-lockhost.exe", "/F"])
-        .output();
+        .output_bounded();
     let _ = fs::remove_file(&mark);
 }
 
@@ -670,7 +912,7 @@ fn impostor_case_system(case: &str, expect: &str, spawn_user_copy: bool) {
     let pid = service_pid(&name).expect("service pid");
     let _ = Command::new("taskkill.exe")
         .args(["/F", "/PID", &pid])
-        .output();
+        .output_bounded();
     assert!(
         wait_for(Duration::from_secs(8), || mark.is_file()),
         "Quit did not call the OS lock"
@@ -683,14 +925,14 @@ fn impostor_case_system(case: &str, expect: &str, spawn_user_copy: bool) {
         "the host never judged the impostor"
     );
     if case == "reuse" {
-        // One second for a late reopen to rewrite the witness. The host
-        // rewrites on every poll, and std::fs::write truncates first, so a
-        // single read can observe an empty file. Empty is not a verdict.
-        thread::sleep(Duration::from_secs(1));
+        // A few host polls for a late reopen to rewrite the witness. The
+        // host rewrites on every poll, and std::fs::write truncates first,
+        // so a single read can observe an empty file. Empty is not a verdict.
+        thread::sleep(Duration::from_millis(200));
     }
     let decision = non_empty_witness(&witness);
     assert_eq!(decision, expect, "impostor case {case} released the guard");
-    thread::sleep(Duration::from_secs(1));
+    thread::sleep(Duration::from_millis(200));
     assert!(
         physical_is_blocked(&probe_window, extra),
         "hooks dropped for an impostor ({case})"
@@ -872,7 +1114,7 @@ fn service_stop_while_locked_keeps_input_blocked() {
     thread::spawn(move || {
         let _ = Command::new("sc.exe")
             .args(["stop", &name_for_stop])
-            .output();
+            .output_bounded();
     });
     let saw_stop = wait_for(Duration::from_secs(15), || {
         fs::read_to_string(&log)
@@ -1158,7 +1400,7 @@ impl Drop for PlantChild {
 fn service_names(service: &Path) -> (String, String) {
     let names = Command::new(service)
         .arg("--print-names")
-        .output()
+        .output_bounded()
         .expect("names");
     let text = String::from_utf8_lossy(&names.stdout);
     let name = text
@@ -1193,7 +1435,6 @@ fn install_service(
 ) -> String {
     let _ = fs::remove_file(probe);
     remove_service(name);
-    thread::sleep(Duration::from_millis(500));
     // sc.exe takes everything after the binPath value as its own options.
     // The exe and `--scm` have to be one quoted ImagePath, or `--scm` is
     // parsed as an sc option and create prints its usage.
@@ -1209,7 +1450,7 @@ fn install_service(
         .raw_arg("start= demand")
         .raw_arg("obj= LocalSystem")
         .raw_arg(format!("DisplayName= \"{display}\""))
-        .output()
+        .output_bounded()
         .expect("sc create");
     assert!(
         created.status.success(),
@@ -1217,12 +1458,15 @@ fn install_service(
         String::from_utf8_lossy(&created.stdout),
         String::from_utf8_lossy(&created.stderr)
     );
-    if !env.is_empty() {
-        set_service_environment(name, env);
-    }
+    let journal = std::env::temp_dir().join(format!("{name}-journal"));
+    let _ = fs::remove_dir_all(&journal);
+    fs::create_dir_all(&journal).expect("journal dir");
+    let mut service_env = env.to_vec();
+    service_env.push(format!("SOFTLOCK_JOURNAL_DIR={}", journal.display()));
+    set_service_environment(name, &service_env);
     let started = Command::new("sc.exe")
         .args(["start", name])
-        .output()
+        .output_bounded()
         .expect("sc start");
     let body = wait_for_file(probe, Duration::from_secs(25));
     assert!(
@@ -1245,7 +1489,7 @@ fn set_service_environment(name: &str, env: &[String]) {
     );
     let wrote = Command::new("powershell.exe")
         .args(["-NoProfile", "-Command", &script])
-        .output()
+        .output_bounded()
         .expect("service environment");
     assert!(
         wrote.status.success(),
@@ -1259,17 +1503,37 @@ fn remove_service(name: &str) {
     if let Some(pid) = service_pid(name) {
         let _ = Command::new("taskkill.exe")
             .args(["/F", "/PID", &pid])
-            .output();
+            .output_bounded();
     }
-    let _ = Command::new("sc.exe").args(["stop", name]).output();
-    thread::sleep(Duration::from_millis(300));
-    let _ = Command::new("sc.exe").args(["delete", name]).output();
+    let _ = Command::new("sc.exe").args(["stop", name]).output_bounded();
+    let _ = Command::new("sc.exe")
+        .args(["delete", name])
+        .output_bounded();
+    wait_until_service_gone(name);
+}
+
+/// `sc delete` marks the key for deletion. `sc create` then fails with
+/// 1072 until the SCM actually drops it. Wait until `sc query` returns
+/// 1060 (the service does not exist).
+fn wait_until_service_gone(name: &str) {
+    const LIMIT: Duration = Duration::from_secs(30);
+    let gone = wait_for(LIMIT, || {
+        let queried = Command::new("sc.exe")
+            .args(["query", name])
+            .output_bounded()
+            .expect("sc query");
+        queried.status.code() == Some(1060)
+    });
+    assert!(
+        gone,
+        "sc delete {name} did not finish in {LIMIT:?}; sc query never returned 1060"
+    );
 }
 
 fn service_pid(name: &str) -> Option<String> {
     let output = Command::new("sc.exe")
         .args(["queryex", name])
-        .output()
+        .output_bounded()
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines() {
@@ -1339,7 +1603,7 @@ fn lock_host_running() -> bool {
             "CSV",
             "/NH",
         ])
-        .output();
+        .output_bounded();
     output.is_ok_and(|output| {
         String::from_utf8_lossy(&output.stdout)
             .to_ascii_lowercase()
@@ -1363,6 +1627,51 @@ fn physical_reached(probe: &Probe, extra: u64) -> bool {
         .filter(|input| input.virtual_key == VK_F14)
         .count()
         > before
+}
+
+#[test]
+fn changing_the_hotkey_makes_the_new_hotkey_lock() {
+    let _guard = gate();
+    softlock_windows::runner_may_lock().expect("refusing the hotkey change off a hosted runner");
+    let session = Session::start(None, true);
+    let toml = "[lock]\nhotkey = \"Ctrl+Alt+Shift+K\"\n";
+    let put = format!(
+        r#"{{"v":1,"id":8,"kind":"PutConfig","toml":"{}","base_revision":1}}"#,
+        json_escape(toml)
+    );
+    let applied = session.transact(&put).expect("put");
+    assert!(
+        applied.contains("Applied"),
+        "the new hotkey was not saved: {applied}"
+    );
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let status_path = session.pin_dir.join("owner-status.txt");
+    let _owner = KillChild(Some(spawn_owner(&session, &status_path)));
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let text = status_file(&status_path);
+            text.contains("hotkey=ok") && text.contains("chord=Ctrl+Alt+Shift+K")
+        }),
+        "the app did not register the saved hotkey: {}",
+        status_file(&status_path)
+    );
+    let before = status_seq(&status_file(&status_path));
+    send_chord(u16::from(b'K'));
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let text = status_file(&status_path);
+            status_seq(&text) > before && text.contains("state=Locked")
+        }),
+        "the saved hotkey did not lock: {}",
+        status_file(&status_path)
+    );
+}
+
+fn json_escape(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[test]
@@ -1616,10 +1925,7 @@ fn app_exe() -> PathBuf {
     if host.to_string_lossy().contains("x86_64-pc-windows-msvc") {
         command.args(["--target", "x86_64-pc-windows-msvc"]);
     }
-    // Nested cargo output splits libtest's "... ok" line and fails the CI grep.
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    let status = command.status().expect("cargo build");
-    assert!(status.success(), "app build failed");
+    cargo_finished(&mut command, "cargo build of softlock-app");
     assert!(app.is_file(), "missing {}", app.display());
     app
 }
@@ -1742,21 +2048,23 @@ fn subscribe_receives_state(session: &Session) -> bool {
 }
 
 fn read_frame_deadline(handle: HANDLE, timeout: Duration) -> Result<Vec<u8>, String> {
-    let raw = handle.0 as usize;
-    let (sender, receiver) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let handle = HANDLE(raw as *mut core::ffi::c_void);
-        let _ = sender.send(read_frame(handle));
-    });
-    match receiver.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(_) => Err("timeout".to_string()),
-    }
+    read_frame_within(handle, timeout)
 }
 
-fn send_default_hotkey() {
+fn send_input_within(inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT]) -> u32 {
     use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
-    let keys = [0xA2u16, 0xA4, 0xA0, u16::from(b'L')];
+    let inputs = inputs.to_vec();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        let _ = sender.send(sent);
+    });
+    // A hook that does not pump makes `SendInput` wait forever. Fail the test.
+    receiver.recv_timeout(Duration::from_secs(3)).unwrap_or(0)
+}
+
+fn send_chord(key: u16) {
+    let keys = [0xA2u16, 0xA4, 0xA0, key];
     let mut inputs = Vec::new();
     for key in keys {
         inputs.push(chord_key(key, false));
@@ -1764,12 +2072,16 @@ fn send_default_hotkey() {
     for key in keys.into_iter().rev() {
         inputs.push(chord_key(key, true));
     }
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    let sent = send_input_within(&inputs);
     assert_eq!(
         sent,
         inputs.len() as u32,
         "SendInput did not deliver the hotkey"
     );
+}
+
+fn send_default_hotkey() {
+    send_chord(u16::from(b'L'));
 }
 
 fn chord_key(virtual_key: u16, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
@@ -1840,14 +2152,14 @@ fn reclaim_data_dir(dir: &Path) {
     let text = dir.display().to_string();
     let _ = Command::new("takeown.exe")
         .args(["/F", &text, "/R", "/D", "Y"])
-        .output();
+        .output_bounded();
     let _ = Command::new("icacls.exe")
         .args([&text, "/grant", "*S-1-1-0:(OI)(CI)F", "/T"])
-        .output();
+        .output_bounded();
     if is_reparse_point(dir).ok() == Some(true) {
         let _ = Command::new("cmd.exe")
             .args(["/C", "rmdir", &text])
-            .output();
+            .output_bounded();
     } else {
         let _ = fs::remove_dir_all(dir);
     }
@@ -1871,10 +2183,10 @@ impl StandardAccount {
         let password = format!("Aa1!QkzzMm9{}", std::process::id() % 97);
         let _ = Command::new("net.exe")
             .args(["user", &name, "/delete"])
-            .output();
+            .output_bounded();
         let added = Command::new("net.exe")
             .args(["user", &name, &password, "/add"])
-            .output()
+            .output_bounded()
             .expect("net user");
         assert!(
             added.status.success(),
@@ -1890,7 +2202,7 @@ impl Drop for StandardAccount {
     fn drop(&mut self) {
         let _ = Command::new("net.exe")
             .args(["user", &self.name, "/delete"])
-            .output();
+            .output_bounded();
     }
 }
 
@@ -2000,7 +2312,7 @@ fn grant_users_modify(path: &Path) {
     let text = path.display().to_string();
     let _ = Command::new("icacls.exe")
         .args([&text, "/grant", "*S-1-1-0:(OI)(CI)M"])
-        .output();
+        .output_bounded();
 }
 
 fn plant_job_from_args() -> Option<PlantJob> {
@@ -2391,15 +2703,267 @@ fn create_junction(link: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_locked_file_edit_is_offered_and_applied_on_accept() {
+    softlock_windows::runner_may_lock().expect("refusing the config edit off a hosted runner");
+    let _guard = gate();
+    let session = within("locked_launch", Duration::from_secs(60), || {
+        Session::start(None, true)
+    });
+    arm_owner(&session);
+    let stored = session.set_pin().expect("set pin");
+    assert!(stored.contains("Ok"), "pin was not stored: {stored}");
+    let locked = session.lock().expect("lock");
+    assert!(
+        locked.contains("Accepted"),
+        "lock was not accepted: {locked}"
+    );
+    assert!(
+        softlock_app_lib::refresh_from_service(),
+        "timed out waiting for the service to answer GetStatus"
+    );
+    let path = session.config_dir.join("config.toml");
+    let original = wait_for_file(&path, Duration::from_secs(10)).expect("config file");
+    let edited = original.replace("Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+K");
+    assert_ne!(edited, original, "the default hotkey was not in the file");
+    write_file_bounded(&path, edited.as_bytes()).expect("write");
+    let offered = within("poll_offer", Duration::from_secs(60), || {
+        wait_for(Duration::from_secs(10), || {
+            softlock_app_lib::poll_config_once();
+            softlock_app_lib::config_offer()
+        })
+    });
+    assert!(
+        offered,
+        "the locked edit did not raise the offer\nstatus {}\nconfig {}\ndisk {}\nlog {}",
+        session.status().unwrap_or_default(),
+        session.config().unwrap_or_default(),
+        read_file_bounded(&path).unwrap_or_default(),
+        log_tail(&session.log)
+    );
+    let during = session.config().expect("config");
+    assert!(
+        during.contains("Ctrl+Alt+Shift+L") && !during.contains("Ctrl+Alt+Shift+K"),
+        "the new value was in effect while locked: {during}"
+    );
+    type_pin(session.extra);
+    let unlocked = wait_for(Duration::from_secs(30), || {
+        session
+            .status()
+            .ok()
+            .is_some_and(|status| status.contains("\"state\":\"Unlocked\""))
+    });
+    let status = session.status().unwrap_or_default();
+    assert!(
+        unlocked && status.contains("\"state\":\"Unlocked\""),
+        "the pin did not unlock after the accepted locked edit: {status}"
+    );
+    assert!(
+        softlock_app_lib::refresh_from_service(),
+        "timed out waiting for the service to answer GetStatus after unlock"
+    );
+    within("accept", Duration::from_secs(60), || {
+        assert!(
+            softlock_app_lib::accept_offered_config(),
+            "PutConfig did not return Applied"
+        );
+    });
+    let after = session.config().expect("config");
+    assert!(
+        after.contains("Ctrl+Alt+Shift+K"),
+        "the accepted value is not effective: {after}"
+    );
+}
+
+#[test]
+fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
+    softlock_windows::runner_may_lock().expect("refusing the config edit off a hosted runner");
+    let _guard = gate();
+    // Ask the service to lock this file's DACL the same way it locks the
+    // real profile. The other seam sessions leave the private directory
+    // unlocked because a failed protected DACL would fail-close every lock.
+    // Each step runs on its own thread. A stuck `CreateFile` or `ReadFile`
+    // inside the step must fail here, not hold the suite until the watchdog.
+    let session = within("launch", Duration::from_secs(60), || {
+        Session::launch_extra(None, true, "1", None, &[("SOFTLOCK_LOCK_CONFIG_ACL", "1")])
+    });
+    arm_owner(&session);
+    let session = within("set_pin", Duration::from_secs(20), move || {
+        session.set_pin().expect("set pin");
+        session
+    });
+    let session = within("lock", Duration::from_secs(20), move || {
+        let locked = session.lock().expect("lock");
+        assert!(
+            locked.contains("Accepted"),
+            "lock was not accepted: {locked}"
+        );
+        session
+    });
+    within("refresh", Duration::from_secs(25), || {
+        assert!(
+            softlock_app_lib::refresh_from_service(),
+            "timed out waiting for the service to answer GetStatus"
+        );
+    });
+    let path = session.config_dir.join("config.toml");
+    let original = within("wait_for_file", Duration::from_secs(20), {
+        let path = path.clone();
+        move || wait_for_file(&path, Duration::from_secs(10)).expect("config file")
+    });
+    let edited = original.replace("Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+K");
+    let denied = within("write_locked", Duration::from_secs(10), {
+        let path = path.clone();
+        let edited = edited.clone();
+        move || write_file_bounded(&path, edited.as_bytes())
+    });
+    assert!(
+        denied.is_err(),
+        "the locked config file still accepted a write"
+    );
+    within("decline_locked", Duration::from_secs(30), || {
+        assert!(
+            !softlock_app_lib::decline_offered_config(),
+            "decline wrote the config file while locked"
+        );
+    });
+    let disk = within("read_locked", Duration::from_secs(10), {
+        let path = path.clone();
+        move || read_file_bounded(&path).expect("locked file")
+    });
+    assert_eq!(disk, original, "decline changed the file while locked");
+    let extra = session.extra;
+    within("type_pin", Duration::from_secs(30), move || type_pin(extra));
+    let unlocked = within("wait_unlocked", Duration::from_secs(45), {
+        let pipe = session.pipe.clone();
+        move || {
+            wait_for(Duration::from_secs(30), || {
+                transact(&pipe, r#"{"v":1,"id":3,"kind":"GetStatus"}"#)
+                    .ok()
+                    .is_some_and(|status| status.contains("\"state\":\"Unlocked\""))
+            })
+        }
+    });
+    let status = session.status().unwrap_or_default();
+    assert!(
+        unlocked && status.contains("\"state\":\"Unlocked\""),
+        "the pin did not unlock after the declined locked edit: {status}\nlog {}",
+        log_tail(&session.log)
+    );
+    within("refresh_unlocked", Duration::from_secs(25), || {
+        assert!(
+            softlock_app_lib::refresh_from_service(),
+            "timed out waiting for the service to answer GetStatus after unlock"
+        );
+    });
+    within("write_unlocked", Duration::from_secs(10), {
+        let path = path.clone();
+        let edited = edited.clone();
+        move || write_file_bounded(&path, edited.as_bytes()).expect("write after unlock")
+    });
+    // An unlocked edit is saved, not offered. Decline writes the effective
+    // document back over the disk. Polling first would PutConfig the new
+    // bytes and there would be nothing left to restore.
+    // The open walks one path component at a time, gives up, then tries one
+    // full-path open. Those deadlines sit inside this step.
+    within("decline_unlocked", Duration::from_secs(90), || {
+        assert!(
+            softlock_app_lib::decline_offered_config(),
+            "decline did not restore the file after unlock"
+        );
+    });
+    assert!(
+        !softlock_app_lib::config_offer(),
+        "an unlocked edit raised the locked-edit offer"
+    );
+    let disk = read_file_bounded(&path).expect("restored file");
+    assert!(
+        disk.contains("Ctrl+Alt+Shift+L") && !disk.contains("Ctrl+Alt+Shift+K"),
+        "decline did not restore the file: {disk}"
+    );
+    let after = session.config().expect("config");
+    assert!(
+        after.contains("Ctrl+Alt+Shift+L") && !after.contains("Ctrl+Alt+Shift+K"),
+        "decline changed the effective config: {after}"
+    );
+}
+
+fn log_tail(path: &Path) -> String {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let start = text.len().saturating_sub(800);
+    let start = (start..=text.len())
+        .find(|index| text.is_char_boundary(*index))
+        .unwrap_or(text.len());
+    text[start..].to_string()
+}
+
+fn arm_owner(session: &Session) {
+    unsafe {
+        std::env::set_var("SOFTLOCK_PIPE", session.pipe());
+        std::env::set_var("SOFTLOCK_CONFIG_DIR", &session.config_dir);
+        std::env::set_var("SOFTLOCK_NO_AUTOSTART", "1");
+    }
+}
+
 fn wait_for_file(path: &Path, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Ok(text) = fs::read_to_string(path)
+        if let Ok(text) = read_file_bounded(path)
             && !text.is_empty()
         {
             return Some(text);
         }
         thread::sleep(Duration::from_millis(200));
     }
-    fs::read_to_string(path).ok()
+    read_file_bounded(path).ok()
+}
+
+/// Runs `work` off the test thread. `thread::scope` would join that worker
+/// and wait out a stuck call, so the worker is detached and this thread is
+/// the one that fails.
+fn within<T: Send + 'static>(
+    step: &'static str,
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        let _ = sender.send(result);
+    });
+    match receiver.recv_timeout(limit) {
+        Ok(Ok(value)) => value,
+        Ok(Err(payload)) => std::panic::resume_unwind(payload),
+        Err(_) => panic!(
+            "timed out during {step}, decline at {}",
+            softlock_app_lib::decline_at()
+        ),
+    }
+}
+
+fn read_file_bounded(path: &Path) -> Result<String, String> {
+    let path = path.to_path_buf();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(fs::read_to_string(path));
+    });
+    match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("timed out reading the config file".to_string()),
+    }
+}
+
+fn write_file_bounded(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let bytes = bytes.to_vec();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(fs::write(path, bytes));
+    });
+    match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("timed out writing the config file".to_string()),
+    }
 }

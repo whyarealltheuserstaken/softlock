@@ -28,6 +28,7 @@ softlock-service = { path = "../softlock-service" }
 
 [target.'cfg(windows)'.dev-dependencies]
 softlock-windows = { path = "../softlock-windows" }
+softlock-app = { path = "../softlock-app/src-tauri", features = ["simulated-physical"] }
 
 [target.'cfg(windows)'.dependencies]
 softlock-core = { path = "../softlock-core" }
@@ -39,6 +40,7 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
     "Win32_System_Memory",
     "Win32_System_Power",
     "Win32_System_RemoteDesktop",

@@ -12,12 +12,12 @@ use softlock_core::{
 
 const ALICE: &str = "S-1-5-21-1-2-3-1001";
 
-fn locked_document(target: &str, previous: SettingValue) -> softlock_core::SettingsJournal {
+fn locked_document(target: &str, previous: &SettingValue) -> softlock_core::SettingsJournal {
     let rows: Vec<(&str, SettingValue)> = LOCKDOWN
         .iter()
         .map(|policy| {
             let value = if policy.target == target {
-                previous
+                previous.clone()
             } else {
                 SettingValue::Absent
             };
@@ -32,7 +32,7 @@ fn assert_row(target: &str, locked: u32, samples: &[SettingValue]) {
     assert_eq!(policy.locked, locked);
     assert!(!blocks_owner_sign_in(target));
     for sample in samples {
-        let doc = locked_document(target, *sample);
+        let doc = locked_document(target, sample);
         assert_eq!(doc.sid, ALICE);
         let parsed = parse_document(&encode_document(&doc).expect("encode")).expect("parse");
         let entry = parsed
@@ -43,11 +43,15 @@ fn assert_row(target: &str, locked: u32, samples: &[SettingValue]) {
         assert_eq!(entry.previous, *sample);
         assert_eq!(entry.new_value, SettingValue::Dword { value: locked });
         let restored =
-            restore_action_for(target, entry.previous, entry.new_value).expect("restore");
+            restore_action_for(target, &entry.previous, &entry.new_value).expect("restore");
         if *sample == entry.new_value {
             assert_eq!(restored, None, "{target} was already the locked value");
         } else {
-            assert_eq!(restored, Some(*sample), "{target} did not restore exactly");
+            assert_eq!(
+                restored,
+                Some(sample.clone()),
+                "{target} did not restore exactly"
+            );
         }
     }
 }
@@ -104,7 +108,7 @@ fn lock_is_set_on_lock_and_restored_including_an_administrator_value() {
             SettingValue::Dword { value: 1 },
         ],
     );
-    let doc = locked_document("DisableLockWorkstation", SettingValue::Dword { value: 1 });
+    let doc = locked_document("DisableLockWorkstation", &SettingValue::Dword { value: 1 });
     let marked = mark_workstation_clear(&doc).expect("clear is journaled");
     assert!(marked.workstation_clear);
     let entry = marked
@@ -191,7 +195,7 @@ fn uac_standard_user_auto_denies_and_restores_an_administrator_value() {
     );
     let doc = locked_document(
         "ConsentPromptBehaviorUser",
-        SettingValue::Dword { value: 3 },
+        &SettingValue::Dword { value: 3 },
     );
     let entry = doc
         .entries()
@@ -199,7 +203,7 @@ fn uac_standard_user_auto_denies_and_restores_an_administrator_value() {
         .find(|entry| entry.target == "ConsentPromptBehaviorUser")
         .expect("row");
     assert_eq!(
-        restore_action_for(entry.target.as_str(), entry.previous, entry.new_value)
+        restore_action_for(entry.target.as_str(), &entry.previous, &entry.new_value)
             .expect("restore"),
         Some(SettingValue::Dword { value: 3 })
     );
@@ -207,7 +211,7 @@ fn uac_standard_user_auto_denies_and_restores_an_administrator_value() {
 
 #[test]
 fn a_group_policy_overwrite_is_reasserted() {
-    let doc = locked_document("NoLogoff", SettingValue::Absent);
+    let doc = locked_document("NoLogoff", &SettingValue::Absent);
     let sign_out = doc
         .entries()
         .iter()
@@ -216,8 +220,8 @@ fn a_group_policy_overwrite_is_reasserted() {
     assert_eq!(
         reassert_write(
             "NoLogoff",
-            sign_out.new_value,
-            SettingValue::Dword { value: 0 },
+            &sign_out.new_value,
+            &SettingValue::Dword { value: 0 },
             false
         ),
         Some(SettingValue::Dword { value: 1 })
@@ -230,8 +234,8 @@ fn a_group_policy_overwrite_is_reasserted() {
     assert_eq!(
         reassert_write(
             "ConsentPromptBehaviorUser",
-            user.new_value,
-            SettingValue::Dword { value: 3 },
+            &user.new_value,
+            &SettingValue::Dword { value: 3 },
             false
         ),
         Some(SettingValue::Dword { value: 0 })
@@ -240,8 +244,8 @@ fn a_group_policy_overwrite_is_reasserted() {
     assert_eq!(
         reassert_write(
             "DisableLockWorkstation",
-            SettingValue::Dword { value: 1 },
-            SettingValue::Absent,
+            &SettingValue::Dword { value: 1 },
+            &SettingValue::Absent,
             marked.workstation_clear
         ),
         None
@@ -255,7 +259,7 @@ fn no_path_leaves_disable_lock_workstation_cleared() {
         SettingValue::Dword { value: 0 },
         SettingValue::Dword { value: 1 },
     ] {
-        let doc = mark_workstation_clear(&locked_document("DisableLockWorkstation", previous))
+        let doc = mark_workstation_clear(&locked_document("DisableLockWorkstation", &previous))
             .expect("clear is journaled");
         assert!(doc.workstation_clear);
         let (settled, write) = workstation_value_after_attempt(&doc)
@@ -269,8 +273,8 @@ fn no_path_leaves_disable_lock_workstation_cleared() {
         assert_eq!(
             reassert_write(
                 "DisableLockWorkstation",
-                SettingValue::Dword { value: 1 },
-                SettingValue::Absent,
+                &SettingValue::Dword { value: 1 },
+                &SettingValue::Absent,
                 settled.workstation_clear
             ),
             Some(SettingValue::Dword { value: 1 }),
@@ -283,7 +287,7 @@ fn no_path_leaves_disable_lock_workstation_cleared() {
             .expect("row");
         assert_eq!(entry.previous, previous);
         let recovered =
-            restore_action_for("DisableLockWorkstation", previous, write).expect("recovery");
+            restore_action_for("DisableLockWorkstation", &previous, &write).expect("recovery");
         if previous == write {
             assert_eq!(recovered, None);
         } else {
@@ -301,7 +305,7 @@ fn fail_closed_clears_disable_lock_workstation_only_before_the_workstation_lock(
     assert!(clears_disable_lock_workstation(Caller::LockHostPrimary));
     assert!(clears_disable_lock_workstation(Caller::ServiceCoordinated));
     assert!(!clears_disable_lock_workstation(Caller::Service));
-    let doc = locked_document("DisableLockWorkstation", SettingValue::Dword { value: 0 });
+    let doc = locked_document("DisableLockWorkstation", &SettingValue::Dword { value: 0 });
     let marked = mark_workstation_clear(&doc).expect("journaled before the delete");
     assert_eq!(
         marked
@@ -362,7 +366,7 @@ fn full_with(target: &str, previous: SettingValue) -> Vec<(&str, SettingValue)> 
         .iter()
         .map(|policy| {
             let value = if policy.target == target {
-                previous
+                previous.clone()
             } else {
                 SettingValue::Absent
             };

@@ -6,10 +6,12 @@ fn main() {
     #[cfg(feature = "simulated-physical")]
     {
         let _ = softlock_service::marker_bytes();
+        let _ = softlock_service::present_physical_marker_bytes();
     }
     #[cfg(feature = "live-fail-closed")]
     {
         let _ = softlock_service::live_fail_closed_marker_bytes();
+        let _ = softlock_service::present_physical_marker_bytes();
     }
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -26,6 +28,9 @@ fn main() {
             #[cfg(windows)]
             {
                 let code = softlock_service::repair_main();
+                // `process::exit` does not flush a redirected stderr buffer,
+                // so the repair task would report a bare exit code.
+                let _ = std::io::Write::flush(&mut std::io::stderr());
                 std::process::exit(code);
             }
             #[cfg(not(windows))]

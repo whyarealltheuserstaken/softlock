@@ -41,7 +41,7 @@ pub struct DevConfig {
 }
 
 pub(crate) enum PipeCommand {
-    Arm,
+    Arm { message: Option<String> },
     Disarm,
     OsLock,
     Quit,
@@ -548,7 +548,8 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             Some(PipeCommand::Disarm) => break,
             Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             Some(PipeCommand::Quit) => service_gone = true,
-            Some(PipeCommand::Arm) | None => {}
+            Some(PipeCommand::Arm { message }) => overlay::set_message(message.as_deref()),
+            None => {}
         }
         if service_gone {
             arm_quit_lock(&mut quit_tried, controller.state());
@@ -1056,6 +1057,8 @@ fn on_key(
 }
 
 fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: &mut PinEntry) {
+    #[cfg(feature = "live-fail-closed")]
+    note_test_pin(entry.bytes.len());
     let secret = Secret::new(&entry.bytes);
     // `Zeroize` for `Vec` clears the length and keeps the allocation, so the
     // next PIN reuses this buffer instead of abandoning a copy.
@@ -1228,6 +1231,33 @@ fn owner_layout() -> windows::Win32::UI::Input::KeyboardAndMouse::HKL {
     }
 }
 
+#[cfg(feature = "live-fail-closed")]
+fn arm_present_physical_arg(requested: bool) {
+    if requested && crate::classify::runner_gate() {
+        crate::classify::arm_present_physical();
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn note_test_pin(len: usize) {
+    // The journal sign-in case sets this path. The length is not the secret.
+    // A release build does not compile this. The runner gate is required
+    // even in a live-fail-closed build.
+    if !crate::classify::runner_gate() {
+        return;
+    }
+    let Ok(path) = std::env::var("SOFTLOCK_TYPE_PIN") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let _ = std::fs::write(
+        std::path::PathBuf::from(path).with_extension("result"),
+        len.to_string(),
+    );
+}
+
 fn publish(shared: &Shared, report: PipeReport) {
     if let Some(sender) = shared
         .reports
@@ -1254,7 +1284,10 @@ fn wait_for_arm(shared: &Shared) -> bool {
             return false;
         }
         match next_command(shared) {
-            Some(PipeCommand::Arm) => return true,
+            Some(PipeCommand::Arm { message }) => {
+                overlay::set_message(message.as_deref());
+                return true;
+            }
             Some(PipeCommand::Disarm) => return false,
             Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             // Hooks are installed only after Arm. Quit before that is not
@@ -1296,6 +1329,11 @@ fn apply_simulated_environment(shared: &Shared) {
 
 pub fn run_service_host() -> i32 {
     use std::os::windows::io::FromRawHandle;
+    // The journal sign-in case asks this build to count injected keys as
+    // physical. A release build does not accept the argument. The PIN itself
+    // is injected by the liveness thread, which is the thread the hook sees.
+    #[cfg(feature = "live-fail-closed")]
+    arm_present_physical_arg(std::env::args().any(|arg| arg == "--present-physical"));
 
     let mut read_handle = None;
     let mut write_handle = None;
@@ -1357,7 +1395,7 @@ pub fn run_service_host() -> i32 {
 fn host_read_loop(mut file: std::fs::File, commands: std::sync::mpsc::Sender<PipeCommand>) {
     while let Ok(frame) = softlock_core::read_prefixed_frame(&mut file) {
         let command = match softlock_core::decode_service_frame(&frame) {
-            Ok(softlock_core::ServiceToHost::Arm) => Some(PipeCommand::Arm),
+            Ok(softlock_core::ServiceToHost::Arm { message }) => Some(PipeCommand::Arm { message }),
             Ok(softlock_core::ServiceToHost::Disarm) => Some(PipeCommand::Disarm),
             Ok(softlock_core::ServiceToHost::OsLock) => Some(PipeCommand::OsLock),
             Ok(softlock_core::ServiceToHost::PromptResult { .. }) => None,
@@ -1524,5 +1562,31 @@ mod quit_thread {
             let result = super::failclosed::wait_for_os_lock_signal(take_quit_os_lock);
             assert_eq!(result, RealLock::Unavailable);
         });
+    }
+}
+
+#[cfg(all(test, feature = "live-fail-closed"))]
+mod present_hook {
+    use crate::classify::{HookInput, InputClass, classify};
+
+    #[test]
+    fn present_physical_and_the_pin_note_stay_off_when_the_runner_gate_is_shut() {
+        let path = std::env::temp_dir().join(format!("sl-note-pin-{}", std::process::id()));
+        let _ = std::fs::remove_file(path.with_extension("result"));
+        unsafe { std::env::set_var("SOFTLOCK_TYPE_PIN", &path) };
+        crate::classify::deny_test_hooks(true);
+        super::arm_present_physical_arg(true);
+        super::note_test_pin(6);
+        let class = classify(HookInput {
+            injected: true,
+            extra_info: 0x5048_5953_5049_4E31,
+        });
+        crate::classify::deny_test_hooks(false);
+        unsafe { std::env::remove_var("SOFTLOCK_TYPE_PIN") };
+        assert_eq!(class, InputClass::Injected);
+        assert!(
+            !path.with_extension("result").exists(),
+            "the PIN length was written with the runner gate shut"
+        );
     }
 }

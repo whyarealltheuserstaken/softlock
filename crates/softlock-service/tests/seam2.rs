@@ -29,6 +29,10 @@ fn authority() -> Authority {
     Authority::new(ServicePlatform::new(OsLock::Fails), true)
 }
 
+fn fresh() -> Authority {
+    authority()
+}
+
 fn lock(authority: &mut Authority, source: LockSource) -> LaunchNonce {
     let nonce = authority.issue_launch_nonce().expect("nonce");
     let response = authority.handle_public(Role::App, RequestKind::Lock { source, note: None });
@@ -45,7 +49,7 @@ fn public_requests_never_unlock_from_locked() {
         .run(
             &(proptest::collection::vec((role, 0u8..6), 1..12)),
             |steps| {
-                let mut authority = authority();
+                let mut authority = fresh();
                 lock(&mut authority, LockSource::Hotkey);
                 for (role, kind) in steps {
                     let _ = authority.handle_public(role, public_kind(kind));
@@ -66,7 +70,7 @@ fn public_requests_never_unlock_from_locked() {
 
 #[test]
 fn private_message_on_the_public_pipe_is_rejected() {
-    let mut authority = authority();
+    let mut authority = fresh();
     let nonce = lock(&mut authority, LockSource::Tray);
     let private = host_hello_frame(3, &nonce).unwrap();
     let response = authority.handle_public_frame(Role::LockClient, &private);
@@ -77,7 +81,7 @@ fn private_message_on_the_public_pipe_is_rejected() {
 
 #[test]
 fn forged_host_ready_does_not_arm_the_host() {
-    let mut authority = authority();
+    let mut authority = fresh();
     let nonce = lock(&mut authority, LockSource::App);
     let mut bytes = *nonce.as_bytes();
     bytes[0] ^= 0xff;
@@ -97,7 +101,7 @@ fn forged_host_ready_does_not_arm_the_host() {
 
 #[test]
 fn forged_launch_nonce_is_rejected() {
-    let mut authority = authority();
+    let mut authority = fresh();
     let nonce = lock(&mut authority, LockSource::App);
     let mut bytes = *nonce.as_bytes();
     bytes[31] ^= 0xff;
@@ -114,7 +118,7 @@ fn forged_launch_nonce_is_rejected() {
 
 #[test]
 fn verified_nonce_is_single_use() {
-    let mut authority = authority();
+    let mut authority = fresh();
     authority.install_pin_hash(hash_pin(PIN));
     let nonce = lock(&mut authority, LockSource::LocalApi);
     let first = authority
@@ -130,7 +134,7 @@ fn verified_nonce_is_single_use() {
 
 #[test]
 fn a_dead_host_after_unlock_is_replaced_idle() {
-    let mut authority = authority();
+    let mut authority = fresh();
     authority.install_pin_hash(hash_pin(PIN));
     let nonce = lock(&mut authority, LockSource::LocalApi);
     authority
@@ -174,7 +178,7 @@ fn get_status_snapshots_source_and_health() {
         LockSource::App,
         LockSource::LocalApi,
     ] {
-        let mut authority = authority();
+        let mut authority = fresh();
         let nonce = lock(&mut authority, source);
         authority
             .accept_host(HostToService::Heartbeat {
@@ -271,7 +275,7 @@ fn release_build_does_not_store_a_pin() {
 
 #[test]
 fn a_client_role_cannot_set_the_pin() {
-    let mut authority = authority();
+    let mut authority = fresh();
     let response = authority.handle_public(
         Role::LockClient,
         RequestKind::SetPin {
@@ -284,7 +288,7 @@ fn a_client_role_cannot_set_the_pin() {
 
 #[test]
 fn host_loss_while_the_os_lock_is_down_never_unlocks() {
-    let mut authority = authority();
+    let mut authority = fresh();
     let nonce = lock(&mut authority, LockSource::Hotkey);
     authority
         .accept_host(HostToService::HostReady { monitors: 1, nonce })
@@ -380,7 +384,7 @@ fn spec_invariant_3_names_the_emergency_path() {
 #[test]
 fn tray_and_app_lock_sources_are_visible_in_get_status() {
     for source in [LockSource::Tray, LockSource::App] {
-        let mut authority = authority();
+        let mut authority = fresh();
         lock(&mut authority, source);
         let status = authority.handle_public(Role::App, RequestKind::GetStatus);
         match status {
@@ -397,7 +401,7 @@ fn tray_and_app_lock_sources_are_visible_in_get_status() {
 
 #[test]
 fn hard_lock_from_the_app_while_locked_is_rejected() {
-    let mut authority = authority();
+    let mut authority = fresh();
     let _nonce = lock(&mut authority, LockSource::Hotkey);
     let attempts = authority.os_lock_attempts();
     assert_eq!(
@@ -465,7 +469,7 @@ fn a_new_subscriber_does_not_replay_an_old_fallback() {
 
 #[test]
 fn subscribe_is_accepted_for_the_app_only() {
-    let mut authority = authority();
+    let mut authority = fresh();
     assert_eq!(
         authority.handle_public(Role::App, RequestKind::Subscribe),
         ResponseKind::Accepted
@@ -501,7 +505,7 @@ fn dev_clear_pin_removes_the_on_disk_hash() {
     let store = PinStore::in_dir(&dir);
     store.save(&hash_pin(PIN)).expect("save");
     assert!(dir.join("pin.phc").is_file());
-    let mut authority = authority();
+    let mut authority = fresh();
     assert_eq!(
         authority.handle_public(Role::App, RequestKind::ClearPin),
         ResponseKind::Ok
@@ -512,10 +516,224 @@ fn dev_clear_pin_removes_the_on_disk_hash() {
 #[cfg(windows)]
 #[test]
 fn clear_pin_refuses_without_localsystem() {
-    let mut authority = authority();
+    let mut authority = fresh();
     assert_eq!(
         authority.handle_public(Role::App, RequestKind::ClearPin),
         ResponseKind::Unsupported
+    );
+}
+
+#[test]
+fn an_invalid_edit_keeps_the_last_good_config() {
+    let dir = std::env::temp_dir().join(format!("softlock-config-errors-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut authority = fresh();
+    authority.set_config_dir(dir.clone());
+    let ResponseKind::Config {
+        toml: before,
+        revision,
+    } = authority.handle_public(Role::App, RequestKind::GetConfig)
+    else {
+        panic!("config");
+    };
+    let response = authority.handle_public(
+        Role::App,
+        RequestKind::PutConfig {
+            toml: "[lock]\nhotkey = \"nope\"\n".to_string(),
+            base_revision: revision,
+        },
+    );
+    let ResponseKind::Invalid { errors } = response else {
+        panic!("expected field errors, got {response:?}");
+    };
+    insta::assert_json_snapshot!(errors);
+    let written = std::fs::read_to_string(dir.join("config.errors.toml")).expect("errors file");
+    assert_eq!(written, errors.join("\n"));
+    let ResponseKind::Config {
+        toml,
+        revision: now,
+    } = authority.handle_public(Role::App, RequestKind::GetConfig)
+    else {
+        panic!("config");
+    };
+    assert_eq!(toml, before);
+    assert_eq!(now, revision);
+    assert!(matches!(authority.state(), LockState::Unlocked));
+    let huge = format!(
+        "[lock]\nmessage = \"{}\"\n",
+        "a".repeat(softlock_core::MAX_CONFIG_BYTES)
+    );
+    let response = authority.handle_public(
+        Role::App,
+        RequestKind::PutConfig {
+            toml: huge,
+            base_revision: revision,
+        },
+    );
+    assert!(matches!(response, ResponseKind::Invalid { .. }));
+    assert_eq!(
+        authority.handle_public(Role::App, RequestKind::GetConfig),
+        ResponseKind::Config {
+            toml: before,
+            revision,
+        }
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn put_config_returns_locked_while_soft_locked_and_while_windows_is_locked() {
+    let mut authority = fresh();
+    let ResponseKind::Config {
+        toml: before,
+        revision,
+    } = authority.handle_public(Role::App, RequestKind::GetConfig)
+    else {
+        panic!("config");
+    };
+    lock(&mut authority, LockSource::Hotkey);
+    let weakening = "[hardening]\ndisable_touch_pen = false\n".to_string();
+    let response = authority.handle_public(
+        Role::App,
+        RequestKind::PutConfig {
+            toml: weakening,
+            base_revision: revision,
+        },
+    );
+    assert_eq!(response, ResponseKind::Locked);
+    assert!(!matches!(authority.state(), LockState::Unlocked));
+    let ResponseKind::Config { toml, .. } =
+        authority.handle_public(Role::App, RequestKind::GetConfig)
+    else {
+        panic!("config");
+    };
+    assert_eq!(toml, before);
+
+    let mut windows = fresh();
+    windows.notify(Event::Session(SessionEvent::OsLocked));
+    assert!(matches!(windows.state(), LockState::Unlocked));
+    let response = windows.handle_public(
+        Role::App,
+        RequestKind::PutConfig {
+            toml: "[lock]\nhotkey = \"Ctrl+Alt+Shift+K\"\n".to_string(),
+            base_revision: revision,
+        },
+    );
+    assert_eq!(response, ResponseKind::Locked);
+    assert!(windows.session_os_locked());
+    let ResponseKind::Config { toml, .. } =
+        windows.handle_public(Role::App, RequestKind::GetConfig)
+    else {
+        panic!("config");
+    };
+    assert_eq!(toml, before);
+}
+
+#[test]
+fn a_stale_base_revision_returns_conflict() {
+    let mut authority = fresh();
+    let ResponseKind::Config { revision, .. } =
+        authority.handle_public(Role::App, RequestKind::GetConfig)
+    else {
+        panic!("config");
+    };
+    let updated = "[lock]\nhotkey = \"Ctrl+Alt+Shift+K\"\n".to_string();
+    let applied = authority.handle_public(
+        Role::App,
+        RequestKind::PutConfig {
+            toml: updated.clone(),
+            base_revision: revision,
+        },
+    );
+    assert_eq!(applied, ResponseKind::Applied);
+    let stale = authority.handle_public(
+        Role::App,
+        RequestKind::PutConfig {
+            toml: "[lock]\nhotkey = \"Ctrl+Alt+Shift+M\"\n".to_string(),
+            base_revision: revision,
+        },
+    );
+    assert_eq!(stale, ResponseKind::Conflict);
+    let ResponseKind::Config { toml, .. } =
+        authority.handle_public(Role::App, RequestKind::GetConfig)
+    else {
+        panic!("config");
+    };
+    assert_eq!(toml, updated);
+    assert!(matches!(authority.state(), LockState::Unlocked));
+}
+
+#[test]
+fn get_config_and_validate_config_work_for_lock_client() {
+    let mut authority = fresh();
+    let ResponseKind::Config { toml, revision } =
+        authority.handle_public(Role::LockClient, RequestKind::GetConfig)
+    else {
+        panic!("LockClient GetConfig");
+    };
+    assert_eq!(revision, 1);
+    assert!(toml.contains("Ctrl+Alt+Shift+L"));
+    assert_eq!(
+        authority.handle_public(
+            Role::LockClient,
+            RequestKind::ValidateConfig { toml: toml.clone() },
+        ),
+        ResponseKind::Valid
+    );
+    let ResponseKind::Invalid { errors } = authority.handle_public(
+        Role::LockClient,
+        RequestKind::ValidateConfig {
+            toml: "schema_version = 1\n[lock]\nhotkey = \"nope\"\n".to_string(),
+        },
+    ) else {
+        panic!("ValidateConfig");
+    };
+    assert!(
+        errors.iter().any(|error| error.contains("hotkey")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn an_absent_value_is_deleted_after_a_restart_mid_lock() {
+    use softlock_core::{
+        HostPresence, SessionFact, SettingValue, StartAction, StartupStep, original_previous,
+        recovery_action, restore_action, startup_steps, task_manager_document,
+    };
+    let doc =
+        task_manager_document("S-1-5-21-1-2-3-1001", SettingValue::Absent, 0).expect("journal");
+    let live = SettingValue::Dword { value: 1 };
+    // A different boot deletes the locked dword. It does not write zero, and
+    // it runs before config load so the live value is not journaled as the
+    // original. The same logon, a query error, and a dead host on an active
+    // console fail closed instead of ending Unlocked.
+    assert_eq!(
+        recovery_action(&doc, SessionFact::DifferentBoot, true, HostPresence::Dead),
+        StartAction::Revert
+    );
+    assert_eq!(
+        recovery_action(&doc, SessionFact::SameLogon, false, HostPresence::Dead),
+        StartAction::FailClosed
+    );
+    assert_eq!(
+        recovery_action(&doc, SessionFact::Unknown, false, HostPresence::Dead),
+        StartAction::FailClosed
+    );
+    assert_eq!(
+        recovery_action(&doc, SessionFact::SameLogon, true, HostPresence::Dead),
+        StartAction::FailClosed
+    );
+    assert_eq!(
+        startup_steps(),
+        [StartupStep::RecoverJournal, StartupStep::LoadConfig]
+    );
+    let locked = SettingValue::Dword { value: 1 };
+    let previous = original_previous(Some(&doc.entries()[0].previous), &live, &locked).clone();
+    assert_eq!(previous, SettingValue::Absent);
+    assert_eq!(
+        restore_action(&previous, &live).expect("restore"),
+        Some(SettingValue::Absent)
     );
 }
 

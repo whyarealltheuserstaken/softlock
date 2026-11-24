@@ -9,17 +9,19 @@ use std::time::{Duration, Instant};
 
 use softlock_core::PRODUCT_DISPLAY_NAME;
 use softlock_core::{
-    CommitFault, HardenError, Journal, JournalEntry, JournalFault, LOCKDOWN, ProductState,
-    RepairAction, SERVICE_NAME, SettingValue, SettingsJournal, StartAction, allowed_previous_for,
-    commit_then_change, encode_document, executable_may_run_as_system, fault_log,
-    lockdown_document, lockdown_policy, mark_workstation_clear, parse_document, reassert_write,
-    repair_action, repair_entry_name, restore_action_for, restore_sid, service_start_action,
-    workstation_value_after_attempt,
+    CONFIG_DIR, CONFIG_FILE, CommitFault, HardenError, HeldStart, Journal, JournalEntry,
+    JournalFault, LOCKDOWN, ProductState, RepairAction, SERVICE_NAME, SettingValue,
+    SettingsJournal, StartAction, allowed_previous_for, commit_then_change, encode_document,
+    executable_may_run_as_system, fault_log, held_start, lockdown_document, lockdown_policy,
+    mark_workstation_clear, original_previous, parse_document, reassert_write, recovery_action,
+    release_os_hold, repair_action, repair_entry_name, restore_action_for, restore_sid,
+    with_config_acl, workstation_value_after_attempt,
 };
 
 use crate::journal_store::{load_journal, save_journal};
 use crate::taskmgr::{
-    console_is_active, console_sid, lock_host_running, read_lockdown, watch_policy, write_lockdown,
+    console_is_active, console_sid, current_lock_identity, lock_host_running, observe_lock,
+    read_lockdown, watch_policy, write_lockdown,
 };
 
 static SKIP_WORKSTATION: AtomicBool = AtomicBool::new(false);
@@ -29,6 +31,8 @@ pub enum Boot {
     Idle,
     Reverted,
     FailClosed(Journal),
+    /// Policies are already restored and the console is not active.
+    StayOsLocked,
 }
 
 #[cfg(test)]
@@ -47,8 +51,7 @@ pub struct SettingsEngine {
     stop: Arc<AtomicBool>,
     last: Instant,
     watcher: Mutex<Option<JoinHandle<()>>>,
-    /// An active lock must keep the lockdown rows. Revert does not clear them.
-    preserve: bool,
+    keep_os_lock: bool,
 }
 
 impl SettingsEngine {
@@ -67,8 +70,12 @@ impl SettingsEngine {
             stop: Arc::new(AtomicBool::new(false)),
             last: Instant::now(),
             watcher: Mutex::new(None),
-            preserve: false,
+            keep_os_lock: false,
         })
+    }
+
+    pub fn keep_os_lock_after_revert(&mut self, keep: bool) {
+        self.keep_os_lock = keep;
     }
 
     pub fn boot(&mut self) -> Result<Boot, &'static str> {
@@ -80,33 +87,48 @@ impl SettingsEngine {
         if doc.is_empty() {
             return Ok(Boot::Idle);
         }
-        self.sid = restore_sid(&doc).map_err(fault_log)?.to_string();
-        let console = match console_is_active() {
-            Ok(active) => active,
-            Err(_) if doc.says_locked() => {
-                self.preserve = true;
-                self.hold();
-                if doc.workstation_clear {
-                    reapply_disable_lock_workstation()?;
+        let console = console_is_active();
+        let console_active = console.unwrap_or(false);
+        if let Some(held) = held_start(&doc, console_active) {
+            return match held {
+                HeldStart::OwnerReturned => {
+                    // An active console with the same logon is the desktop
+                    // we disconnected, not a new sign-in. Stay OsLocked.
+                    let fact = observe_lock(doc.lock, true);
+                    if !release_os_hold(fact) {
+                        return Ok(Boot::StayOsLocked);
+                    }
+                    let empty = encode_document(&SettingsJournal::empty()).map_err(fault_log)?;
+                    save_journal(&empty).map_err(|_| "not-durable")?;
+                    Ok(Boot::Idle)
                 }
-                return Ok(Boot::FailClosed(memory_journal(&doc)));
-            }
-            Err(_) => false,
-        };
-        match service_start_action(&doc, console, lock_host_running()) {
+                HeldStart::StayOsLocked => Ok(Boot::StayOsLocked),
+            };
+        }
+        self.sid = restore_sid(&doc).map_err(fault_log)?.to_string();
+        // A failed WTS query comes back as SessionFact::Unknown and fails
+        // closed. A proven different boot, a missing session, or a different
+        // logon is the only revert. SPEC Decision 5 and section 7.
+        let mut fact = observe_lock(doc.lock, console_active);
+        if console.is_err() && fact == softlock_core::SessionFact::SameLogon {
+            fact = softlock_core::SessionFact::Unknown;
+        }
+        match recovery_action(&doc, fact, console.unwrap_or(false), lock_host_running()) {
             StartAction::Idle => Ok(Boot::Idle),
             StartAction::Revert => {
                 self.revert_document(&doc)?;
                 Ok(Boot::Reverted)
             }
             StartAction::FailClosed => {
-                self.preserve = true;
+                // Hold the rows until the OS lock is confirmed. The controller
+                // reverts then, from this journal. SPEC section 7.
                 self.hold();
                 if doc.workstation_clear {
                     reapply_disable_lock_workstation()?;
                 }
                 Ok(Boot::FailClosed(memory_journal(&doc)))
             }
+            StartAction::StayOsLocked => Ok(Boot::StayOsLocked),
         }
     }
 
@@ -116,21 +138,75 @@ impl SettingsEngine {
             HardenError::Failed
         })?;
         self.sid = sid;
+        // A live lockdown dword keeps the journaled previous. Any other live
+        // value is the user's, so a stale absent original cannot delete it.
+        let durable = load_journal().ok().flatten().and_then(|text| {
+            parse_document(text.as_bytes())
+                .ok()
+                .filter(|doc| doc.says_locked())
+        });
         let mut previous = Vec::with_capacity(LOCKDOWN.len());
         for policy in LOCKDOWN {
-            let value = read_lockdown(&self.sid, policy).map_err(|reason| {
+            let live = read_lockdown(&self.sid, policy).map_err(|reason| {
                 crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
                 HardenError::Failed
             })?;
-            previous.push((policy.target, value));
+            let journaled = durable.as_ref().and_then(|doc| {
+                doc.entries()
+                    .iter()
+                    .find(|entry| entry.target == policy.target)
+                    .map(|entry| &entry.previous)
+            });
+            let locked = SettingValue::Dword {
+                value: policy.locked,
+            };
+            previous.push((
+                policy.target,
+                original_previous(journaled, &live, &locked).clone(),
+            ));
         }
-        let doc = lockdown_document(&self.sid, &previous, journal.failures()).map_err(|fault| {
-            crate::audit(
-                "settings",
-                &[("result", "failed"), ("reason", fault_log(fault))],
-            );
-            HardenError::Failed
-        })?;
+        let mut doc =
+            lockdown_document(&self.sid, &previous, journal.failures()).map_err(|fault| {
+                crate::audit(
+                    "settings",
+                    &[("result", "failed"), ("reason", fault_log(fault))],
+                );
+                HardenError::Failed
+            })?;
+        doc.lock = current_lock_identity();
+        // The seam service runs as the console user. A protected DACL on its
+        // private file needs a privilege that user does not have, and a failed
+        // row fail-closes the lock. SOFTLOCK_LOCK_CONFIG_ACL=1 is the decline
+        // proof, which does take that lock. The hosted LocalSystem job covers
+        // the real profile file.
+        if lock_config_acl() {
+            let path = crate::config_file::configured_path().map_err(|reason| {
+                crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+                HardenError::Failed
+            })?;
+            let entry = crate::config_file::prepare_entry(&path).map_err(|reason| {
+                crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+                HardenError::Failed
+            })?;
+            let directory = crate::config_file::prepare_dir_entry(&path).map_err(|reason| {
+                crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+                HardenError::Failed
+            })?;
+            doc = with_config_acl(doc, entry).map_err(|fault| {
+                crate::audit(
+                    "settings",
+                    &[("result", "failed"), ("reason", fault_log(fault))],
+                );
+                HardenError::Failed
+            })?;
+            doc = with_config_acl(doc, directory).map_err(|fault| {
+                crate::audit(
+                    "settings",
+                    &[("result", "failed"), ("reason", fault_log(fault))],
+                );
+                HardenError::Failed
+            })?;
+        }
         self.pending = Some(doc);
         for (target, value) in &previous {
             let locked = lockdown_policy(target)
@@ -138,7 +214,7 @@ impl SettingsEngine {
                 .unwrap_or(1);
             journal.record(JournalEntry {
                 target: (*target).to_string(),
-                previous: previous_text(*value),
+                previous: previous_text(value),
                 new_value: locked.to_string(),
             });
         }
@@ -168,10 +244,18 @@ impl SettingsEngine {
                 // journal until unlock.
                 pause_for("before");
                 for entry in doc.entries() {
+                    if entry.target == CONFIG_FILE || entry.target == CONFIG_DIR {
+                        continue;
+                    }
                     let Some(policy) = lockdown_policy(&entry.target) else {
                         return Err("target");
                     };
-                    write_lockdown(&sid, policy, entry.new_value)?;
+                    write_lockdown(&sid, policy, entry.new_value.clone())?;
+                }
+                for entry in doc.entries() {
+                    if entry.target == CONFIG_FILE || entry.target == CONFIG_DIR {
+                        crate::config_file::apply_entry(entry)?;
+                    }
                 }
                 pause_for("after");
                 Ok(())
@@ -198,9 +282,9 @@ impl SettingsEngine {
     }
 
     pub fn revert_memory(&mut self, journal: &Journal) -> Result<(), &'static str> {
-        if self.preserve {
-            return Ok(());
-        }
+        // Called when the OS lock is confirmed, or when the owner unlocks.
+        // SPEC section 7 reverts the journal at confirmation, not before.
+        // Confirmation keeps an OsLocked marker. An owner unlock clears it.
         if let Some(text) = load_journal().map_err(|_| "journal")? {
             let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
             return self.revert_document(&doc);
@@ -218,13 +302,35 @@ impl SettingsEngine {
                     SettingValue::Dword { value }
                 }
             };
-            if !allowed_previous_for(&entry.target, previous) {
+            if !allowed_previous_for(&entry.target, &previous) {
                 return Err("value");
             }
             self.write_previous(&entry.target, previous)?;
         }
         self.release();
         Ok(())
+    }
+
+    /// `Some(true)` while the confirmed-disconnect marker is still on disk.
+    /// `Some(false)` once [`Self::repair_leftover`] has removed it. `None`
+    /// means the journal could not be read, which is not a sign-in.
+    pub fn os_confirmed_marker(&mut self) -> Option<bool> {
+        let text = load_journal().ok()??;
+        let doc = parse_document(text.as_bytes()).ok()?;
+        Some(doc.os_confirmed)
+    }
+
+    /// The confirmed disconnect's logon is the console again, and that
+    /// console is active. This is the read [`Self::repair_leftover`] uses
+    /// before it writes.
+    pub fn owner_back(&mut self) -> bool {
+        let Some(text) = load_journal().ok().flatten() else {
+            return false;
+        };
+        let Ok(doc) = parse_document(text.as_bytes()) else {
+            return false;
+        };
+        doc.os_confirmed && doc.lock.is_some_and(crate::taskmgr::owner_session_returned)
     }
 
     pub fn repair_leftover(&mut self) -> Result<(), &'static str> {
@@ -235,8 +341,20 @@ impl SettingsEngine {
         if doc.is_empty() {
             return Ok(());
         }
+        // A confirmed disconnect is cleared only when this same logon is the
+        // console again. The running service calls this on the logon or
+        // unlock that brings the owner back, and the ONLOGON task calls it
+        // when the service is not the process that sees the event. A session
+        // that merely looks active before it has left is not a sign-in.
+        if doc.os_confirmed {
+            let returned = doc.lock.is_some_and(crate::taskmgr::owner_session_returned);
+            if softlock_core::sign_in_release(softlock_core::ProductState::OsLocked, returned)
+                != softlock_core::RepairAction::Revert
+            {
+                return Err("session");
+            }
+        }
         self.sid = restore_sid(&doc).map_err(fault_log)?.to_string();
-        self.preserve = false;
         self.revert_document(&doc)
     }
 
@@ -244,18 +362,25 @@ impl SettingsEngine {
         if RESTORED.load(Ordering::Acquire) {
             return Ok(());
         }
+        // A failed row must not spin. The next attempt waits the normal
+        // interval even when this one returns an error before the end.
+        self.last = Instant::now();
         let Some(text) = load_journal().map_err(|_| "journal")? else {
             return Ok(());
         };
         let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
         let skip_workstation = SKIP_WORKSTATION.load(Ordering::Acquire) || doc.workstation_clear;
         for entry in doc.entries() {
+            if entry.target == CONFIG_FILE || entry.target == CONFIG_DIR {
+                crate::config_file::reassert_entry(entry)?;
+                continue;
+            }
             let Some(policy) = lockdown_policy(&entry.target) else {
                 return Err("target");
             };
             let current = read_lockdown(&self.sid, policy)?;
             let skip = skip_workstation && entry.target == "DisableLockWorkstation";
-            if let Some(next) = reassert_write(&entry.target, entry.new_value, current, skip) {
+            if let Some(next) = reassert_write(&entry.target, &entry.new_value, &current, skip) {
                 write_lockdown(&self.sid, policy, next)?;
                 crate::audit(
                     "settings",
@@ -263,7 +388,6 @@ impl SettingsEngine {
                 );
             }
         }
-        self.last = Instant::now();
         Ok(())
     }
 
@@ -284,7 +408,7 @@ impl SettingsEngine {
             return Err("target");
         };
         let current = read_lockdown(&self.sid, policy)?;
-        match restore_action_for(target, previous, current).map_err(|_| "value")? {
+        match restore_action_for(target, &previous, &current).map_err(|_| "value")? {
             Some(next) => write_lockdown(&self.sid, policy, next),
             None => Ok(()),
         }
@@ -293,12 +417,25 @@ impl SettingsEngine {
     fn revert_document(&mut self, doc: &SettingsJournal) -> Result<(), &'static str> {
         RESTORED.store(true, Ordering::Release);
         for entry in doc.entries() {
+            if entry.target == CONFIG_FILE || entry.target == CONFIG_DIR {
+                crate::config_file::restore_entry(entry)?;
+                continue;
+            }
             if lockdown_policy(&entry.target).is_none() {
                 return Err("target");
             }
-            self.write_previous(&entry.target, entry.previous)?;
+            self.write_previous(&entry.target, entry.previous.clone())?;
         }
-        let empty = encode_document(&SettingsJournal::empty()).map_err(|_| "malformed")?;
+        let next = if self.keep_os_lock {
+            let mut held = SettingsJournal::empty();
+            held.sid = doc.sid.clone();
+            held.os_confirmed = true;
+            held.lock = doc.lock;
+            held
+        } else {
+            SettingsJournal::empty()
+        };
+        let empty = encode_document(&next).map_err(|_| "malformed")?;
         save_journal(&empty).map_err(|_| "not-durable")?;
         SKIP_WORKSTATION.store(false, Ordering::Release);
         self.release();
@@ -333,10 +470,18 @@ impl SettingsEngine {
     }
 }
 
-fn previous_text(value: SettingValue) -> Option<String> {
+fn lock_config_acl() -> bool {
+    if crate::config_file::test_config_dir().is_none() {
+        return true;
+    }
+    std::env::var("SOFTLOCK_LOCK_CONFIG_ACL").ok().as_deref() == Some("1")
+}
+
+fn previous_text(value: &SettingValue) -> Option<String> {
     match value {
         SettingValue::Absent => None,
         SettingValue::Dword { value } => Some(value.to_string()),
+        SettingValue::Sddl { .. } => None,
     }
 }
 
@@ -345,10 +490,11 @@ fn memory_journal(doc: &SettingsJournal) -> Journal {
     for entry in doc.entries() {
         journal.record(JournalEntry {
             target: entry.target.clone(),
-            previous: previous_text(entry.previous),
-            new_value: match entry.new_value {
+            previous: previous_text(&entry.previous),
+            new_value: match &entry.new_value {
                 SettingValue::Dword { value } => value.to_string(),
                 SettingValue::Absent => "0".to_string(),
+                SettingValue::Sddl { value } => value.clone(),
             },
         });
     }
@@ -456,14 +602,12 @@ pub fn register_sign_in_recovery() {
     }
     let task = format!("{SERVICE_NAME}-restore");
     let command = format!("\"{}\" --repair-settings", exe.display());
-    let created = Command::new(r"C:\Windows\System32\schtasks.exe")
-        .args([
-            "/Create", "/F", "/TN", &task, "/SC", "ONLOGON", "/RU", "SYSTEM", "/RL", "HIGHEST",
-            "/TR", &command,
-        ])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+    let mut created_task = Command::new(r"C:\Windows\System32\schtasks.exe");
+    created_task.args([
+        "/Create", "/F", "/TN", &task, "/SC", "ONLOGON", "/RU", "SYSTEM", "/RL", "HIGHEST", "/TR",
+        &command,
+    ]);
+    let created = command_status(&mut created_task);
     if !created {
         crate::audit(
             "settings",
@@ -471,11 +615,9 @@ pub fn register_sign_in_recovery() {
         );
         return;
     }
-    let present = Command::new(r"C:\Windows\System32\schtasks.exe")
-        .args(["/Query", "/TN", &task])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+    let mut query_task = Command::new(r"C:\Windows\System32\schtasks.exe");
+    query_task.args(["/Query", "/TN", &task]);
+    let present = command_status(&mut query_task);
     if !present {
         crate::audit(
             "settings",
@@ -486,6 +628,31 @@ pub fn register_sign_in_recovery() {
     crate::audit("settings", &[("result", "task")]);
     if let Err(reason) = write_start_menu(&exe) {
         crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+    }
+}
+
+fn command_status(command: &mut Command) -> bool {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < Duration::from_secs(15) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.try_wait();
+                return false;
+            }
+        }
     }
 }
 

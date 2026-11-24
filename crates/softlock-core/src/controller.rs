@@ -8,8 +8,8 @@ use crate::heartbeat::{ARM_STEP_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_MISSES_BE
 use crate::ipc::{RequestKind, ResponseKind};
 use crate::journal::Journal;
 use crate::platform::{
-    AwakeGuard, AwakeRequest, Credentials, Hardening, InputGuard, LockScreenLook, Overlay,
-    PhysicalInputSink, Platform, Power, SessionControl, Verdict, standard_hardening_plan,
+    AwakeGuard, AwakeRequest, Credentials, DisplayMode, Hardening, InputGuard, LockScreenLook,
+    Overlay, PhysicalInputSink, Platform, Power, SessionControl, Verdict, standard_hardening_plan,
 };
 use crate::state::{
     ArmStep, DisarmStep, FailReason, Fallback, HeartbeatReport, LaunchNonce, LockSource, LockState,
@@ -290,8 +290,30 @@ impl<P: Platform> LockController<P> {
         self.config.revision()
     }
 
+    /// Install the on-disk document as the current revision. Does not bump.
+    pub fn install_startup_config(&mut self, toml: &str) -> Result<(), Vec<String>> {
+        self.config.install_startup(toml)
+    }
+
+    /// The ONLOGON repair task already reverted the journal. Leave `OsLocked`.
+    pub fn release_after_repair(&mut self) {
+        if matches!(self.state, LockState::OsLocked { .. }) {
+            self.session_os_locked = false;
+            self.broker_launched = false;
+            self.enter(LockState::Unlocked);
+        }
+    }
+
     pub fn config_toml(&self) -> &str {
         self.config.document()
+    }
+
+    pub fn config_hotkey(&self) -> &str {
+        self.config.hotkey()
+    }
+
+    pub fn config_message(&self) -> &str {
+        self.config.message()
     }
 
     pub fn last_response(&self) -> Option<&ResponseKind> {
@@ -377,11 +399,13 @@ impl<P: Platform> LockController<P> {
                     Err(_) => self.fail_closed(FailReason::ArmStep { step }),
                 }
             }
-            ArmStep::Overlay => match Overlay::show(&mut self.platform, &LockScreenLook::default())
-            {
-                Ok(()) => self.enter_arm(source, ArmStep::Hardening),
-                Err(_) => self.fail_closed(FailReason::ArmStep { step }),
-            },
+            ArmStep::Overlay => {
+                let look = self.lock_look();
+                match Overlay::show(&mut self.platform, &look) {
+                    Ok(()) => self.enter_arm(source, ArmStep::Hardening),
+                    Err(_) => self.fail_closed(FailReason::ArmStep { step }),
+                }
+            }
             ArmStep::Hardening => match self.journal_and_apply() {
                 Ok(()) => self.enter_arm(source, ArmStep::Power),
                 Err(_) => self.fail_closed(FailReason::ArmStep { step }),
@@ -528,7 +552,12 @@ impl<P: Platform> LockController<P> {
             self.reject("OsLockConfirmed");
             return;
         };
-        if !self.teardown() {
+        // Revert the policies, and keep a durable OsLocked marker. A restart
+        // before the owner returns must not come back Unlocked.
+        self.platform.keep_os_lock_after_revert(true);
+        let reverted = self.teardown();
+        self.platform.keep_os_lock_after_revert(false);
+        if !reverted {
             self.reject("Revert");
         }
         self.enter(LockState::OsLocked {
@@ -786,6 +815,23 @@ impl<P: Platform> LockController<P> {
                             self.enter(LockState::OsLocked { after_fail });
                             return;
                         }
+                        // The in-memory journal is clear. Drop the durable
+                        // OsLocked marker too, so a restart does not lock again
+                        // after the owner has signed back in. A failed clear
+                        // stays OsLocked.
+                        if Hardening::revert(&mut self.platform, &self.journal).is_err() {
+                            self.release_guard_and_overlay();
+                            push_bounded(
+                                &mut self.notifications,
+                                Fallback {
+                                    reason: FailReason::Repair,
+                                    at_ms: self.now.as_millis(),
+                                    at_utc_ms: wall_unix_ms(),
+                                },
+                            );
+                            self.enter(LockState::OsLocked { after_fail });
+                            return;
+                        }
                         if let Some(reason) = after_fail {
                             push_bounded(
                                 &mut self.notifications,
@@ -817,6 +863,14 @@ impl<P: Platform> LockController<P> {
     }
 
     fn on_service_started(&mut self, journal: Journal, session_active: bool) {
+        if journal.os_held() {
+            // Policies are already restored. The console is not active.
+            // SPEC section 7: stay OsLocked until the owner signs back in.
+            self.enter(LockState::OsLocked {
+                after_fail: Some(FailReason::SessionActive),
+            });
+            return;
+        }
         if journal.is_empty() {
             return;
         }
@@ -953,6 +1007,21 @@ fn request_name(kind: &RequestKind) -> &'static str {
         RequestKind::Subscribe => "Subscribe",
         RequestKind::CheckUpdate => "CheckUpdate",
         RequestKind::InstallUpdate { .. } => "InstallUpdate",
+    }
+}
+
+impl<P: Platform> LockController<P> {
+    fn lock_look(&self) -> LockScreenLook {
+        let message = self.config.message();
+        LockScreenLook {
+            display: DisplayMode::Opaque,
+            message: if message.is_empty() {
+                None
+            } else {
+                Some(message.to_string())
+            },
+            show_clock: true,
+        }
     }
 }
 
