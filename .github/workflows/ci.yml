@@ -98,6 +98,30 @@ jobs:
           grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam1.txt
           grep -F "inherited_group_write_aces_lose_write_with_the_owner ... ok" target/seam1.txt
           grep -F "a_locked_file_edit_is_offered_and_an_unlocked_edit_is_saved ... ok" target/seam1.txt
+      - name: Live hooks stay shut without the runner gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p softlock-lockhost --features live-fail-closed --lib \
+            -- the_magic_extra_stays_injected_until_the_runner_gate_is_open \
+               the_test_pin_is_not_typed_when_the_runner_gate_is_shut \
+               present_physical_and_the_pin_note_stay_off_when_the_runner_gate_is_shut \
+               --test-threads=1 \
+            2>&1 | tee target/live-hooks.txt
+          grep -F "the_magic_extra_stays_injected_until_the_runner_gate_is_open ... ok" target/live-hooks.txt
+          if [ "${OS:-}" = "Windows_NT" ]; then
+            grep -F "the_test_pin_is_not_typed_when_the_runner_gate_is_shut ... ok" target/live-hooks.txt
+            grep -F "present_physical_and_the_pin_note_stay_off_when_the_runner_gate_is_shut ... ok" target/live-hooks.txt
+            cargo test --locked -p softlock-service --features live-fail-closed --lib \
+              -- the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut \
+                 an_unlock_from_an_absent_logon_stays_os_locked \
+                 the_same_logon_on_the_console_clears_os_locked \
+                 --test-threads=1 \
+              2>&1 | tee target/live-hooks-service.txt
+            grep -F "the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut ... ok" target/live-hooks-service.txt
+            grep -F "an_unlock_from_an_absent_logon_stays_os_locked ... ok" target/live-hooks-service.txt
+            grep -F "the_same_logon_on_the_console_clears_os_locked ... ok" target/live-hooks-service.txt
+          fi
       - name: test-support stays out of product builds
         shell: bash
         run: |
@@ -120,6 +144,18 @@ jobs:
           fi
           if grep -F live-fail-closed target/product-features.txt; then
             echo "live-fail-closed feature reached a product crate"
+            exit 1
+          fi
+      - name: Default test and bin targets omit live-fail-closed
+        shell: bash
+        run: |
+          mkdir -p target
+          cargo tree --locked -e normal,dev -e features \
+            -p softlock-app -p softlock-service -p softlock-lockhost \
+            -p softlock-broker -p softlock-windows -p softlock-macos -p softlock-linux \
+            > target/default-targets.txt
+          if grep -F live-fail-closed target/default-targets.txt; then
+            echo "live-fail-closed reached a default-feature test or bin target"
             exit 1
           fi
       - name: Release binaries omit test-only markers
@@ -192,6 +228,30 @@ jobs:
           grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam1.txt
           grep -F "inherited_group_write_aces_lose_write_with_the_owner ... ok" target/seam1.txt
           grep -F "a_locked_file_edit_is_offered_and_an_unlocked_edit_is_saved ... ok" target/seam1.txt
+      - name: Live hooks stay shut without the runner gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p softlock-lockhost --features live-fail-closed --lib \
+            -- the_magic_extra_stays_injected_until_the_runner_gate_is_open \
+               the_test_pin_is_not_typed_when_the_runner_gate_is_shut \
+               present_physical_and_the_pin_note_stay_off_when_the_runner_gate_is_shut \
+               --test-threads=1 \
+            2>&1 | tee target/live-hooks.txt
+          grep -F "the_magic_extra_stays_injected_until_the_runner_gate_is_open ... ok" target/live-hooks.txt
+          if [ "${OS:-}" = "Windows_NT" ]; then
+            grep -F "the_test_pin_is_not_typed_when_the_runner_gate_is_shut ... ok" target/live-hooks.txt
+            grep -F "present_physical_and_the_pin_note_stay_off_when_the_runner_gate_is_shut ... ok" target/live-hooks.txt
+            cargo test --locked -p softlock-service --features live-fail-closed --lib \
+              -- the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut \
+                 an_unlock_from_an_absent_logon_stays_os_locked \
+                 the_same_logon_on_the_console_clears_os_locked \
+                 --test-threads=1 \
+              2>&1 | tee target/live-hooks-service.txt
+            grep -F "the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut ... ok" target/live-hooks-service.txt
+            grep -F "an_unlock_from_an_absent_logon_stays_os_locked ... ok" target/live-hooks-service.txt
+            grep -F "the_same_logon_on_the_console_clears_os_locked ... ok" target/live-hooks-service.txt
+          fi
       - name: test-support stays out of product builds
         shell: bash
         run: |
@@ -214,6 +274,18 @@ jobs:
           fi
           if grep -F live-fail-closed target/product-features.txt; then
             echo "live-fail-closed feature reached a product crate"
+            exit 1
+          fi
+      - name: Default test and bin targets omit live-fail-closed
+        shell: bash
+        run: |
+          mkdir -p target
+          cargo tree --locked -e normal,dev -e features \
+            -p softlock-app -p softlock-service -p softlock-lockhost \
+            -p softlock-broker -p softlock-windows -p softlock-macos -p softlock-linux \
+            > target/default-targets.txt
+          if grep -F live-fail-closed target/default-targets.txt; then
+            echo "live-fail-closed reached a default-feature test or bin target"
             exit 1
           fi
       - name: Release binaries omit test-only markers
@@ -310,6 +382,30 @@ jobs:
           grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam1.txt
           grep -F "inherited_group_write_aces_lose_write_with_the_owner ... ok" target/seam1.txt
           grep -F "a_locked_file_edit_is_offered_and_an_unlocked_edit_is_saved ... ok" target/seam1.txt
+      - name: Live hooks stay shut without the runner gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p softlock-lockhost --features live-fail-closed --lib \
+            -- the_magic_extra_stays_injected_until_the_runner_gate_is_open \
+               the_test_pin_is_not_typed_when_the_runner_gate_is_shut \
+               present_physical_and_the_pin_note_stay_off_when_the_runner_gate_is_shut \
+               --test-threads=1 \
+            2>&1 | tee target/live-hooks.txt
+          grep -F "the_magic_extra_stays_injected_until_the_runner_gate_is_open ... ok" target/live-hooks.txt
+          if [ "${OS:-}" = "Windows_NT" ]; then
+            grep -F "the_test_pin_is_not_typed_when_the_runner_gate_is_shut ... ok" target/live-hooks.txt
+            grep -F "present_physical_and_the_pin_note_stay_off_when_the_runner_gate_is_shut ... ok" target/live-hooks.txt
+            cargo test --locked -p softlock-service --features live-fail-closed --lib \
+              -- the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut \
+                 an_unlock_from_an_absent_logon_stays_os_locked \
+                 the_same_logon_on_the_console_clears_os_locked \
+                 --test-threads=1 \
+              2>&1 | tee target/live-hooks-service.txt
+            grep -F "the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut ... ok" target/live-hooks-service.txt
+            grep -F "an_unlock_from_an_absent_logon_stays_os_locked ... ok" target/live-hooks-service.txt
+            grep -F "the_same_logon_on_the_console_clears_os_locked ... ok" target/live-hooks-service.txt
+          fi
       - name: test-support stays out of product builds
         shell: bash
         run: |
@@ -332,6 +428,18 @@ jobs:
           fi
           if grep -F live-fail-closed target/product-features.txt; then
             echo "live-fail-closed feature reached a product crate"
+            exit 1
+          fi
+      - name: Default test and bin targets omit live-fail-closed
+        shell: bash
+        run: |
+          mkdir -p target
+          cargo tree --locked -e normal,dev -e features \
+            -p softlock-app -p softlock-service -p softlock-lockhost \
+            -p softlock-broker -p softlock-windows -p softlock-macos -p softlock-linux \
+            > target/default-targets.txt
+          if grep -F live-fail-closed target/default-targets.txt; then
+            echo "live-fail-closed reached a default-feature test or bin target"
             exit 1
           fi
       - name: Release binaries omit test-only markers

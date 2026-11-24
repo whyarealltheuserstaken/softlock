@@ -788,7 +788,7 @@ fn kill_while_locked(stub: &str, stay_blocked: bool) {
     );
     assert!(marked, "Quit did not call the OS lock");
     if stay_blocked {
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(200));
         assert!(
             physical_is_blocked(&probe, session.extra),
             "hooks dropped after the service died without an OS lock"
@@ -925,14 +925,14 @@ fn impostor_case_system(case: &str, expect: &str, spawn_user_copy: bool) {
         "the host never judged the impostor"
     );
     if case == "reuse" {
-        // One second for a late reopen to rewrite the witness. The host
-        // rewrites on every poll, and std::fs::write truncates first, so a
-        // single read can observe an empty file. Empty is not a verdict.
-        thread::sleep(Duration::from_secs(1));
+        // A few host polls for a late reopen to rewrite the witness. The
+        // host rewrites on every poll, and std::fs::write truncates first,
+        // so a single read can observe an empty file. Empty is not a verdict.
+        thread::sleep(Duration::from_millis(200));
     }
     let decision = non_empty_witness(&witness);
     assert_eq!(decision, expect, "impostor case {case} released the guard");
-    thread::sleep(Duration::from_secs(1));
+    thread::sleep(Duration::from_millis(200));
     assert!(
         physical_is_blocked(&probe_window, extra),
         "hooks dropped for an impostor ({case})"
@@ -1435,7 +1435,7 @@ fn install_service(
 ) -> String {
     let _ = fs::remove_file(probe);
     remove_service(name);
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(200));
     // sc.exe takes everything after the binPath value as its own options.
     // The exe and `--scm` have to be one quoted ImagePath, or `--scm` is
     // parsed as an sc option and create prints its usage.
