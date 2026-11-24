@@ -2756,42 +2756,67 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
     // Ask the service to lock this file's DACL the same way it locks the
     // real profile. The other seam sessions leave the private directory
     // unlocked because a failed protected DACL would fail-close every lock.
-    let session =
-        Session::launch_extra(None, true, "1", None, &[("SOFTLOCK_LOCK_CONFIG_ACL", "1")]);
+    // Each step runs on its own thread. A stuck `CreateFile` or `ReadFile`
+    // inside the step must fail here, not hold the suite until the watchdog.
+    let session = within("launch", Duration::from_secs(60), || {
+        Session::launch_extra(None, true, "1", None, &[("SOFTLOCK_LOCK_CONFIG_ACL", "1")])
+    });
     arm_owner(&session);
-    session.set_pin().expect("set pin");
-    let locked = session.lock().expect("lock");
-    assert!(
-        locked.contains("Accepted"),
-        "lock was not accepted: {locked}"
-    );
-    assert!(
-        softlock_app_lib::refresh_from_service(),
-        "timed out waiting for the service to answer GetStatus"
-    );
+    let session = within("set_pin", Duration::from_secs(20), move || {
+        session.set_pin().expect("set pin");
+        session
+    });
+    let session = within("lock", Duration::from_secs(20), move || {
+        let locked = session.lock().expect("lock");
+        assert!(
+            locked.contains("Accepted"),
+            "lock was not accepted: {locked}"
+        );
+        session
+    });
+    within("refresh", Duration::from_secs(25), || {
+        assert!(
+            softlock_app_lib::refresh_from_service(),
+            "timed out waiting for the service to answer GetStatus"
+        );
+    });
     let path = session.config_dir.join("config.toml");
-    let original = wait_for_file(&path, Duration::from_secs(10)).expect("config file");
+    let original = within("wait_for_file", Duration::from_secs(20), {
+        let path = path.clone();
+        move || wait_for_file(&path, Duration::from_secs(10)).expect("config file")
+    });
     let edited = original.replace("Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+K");
-    let denied = write_file_bounded(&path, edited.as_bytes());
+    let denied = within("write_locked", Duration::from_secs(10), {
+        let path = path.clone();
+        let edited = edited.clone();
+        move || write_file_bounded(&path, edited.as_bytes())
+    });
     assert!(
         denied.is_err(),
         "the locked config file still accepted a write"
     );
-    assert!(
-        !softlock_app_lib::decline_offered_config(),
-        "decline wrote the config file while locked"
-    );
-    assert_eq!(
-        read_file_bounded(&path).expect("locked file"),
-        original,
-        "decline changed the file while locked"
-    );
-    type_pin(session.extra);
-    let unlocked = wait_for(Duration::from_secs(30), || {
-        session
-            .status()
-            .ok()
-            .is_some_and(|status| status.contains("\"state\":\"Unlocked\""))
+    within("decline_locked", Duration::from_secs(30), || {
+        assert!(
+            !softlock_app_lib::decline_offered_config(),
+            "decline wrote the config file while locked"
+        );
+    });
+    let disk = within("read_locked", Duration::from_secs(10), {
+        let path = path.clone();
+        move || read_file_bounded(&path).expect("locked file")
+    });
+    assert_eq!(disk, original, "decline changed the file while locked");
+    let extra = session.extra;
+    within("type_pin", Duration::from_secs(30), move || type_pin(extra));
+    let unlocked = within("wait_unlocked", Duration::from_secs(45), {
+        let pipe = session.pipe.clone();
+        move || {
+            wait_for(Duration::from_secs(30), || {
+                transact(&pipe, r#"{"v":1,"id":3,"kind":"GetStatus"}"#)
+                    .ok()
+                    .is_some_and(|status| status.contains("\"state\":\"Unlocked\""))
+            })
+        }
     });
     let status = session.status().unwrap_or_default();
     assert!(
@@ -2799,18 +2824,26 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
         "the pin did not unlock after the declined locked edit: {status}\nlog {}",
         log_tail(&session.log)
     );
-    assert!(
-        softlock_app_lib::refresh_from_service(),
-        "timed out waiting for the service to answer GetStatus after unlock"
-    );
-    write_file_bounded(&path, edited.as_bytes()).expect("write after unlock");
+    within("refresh_unlocked", Duration::from_secs(25), || {
+        assert!(
+            softlock_app_lib::refresh_from_service(),
+            "timed out waiting for the service to answer GetStatus after unlock"
+        );
+    });
+    within("write_unlocked", Duration::from_secs(10), {
+        let path = path.clone();
+        let edited = edited.clone();
+        move || write_file_bounded(&path, edited.as_bytes()).expect("write after unlock")
+    });
     // An unlocked edit is saved, not offered. Decline writes the effective
     // document back over the disk. Polling first would PutConfig the new
     // bytes and there would be nothing left to restore.
-    assert!(
-        softlock_app_lib::decline_offered_config(),
-        "decline did not restore the file after unlock"
-    );
+    within("decline_unlocked", Duration::from_secs(30), || {
+        assert!(
+            softlock_app_lib::decline_offered_config(),
+            "decline did not restore the file after unlock"
+        );
+    });
     assert!(
         !softlock_app_lib::config_offer(),
         "an unlocked edit raised the locked-edit offer"
@@ -2857,8 +2890,26 @@ fn wait_for_file(path: &Path, timeout: Duration) -> Option<String> {
     read_file_bounded(path).ok()
 }
 
-/// `read` and `write` on the locked config return access-denied, or they sit
-/// in the open until the job timeout. Either way the test has to stop.
+/// Runs `work` off the test thread. `thread::scope` would join that worker
+/// and wait out a stuck call, so the worker is detached and this thread is
+/// the one that fails.
+fn within<T: Send + 'static>(
+    step: &'static str,
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        let _ = sender.send(result);
+    });
+    match receiver.recv_timeout(limit) {
+        Ok(Ok(value)) => value,
+        Ok(Err(payload)) => std::panic::resume_unwind(payload),
+        Err(_) => panic!("timed out during {step}"),
+    }
+}
+
 fn read_file_bounded(path: &Path) -> Result<String, String> {
     let path = path.to_path_buf();
     let (sender, receiver) = mpsc::channel();
