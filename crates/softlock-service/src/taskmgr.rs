@@ -642,7 +642,7 @@ fn session_listed(session: u32) -> Result<bool, ()> {
     }
 }
 
-fn logon_luid(session: u32) -> Result<u64, ()> {
+pub(crate) fn logon_luid(session: u32) -> Result<u64, ()> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Security::{GetTokenInformation, TOKEN_STATISTICS, TokenStatistics};
     use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;

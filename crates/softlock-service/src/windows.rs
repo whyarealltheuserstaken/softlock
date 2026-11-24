@@ -409,7 +409,16 @@ fn install_journal(authority: &mut Authority) {
                 });
             }
             Ok(crate::settings::Boot::StayOsLocked) => {
+                let owner_back = engine.owner_back();
                 authority.platform_mut().install_engine(engine);
+                // A restart does not see the disconnect that confirmed the
+                // lock. Hold that disconnect anyway, and remember the owner
+                // was away when this boot did not find them on the console.
+                // OsLocked then clears only through the sign-in repair.
+                DISCONNECT_HELD.store(true, Ordering::Release);
+                if !owner_back {
+                    OWNER_WAS_AWAY.store(true, Ordering::Release);
+                }
                 let mut journal = softlock_core::Journal::empty();
                 journal.mark_os_held();
                 authority.notify(Event::ServiceStarted {
@@ -641,10 +650,22 @@ fn apply_session_events(authority: &Arc<Mutex<Authority>>, events: &Receiver<Ses
                 continue;
             }
         }
-        // The disconnect's own unlock, including when some other console
-        // session is already active, is not the owner signing back in.
-        if matches!(event, SessionEvent::OsUnlocked) && DISCONNECT_HELD.load(Ordering::Acquire) {
-            continue;
+        // OsLocked does not end on the session notification. The owner
+        // coming back is owner_authenticated above, release_returned_owner,
+        // or repair_leftover. Forwarding OsUnlocked here reverts and reports
+        // Unlocked for a different logon, and for the unlock Windows sends
+        // with the disconnect itself.
+        if matches!(event, SessionEvent::OsUnlocked) {
+            let locked = matches!(
+                authority
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .state(),
+                LockState::OsLocked { .. }
+            );
+            if locked {
+                continue;
+            }
         }
         if matches!(event, SessionEvent::Logon) {
             continue;
@@ -1128,7 +1149,9 @@ fn launch_host(read: HANDLE, write: HANDLE, allow_panic: bool) -> std::io::Resul
         write.0 as usize
     );
     #[cfg(feature = "live-fail-closed")]
-    let command = if std::env::var("SOFTLOCK_PRESENT_PHYSICAL").ok().as_deref() == Some("1") {
+    let command = if live_hooks_allowed()
+        && std::env::var("SOFTLOCK_PRESENT_PHYSICAL").ok().as_deref() == Some("1")
+    {
         format!("{command} --present-physical")
     } else {
         command
@@ -1434,10 +1457,14 @@ fn host_test_env(key: &str) -> bool {
         return true;
     }
     #[cfg(feature = "live-fail-closed")]
+    if key.eq_ignore_ascii_case("SOFTLOCK_PRESENT_PHYSICAL")
+        || key.eq_ignore_ascii_case("SOFTLOCK_TYPE_PIN")
+    {
+        return live_hooks_allowed();
+    }
+    #[cfg(feature = "live-fail-closed")]
     if key.eq_ignore_ascii_case("SOFTLOCK_FORCE_GUARD_DOWN")
         || key.eq_ignore_ascii_case("SOFTLOCK_HOST_READY")
-        || key.eq_ignore_ascii_case("SOFTLOCK_PRESENT_PHYSICAL")
-        || key.eq_ignore_ascii_case("SOFTLOCK_TYPE_PIN")
         || key.eq_ignore_ascii_case("GITHUB_ACTIONS")
         || key.eq_ignore_ascii_case("RUNNER_ENVIRONMENT")
     {
@@ -1895,8 +1922,15 @@ fn dev_app_role_allowed() -> bool {
     live_hooks_allowed()
 }
 
+#[cfg(all(test, feature = "live-fail-closed"))]
+static DENY_LIVE_HOOKS: AtomicBool = AtomicBool::new(false);
+
 #[cfg(feature = "live-fail-closed")]
 pub fn live_hooks_allowed() -> bool {
+    #[cfg(test)]
+    if DENY_LIVE_HOOKS.load(Ordering::SeqCst) {
+        return false;
+    }
     softlock_windows::runner_may_lock().is_ok()
 }
 
@@ -2224,6 +2258,22 @@ fn set_status(
     }
 }
 
+#[cfg(all(test, feature = "live-fail-closed"))]
+mod hook_forward {
+    use super::{DENY_LIVE_HOOKS, host_test_env};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut() {
+        DENY_LIVE_HOOKS.store(true, Ordering::SeqCst);
+        let present = host_test_env("SOFTLOCK_PRESENT_PHYSICAL");
+        let pin = host_test_env("SOFTLOCK_TYPE_PIN");
+        DENY_LIVE_HOOKS.store(false, Ordering::SeqCst);
+        assert!(!present, "SOFTLOCK_PRESENT_PHYSICAL was forwarded");
+        assert!(!pin, "SOFTLOCK_TYPE_PIN was forwarded");
+    }
+}
+
 #[cfg(test)]
 mod settings_boot {
     use super::install_journal;
@@ -2259,6 +2309,111 @@ mod settings_boot {
             "an open error returned to Unlocked"
         );
         assert!(authority.platform_mut().settings_are_required());
+    }
+
+    #[test]
+    fn an_unlock_from_an_absent_logon_stays_os_locked() {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+        super::DISCONNECT_HELD.store(false, Ordering::Release);
+        super::OWNER_WAS_AWAY.store(false, Ordering::Release);
+        super::REPLACE_HOST.store(false, Ordering::Release);
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), false);
+        let mut journal = softlock_core::Journal::empty();
+        journal.mark_os_held();
+        authority.notify(softlock_core::Event::ServiceStarted {
+            journal,
+            session_active: false,
+        });
+        let authority = Arc::new(Mutex::new(authority));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(softlock_core::SessionEvent::OsUnlocked).unwrap();
+        super::apply_session_events(&authority, &rx);
+        let state = authority
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .state()
+            .clone();
+        assert!(
+            matches!(state, LockState::OsLocked { .. }),
+            "an unlock with no sign-in left {state:?}"
+        );
+        assert!(!super::REPLACE_HOST.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "live-fail-closed")]
+    #[test]
+    fn the_same_logon_on_the_console_clears_os_locked() {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+        let dir = std::env::temp_dir().join(format!("sl-stay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("journal dir");
+        struct Env;
+        impl Drop for Env {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("SOFTLOCK_JOURNAL_DIR") };
+            }
+        }
+        let _env = Env;
+        unsafe { std::env::set_var("SOFTLOCK_JOURNAL_DIR", &dir) };
+        assert!(
+            crate::authority::test_path("SOFTLOCK_JOURNAL_DIR").is_some(),
+            "the journal override is refused"
+        );
+        let session = super::console_session();
+        let logon = crate::taskmgr::logon_luid(session).expect("console logon");
+        let doc = softlock_core::SettingsJournal {
+            v: 1,
+            sid: "S-1-5-21-1-2-3-1001".to_string(),
+            workstation_clear: false,
+            says_locked: false,
+            os_confirmed: true,
+            failures: 0,
+            entries: Vec::new(),
+            lock: Some(softlock_core::LockIdentity {
+                boot: 1,
+                session,
+                logon,
+            }),
+        };
+        let bytes = softlock_core::encode_document(&doc).expect("journal");
+        crate::journal_store::save_journal(&bytes).expect("save");
+        super::DISCONNECT_HELD.store(false, Ordering::Release);
+        super::OWNER_WAS_AWAY.store(false, Ordering::Release);
+        super::REPLACE_HOST.store(false, Ordering::Release);
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), false);
+        install_journal(&mut authority);
+        assert!(
+            matches!(authority.state(), LockState::OsLocked { .. }),
+            "restart left {:?}",
+            authority.state()
+        );
+        assert!(
+            super::DISCONNECT_HELD.load(Ordering::Acquire),
+            "StayOsLocked did not hold the disconnect"
+        );
+        // This boot found the owner already on the console, so it does not
+        // record that they had left. The clear below is the later moment
+        // they come back: the same logon, active, after a boot that saw them
+        // away.
+        assert!(!super::OWNER_WAS_AWAY.load(Ordering::Acquire));
+        super::OWNER_WAS_AWAY.store(true, Ordering::Release);
+        let authority = Arc::new(Mutex::new(authority));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(softlock_core::SessionEvent::OsUnlocked).unwrap();
+        super::apply_session_events(&authority, &rx);
+        let state = authority
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .state()
+            .clone();
+        assert!(
+            matches!(state, LockState::Unlocked),
+            "the same logon on the console left {state:?}"
+        );
+        assert!(super::REPLACE_HOST.load(Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
