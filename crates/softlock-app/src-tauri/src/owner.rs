@@ -4,7 +4,7 @@
 
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -167,26 +167,40 @@ pub fn lock_from_app() {
     enqueue_lock(LockSource::App);
 }
 
+static DECLINE_AT: AtomicU8 = AtomicU8::new(0);
+
+/// Which line `decline_config` reached. The seam test reads this when the
+/// call does not return.
+pub fn decline_at() -> u8 {
+    DECLINE_AT.load(Ordering::Relaxed)
+}
+
 pub fn decline_config() -> bool {
     // Same rule as accept: a locked session does not write the config file.
     // The service holds the DACL until the owner unlocks.
+    DECLINE_AT.store(1, Ordering::Relaxed);
     if current_view().locked() {
         return false;
     }
+    DECLINE_AT.store(2, Ordering::Relaxed);
     let effective = current_config();
+    DECLINE_AT.store(3, Ordering::Relaxed);
     CONFIG_OFFER.store(false, Ordering::Release);
     *PENDING_CONFIG
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = String::new();
+    DECLINE_AT.store(4, Ordering::Relaxed);
     if let Some(document) = effective
         && let Some(path) = profile_config_path()
         && !write_user_file(&path, &document)
     {
         return false;
     }
+    DECLINE_AT.store(5, Ordering::Relaxed);
     if let Ok(view) = view_slot().lock() {
         publish(&view);
     }
+    DECLINE_AT.store(6, Ordering::Relaxed);
     true
 }
 

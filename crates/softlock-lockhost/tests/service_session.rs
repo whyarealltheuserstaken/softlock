@@ -38,8 +38,11 @@ fn gate() -> MutexGuard<'static, ()> {
         thread::spawn(|| {
             // The suite finishes in about a minute on main. Anything still
             // running here is a wait the per-call deadlines did not cover.
-            thread::sleep(Duration::from_secs(20 * 60));
-            eprintln!("service_session did not finish within 20 minutes");
+            thread::sleep(Duration::from_secs(8 * 60));
+            eprintln!(
+                "service_session did not finish within 8 minutes, decline at {}",
+                softlock_app_lib::decline_at()
+            );
             std::process::exit(3);
         });
     });
@@ -2687,7 +2690,9 @@ fn create_junction(link: &Path, target: &Path) -> std::io::Result<()> {
 fn a_locked_file_edit_is_offered_and_applied_on_accept() {
     softlock_windows::runner_may_lock().expect("refusing the config edit off a hosted runner");
     let _guard = gate();
-    let session = Session::start(None, true);
+    let session = within("locked_launch", Duration::from_secs(60), || {
+        Session::start(None, true)
+    });
     arm_owner(&session);
     let stored = session.set_pin().expect("set pin");
     assert!(stored.contains("Ok"), "pin was not stored: {stored}");
@@ -2912,7 +2917,10 @@ fn within<T: Send + 'static>(
     match receiver.recv_timeout(limit) {
         Ok(Ok(value)) => value,
         Ok(Err(payload)) => std::panic::resume_unwind(payload),
-        Err(_) => panic!("timed out during {step}"),
+        Err(_) => panic!(
+            "timed out during {step}, decline at {}",
+            softlock_app_lib::decline_at()
+        ),
     }
 }
 
