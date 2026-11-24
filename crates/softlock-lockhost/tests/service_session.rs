@@ -8,7 +8,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,16 @@ const PIN: &[u8] = b"135742";
 const NOTE: &str = "Quarterly Report - Notepad";
 
 fn gate() -> MutexGuard<'static, ()> {
+    static WATCHDOG: Once = Once::new();
+    WATCHDOG.call_once(|| {
+        thread::spawn(|| {
+            // The suite finishes in about a minute on main. Anything still
+            // running here is a wait the per-call deadlines did not cover.
+            thread::sleep(Duration::from_secs(20 * 60));
+            eprintln!("service_session did not finish within 20 minutes");
+            std::process::exit(3);
+        });
+    });
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
 }

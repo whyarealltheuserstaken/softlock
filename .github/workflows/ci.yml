@@ -544,10 +544,24 @@ jobs:
             --target x86_64-pc-windows-msvc
           # A file, not a pipe. A lock-host child that outlives cargo keeps a
           # pipe open and tee never sees EOF, so the job sits until timeout.
+          # The test process also exits itself after 20 minutes. This wait is
+          # the backstop when cargo never starts that process.
           set +e
           cargo test --locked -p softlock-lockhost --features simulated-physical \
             --target x86_64-pc-windows-msvc --test service_session -- --test-threads=1 --nocapture \
-            > target/seam3-service.txt 2>&1
+            > target/seam3-service.txt 2>&1 &
+          pid=$!
+          elapsed=0
+          while kill -0 "$pid" 2>/dev/null; do
+            if [ "$elapsed" -ge 1500 ]; then
+              taskkill //F //T //PID "$pid" || true
+              echo "cargo test service_session timed out after 1500s" >> target/seam3-service.txt
+              break
+            fi
+            sleep 5
+            elapsed=$((elapsed + 5))
+          done
+          wait "$pid"
           status=$?
           set -e
           cat target/seam3-service.txt
