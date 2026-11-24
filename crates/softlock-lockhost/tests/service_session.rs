@@ -464,7 +464,22 @@ fn read_frame(handle: HANDLE) -> Result<Vec<u8>, String> {
 }
 
 fn read_frame_within(handle: HANDLE, timeout: Duration) -> Result<Vec<u8>, String> {
-    let deadline = Instant::now() + timeout;
+    let raw = handle.0 as usize;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let handle = HANDLE(raw as *mut core::ffi::c_void);
+        let _ = sender.send(read_frame_blocking(handle));
+    });
+    // `PeekNamedPipe` and `ReadFile` run on the worker. A stuck call never
+    // gets back to the deadline on this thread.
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err("timed out waiting for the service to answer".to_string()),
+    }
+}
+
+fn read_frame_blocking(handle: HANDLE) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut prefix = [0u8; 4];
     read_until(handle, &mut prefix, deadline)?;
     let length = u32::from_le_bytes(prefix) as usize;
