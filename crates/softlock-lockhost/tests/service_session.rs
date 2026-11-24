@@ -8,6 +8,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard, Once};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2695,12 +2696,15 @@ fn a_locked_file_edit_is_offered_and_applied_on_accept() {
         locked.contains("Accepted"),
         "lock was not accepted: {locked}"
     );
-    assert!(softlock_app_lib::refresh_from_service());
+    assert!(
+        softlock_app_lib::refresh_from_service(),
+        "timed out waiting for the service to answer GetStatus"
+    );
     let path = session.config_dir.join("config.toml");
     let original = wait_for_file(&path, Duration::from_secs(10)).expect("config file");
     let edited = original.replace("Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+K");
     assert_ne!(edited, original, "the default hotkey was not in the file");
-    fs::write(&path, &edited).expect("write");
+    write_file_bounded(&path, edited.as_bytes()).expect("write");
     let offered = wait_for(Duration::from_secs(10), || {
         softlock_app_lib::poll_config_once();
         softlock_app_lib::config_offer()
@@ -2710,7 +2714,7 @@ fn a_locked_file_edit_is_offered_and_applied_on_accept() {
         "the locked edit did not raise the offer\nstatus {}\nconfig {}\ndisk {}\nlog {}",
         session.status().unwrap_or_default(),
         session.config().unwrap_or_default(),
-        fs::read_to_string(&path).unwrap_or_default(),
+        read_file_bounded(&path).unwrap_or_default(),
         log_tail(&session.log)
     );
     let during = session.config().expect("config");
@@ -2730,7 +2734,10 @@ fn a_locked_file_edit_is_offered_and_applied_on_accept() {
         unlocked && status.contains("\"state\":\"Unlocked\""),
         "the pin did not unlock after the accepted locked edit: {status}"
     );
-    assert!(softlock_app_lib::refresh_from_service());
+    assert!(
+        softlock_app_lib::refresh_from_service(),
+        "timed out waiting for the service to answer GetStatus after unlock"
+    );
     assert!(
         softlock_app_lib::accept_offered_config(),
         "PutConfig did not return Applied"
@@ -2758,11 +2765,14 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
         locked.contains("Accepted"),
         "lock was not accepted: {locked}"
     );
-    assert!(softlock_app_lib::refresh_from_service());
+    assert!(
+        softlock_app_lib::refresh_from_service(),
+        "timed out waiting for the service to answer GetStatus"
+    );
     let path = session.config_dir.join("config.toml");
     let original = wait_for_file(&path, Duration::from_secs(10)).expect("config file");
     let edited = original.replace("Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+K");
-    let denied = fs::write(&path, &edited);
+    let denied = write_file_bounded(&path, edited.as_bytes());
     assert!(
         denied.is_err(),
         "the locked config file still accepted a write"
@@ -2772,7 +2782,7 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
         "decline wrote the config file while locked"
     );
     assert_eq!(
-        fs::read_to_string(&path).expect("locked file"),
+        read_file_bounded(&path).expect("locked file"),
         original,
         "decline changed the file while locked"
     );
@@ -2789,8 +2799,11 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
         "the pin did not unlock after the declined locked edit: {status}\nlog {}",
         log_tail(&session.log)
     );
-    assert!(softlock_app_lib::refresh_from_service());
-    fs::write(&path, &edited).expect("write after unlock");
+    assert!(
+        softlock_app_lib::refresh_from_service(),
+        "timed out waiting for the service to answer GetStatus after unlock"
+    );
+    write_file_bounded(&path, edited.as_bytes()).expect("write after unlock");
     // An unlocked edit is saved, not offered. Decline writes the effective
     // document back over the disk. Polling first would PutConfig the new
     // bytes and there would be nothing left to restore.
@@ -2802,7 +2815,7 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
         !softlock_app_lib::config_offer(),
         "an unlocked edit raised the locked-edit offer"
     );
-    let disk = fs::read_to_string(&path).expect("restored file");
+    let disk = read_file_bounded(&path).expect("restored file");
     assert!(
         disk.contains("Ctrl+Alt+Shift+L") && !disk.contains("Ctrl+Alt+Shift+K"),
         "decline did not restore the file: {disk}"
@@ -2834,12 +2847,41 @@ fn arm_owner(session: &Session) {
 fn wait_for_file(path: &Path, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Ok(text) = fs::read_to_string(path)
+        if let Ok(text) = read_file_bounded(path)
             && !text.is_empty()
         {
             return Some(text);
         }
         thread::sleep(Duration::from_millis(200));
     }
-    fs::read_to_string(path).ok()
+    read_file_bounded(path).ok()
+}
+
+/// `read` and `write` on the locked config return access-denied, or they sit
+/// in the open until the job timeout. Either way the test has to stop.
+fn read_file_bounded(path: &Path) -> Result<String, String> {
+    let path = path.to_path_buf();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(fs::read_to_string(path));
+    });
+    match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("timed out reading the config file".to_string()),
+    }
+}
+
+fn write_file_bounded(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let bytes = bytes.to_vec();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(fs::write(path, bytes));
+    });
+    match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("timed out writing the config file".to_string()),
+    }
 }

@@ -1247,8 +1247,21 @@ fn register_autostart() {
 }
 
 fn transact(kind: RequestKind) -> Result<ResponseKind, String> {
-    let mut io = connect_retry()?;
-    exchange(&mut io, client::next_id(), &kind).map_err(|error| format!("{error:?}"))
+    // `connect` and `exchange` sit in `CreateFileW` / `ReadFile`. The retry
+    // deadline is only checked once those calls return, so a busy pipe held
+    // the caller until the job was killed. The worker may stay blocked after
+    // this returns; the caller must not.
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = (|| {
+            let mut io = connect_retry()?;
+            exchange(&mut io, client::next_id(), &kind).map_err(|error| format!("{error:?}"))
+        })();
+        let _ = sender.send(result);
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap_or_else(|_| Err("timed out waiting for the service".to_string()))
 }
 
 fn connect_retry() -> Result<File, String> {
@@ -1263,6 +1276,16 @@ fn connect_retry() -> Result<File, String> {
 }
 
 fn connect() -> Result<File, String> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(open_pipe());
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_else(|_| Err("timed out opening the service pipe".to_string()))
+}
+
+fn open_pipe() -> Result<File, String> {
     let name = wide(&public_pipe_name());
     let handle = unsafe {
         CreateFileW(
