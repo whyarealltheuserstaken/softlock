@@ -747,57 +747,38 @@ fn call_with_deadline<T: Send + 'static>(
     receiver.recv_timeout(limit).ok()
 }
 
-fn open_user_file(path: &std::path::Path, write: bool) -> Option<File> {
-    let path_buf = path.to_path_buf();
-    match call_with_deadline(Duration::from_secs(5), move || {
-        open_user_file_walk(&path_buf, write)
-    }) {
-        Some(opened) => opened,
-        // The component walk sits in `CreateFileW` or `NtCreateFile` on the
-        // runner. A full-path open still refuses a reparse at the final name.
-        None => {
-            let path_buf = path.to_path_buf();
-            call_with_deadline(Duration::from_secs(5), move || {
-                open_user_file_whole(&path_buf, write)
-            })
-            .flatten()
+#[cfg(test)]
+static WALK_PAUSE: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static OPEN_LIMIT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn open_limit() -> Duration {
+    #[cfg(test)]
+    {
+        let millis = OPEN_LIMIT_MS.load(Ordering::Relaxed);
+        if millis != 0 {
+            return Duration::from_millis(millis);
         }
     }
+    Duration::from_secs(5)
 }
 
-fn open_user_file_whole(path: &std::path::Path, write: bool) -> Option<File> {
-    use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-    let text = path.to_string_lossy().replace('/', "\\");
-    if text.contains("..") {
-        return None;
-    }
-    let wide_path = wide(&text);
-    let access = if write {
-        FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0
-    } else {
-        FILE_GENERIC_READ.0
-    };
-    let handle = unsafe {
-        CreateFileW(
-            PCWSTR(wide_path.as_ptr()),
-            access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
-        )
-        .ok()?
-    };
-    if handle_is_reparse(handle) {
-        close_user_handle(handle);
-        return None;
-    }
-    Some(unsafe { File::from_raw_handle(handle.0) })
+fn open_user_file(path: &std::path::Path, write: bool) -> Option<File> {
+    let path_buf = path.to_path_buf();
+    // A walk that does not return, or that refuses the path, does not fall
+    // back to a full-path open. That open would follow a junction in a parent.
+    call_with_deadline(open_limit(), move || open_user_file_walk(&path_buf, write)).flatten()
 }
 
 fn open_user_file_walk(path: &std::path::Path, write: bool) -> Option<File> {
     use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+    #[cfg(test)]
+    {
+        let pause = WALK_PAUSE.load(Ordering::Relaxed);
+        if pause != 0 {
+            thread::sleep(Duration::from_millis(pause));
+        }
+    }
     let text = path.to_string_lossy().replace('/', "\\");
     if text.contains("..") {
         return None;
@@ -1409,6 +1390,23 @@ mod owner_file_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         dir
+    }
+
+    #[test]
+    fn a_walk_that_does_not_return_does_not_open_the_full_path() {
+        let dir = temp_dir("sl-nofallback");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "secret").expect("write");
+        super::OPEN_LIMIT_MS.store(30, Ordering::Relaxed);
+        super::WALK_PAUSE.store(400, Ordering::Relaxed);
+        let read = super::read_user_file(&path);
+        super::OPEN_LIMIT_MS.store(0, Ordering::Relaxed);
+        super::WALK_PAUSE.store(0, Ordering::Relaxed);
+        assert!(
+            read.is_none(),
+            "a timed-out component walk opened the file by its full path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
