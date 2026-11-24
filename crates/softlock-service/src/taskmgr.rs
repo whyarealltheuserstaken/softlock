@@ -537,7 +537,46 @@ fn token_sid(token: HANDLE) -> Result<String, &'static str> {
     }
 }
 
+/// The seam test names the console logon. `WTSQueryUserToken` is
+/// LocalSystem-only, so a unit test cannot read it. The override is
+/// compiled out of the service binary.
+#[cfg(test)]
+struct ForcedConsole {
+    active: bool,
+    logon: u64,
+}
+
+#[cfg(test)]
+static FORCED_CONSOLE: std::sync::Mutex<Option<ForcedConsole>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn force_console_for_test(active: bool, logon: u64) {
+    *FORCED_CONSOLE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(ForcedConsole { active, logon });
+}
+
+#[cfg(test)]
+pub(crate) fn clear_forced_console() {
+    *FORCED_CONSOLE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
+}
+
+#[cfg(test)]
+fn forced_console() -> Option<(bool, u64)> {
+    FORCED_CONSOLE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .map(|forced| (forced.active, forced.logon))
+}
+
 pub fn console_is_active() -> Result<bool, &'static str> {
+    #[cfg(test)]
+    if let Some((active, _)) = forced_console() {
+        return Ok(active);
+    }
     use windows::Win32::System::RemoteDesktop::{
         WTSActive, WTSConnectState, WTSFreeMemory, WTSQuerySessionInformationW,
     };
@@ -643,6 +682,14 @@ fn session_listed(session: u32) -> Result<bool, ()> {
 }
 
 pub(crate) fn logon_luid(session: u32) -> Result<u64, ()> {
+    #[cfg(test)]
+    if let Some((_, logon)) = forced_console() {
+        return if session == u32::MAX || logon == 0 {
+            Err(())
+        } else {
+            Ok(logon)
+        };
+    }
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Security::{GetTokenInformation, TOKEN_STATISTICS, TokenStatistics};
     use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;

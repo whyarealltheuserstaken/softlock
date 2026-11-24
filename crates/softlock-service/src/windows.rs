@@ -2362,6 +2362,19 @@ mod settings_boot {
             "the journal override is refused"
         );
         let session = super::console_session();
+        assert_ne!(session, u32::MAX, "there is no console session");
+        // The runner user cannot call WTSQueryUserToken. The seam names
+        // this logon and an active console. The service binary does not
+        // compile the override.
+        const LOGON: u64 = 0x1001;
+        crate::taskmgr::force_console_for_test(true, LOGON);
+        struct ClearConsole;
+        impl Drop for ClearConsole {
+            fn drop(&mut self) {
+                crate::taskmgr::clear_forced_console();
+            }
+        }
+        let _console = ClearConsole;
         let logon = crate::taskmgr::logon_luid(session).expect("console logon");
         let doc = softlock_core::SettingsJournal {
             v: 1,
