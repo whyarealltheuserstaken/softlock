@@ -196,17 +196,6 @@ impl Session {
         }
         String::from_utf8(response).map_err(|error| error.to_string())
     }
-
-    fn wait_until(&self, mut ready: impl FnMut(&Self) -> bool, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if ready(self) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(ready(self), "timed out waiting for the service");
-    }
 }
 
 impl Drop for Session {
@@ -399,10 +388,6 @@ fn read_frame_within(handle: HANDLE, timeout: Duration) -> Result<Vec<u8>, Strin
     let mut body = vec![0u8; length];
     read_until(handle, &mut body, deadline)?;
     Ok(body)
-}
-
-fn read_exact(handle: HANDLE, buf: &mut [u8]) -> Result<(), String> {
-    read_until(handle, buf, Instant::now() + Duration::from_secs(15))
 }
 
 fn read_until(handle: HANDLE, buf: &mut [u8], deadline: Instant) -> Result<(), String> {
