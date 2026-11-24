@@ -376,6 +376,25 @@ impl SettingsJournal {
         }
     }
 
+    /// A rewrite that drops lockdown rows keeps the password stamps.
+    /// `OwnerReturned` and a revert that does not stay OS-locked both use this.
+    pub fn keeping_password_attempts(attempts: &[crate::backoff::PasswordStamp]) -> Self {
+        let mut doc = Self::empty();
+        doc.password_attempts = attempts.to_vec();
+        doc
+    }
+
+    /// The OS-lock hold written after revert. Rows are gone. The stamps, the
+    /// sid, and the lock identity stay.
+    pub fn os_held_keeping_password(doc: &Self) -> Self {
+        let mut held = Self::empty();
+        held.sid = doc.sid.clone();
+        held.os_confirmed = true;
+        held.lock = doc.lock;
+        held.password_attempts = doc.password_attempts.clone();
+        held
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && !self.says_locked && !self.os_confirmed && self.failures == 0
     }
@@ -1691,6 +1710,43 @@ mod tests {
                 .is_err()
         );
         assert!(parse_document(b"not-json").is_err());
+        assert!(parsed.password_attempts.is_empty());
+        assert!(parsed.entries()[0].previous_owner.is_empty());
+        assert_eq!(parsed.v, JOURNAL_VERSION);
+    }
+
+    #[test]
+    fn password_attempts_survive_a_restore_and_an_owner_returned_rewrite() {
+        let stamp = crate::backoff::PasswordStamp {
+            tick: 90_000,
+            wall_ms: 1_700_000_000_000,
+        };
+        let mut locked = task_manager_document(ALICE, SettingValue::Absent, 2).expect("doc");
+        locked.password_attempts = vec![stamp];
+        locked.entries[0].previous_owner = ALICE.to_string();
+        locked.lock = Some(LockIdentity {
+            boot: 10,
+            session: 1,
+            logon: 20,
+        });
+        let owner_returned = SettingsJournal::keeping_password_attempts(&locked.password_attempts);
+        let restored = encode_document(&owner_returned).expect("encode");
+        let parsed = parse_document(&restored).expect("parse");
+        assert_eq!(parsed.password_attempts, vec![stamp]);
+        assert!(parsed.entries().is_empty());
+        assert_eq!(parsed.v, JOURNAL_VERSION);
+        let held = SettingsJournal::os_held_keeping_password(&locked);
+        assert_eq!(held.password_attempts, vec![stamp]);
+        assert_eq!(held.sid, ALICE);
+        assert!(held.os_confirmed);
+        assert_eq!(held.lock, locked.lock);
+        assert!(held.entries().is_empty());
+        let held_bytes = encode_document(&held).expect("encode held");
+        assert_eq!(parse_document(&held_bytes).expect("parse held"), held);
+        let round = encode_document(&locked).expect("encode locked");
+        let again = parse_document(&round).expect("parse locked");
+        assert_eq!(again.password_attempts, vec![stamp]);
+        assert_eq!(again.entries()[0].previous_owner, ALICE);
     }
 
     #[test]

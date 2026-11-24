@@ -132,8 +132,8 @@ impl SettingsEngine {
                     if !release_os_hold(fact) {
                         return Ok(Boot::StayOsLocked);
                     }
-                    let mut cleared = SettingsJournal::empty();
-                    cleared.password_attempts = self.password_attempts.clone();
+                    let cleared =
+                        SettingsJournal::keeping_password_attempts(&self.password_attempts);
                     let empty = encode_document(&cleared).map_err(fault_log)?;
                     save_journal(&empty).map_err(|_| "not-durable")?;
                     Ok(Boot::Idle)
@@ -463,16 +463,11 @@ impl SettingsEngine {
             }
             self.write_previous(&entry.target, entry.previous.clone())?;
         }
-        let mut next = if self.keep_os_lock {
-            let mut held = SettingsJournal::empty();
-            held.sid = doc.sid.clone();
-            held.os_confirmed = true;
-            held.lock = doc.lock;
-            held
+        let next = if self.keep_os_lock {
+            SettingsJournal::os_held_keeping_password(doc)
         } else {
-            SettingsJournal::empty()
+            SettingsJournal::keeping_password_attempts(&doc.password_attempts)
         };
-        next.password_attempts = doc.password_attempts.clone();
         self.password_attempts = next.password_attempts.clone();
         let empty = encode_document(&next).map_err(|_| "malformed")?;
         save_journal(&empty).map_err(|_| "not-durable")?;

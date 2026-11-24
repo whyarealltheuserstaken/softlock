@@ -44,7 +44,9 @@ pub struct DevConfig {
 }
 
 pub(crate) enum PipeCommand {
-    Arm { message: Option<String> },
+    Arm {
+        message: Option<String>,
+    },
     Disarm,
     OsLock,
     Quit,

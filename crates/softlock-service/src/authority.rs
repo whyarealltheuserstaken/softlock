@@ -735,45 +735,8 @@ impl Authority {
         };
         drop(secret);
         match outcome {
-            PasswordLogon::Verified if self.grant_allowed() => {
-                let kept = self.password_attempts.clone();
-                self.password_attempts.clear();
-                self.password_journal_block = None;
-                self.password_off = None;
-                if self.persist_password_attempts().is_err() {
-                    self.password_attempts = kept;
-                    audit(
-                        "unlock",
-                        &[
-                            ("method", "os_password"),
-                            ("result", "rejected"),
-                            ("reason", "journal"),
-                        ],
-                    );
-                    return self.password_prompt(false);
-                }
-                let Some(stored) = self.launch.take() else {
-                    audit(
-                        "unlock",
-                        &[("method", "os_password"), ("result", "rejected")],
-                    );
-                    return self.password_prompt(false);
-                };
-                let mut bytes = *stored.as_bytes();
-                self.controller.handle(Event::AdoptLaunchNonce {
-                    nonce: LaunchNonce::from_bytes(bytes),
-                });
-                self.controller.handle(Event::Verified {
-                    nonce: LaunchNonce::from_bytes(bytes),
-                });
-                bytes.zeroize();
-                self.backoff_deadline = None;
-                audit("unlock", &[("method", "os_password"), ("result", "ok")]);
-                self.controller.acknowledge_recovery();
-                self.host_ready = false;
-                ServiceToHost::Disarm
-            }
-            PasswordLogon::Verified | PasswordLogon::Mismatch => {
+            PasswordLogon::Verified => self.finish_verified_password(),
+            PasswordLogon::Mismatch => {
                 self.undo_pending_stamp();
                 audit(
                     "unlock",
@@ -954,6 +917,56 @@ impl Authority {
         matches!(self.controller.state(), LockState::Locked { .. })
             || (self.controller.os_lock_unavailable()
                 && matches!(self.controller.state(), LockState::FailingClosed { .. }))
+    }
+
+    /// A correct password disarms only when [`Self::grant_allowed`] is true.
+    /// `OsLocked` and `StayOsLocked` are refused here, before `Verified` is
+    /// delivered, so the disconnect guard is not bypassed.
+    fn finish_verified_password(&mut self) -> ServiceToHost {
+        if !self.grant_allowed() {
+            self.undo_pending_stamp();
+            audit(
+                "unlock",
+                &[("method", "os_password"), ("result", "rejected")],
+            );
+            return self.password_prompt(false);
+        }
+        let kept = self.password_attempts.clone();
+        self.password_attempts.clear();
+        self.password_journal_block = None;
+        self.password_off = None;
+        if self.persist_password_attempts().is_err() {
+            self.password_attempts = kept;
+            audit(
+                "unlock",
+                &[
+                    ("method", "os_password"),
+                    ("result", "rejected"),
+                    ("reason", "journal"),
+                ],
+            );
+            return self.password_prompt(false);
+        }
+        let Some(stored) = self.launch.take() else {
+            audit(
+                "unlock",
+                &[("method", "os_password"), ("result", "rejected")],
+            );
+            return self.password_prompt(false);
+        };
+        let mut bytes = *stored.as_bytes();
+        self.controller.handle(Event::AdoptLaunchNonce {
+            nonce: LaunchNonce::from_bytes(bytes),
+        });
+        self.controller.handle(Event::Verified {
+            nonce: LaunchNonce::from_bytes(bytes),
+        });
+        bytes.zeroize();
+        self.backoff_deadline = None;
+        audit("unlock", &[("method", "os_password"), ("result", "ok")]);
+        self.controller.acknowledge_recovery();
+        self.host_ready = false;
+        ServiceToHost::Disarm
     }
 
     fn matches_launch(&self, presented: &LaunchNonce) -> bool {
@@ -1200,8 +1213,8 @@ pub fn stub_os_lock() -> bool {
 #[cfg(test)]
 mod host_ready_tests {
     use softlock_core::{
-        HostToService, LaunchNonce, LockSource, LockState, RequestKind, ResponseKind, Role,
-        StateName,
+        Event, HostToService, Journal, LaunchNonce, LockSource, LockState, RequestKind,
+        ResponseKind, Role, ServiceToHost, StateName,
     };
 
     use std::time::Instant;
@@ -1380,6 +1393,39 @@ mod host_ready_tests {
         );
         assert!(!wait.is_waiting(), "the arm slot stayed waiting");
         assert_eq!(action, HostAction::Respawn { arm: true });
+    }
+
+    #[test]
+    fn a_correct_password_while_os_locked_is_refused() {
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), true);
+        let mut journal = Journal::empty();
+        journal.mark_os_held();
+        authority.notify(Event::ServiceStarted {
+            journal,
+            session_active: false,
+        });
+        assert!(matches!(authority.state(), LockState::OsLocked { .. }));
+        assert!(!authority.grant_allowed());
+        authority
+            .password_attempts
+            .push(softlock_core::PasswordStamp {
+                tick: 1,
+                wall_ms: 1,
+            });
+        let reply = authority.finish_verified_password();
+        assert!(
+            !matches!(reply, ServiceToHost::Disarm),
+            "a correct password disarmed from OsLocked"
+        );
+        assert!(
+            matches!(authority.state(), LockState::OsLocked { .. }),
+            "OsLocked changed after a correct password"
+        );
+        assert!(
+            authority.password_attempts.is_empty(),
+            "the refused password kept a stamp"
+        );
+        assert!(!authority.returned_to_unlocked());
     }
 }
 
