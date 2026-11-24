@@ -3,6 +3,7 @@
 #![cfg(all(windows, feature = "simulated-physical"))]
 
 use std::fs;
+use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -204,7 +205,7 @@ impl Drop for Session {
         wait_child(&mut self.child, Duration::from_secs(5));
         let _ = Command::new("taskkill")
             .args(["/F", "/T", "/PID", &self.child.id().to_string()])
-            .output();
+            .output_bounded();
         // Quit while the OS lock is unavailable does not exit the host. The
         // test process must not leave it holding the runner's stdout pipe.
         stop_lock_hosts();
@@ -256,6 +257,65 @@ fn wait_child(child: &mut std::process::Child, limit: Duration) {
             Ok(None) if started.elapsed() < limit => thread::sleep(Duration::from_millis(50)),
             _ => return,
         }
+    }
+}
+
+trait BoundedOutput {
+    fn output_bounded(&mut self) -> std::io::Result<std::process::Output>;
+}
+
+impl BoundedOutput for Command {
+    fn output_bounded(&mut self) -> std::io::Result<std::process::Output> {
+        const LIMIT: Duration = Duration::from_secs(30);
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = self.spawn()?;
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(take_output(status, &mut child)),
+                Ok(None) if started.elapsed() < LIMIT => thread::sleep(Duration::from_millis(50)),
+                Ok(None) => {
+                    let _ = child.kill();
+                    let killed = Instant::now();
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => return Ok(take_output(status, &mut child)),
+                            Ok(None) if killed.elapsed() < Duration::from_secs(2) => {
+                                thread::sleep(Duration::from_millis(50));
+                            }
+                            _ => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "command timed out after 30s",
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+fn take_output(
+    status: std::process::ExitStatus,
+    child: &mut std::process::Child,
+) -> std::process::Output {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_end(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_end(&mut stderr);
+    }
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
     }
 }
 
@@ -702,7 +762,7 @@ fn kill_while_locked(stub: &str, stay_blocked: bool) {
     }
     let _ = Command::new("taskkill")
         .args(["/IM", "softlock-lockhost.exe", "/F"])
-        .output();
+        .output_bounded();
     let _ = fs::remove_file(&mark);
 }
 
@@ -797,7 +857,7 @@ fn impostor_case_system(case: &str, expect: &str, spawn_user_copy: bool) {
     let pid = service_pid(&name).expect("service pid");
     let _ = Command::new("taskkill.exe")
         .args(["/F", "/PID", &pid])
-        .output();
+        .output_bounded();
     assert!(
         wait_for(Duration::from_secs(8), || mark.is_file()),
         "Quit did not call the OS lock"
@@ -999,7 +1059,7 @@ fn service_stop_while_locked_keeps_input_blocked() {
     thread::spawn(move || {
         let _ = Command::new("sc.exe")
             .args(["stop", &name_for_stop])
-            .output();
+            .output_bounded();
     });
     let saw_stop = wait_for(Duration::from_secs(15), || {
         fs::read_to_string(&log)
@@ -1285,7 +1345,7 @@ impl Drop for PlantChild {
 fn service_names(service: &Path) -> (String, String) {
     let names = Command::new(service)
         .arg("--print-names")
-        .output()
+        .output_bounded()
         .expect("names");
     let text = String::from_utf8_lossy(&names.stdout);
     let name = text
@@ -1336,7 +1396,7 @@ fn install_service(
         .raw_arg("start= demand")
         .raw_arg("obj= LocalSystem")
         .raw_arg(format!("DisplayName= \"{display}\""))
-        .output()
+        .output_bounded()
         .expect("sc create");
     assert!(
         created.status.success(),
@@ -1352,7 +1412,7 @@ fn install_service(
     set_service_environment(name, &service_env);
     let started = Command::new("sc.exe")
         .args(["start", name])
-        .output()
+        .output_bounded()
         .expect("sc start");
     let body = wait_for_file(probe, Duration::from_secs(25));
     assert!(
@@ -1375,7 +1435,7 @@ fn set_service_environment(name: &str, env: &[String]) {
     );
     let wrote = Command::new("powershell.exe")
         .args(["-NoProfile", "-Command", &script])
-        .output()
+        .output_bounded()
         .expect("service environment");
     assert!(
         wrote.status.success(),
@@ -1389,17 +1449,17 @@ fn remove_service(name: &str) {
     if let Some(pid) = service_pid(name) {
         let _ = Command::new("taskkill.exe")
             .args(["/F", "/PID", &pid])
-            .output();
+            .output_bounded();
     }
-    let _ = Command::new("sc.exe").args(["stop", name]).output();
+    let _ = Command::new("sc.exe").args(["stop", name]).output_bounded();
     thread::sleep(Duration::from_millis(300));
-    let _ = Command::new("sc.exe").args(["delete", name]).output();
+    let _ = Command::new("sc.exe").args(["delete", name]).output_bounded();
 }
 
 fn service_pid(name: &str) -> Option<String> {
     let output = Command::new("sc.exe")
         .args(["queryex", name])
-        .output()
+        .output_bounded()
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines() {
@@ -1469,7 +1529,7 @@ fn lock_host_running() -> bool {
             "CSV",
             "/NH",
         ])
-        .output();
+        .output_bounded();
     output.is_ok_and(|output| {
         String::from_utf8_lossy(&output.stdout)
             .to_ascii_lowercase()
@@ -2018,14 +2078,14 @@ fn reclaim_data_dir(dir: &Path) {
     let text = dir.display().to_string();
     let _ = Command::new("takeown.exe")
         .args(["/F", &text, "/R", "/D", "Y"])
-        .output();
+        .output_bounded();
     let _ = Command::new("icacls.exe")
         .args([&text, "/grant", "*S-1-1-0:(OI)(CI)F", "/T"])
-        .output();
+        .output_bounded();
     if is_reparse_point(dir).ok() == Some(true) {
         let _ = Command::new("cmd.exe")
             .args(["/C", "rmdir", &text])
-            .output();
+            .output_bounded();
     } else {
         let _ = fs::remove_dir_all(dir);
     }
@@ -2049,10 +2109,10 @@ impl StandardAccount {
         let password = format!("Aa1!QkzzMm9{}", std::process::id() % 97);
         let _ = Command::new("net.exe")
             .args(["user", &name, "/delete"])
-            .output();
+            .output_bounded();
         let added = Command::new("net.exe")
             .args(["user", &name, &password, "/add"])
-            .output()
+            .output_bounded()
             .expect("net user");
         assert!(
             added.status.success(),
@@ -2068,7 +2128,7 @@ impl Drop for StandardAccount {
     fn drop(&mut self) {
         let _ = Command::new("net.exe")
             .args(["user", &self.name, "/delete"])
-            .output();
+            .output_bounded();
     }
 }
 
@@ -2178,7 +2238,7 @@ fn grant_users_modify(path: &Path) {
     let text = path.display().to_string();
     let _ = Command::new("icacls.exe")
         .args([&text, "/grant", "*S-1-1-0:(OI)(CI)M"])
-        .output();
+        .output_bounded();
 }
 
 fn plant_job_from_args() -> Option<PlantJob> {

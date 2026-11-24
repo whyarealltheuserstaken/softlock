@@ -1136,11 +1136,11 @@ fn recover_active(guard: &mut Guard) -> Result<(), String> {
     });
     if saw_unlocked {
         let _ = boot.kill();
-        let _ = boot.wait();
+        wait_child(&mut boot, Duration::from_secs(5));
         return Err("an active lock returned to Unlocked".to_string());
     }
     let _ = boot.kill();
-    let _ = boot.wait();
+    wait_child(&mut boot, Duration::from_secs(5));
     let value = query_taskmgr();
     if !closed || (value != "1" && value != "0") {
         return Err(format!(
@@ -2036,6 +2036,17 @@ fn finish_command(
                 return Err(format!("{what} timed out after {}s", limit.as_secs()));
             }
             Err(error) => return Err(format!("{what} wait failed: {error}")),
+        }
+    }
+}
+
+fn wait_child(child: &mut std::process::Child, limit: Duration) {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if started.elapsed() < limit => thread::sleep(Duration::from_millis(50)),
+            _ => return,
         }
     }
 }
