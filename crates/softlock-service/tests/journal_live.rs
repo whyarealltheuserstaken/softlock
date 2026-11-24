@@ -477,10 +477,10 @@ fn session_aligned() -> bool {
     });
     // `WTSQuerySessionInformationW` sits inside `wait_until`. A blocked query
     // would never come back to the 20s deadline. One query in flight is enough.
-    match receiver.recv_timeout(Duration::from_secs(2)) {
-        Ok(aligned) => aligned,
-        Err(_) => false,
-    }
+    let aligned: bool = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_default();
+    aligned
 }
 
 #[cfg(feature = "live-fail-closed")]
