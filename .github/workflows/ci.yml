@@ -121,6 +121,17 @@ jobs:
             grep -F "the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut ... ok" target/live-hooks-service.txt
             grep -F "an_unlock_from_an_absent_logon_stays_os_locked ... ok" target/live-hooks-service.txt
             grep -F "the_same_logon_on_the_console_clears_os_locked ... ok" target/live-hooks-service.txt
+            cargo test --locked -p softlock-service --features simulated-physical,live-fail-closed --lib \
+              -- file_clock_returns_none_when_the_runner_may_not_lock \
+                 overridden_account_returns_none_when_the_runner_may_not_lock \
+                 password_attempts_round_trip_an_owner_returned_boot \
+                 password_attempts_round_trip_a_keep_os_lock_revert \
+                 --test-threads=1 \
+              2>&1 | tee target/password-gates.txt
+            grep -F "file_clock_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "overridden_account_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_an_owner_returned_boot ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_a_keep_os_lock_revert ... ok" target/password-gates.txt
           fi
       - name: test-support stays out of product builds
         shell: bash
@@ -251,6 +262,17 @@ jobs:
             grep -F "the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut ... ok" target/live-hooks-service.txt
             grep -F "an_unlock_from_an_absent_logon_stays_os_locked ... ok" target/live-hooks-service.txt
             grep -F "the_same_logon_on_the_console_clears_os_locked ... ok" target/live-hooks-service.txt
+            cargo test --locked -p softlock-service --features simulated-physical,live-fail-closed --lib \
+              -- file_clock_returns_none_when_the_runner_may_not_lock \
+                 overridden_account_returns_none_when_the_runner_may_not_lock \
+                 password_attempts_round_trip_an_owner_returned_boot \
+                 password_attempts_round_trip_a_keep_os_lock_revert \
+                 --test-threads=1 \
+              2>&1 | tee target/password-gates.txt
+            grep -F "file_clock_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "overridden_account_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_an_owner_returned_boot ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_a_keep_os_lock_revert ... ok" target/password-gates.txt
           fi
       - name: test-support stays out of product builds
         shell: bash
@@ -405,6 +427,17 @@ jobs:
             grep -F "the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut ... ok" target/live-hooks-service.txt
             grep -F "an_unlock_from_an_absent_logon_stays_os_locked ... ok" target/live-hooks-service.txt
             grep -F "the_same_logon_on_the_console_clears_os_locked ... ok" target/live-hooks-service.txt
+            cargo test --locked -p softlock-service --features simulated-physical,live-fail-closed --lib \
+              -- file_clock_returns_none_when_the_runner_may_not_lock \
+                 overridden_account_returns_none_when_the_runner_may_not_lock \
+                 password_attempts_round_trip_an_owner_returned_boot \
+                 password_attempts_round_trip_a_keep_os_lock_revert \
+                 --test-threads=1 \
+              2>&1 | tee target/password-gates.txt
+            grep -F "file_clock_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "overridden_account_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_an_owner_returned_boot ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_a_keep_os_lock_revert ... ok" target/password-gates.txt
           fi
       - name: test-support stays out of product builds
         shell: bash
@@ -647,6 +680,7 @@ jobs:
           grep -F "a_stale_base_revision_returns_conflict ... ok" target/seam2-service.txt
           grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam2-service.txt
           grep -F "get_config_and_validate_config_work_for_lock_client ... ok" target/seam2-service.txt
+          grep -F "os_locked_password_writes_no_stamp_and_does_not_log_on ... ok" target/seam2-service.txt
           cargo build --locked -p softlock-service -p softlock-lockhost \
             --features softlock-service/simulated-physical,softlock-lockhost/simulated-physical \
             --target x86_64-pc-windows-msvc

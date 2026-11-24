@@ -214,6 +214,67 @@ fn overridden_account() -> Option<Result<Identity, ()>> {
     }))
 }
 
+#[cfg(all(test, feature = "simulated-physical"))]
+mod gate_tests {
+    use std::sync::Mutex;
+
+    use super::overridden_account;
+
+    static ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn overridden_account_returns_none_when_the_runner_may_not_lock() {
+        let _guard = ENV.lock().unwrap_or_else(|poison| poison.into_inner());
+        let user = std::env::var("SOFTLOCK_SESSION_USER").ok();
+        let domain = std::env::var("SOFTLOCK_SESSION_DOMAIN").ok();
+        let actions = std::env::var("GITHUB_ACTIONS").ok();
+        let runner = std::env::var("RUNNER_ENVIRONMENT").ok();
+        struct Restore {
+            user: Option<String>,
+            domain: Option<String>,
+            actions: Option<String>,
+            runner: Option<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                restore("SOFTLOCK_SESSION_USER", &self.user);
+                restore("SOFTLOCK_SESSION_DOMAIN", &self.domain);
+                restore("GITHUB_ACTIONS", &self.actions);
+                restore("RUNNER_ENVIRONMENT", &self.runner);
+            }
+        }
+        let _restore = Restore {
+            user,
+            domain,
+            actions,
+            runner,
+        };
+        unsafe {
+            std::env::set_var("SOFTLOCK_SESSION_USER", "softlock-gate-shut");
+            std::env::set_var("SOFTLOCK_SESSION_DOMAIN", ".");
+            std::env::remove_var("GITHUB_ACTIONS");
+            std::env::remove_var("RUNNER_ENVIRONMENT");
+        }
+        assert!(
+            softlock_windows::runner_may_lock().is_err(),
+            "the runner gate stayed open"
+        );
+        assert!(
+            overridden_account().is_none(),
+            "SOFTLOCK_SESSION_USER was used while the runner gate was shut"
+        );
+    }
+
+    fn restore(name: &str, value: &Option<String>) {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 fn network_logon_matches(
     user: &Wide,
     domain: &Wide,

@@ -8,7 +8,7 @@
 //! Unlocked.
 
 use std::path::{Path, PathBuf};
-
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
@@ -22,6 +22,11 @@ use softlock_core::{
 
 use crate::log::{audit, source_name};
 use crate::platform::{ARM_READY_LIMIT, ArmWait, ServicePlatform};
+
+#[cfg(test)]
+pub(crate) static PASSWORD_LOGON_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static LOCKOUT_POLICY_READS: AtomicUsize = AtomicUsize::new(0);
 
 fn password_path_off(code: u32) -> bool {
     // 1909 locked out, 1330 password expired, 1907 must change, 1385 logon
@@ -725,11 +730,15 @@ impl Authority {
         let outcome = {
             #[cfg(windows)]
             {
+                #[cfg(test)]
+                PASSWORD_LOGON_CALLS.fetch_add(1, Ordering::SeqCst);
                 crate::password::verify_session_password(&secret)
             }
             #[cfg(not(windows))]
             {
                 let _ = &secret;
+                #[cfg(test)]
+                PASSWORD_LOGON_CALLS.fetch_add(1, Ordering::SeqCst);
                 PasswordLogon::Failed(1326)
             }
         };
@@ -809,6 +818,8 @@ impl Authority {
     }
 
     fn lockout_policy(&self) -> softlock_core::LockoutPolicy {
+        #[cfg(test)]
+        LOCKOUT_POLICY_READS.fetch_add(1, Ordering::SeqCst);
         #[cfg(windows)]
         {
             crate::password::read_lockout_policy()
@@ -1214,9 +1225,10 @@ pub fn stub_os_lock() -> bool {
 mod host_ready_tests {
     use softlock_core::{
         Event, HostToService, Journal, LaunchNonce, LockSource, LockState, RequestKind,
-        ResponseKind, Role, ServiceToHost, StateName,
+        ResponseKind, Role, Secret, ServiceToHost, StateName,
     };
 
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     use super::{Authority, HostAction, HostLoss};
@@ -1426,6 +1438,47 @@ mod host_ready_tests {
             "the refused password kept a stamp"
         );
         assert!(!authority.returned_to_unlocked());
+    }
+
+    #[test]
+    fn os_locked_password_writes_no_stamp_and_does_not_log_on() {
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), true);
+        let mut journal = Journal::empty();
+        journal.mark_os_held();
+        authority.notify(Event::ServiceStarted {
+            journal,
+            session_active: false,
+        });
+        assert!(matches!(authority.state(), LockState::OsLocked { .. }));
+        let logons = super::PASSWORD_LOGON_CALLS.load(Ordering::SeqCst);
+        let reads = super::LOCKOUT_POLICY_READS.load(Ordering::SeqCst);
+        let reply = authority.decide_password(Secret::new(b"correct-horse"));
+        assert!(
+            matches!(
+                reply,
+                ServiceToHost::PromptResult {
+                    accepted: false,
+                    password_path: true,
+                    ..
+                }
+            ),
+            "an OsLocked password was not refused at the prompt"
+        );
+        assert!(
+            authority.password_attempts.is_empty(),
+            "OsLocked wrote a password stamp"
+        );
+        assert_eq!(
+            super::PASSWORD_LOGON_CALLS.load(Ordering::SeqCst),
+            logons,
+            "OsLocked called LogonUser"
+        );
+        assert_eq!(
+            super::LOCKOUT_POLICY_READS.load(Ordering::SeqCst),
+            reads,
+            "OsLocked read the lockout policy"
+        );
+        assert!(matches!(authority.state(), LockState::OsLocked { .. }));
     }
 }
 

@@ -1086,3 +1086,117 @@ mod path_and_menu {
         assert!(reparse_file.is_err(), "a symlink command was rewritten");
     }
 }
+
+#[cfg(all(test, feature = "simulated-physical", feature = "live-fail-closed"))]
+mod password_journal {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use softlock_core::{LockIdentity, PasswordStamp, SettingsJournal, parse_document};
+
+    use super::{Boot, SettingsEngine};
+    use crate::journal_store::{load_journal, save_journal};
+    use crate::taskmgr::{clear_forced_console, force_console_for_test};
+
+    fn with_journal(test: impl FnOnce()) {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sl-pw-journal-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("journal dir");
+        let previous = std::env::var("SOFTLOCK_JOURNAL_DIR").ok();
+        struct Restore {
+            dir: std::path::PathBuf,
+            previous: Option<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                clear_forced_console();
+                unsafe {
+                    match &self.previous {
+                        Some(value) => std::env::set_var("SOFTLOCK_JOURNAL_DIR", value),
+                        None => std::env::remove_var("SOFTLOCK_JOURNAL_DIR"),
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+        let _restore = Restore {
+            dir: dir.clone(),
+            previous,
+        };
+        unsafe { std::env::set_var("SOFTLOCK_JOURNAL_DIR", &dir) };
+        assert!(
+            crate::authority::test_path("SOFTLOCK_JOURNAL_DIR").is_some(),
+            "the journal override is refused"
+        );
+        super::fail_open_for_test(false);
+        force_console_for_test(true, 0x1001);
+        test();
+    }
+
+    fn stamp() -> PasswordStamp {
+        PasswordStamp {
+            tick: 90_000,
+            wall_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn held_with(stamp: PasswordStamp) -> SettingsJournal {
+        let mut held = SettingsJournal::os_held_keeping_password(
+            &SettingsJournal::keeping_password_attempts(std::slice::from_ref(&stamp)),
+        );
+        held.sid = "S-1-5-21-1-2-3-1001".to_string();
+        held.lock = Some(LockIdentity {
+            boot: 1,
+            session: 1,
+            logon: 0x1001,
+        });
+        held
+    }
+
+    #[test]
+    fn password_attempts_round_trip_an_owner_returned_boot() {
+        with_journal(|| {
+            let stamp = stamp();
+            let held = held_with(stamp);
+            let bytes = softlock_core::encode_document(&held).expect("encode");
+            save_journal(&bytes).expect("save");
+            let mut engine = SettingsEngine::open().expect("engine");
+            let boot = engine.boot().expect("boot");
+            assert!(
+                matches!(boot, Boot::Idle),
+                "OwnerReturned did not clear the hold"
+            );
+            assert_eq!(engine.password_attempts(), vec![stamp]);
+            let text = load_journal().expect("load").expect("file");
+            let parsed = parse_document(text.as_bytes()).expect("parse");
+            assert_eq!(parsed.password_attempts, vec![stamp]);
+            assert!(!parsed.os_confirmed);
+            assert!(parsed.entries().is_empty());
+        });
+    }
+
+    #[test]
+    fn password_attempts_round_trip_a_keep_os_lock_revert() {
+        with_journal(|| {
+            let stamp = stamp();
+            let source = held_with(stamp);
+            let mut engine = SettingsEngine::open().expect("engine");
+            engine.keep_os_lock_after_revert(true);
+            engine.revert_document(&source).expect("revert");
+            let text = load_journal().expect("load").expect("file");
+            let parsed = parse_document(text.as_bytes()).expect("parse");
+            assert_eq!(parsed.password_attempts, vec![stamp]);
+            assert!(parsed.os_confirmed);
+            assert_eq!(parsed.sid, source.sid);
+            assert_eq!(parsed.lock, source.lock);
+            assert!(parsed.entries().is_empty());
+            let mut again = SettingsEngine::open().expect("engine");
+            let _boot = again.boot().expect("boot");
+            assert_eq!(again.password_attempts(), vec![stamp]);
+            let after = load_journal().expect("load").expect("file");
+            let parsed = parse_document(after.as_bytes()).expect("parse");
+            assert_eq!(parsed.password_attempts, vec![stamp]);
+        });
+    }
+}

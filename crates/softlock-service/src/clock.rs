@@ -28,6 +28,69 @@ fn file_clock() -> Option<ClockSample> {
     Some(ClockSample { tick, wall_ms })
 }
 
+#[cfg(all(test, windows, feature = "simulated-physical"))]
+mod gate_tests {
+    use std::sync::Mutex;
+
+    use super::file_clock;
+
+    static ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn file_clock_returns_none_when_the_runner_may_not_lock() {
+        let _guard = ENV.lock().unwrap_or_else(|poison| poison.into_inner());
+        let dir = std::env::temp_dir().join(format!("sl-clock-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("clock");
+        std::fs::write(&path, "5000 6000").expect("clock file");
+        let clock = std::env::var("SOFTLOCK_CLOCK_FILE").ok();
+        let actions = std::env::var("GITHUB_ACTIONS").ok();
+        let runner = std::env::var("RUNNER_ENVIRONMENT").ok();
+        struct Restore {
+            clock: Option<String>,
+            actions: Option<String>,
+            runner: Option<String>,
+            path: std::path::PathBuf,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                restore("SOFTLOCK_CLOCK_FILE", &self.clock);
+                restore("GITHUB_ACTIONS", &self.actions);
+                restore("RUNNER_ENVIRONMENT", &self.runner);
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+        let _restore = Restore {
+            clock,
+            actions,
+            runner,
+            path: path.clone(),
+        };
+        unsafe {
+            std::env::set_var("SOFTLOCK_CLOCK_FILE", &path);
+            std::env::remove_var("GITHUB_ACTIONS");
+            std::env::remove_var("RUNNER_ENVIRONMENT");
+        }
+        assert!(
+            softlock_windows::runner_may_lock().is_err(),
+            "the runner gate stayed open"
+        );
+        assert!(
+            file_clock().is_none(),
+            "SOFTLOCK_CLOCK_FILE was read while the runner gate was shut"
+        );
+    }
+
+    fn restore(name: &str, value: &Option<String>) {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 fn real_clock() -> ClockSample {
     let wall_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
