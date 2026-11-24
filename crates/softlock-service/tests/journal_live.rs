@@ -2117,7 +2117,7 @@ fn read_pipe_until(file: &std::fs::File, buf: &mut [u8], deadline: Instant) -> R
     while offset < buf.len() {
         let mut available = 0u32;
         unsafe {
-            windows::Win32::Storage::FileSystem::PeekNamedPipe(
+            windows::Win32::System::Pipes::PeekNamedPipe(
                 handle,
                 None,
                 0,

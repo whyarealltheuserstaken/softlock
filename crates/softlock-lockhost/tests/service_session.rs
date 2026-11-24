@@ -20,7 +20,7 @@ use softlock_service::{
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING, PeekNamedPipe, ReadFile, WriteFile,
+    FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows::core::PCWSTR;
 
@@ -409,7 +409,16 @@ fn read_until(handle: HANDLE, buf: &mut [u8], deadline: Instant) -> Result<(), S
     let mut offset = 0;
     while offset < buf.len() {
         let mut available = 0u32;
-        unsafe { PeekNamedPipe(handle, None, 0, None, Some(&mut available), None) }
+        unsafe {
+            windows::Win32::System::Pipes::PeekNamedPipe(
+                handle,
+                None,
+                0,
+                None,
+                Some(&mut available),
+                None,
+            )
+        }
             .map_err(|error| format!("read: {error}"))?;
         if available == 0 {
             if Instant::now() >= deadline {
