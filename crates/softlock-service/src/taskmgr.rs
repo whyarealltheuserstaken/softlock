@@ -540,30 +540,30 @@ fn token_sid(token: HANDLE) -> Result<String, &'static str> {
 /// The seam test names the console logon. `WTSQueryUserToken` is
 /// LocalSystem-only, so a unit test cannot read it. The override is
 /// compiled out of the service binary.
-#[cfg(test)]
+#[cfg(all(test, feature = "live-fail-closed"))]
 struct ForcedConsole {
     active: bool,
     logon: u64,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "live-fail-closed"))]
 static FORCED_CONSOLE: std::sync::Mutex<Option<ForcedConsole>> = std::sync::Mutex::new(None);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "live-fail-closed"))]
 pub(crate) fn force_console_for_test(active: bool, logon: u64) {
     *FORCED_CONSOLE
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = Some(ForcedConsole { active, logon });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "live-fail-closed"))]
 pub(crate) fn clear_forced_console() {
     *FORCED_CONSOLE
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = None;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "live-fail-closed"))]
 fn forced_console() -> Option<(bool, u64)> {
     FORCED_CONSOLE
         .lock()
@@ -573,7 +573,7 @@ fn forced_console() -> Option<(bool, u64)> {
 }
 
 pub fn console_is_active() -> Result<bool, &'static str> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "live-fail-closed"))]
     if let Some((active, _)) = forced_console() {
         return Ok(active);
     }
@@ -682,7 +682,7 @@ fn session_listed(session: u32) -> Result<bool, ()> {
 }
 
 pub(crate) fn logon_luid(session: u32) -> Result<u64, ()> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "live-fail-closed"))]
     if let Some((_, logon)) = forced_console() {
         return if session == u32::MAX || logon == 0 {
             Err(())

@@ -1435,7 +1435,6 @@ fn install_service(
 ) -> String {
     let _ = fs::remove_file(probe);
     remove_service(name);
-    thread::sleep(Duration::from_millis(200));
     // sc.exe takes everything after the binPath value as its own options.
     // The exe and `--scm` have to be one quoted ImagePath, or `--scm` is
     // parsed as an sc option and create prints its usage.
@@ -1507,10 +1506,28 @@ fn remove_service(name: &str) {
             .output_bounded();
     }
     let _ = Command::new("sc.exe").args(["stop", name]).output_bounded();
-    thread::sleep(Duration::from_millis(300));
     let _ = Command::new("sc.exe")
         .args(["delete", name])
         .output_bounded();
+    wait_until_service_gone(name);
+}
+
+/// `sc delete` marks the key for deletion. `sc create` then fails with
+/// 1072 until the SCM actually drops it. Wait until `sc query` returns
+/// 1060 (the service does not exist).
+fn wait_until_service_gone(name: &str) {
+    const LIMIT: Duration = Duration::from_secs(30);
+    let gone = wait_for(LIMIT, || {
+        let queried = Command::new("sc.exe")
+            .args(["query", name])
+            .output_bounded()
+            .expect("sc query");
+        queried.status.code() == Some(1060)
+    });
+    assert!(
+        gone,
+        "sc delete {name} did not finish in {LIMIT:?}; sc query never returned 1060"
+    );
 }
 
 fn service_pid(name: &str) -> Option<String> {
