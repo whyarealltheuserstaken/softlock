@@ -419,7 +419,7 @@ fn read_until(handle: HANDLE, buf: &mut [u8], deadline: Instant) -> Result<(), S
                 None,
             )
         }
-            .map_err(|error| format!("read: {error}"))?;
+        .map_err(|error| format!("read: {error}"))?;
         if available == 0 {
             if Instant::now() >= deadline {
                 return Err("timed out waiting for the service to answer".to_string());
