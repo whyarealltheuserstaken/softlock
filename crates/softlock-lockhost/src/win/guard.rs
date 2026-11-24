@@ -215,7 +215,11 @@ fn maybe_type_test_pin() {
     // The journal sign-in case drops this file once the second lock is up.
     // SendInput from the test process does not reach this hook. This thread
     // already injects the liveness key, and the hook sees that, so the PIN
-    // is injected from here too. A release build does not compile this.
+    // is injected from here too. A release build does not compile this, and
+    // a live-fail-closed build still refuses it unless the runner gate passes.
+    if !crate::classify::runner_gate() {
+        return;
+    }
     let Ok(path) = std::env::var("SOFTLOCK_TYPE_PIN") else {
         return;
     };
@@ -623,4 +627,23 @@ pub(crate) fn session_ptr() -> Option<&'static Shared> {
 fn module_instance() -> HINSTANCE {
     let module = unsafe { GetModuleHandleW(PCWSTR::null()) }.unwrap_or(HMODULE::default());
     HINSTANCE(module.0)
+}
+
+#[cfg(all(test, feature = "live-fail-closed"))]
+mod pin_hook {
+    #[test]
+    fn the_test_pin_is_not_typed_when_the_runner_gate_is_shut() {
+        let path = std::env::temp_dir().join(format!("sl-type-pin-{}", std::process::id()));
+        std::fs::write(&path, b"1").expect("pin file");
+        unsafe { std::env::set_var("SOFTLOCK_TYPE_PIN", &path) };
+        crate::classify::deny_test_hooks(true);
+        super::maybe_type_test_pin();
+        crate::classify::deny_test_hooks(false);
+        assert!(
+            path.is_file(),
+            "the liveness thread typed the PIN with the runner gate shut"
+        );
+        let _ = std::fs::remove_file(&path);
+        unsafe { std::env::remove_var("SOFTLOCK_TYPE_PIN") };
+    }
 }

@@ -1232,9 +1232,20 @@ fn owner_layout() -> windows::Win32::UI::Input::KeyboardAndMouse::HKL {
 }
 
 #[cfg(feature = "live-fail-closed")]
+fn arm_present_physical_arg(requested: bool) {
+    if requested && crate::classify::runner_gate() {
+        crate::classify::arm_present_physical();
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
 fn note_test_pin(len: usize) {
     // The journal sign-in case sets this path. The length is not the secret.
-    // A release build does not compile this.
+    // A release build does not compile this. The runner gate is required
+    // even in a live-fail-closed build.
+    if !crate::classify::runner_gate() {
+        return;
+    }
     let Ok(path) = std::env::var("SOFTLOCK_TYPE_PIN") else {
         return;
     };
@@ -1322,9 +1333,7 @@ pub fn run_service_host() -> i32 {
     // physical. A release build does not accept the argument. The PIN itself
     // is injected by the liveness thread, which is the thread the hook sees.
     #[cfg(feature = "live-fail-closed")]
-    if std::env::args().any(|arg| arg == "--present-physical") {
-        crate::classify::arm_present_physical();
-    }
+    arm_present_physical_arg(std::env::args().any(|arg| arg == "--present-physical"));
 
     let mut read_handle = None;
     let mut write_handle = None;
@@ -1553,5 +1562,31 @@ mod quit_thread {
             let result = super::failclosed::wait_for_os_lock_signal(take_quit_os_lock);
             assert_eq!(result, RealLock::Unavailable);
         });
+    }
+}
+
+#[cfg(all(test, feature = "live-fail-closed"))]
+mod present_hook {
+    use crate::classify::{HookInput, InputClass, classify};
+
+    #[test]
+    fn present_physical_and_the_pin_note_stay_off_when_the_runner_gate_is_shut() {
+        let path = std::env::temp_dir().join(format!("sl-note-pin-{}", std::process::id()));
+        let _ = std::fs::remove_file(path.with_extension("result"));
+        unsafe { std::env::set_var("SOFTLOCK_TYPE_PIN", &path) };
+        crate::classify::deny_test_hooks(true);
+        super::arm_present_physical_arg(true);
+        super::note_test_pin(6);
+        let class = classify(HookInput {
+            injected: true,
+            extra_info: 0x5048_5953_5049_4E31,
+        });
+        crate::classify::deny_test_hooks(false);
+        unsafe { std::env::remove_var("SOFTLOCK_TYPE_PIN") };
+        assert_eq!(class, InputClass::Injected);
+        assert!(
+            !path.with_extension("result").exists(),
+            "the PIN length was written with the runner gate shut"
+        );
     }
 }
