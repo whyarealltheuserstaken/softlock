@@ -304,14 +304,25 @@ fn take_output(
     status: std::process::ExitStatus,
     child: &mut std::process::Child,
 ) -> std::process::Output {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_end(&mut stdout);
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_end(&mut stderr);
-    }
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            let _ = pipe.read_to_end(&mut stdout);
+        }
+        if let Some(mut pipe) = stderr_pipe.take() {
+            let _ = pipe.read_to_end(&mut stderr);
+        }
+        let _ = sender.send((stdout, stderr));
+    });
+    // A grandchild that inherited the pipe keeps `read_to_end` blocked after
+    // the process itself has already exited.
+    let (stdout, stderr) = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_default();
     std::process::Output {
         status,
         stdout,
@@ -418,6 +429,19 @@ fn open_pipe_blocking(name: &str) -> Result<HANDLE, String> {
 }
 
 fn write_all(handle: HANDLE, bytes: &[u8]) -> Result<(), String> {
+    let bytes = bytes.to_vec();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(write_blocking(handle, &bytes));
+    });
+    // A server that never reads fills the pipe and `WriteFile` does not return.
+    match receiver.recv_timeout(Duration::from_secs(15)) {
+        Ok(result) => result,
+        Err(_) => Err("timed out writing to the service".to_string()),
+    }
+}
+
+fn write_blocking(handle: HANDLE, bytes: &[u8]) -> Result<(), String> {
     let mut offset = 0;
     while offset < bytes.len() {
         let mut wrote = 0u32;

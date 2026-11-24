@@ -2075,8 +2075,18 @@ fn transact(pipe: &str, json: &str) -> Result<String, String> {
     frame.extend_from_slice(json.as_bytes());
     let handle = open_pipe_timed(pipe)?;
     let mut file = unsafe { std::fs::File::from_raw_handle(handle.0) };
-    file.write_all(&frame)
-        .map_err(|error| format!("write: {error}"))?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let result = file
+            .write_all(&frame)
+            .map_err(|error| format!("write: {error}"));
+        let _ = sender.send((file, result));
+    });
+    // A server that never reads fills the pipe and `write_all` does not return.
+    let (file, wrote) = receiver
+        .recv_timeout(Duration::from_secs(15))
+        .map_err(|_| "timed out writing to the service".to_string())?;
+    wrote?;
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut prefix = [0u8; 4];
     read_pipe_until(&file, &mut prefix, deadline)?;
