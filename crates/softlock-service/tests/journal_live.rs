@@ -293,24 +293,23 @@ fn align_console() -> Result<(), String> {
     );
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "sl-align", "/F"])
-        .status();
+        .status_within(Duration::from_secs(30), "command");
     let created = Command::new("schtasks")
         .args([
             "/Create", "/TN", "sl-align", "/TR", &bin, "/SC", "ONCE", "/ST", "00:00", "/RU",
             "SYSTEM", "/RL", "HIGHEST", "/F",
         ])
-        .status()
-        .map_err(|_| "align task".to_string())?;
+        .status_within(Duration::from_secs(30), "command")?;
     if !created.success() {
         return Err("align task was not created".to_string());
     }
     let _ = Command::new("schtasks")
         .args(["/Run", "/TN", "sl-align"])
-        .status();
+        .status_within(Duration::from_secs(30), "schtasks /Run")?;
     let aligned = wait_until(Duration::from_secs(20), session_aligned);
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "sl-align", "/F"])
-        .status();
+        .status_within(Duration::from_secs(30), "command");
     if aligned {
         Ok(())
     } else {
@@ -393,21 +392,19 @@ public class SoftlockAcl {{
     );
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "sl-dacl", "/F"])
-        .status();
+        .status_within(Duration::from_secs(30), "command");
     let created = Command::new("schtasks")
         .args([
             "/Create", "/TN", "sl-dacl", "/TR", &bin, "/SC", "ONCE", "/ST", "00:00", "/RU",
             "SYSTEM", "/RL", "HIGHEST", "/F",
         ])
-        .status()
-        .map_err(|_| "dacl task".to_string())?;
+        .status_within(Duration::from_secs(30), "command")?;
     if !created.success() {
         return Err("dacl task was not created".to_string());
     }
     let started = Command::new("schtasks")
         .args(["/Run", "/TN", "sl-dacl"])
-        .status()
-        .map_err(|_| "dacl task".to_string())?;
+        .status_within(Duration::from_secs(30), "command")?;
     let recorded = started.success()
         && wait_until(Duration::from_secs(15), || {
             fs::read_to_string(&log)
@@ -416,7 +413,7 @@ public class SoftlockAcl {{
         });
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "sl-dacl", "/F"])
-        .status();
+        .status_within(Duration::from_secs(30), "command");
     let note = fs::read_to_string(&log).unwrap_or_default();
     // The locked DACL still says FA for SYSTEM. A restored file has no FR ACE.
     let granted = note.lines().any(|line| {
@@ -433,7 +430,7 @@ public class SoftlockAcl {{
 }
 
 #[cfg(feature = "live-fail-closed")]
-fn session_aligned() -> bool {
+fn query_session_aligned() -> bool {
     use windows::Win32::System::RemoteDesktop::{
         ProcessIdToSessionId, WTSActive, WTSConnectState, WTSFreeMemory,
         WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW,
@@ -462,6 +459,27 @@ fn session_aligned() -> bool {
         let state = *buffer.0.cast::<u32>();
         WTSFreeMemory(buffer.0.cast());
         state == WTSActive.0 as u32
+    }
+}
+
+#[cfg(feature = "live-fail-closed")]
+fn session_aligned() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let aligned = query_session_aligned();
+        let _ = sender.send(aligned);
+        BUSY.store(false, Ordering::Release);
+    });
+    // `WTSQuerySessionInformationW` sits inside `wait_until`. A blocked query
+    // would never come back to the 20s deadline. One query in flight is enough.
+    match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(aligned) => aligned,
+        Err(_) => false,
     }
 }
 
@@ -506,11 +524,15 @@ fn force_remove(path: &Path) {
     let text = path.display().to_string();
     let _ = fs::remove_file(path);
     if path.exists() {
-        let _ = Command::new("takeown").args(["/f", &text, "/a"]).status();
-        let _ = Command::new("icacls").args([&text, "/reset"]).status();
+        let _ = Command::new("takeown")
+            .args(["/f", &text, "/a"])
+            .status_within(Duration::from_secs(30), "command");
+        let _ = Command::new("icacls")
+            .args([&text, "/reset"])
+            .status_within(Duration::from_secs(30), "command");
         let _ = Command::new("icacls")
             .args([&text, "/grant", "Everyone:F"])
-            .status();
+            .status_within(Duration::from_secs(30), "command");
         let _ = fs::remove_file(path);
     }
 }
@@ -541,8 +563,7 @@ fn explicit_user_dacl(dacl: &str, sid: &str) -> bool {
 fn console_user_sid() -> Result<String, String> {
     let output = Command::new("whoami")
         .args(["/user", "/fo", "csv", "/nh"])
-        .output()
-        .map_err(|_| "whoami".to_string())?;
+        .output_within(Duration::from_secs(30), "whoami")?;
     let text = String::from_utf8_lossy(&output.stdout);
     let sid = text
         .split(',')
@@ -755,8 +776,7 @@ impl Drop for ClockRestore {
 fn powershell(script: &str) -> Result<String, String> {
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .map_err(|_| "powershell".to_string())?;
+        .output_within(Duration::from_secs(30), "powershell")?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
@@ -778,7 +798,7 @@ fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
     }
     let _ = Command::new("reg")
         .args(["delete", KEY, "/v", "DisableTaskMgr", "/f"])
-        .status();
+        .status_within(Duration::from_secs(30), "command");
     if !wait_until(Duration::from_secs(8), || query_taskmgr() == "1") {
         return Err("cleared DisableTaskMgr was not re-asserted within 5 s".to_string());
     }
@@ -854,7 +874,7 @@ fn sign_in_then_the_next_lock_unlocks(guard: &mut Guard) -> Result<(), String> {
     let baseline = log_baseline();
     let _ = Command::new("taskkill")
         .args(["/F", "/IM", "softlock-lockhost.exe"])
-        .status();
+        .status_within(Duration::from_secs(30), "command");
     let held = wait_until(Duration::from_secs(25), || {
         session_os_held()
             || (status_state(&transact(&pipe_name(), status_body()).unwrap_or_default()).as_deref()
@@ -978,7 +998,7 @@ public class SoftlockPin {{
     let note = fs::read_to_string(&log).unwrap_or_default();
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "sl-pin", "/F"])
-        .status();
+        .status_within(Duration::from_secs(30), "command");
     if note.trim() == "ok" {
         Ok(())
     } else {
@@ -1002,20 +1022,19 @@ fn run_system_task(name: &str, script: &Path) -> Result<(), String> {
     );
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", name, "/F"])
-        .status();
+        .status_within(Duration::from_secs(30), "command");
     let created = Command::new("schtasks")
         .args([
             "/Create", "/TN", name, "/TR", &bin, "/SC", "ONCE", "/ST", "00:00", "/RU", "SYSTEM",
             "/RL", "HIGHEST", "/F",
         ])
-        .status()
-        .map_err(|_| "task".to_string())?;
+        .status_within(Duration::from_secs(30), "command")?;
     if !created.success() {
         return Err(format!("{name} was not created"));
     }
     let _ = Command::new("schtasks")
         .args(["/Run", "/TN", name])
-        .status();
+        .status_within(Duration::from_secs(30), "schtasks /Run")?;
     Ok(())
 }
 
@@ -1188,9 +1207,11 @@ impl Drop for Guard {
     fn drop(&mut self) {
         let _ = Command::new("taskkill")
             .args(["/F", "/IM", "softlock-lockhost.exe"])
-            .status();
+            .status_within(Duration::from_secs(30), "command");
         kill_service_process();
-        let _ = Command::new("sc").args(["delete", SERVICE_NAME]).status();
+        let _ = Command::new("sc")
+            .args(["delete", SERVICE_NAME])
+            .status_within(Duration::from_secs(30), "command");
         for row in &self.rows {
             let _ = set_value(row.key, row.name, &row.value);
         }
@@ -1215,8 +1236,12 @@ impl Drop for Guard {
 }
 
 fn ensure_service() -> Result<(), String> {
-    let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
-    let _ = Command::new("sc").args(["delete", SERVICE_NAME]).status();
+    let _ = Command::new("sc")
+        .args(["stop", SERVICE_NAME])
+        .status_within(Duration::from_secs(30), "command");
+    let _ = Command::new("sc")
+        .args(["delete", SERVICE_NAME])
+        .status_within(Duration::from_secs(30), "command");
     thread::sleep(Duration::from_millis(400));
     let bin = service_exe().display().to_string();
     let status = Command::new("sc")
@@ -1230,8 +1255,7 @@ fn ensure_service() -> Result<(), String> {
             "obj=",
             "LocalSystem",
         ])
-        .status()
-        .map_err(|_| "sc create".to_string())?;
+        .status_within(Duration::from_secs(30), "command")?;
     if status.success() {
         Ok(())
     } else {
@@ -1281,8 +1305,7 @@ fn spawn_service(
 fn start_service() -> Result<(), String> {
     let output = Command::new("sc")
         .args(["start", SERVICE_NAME])
-        .output()
-        .map_err(|_| "sc start".to_string())?;
+        .output_within(Duration::from_secs(45), "sc start")?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1300,7 +1323,10 @@ fn start_service() -> Result<(), String> {
 }
 
 fn service_state() -> String {
-    let Ok(output) = Command::new("sc").args(["query", SERVICE_NAME]).output() else {
+    let Ok(output) = Command::new("sc")
+        .args(["query", SERVICE_NAME])
+        .output_within(Duration::from_secs(30), "command")
+    else {
         return "unreadable".to_string();
     };
     let text = format!(
@@ -1367,8 +1393,7 @@ fn write_service_env(pause: Option<&str>, pause_file: &Path) -> Result<(), Strin
             &data,
             "/f",
         ])
-        .status()
-        .map_err(|_| "env".to_string())?;
+        .status_within(Duration::from_secs(30), "command")?;
     if status.success() {
         Ok(())
     } else {
@@ -1390,23 +1415,27 @@ fn stop_in_order(_guard: &mut Guard, order: KillOrder) -> Result<(), String> {
     match order {
         KillOrder::ServiceFirst => {
             kill_image("softlock-service.exe", "service did not exit")?;
-            let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
+            let _ = Command::new("sc")
+                .args(["stop", SERVICE_NAME])
+                .status_within(Duration::from_secs(30), "command");
             kill_image("softlock-lockhost.exe", "lock host did not exit")?;
         }
         KillOrder::HostFirst => {
             kill_image("softlock-lockhost.exe", "lock host did not exit")?;
             kill_image("softlock-service.exe", "service did not exit")?;
-            let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
+            let _ = Command::new("sc")
+                .args(["stop", SERVICE_NAME])
+                .status_within(Duration::from_secs(30), "command");
         }
         KillOrder::Both => {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 let _ = Command::new("taskkill")
                     .args(["/F", "/IM", "softlock-service.exe"])
-                    .status();
+                    .status_within(Duration::from_secs(30), "command");
                 let _ = Command::new("taskkill")
                     .args(["/F", "/IM", "softlock-lockhost.exe"])
-                    .status();
+                    .status_within(Duration::from_secs(30), "command");
                 if !image_running("softlock-service.exe") && !host_running() {
                     break;
                 }
@@ -1415,7 +1444,9 @@ fn stop_in_order(_guard: &mut Guard, order: KillOrder) -> Result<(), String> {
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
+            let _ = Command::new("sc")
+                .args(["stop", SERVICE_NAME])
+                .status_within(Duration::from_secs(30), "command");
         }
     }
     Ok(())
@@ -1424,7 +1455,9 @@ fn stop_in_order(_guard: &mut Guard, order: KillOrder) -> Result<(), String> {
 fn kill_image(image: &str, error: &str) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let _ = Command::new("taskkill").args(["/F", "/IM", image]).status();
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", image])
+            .status_within(Duration::from_secs(30), "command");
         let gone = if image == "softlock-lockhost.exe" {
             !host_running()
         } else {
@@ -1490,7 +1523,7 @@ fn suspend_pid(image: &str, pid: u32) -> Result<(), String> {
 fn image_running(image: &str) -> bool {
     let Ok(output) = Command::new("tasklist")
         .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
-        .output()
+        .output_within(Duration::from_secs(30), "command")
     else {
         return false;
     };
@@ -1502,7 +1535,7 @@ fn image_running(image: &str) -> bool {
 fn image_pid(image: &str) -> Option<u32> {
     let output = Command::new("tasklist")
         .args(["/FI", &format!("IMAGENAME eq {image}"), "/FO", "CSV", "/NH"])
-        .output()
+        .output_within(Duration::from_secs(30), "command")
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     let line = text.lines().find(|line| {
@@ -1522,15 +1555,17 @@ fn kill_service_process() {
     if let Some(pid) = service_pid() {
         let _ = Command::new("taskkill")
             .args(["/F", "/PID", &pid.to_string()])
-            .status();
+            .status_within(Duration::from_secs(30), "command");
     }
-    let _ = Command::new("sc").args(["stop", SERVICE_NAME]).status();
+    let _ = Command::new("sc")
+        .args(["stop", SERVICE_NAME])
+        .status_within(Duration::from_secs(30), "command");
 }
 
 fn service_pid() -> Option<u32> {
     let output = Command::new("sc")
         .args(["queryex", SERVICE_NAME])
-        .output()
+        .output_within(Duration::from_secs(30), "command")
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines() {
@@ -1549,7 +1584,10 @@ fn service_pid() -> Option<u32> {
 }
 
 fn service_running() -> bool {
-    let Ok(output) = Command::new("sc").args(["query", SERVICE_NAME]).output() else {
+    let Ok(output) = Command::new("sc")
+        .args(["query", SERVICE_NAME])
+        .output_within(Duration::from_secs(30), "command")
+    else {
         return false;
     };
     String::from_utf8_lossy(&output.stdout).contains("RUNNING")
@@ -1568,7 +1606,7 @@ fn capture() {
     let parent = dir.parent().unwrap_or(dir.as_path());
     let listing = Command::new("cmd")
         .args(["/c", "dir", "/a", &parent.display().to_string()])
-        .output();
+        .output_within(Duration::from_secs(30), "command");
     let text = listing
         .map(|output| {
             let mut body = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1608,7 +1646,7 @@ fn repair_as_system() -> Result<(i32, String), String> {
     );
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "sl-repair", "/F"])
-        .status();
+        .status_within(Duration::from_secs(30), "command");
     let created = Command::new("schtasks")
         .args([
             "/Create",
@@ -1626,8 +1664,7 @@ fn repair_as_system() -> Result<(i32, String), String> {
             "HIGHEST",
             "/F",
         ])
-        .status()
-        .map_err(|_| "repair task".to_string())?;
+        .status_within(Duration::from_secs(30), "command")?;
     if !created.success() {
         return Err("repair task was not created".to_string());
     }
@@ -1637,8 +1674,7 @@ fn repair_as_system() -> Result<(i32, String), String> {
     for _ in 0..2 {
         let started = Command::new("schtasks")
             .args(["/Run", "/TN", "sl-repair"])
-            .status()
-            .map_err(|_| "repair task".to_string())?;
+            .status_within(Duration::from_secs(30), "schtasks /Run")?;
         if started.success() && wait_until(Duration::from_secs(20), || code_path.is_file()) {
             ready = true;
             break;
@@ -1646,7 +1682,7 @@ fn repair_as_system() -> Result<(i32, String), String> {
     }
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "sl-repair", "/F"])
-        .status();
+        .status_within(Duration::from_secs(30), "command");
     if !ready {
         return Err("repair task did not finish".to_string());
     }
@@ -1702,8 +1738,7 @@ fn repair_settings() -> Result<(i32, String), String> {
     let output = Command::new(service_exe())
         .arg("--repair-settings")
         .env("SOFTLOCK_PIPE", pipe_name())
-        .output()
-        .map_err(|_| "repair".to_string())?;
+        .output_within(Duration::from_secs(30), "repair")?;
     let mut note = String::from_utf8_lossy(&output.stderr)
         .chars()
         .map(|c| if c.is_control() || c == '"' { ' ' } else { c })
@@ -1769,7 +1804,7 @@ fn query_taskmgr() -> String {
 fn query_value(key: &str, name: &str) -> String {
     let output = Command::new("reg")
         .args(["query", key, "/v", name])
-        .output();
+        .output_within(Duration::from_secs(30), "command");
     let Ok(output) = output else {
         return "absent".to_string();
     };
@@ -1794,7 +1829,7 @@ fn set_value(key: &str, name: &str, value: &str) -> Result<(), String> {
     if value == "absent" {
         let _ = Command::new("reg")
             .args(["delete", key, "/v", name, "/f"])
-            .status();
+            .status_within(Duration::from_secs(30), "command");
         if query_value(key, name) != "absent" {
             return Err(format!("could not delete {name}"));
         }
@@ -1802,8 +1837,7 @@ fn set_value(key: &str, name: &str, value: &str) -> Result<(), String> {
     }
     let status = Command::new("reg")
         .args(["add", key, "/v", name, "/t", "REG_DWORD", "/d", value, "/f"])
-        .status()
-        .map_err(|_| "reg add".to_string())?;
+        .status_within(Duration::from_secs(30), "command")?;
     if status.success() && query_value(key, name) == value {
         Ok(())
     } else {
@@ -1873,7 +1907,10 @@ fn row_report(chosen: &[(&str, &str, &str, &str)]) -> String {
 }
 
 fn installed_service_running() -> bool {
-    let Ok(output) = Command::new("sc").args(["query", SERVICE_NAME]).output() else {
+    let Ok(output) = Command::new("sc")
+        .args(["query", SERVICE_NAME])
+        .output_within(Duration::from_secs(30), "command")
+    else {
         return false;
     };
     String::from_utf8_lossy(&output.stdout).contains("RUNNING")
@@ -1888,7 +1925,7 @@ fn host_running() -> bool {
             "CSV",
             "/NH",
         ])
-        .output()
+        .output_within(Duration::from_secs(30), "command")
     else {
         return false;
     };
@@ -1933,6 +1970,69 @@ fn status_body() -> &'static str {
     r#"{"v":1,"id":3,"kind":"GetStatus"}"#
 }
 
+trait BoundedCommand {
+    fn status_within(self, limit: Duration, what: &str)
+    -> Result<std::process::ExitStatus, String>;
+    fn output_within(self, limit: Duration, what: &str) -> Result<std::process::Output, String>;
+}
+
+impl BoundedCommand for Command {
+    fn status_within(
+        mut self,
+        limit: Duration,
+        what: &str,
+    ) -> Result<std::process::ExitStatus, String> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        finish_command(self, limit, what).map(|output| output.status)
+    }
+
+    fn output_within(
+        mut self,
+        limit: Duration,
+        what: &str,
+    ) -> Result<std::process::Output, String> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        finish_command(self, limit, what)
+    }
+}
+
+fn finish_command(
+    mut command: Command,
+    limit: Duration,
+    what: &str,
+) -> Result<std::process::Output, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{what} did not start: {error}"))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("{what} wait failed: {error}"));
+            }
+            Ok(None) if started.elapsed() < limit => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let kill_deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < kill_deadline {
+                    if child.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                return Err(format!("{what} timed out after {}s", limit.as_secs()));
+            }
+            Err(error) => return Err(format!("{what} wait failed: {error}")),
+        }
+    }
+}
+
 fn wait_until(limit: Duration, mut probe: impl FnMut() -> bool) -> bool {
     let started = Instant::now();
     while started.elapsed() < limit {
@@ -1951,36 +2051,97 @@ fn write_result(body: &str) {
 }
 
 fn transact(pipe: &str, json: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::os::windows::io::FromRawHandle;
     let mut frame = (json.len() as u32).to_le_bytes().to_vec();
     frame.extend_from_slice(json.as_bytes());
-    let wide: Vec<u16> = pipe.encode_utf16().chain(std::iter::once(0)).collect();
-    let handle = unsafe {
-        windows::Win32::Storage::FileSystem::CreateFileW(
-            windows::core::PCWSTR(wide.as_ptr()),
-            0xC000_0000,
-            windows::Win32::Storage::FileSystem::FILE_SHARE_READ
-                | windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
-            None,
-            windows::Win32::Storage::FileSystem::OPEN_EXISTING,
-            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
-            None,
-        )
-        .map_err(|error| format!("open: {error}"))?
-    };
+    let handle = open_pipe_timed(pipe)?;
     let mut file = unsafe { std::fs::File::from_raw_handle(handle.0) };
     file.write_all(&frame)
         .map_err(|error| format!("write: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut prefix = [0u8; 4];
-    file.read_exact(&mut prefix)
-        .map_err(|error| format!("read: {error}"))?;
+    read_pipe_until(&file, &mut prefix, deadline)?;
     let length = u32::from_le_bytes(prefix) as usize;
     if length > 64 * 1024 {
         return Err("frame".to_string());
     }
     let mut body = vec![0u8; length];
-    file.read_exact(&mut body)
-        .map_err(|error| format!("body: {error}"))?;
+    read_pipe_until(&file, &mut body, deadline)?;
     String::from_utf8(body).map_err(|_| "utf8".to_string())
+}
+
+fn open_pipe_timed(pipe: &str) -> Result<windows::Win32::Foundation::HANDLE, String> {
+    let pipe = pipe.to_string();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let wide: Vec<u16> = pipe.encode_utf16().chain(std::iter::once(0)).collect();
+        let opened = unsafe {
+            windows::Win32::Storage::FileSystem::CreateFileW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                0xC000_0000,
+                windows::Win32::Storage::FileSystem::FILE_SHARE_READ
+                    | windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+                None,
+                windows::Win32::Storage::FileSystem::OPEN_EXISTING,
+                windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        };
+        let _ = sender.send(
+            opened
+                .map(|handle| handle.0 as isize)
+                .map_err(|error| format!("open: {error}")),
+        );
+    });
+    match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(raw)) => Ok(windows::Win32::Foundation::HANDLE(
+            raw as *mut core::ffi::c_void,
+        )),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err("timed out opening the service pipe".to_string()),
+    }
+}
+
+fn read_pipe_until(file: &std::fs::File, buf: &mut [u8], deadline: Instant) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = windows::Win32::Foundation::HANDLE(file.as_raw_handle());
+    let mut offset = 0;
+    while offset < buf.len() {
+        let mut available = 0u32;
+        unsafe {
+            windows::Win32::Storage::FileSystem::PeekNamedPipe(
+                handle,
+                None,
+                0,
+                None,
+                Some(&mut available),
+                None,
+            )
+        }
+        .map_err(|error| format!("read: {error}"))?;
+        if available == 0 {
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for the service to answer".to_string());
+            }
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let want = (buf.len() - offset).min(available as usize);
+        let mut read = 0u32;
+        unsafe {
+            windows::Win32::Storage::FileSystem::ReadFile(
+                handle,
+                Some(&mut buf[offset..offset + want]),
+                Some(&mut read),
+                None,
+            )
+        }
+        .map_err(|error| format!("read: {error}"))?;
+        if read == 0 {
+            return Err("eof".to_string());
+        }
+        offset += read as usize;
+    }
+    Ok(())
 }

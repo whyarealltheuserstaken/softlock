@@ -602,14 +602,10 @@ pub fn register_sign_in_recovery() {
     }
     let task = format!("{SERVICE_NAME}-restore");
     let command = format!("\"{}\" --repair-settings", exe.display());
-    let created = Command::new(r"C:\Windows\System32\schtasks.exe")
-        .args([
-            "/Create", "/F", "/TN", &task, "/SC", "ONLOGON", "/RU", "SYSTEM", "/RL", "HIGHEST",
-            "/TR", &command,
-        ])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+    let created = command_status(Command::new(r"C:\Windows\System32\schtasks.exe").args([
+        "/Create", "/F", "/TN", &task, "/SC", "ONLOGON", "/RU", "SYSTEM", "/RL", "HIGHEST", "/TR",
+        &command,
+    ]));
     if !created {
         crate::audit(
             "settings",
@@ -617,11 +613,9 @@ pub fn register_sign_in_recovery() {
         );
         return;
     }
-    let present = Command::new(r"C:\Windows\System32\schtasks.exe")
-        .args(["/Query", "/TN", &task])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+    let present = command_status(
+        Command::new(r"C:\Windows\System32\schtasks.exe").args(["/Query", "/TN", &task]),
+    );
     if !present {
         crate::audit(
             "settings",
@@ -632,6 +626,31 @@ pub fn register_sign_in_recovery() {
     crate::audit("settings", &[("result", "task")]);
     if let Err(reason) = write_start_menu(&exe) {
         crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
+    }
+}
+
+fn command_status(mut command: Command) -> bool {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < Duration::from_secs(15) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.try_wait();
+                return false;
+            }
+        }
     }
 }
 

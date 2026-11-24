@@ -1740,7 +1740,12 @@ pub(crate) fn list_directory_names(
 ) -> io::Result<Vec<String>> {
     let mut names = Vec::new();
     let mut restart = 1u8;
+    let mut rounds = 0u32;
     loop {
+        rounds += 1;
+        if rounds > 1024 {
+            return Err(io::Error::other("directory listing did not finish"));
+        }
         let mut buffer = vec![0u8; 16 * 1024];
         let mut iosb = IoStatusBlock {
             status: 0,
@@ -1766,6 +1771,11 @@ pub(crate) fn list_directory_names(
             break;
         }
         nt_result(status)?;
+        // A success with nothing in the buffer does not advance the scan.
+        // Calling again repeats the same result and never returns.
+        if iosb.information == 0 {
+            break;
+        }
         let mut offset = 0usize;
         loop {
             if offset + 12 > buffer.len() {

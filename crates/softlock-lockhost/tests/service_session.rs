@@ -20,7 +20,7 @@ use softlock_service::{
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
+    FILE_SHARE_WRITE, OPEN_EXISTING, PeekNamedPipe, ReadFile, WriteFile,
 };
 use windows::core::PCWSTR;
 
@@ -129,7 +129,24 @@ impl Session {
             config_dir,
             extra,
         };
-        session.wait_until(|session| session.hello().is_ok(), Duration::from_secs(15));
+        // `hello` used to block inside `ReadFile`, so this deadline was never
+        // checked and a silent service held the job until the runner killed it.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_error = String::new();
+        while Instant::now() < deadline {
+            match session.hello() {
+                Ok(_) => {
+                    last_error.clear();
+                    break;
+                }
+                Err(error) => last_error = error,
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            last_error.is_empty(),
+            "timed out waiting for the service: {last_error}"
+        );
         session
     }
 
@@ -195,7 +212,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        wait_child(&mut self.child, Duration::from_secs(5));
         let _ = Command::new("taskkill")
             .args(["/F", "/T", "/PID", &self.child.id().to_string()])
             .output();
@@ -211,17 +228,74 @@ impl Drop for KillChild {
     fn drop(&mut self) {
         if let Some(child) = self.0.as_mut() {
             let _ = child.kill();
-            let _ = child.wait();
+            wait_child(child, Duration::from_secs(5));
         }
     }
 }
 
 fn stop_lock_hosts() {
-    let _ = Command::new("taskkill")
+    let mut command = Command::new("taskkill");
+    command
         .args(["/F", "/IM", "softlock-lockhost.exe"])
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if started.elapsed() < Duration::from_secs(5) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.try_wait();
+                return;
+            }
+        }
+    }
+}
+
+fn wait_child(child: &mut std::process::Child, limit: Duration) {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if started.elapsed() < limit => thread::sleep(Duration::from_millis(50)),
+            _ => return,
+        }
+    }
+}
+
+fn cargo_finished(command: &mut Command, what: &str) {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().unwrap_or_else(|error| {
+        panic!("{what} did not start: {error}");
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "{what} failed");
+                return;
+            }
+            Ok(None) if started.elapsed() < Duration::from_secs(180) => {
+                thread::sleep(Duration::from_millis(200));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                wait_child(&mut child, Duration::from_secs(5));
+                panic!("{what} timed out after 180s");
+            }
+            Err(error) => panic!("{what} wait failed: {error}"),
+        }
+    }
 }
 
 fn service_exe() -> PathBuf {
@@ -241,8 +315,7 @@ fn service_exe() -> PathBuf {
     if host.to_string_lossy().contains("x86_64-pc-windows-msvc") {
         command.args(["--target", "x86_64-pc-windows-msvc"]);
     }
-    let status = command.status().expect("cargo build");
-    assert!(status.success(), "service build failed");
+    cargo_finished(&mut command, "cargo build of softlock-service");
     assert!(service.is_file(), "missing {}", service.display());
     service
 }
@@ -265,6 +338,21 @@ fn open_pipe(name: &str) -> Result<HANDLE, String> {
 }
 
 fn open_pipe_once(name: &str) -> Result<HANDLE, String> {
+    let name = name.to_string();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(open_pipe_blocking(&name).map(|handle| handle.0 as isize));
+    });
+    // `PIPE_WAIT` makes `CreateFileW` itself block when every instance is taken.
+    // The retry loop above never gets to check its deadline in that case.
+    match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(raw)) => Ok(HANDLE(raw as *mut core::ffi::c_void)),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err("timed out opening the service pipe".to_string()),
+    }
+}
+
+fn open_pipe_blocking(name: &str) -> Result<HANDLE, String> {
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         CreateFileW(
@@ -297,24 +385,49 @@ fn write_all(handle: HANDLE, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn read_frame(handle: HANDLE) -> Result<Vec<u8>, String> {
+    read_frame_within(handle, Duration::from_secs(15))
+}
+
+fn read_frame_within(handle: HANDLE, timeout: Duration) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now() + timeout;
     let mut prefix = [0u8; 4];
-    read_exact(handle, &mut prefix)?;
+    read_until(handle, &mut prefix, deadline)?;
     let length = u32::from_le_bytes(prefix) as usize;
     if length > 64 * 1024 {
         return Err("frame too large".to_string());
     }
     let mut body = vec![0u8; length];
-    read_exact(handle, &mut body)?;
+    read_until(handle, &mut body, deadline)?;
     Ok(body)
 }
 
 fn read_exact(handle: HANDLE, buf: &mut [u8]) -> Result<(), String> {
+    read_until(handle, buf, Instant::now() + Duration::from_secs(15))
+}
+
+fn read_until(handle: HANDLE, buf: &mut [u8], deadline: Instant) -> Result<(), String> {
     let mut offset = 0;
     while offset < buf.len() {
+        let mut available = 0u32;
+        unsafe { PeekNamedPipe(handle, None, 0, None, Some(&mut available), None) }
+            .map_err(|error| format!("read: {error}"))?;
+        if available == 0 {
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for the service to answer".to_string());
+            }
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let want = (buf.len() - offset).min(available as usize);
         let mut read = 0u32;
         unsafe {
-            ReadFile(handle, Some(&mut buf[offset..]), Some(&mut read), None)
-                .map_err(|error| format!("read: {error}"))?;
+            ReadFile(
+                handle,
+                Some(&mut buf[offset..offset + want]),
+                Some(&mut read),
+                None,
+            )
+            .map_err(|error| format!("read: {error}"))?;
         }
         if read == 0 {
             return Err("eof".to_string());
@@ -549,7 +662,7 @@ fn kill_while_locked(stub: &str, stay_blocked: bool) {
         "lock did not block physical input"
     );
     session.child.kill().expect("kill service");
-    let _ = session.child.wait();
+    wait_child(&mut session.child, Duration::from_secs(5));
     let mut passed_before_mark = false;
     let marked = wait_for(Duration::from_secs(8), || {
         if !mark.is_file() {
@@ -1684,10 +1797,7 @@ fn app_exe() -> PathBuf {
     if host.to_string_lossy().contains("x86_64-pc-windows-msvc") {
         command.args(["--target", "x86_64-pc-windows-msvc"]);
     }
-    // Nested cargo output splits libtest's "... ok" line and fails the CI grep.
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    let status = command.status().expect("cargo build");
-    assert!(status.success(), "app build failed");
+    cargo_finished(&mut command, "cargo build of softlock-app");
     assert!(app.is_file(), "missing {}", app.display());
     app
 }
@@ -1810,20 +1920,22 @@ fn subscribe_receives_state(session: &Session) -> bool {
 }
 
 fn read_frame_deadline(handle: HANDLE, timeout: Duration) -> Result<Vec<u8>, String> {
-    let raw = handle.0 as usize;
+    read_frame_within(handle, timeout)
+}
+
+fn send_input_within(inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT]) -> u32 {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
+    let inputs = inputs.to_vec();
     let (sender, receiver) = std::sync::mpsc::channel();
     thread::spawn(move || {
-        let handle = HANDLE(raw as *mut core::ffi::c_void);
-        let _ = sender.send(read_frame(handle));
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        let _ = sender.send(sent);
     });
-    match receiver.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(_) => Err("timeout".to_string()),
-    }
+    // A hook that does not pump makes `SendInput` wait forever. Fail the test.
+    receiver.recv_timeout(Duration::from_secs(3)).unwrap_or(0)
 }
 
 fn send_chord(key: u16) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
     let keys = [0xA2u16, 0xA4, 0xA0, key];
     let mut inputs = Vec::new();
     for key in keys {
@@ -1832,7 +1944,7 @@ fn send_chord(key: u16) {
     for key in keys.into_iter().rev() {
         inputs.push(chord_key(key, true));
     }
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    let sent = send_input_within(&inputs);
     assert_eq!(
         sent,
         inputs.len() as u32,
