@@ -430,8 +430,10 @@ fn open_pipe_blocking(name: &str) -> Result<HANDLE, String> {
 
 fn write_all(handle: HANDLE, bytes: &[u8]) -> Result<(), String> {
     let bytes = bytes.to_vec();
+    let raw = handle.0 as usize;
     let (sender, receiver) = std::sync::mpsc::channel();
     thread::spawn(move || {
+        let handle = HANDLE(raw as *mut core::ffi::c_void);
         let _ = sender.send(write_blocking(handle, &bytes));
     });
     // A server that never reads fills the pipe and `WriteFile` does not return.
