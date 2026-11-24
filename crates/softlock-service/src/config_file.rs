@@ -75,16 +75,18 @@ pub fn prepare_entry(path: &Path) -> Result<SettingEntry, &'static str> {
     let handle = open_config(path, false).map_err(|_| "config")?;
     let text = read_handle(handle);
     let previous = dacl_sddl_handle(handle);
+    let owner = owner_sid_handle(handle);
     drop_handle(handle);
     let text = text.map_err(|_| "config")?;
     if text.len() > MAX_CONFIG_BYTES {
         return Err("config");
     }
     let previous = previous.map_err(|_| "acl")?;
+    let owner = owner.map_err(|_| "acl")?;
     let console = crate::taskmgr::console_sid().map_err(|_| "sid")?;
     let locked = dacl_without_owner_write(&previous, &console).map_err(|_| "acl")?;
     let path_text = path_text(path).map_err(|_| "acl")?;
-    config_acl_entry(&path_text, &previous, &locked).map_err(fault)
+    config_acl_entry(&path_text, &previous, &locked, &owner).map_err(fault)
 }
 
 pub fn prepare_dir_entry(path: &Path) -> Result<SettingEntry, &'static str> {
@@ -93,12 +95,14 @@ pub fn prepare_dir_entry(path: &Path) -> Result<SettingEntry, &'static str> {
     };
     let handle = open_acl(dir, true).map_err(|_| "acl")?;
     let previous = dacl_sddl_handle(handle);
+    let owner = owner_sid_handle(handle);
     drop_handle(handle);
     let previous = previous.map_err(|_| "acl")?;
+    let owner = owner.map_err(|_| "acl")?;
     let console = crate::taskmgr::console_sid().map_err(|_| "sid")?;
     let locked = dacl_without_owner_write(&previous, &console).map_err(|_| "acl")?;
     let text = dir.to_string_lossy().replace('/', "\\");
-    config_dir_entry(&text, &previous, &locked).map_err(fault)
+    config_dir_entry(&text, &previous, &locked, &owner).map_err(fault)
 }
 
 pub fn apply_entry(entry: &SettingEntry) -> Result<(), &'static str> {
@@ -118,11 +122,17 @@ pub fn restore_entry(entry: &SettingEntry) -> Result<(), &'static str> {
     }
     // The locked DACL, or one that denies SYSTEM WRITE_DAC, refuses the
     // ordinary open. Take ownership and write the journaled previous with
-    // backup semantics. A failed restore still fail-closes.
+    // backup semantics. A failed restore still fail-closes. The owner is
+    // restored with the DACL so the descriptor matches the original.
     let SettingValue::Sddl { value } = &entry.previous else {
         return ordinary;
     };
-    write_dacl_privileged(Path::new(&entry.path), entry.target == CONFIG_DIR, value)
+    write_dacl_privileged(
+        Path::new(&entry.path),
+        entry.target == CONFIG_DIR,
+        value,
+        &entry.previous_owner,
+    )
 }
 
 fn restore_entry_ordinary(entry: &SettingEntry) -> Result<(), &'static str> {
@@ -132,9 +142,12 @@ fn restore_entry_ordinary(entry: &SettingEntry) -> Result<(), &'static str> {
         Ok(current) => {
             let current_value = SettingValue::Sddl { value: current };
             match restore_action(&entry.previous, &current_value).map_err(|_| "value")? {
-                Some(SettingValue::Sddl { value }) => set_dacl_handle(handle, &value),
+                Some(SettingValue::Sddl { value }) => {
+                    set_dacl_handle(handle, &value)?;
+                    set_owner_sid(handle, &entry.previous_owner)
+                }
                 Some(_) => Err("value"),
-                None => Ok(()),
+                None => set_owner_sid(handle, &entry.previous_owner),
             }
         }
         Err(reason) => Err(reason),
@@ -143,7 +156,20 @@ fn restore_entry_ordinary(entry: &SettingEntry) -> Result<(), &'static str> {
     result
 }
 
-fn write_dacl_privileged(path: &Path, directory: bool, sddl: &str) -> Result<(), &'static str> {
+fn set_owner_sid(handle: HANDLE, owner: &str) -> Result<(), &'static str> {
+    if owner.is_empty() {
+        return Ok(());
+    }
+    use windows::Win32::Security::OWNER_SECURITY_INFORMATION;
+    set_security_handle(handle, &format!("O:{owner}"), OWNER_SECURITY_INFORMATION)
+}
+
+fn write_dacl_privileged(
+    path: &Path,
+    directory: bool,
+    sddl: &str,
+    owner: &str,
+) -> Result<(), &'static str> {
     use windows::Win32::Security::{SE_BACKUP_NAME, SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME};
     let _take =
         crate::secrets::enable_privilege_scoped(SE_TAKE_OWNERSHIP_NAME).map_err(|_| "privilege")?;
@@ -156,7 +182,7 @@ fn write_dacl_privileged(path: &Path, directory: bool, sddl: &str) -> Result<(),
         drop_handle(handle);
         return Err("reparse");
     }
-    let result = set_dacl_handle(handle, sddl);
+    let result = set_dacl_handle(handle, sddl).and_then(|()| set_owner_sid(handle, owner));
     drop_handle(handle);
     result
 }

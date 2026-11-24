@@ -131,6 +131,10 @@ pub struct SettingEntry {
     pub path: String,
     pub previous: SettingValue,
     pub new_value: SettingValue,
+    /// Owner SID before the lock. Restore writes it back with the DACL.
+    /// Empty on a journal saved before the owner was recorded.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub previous_owner: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,6 +407,7 @@ pub fn task_manager_document(
             new_value: SettingValue::Dword {
                 value: LOCKED_DWORD,
             },
+            previous_owner: String::new(),
         }],
         lock: None,
     })
@@ -468,6 +473,7 @@ pub fn lockdown_document(
             new_value: SettingValue::Dword {
                 value: policy.locked,
             },
+            previous_owner: String::new(),
         });
     }
     Ok(SettingsJournal {
@@ -563,6 +569,9 @@ fn validate(doc: &SettingsJournal) -> Result<(), JournalFault> {
             if !sddl_allowed(previous) || !sddl_allowed(locked) {
                 return Err(JournalFault::Value);
             }
+            if !owner_sid_ok(&entry.previous_owner) {
+                return Err(JournalFault::Sid);
+            }
             continue;
         }
         if lockdown_policy(&entry.target).is_none() {
@@ -601,6 +610,7 @@ pub fn config_acl_entry(
     path: &str,
     previous: &str,
     locked: &str,
+    owner: &str,
 ) -> Result<SettingEntry, JournalFault> {
     acl_entry(
         CONFIG_FILE,
@@ -608,6 +618,7 @@ pub fn config_acl_entry(
         config_path_allowed(path),
         previous,
         locked,
+        owner,
     )
 }
 
@@ -615,8 +626,16 @@ pub fn config_dir_entry(
     path: &str,
     previous: &str,
     locked: &str,
+    owner: &str,
 ) -> Result<SettingEntry, JournalFault> {
-    acl_entry(CONFIG_DIR, path, config_dir_allowed(path), previous, locked)
+    acl_entry(
+        CONFIG_DIR,
+        path,
+        config_dir_allowed(path),
+        previous,
+        locked,
+        owner,
+    )
 }
 
 fn acl_entry(
@@ -625,7 +644,11 @@ fn acl_entry(
     path_ok: bool,
     previous: &str,
     locked: &str,
+    owner: &str,
 ) -> Result<SettingEntry, JournalFault> {
+    if !owner_sid_ok(owner) {
+        return Err(JournalFault::Sid);
+    }
     let entry = SettingEntry {
         target: target.to_string(),
         path: path.to_string(),
@@ -635,6 +658,7 @@ fn acl_entry(
         new_value: SettingValue::Sddl {
             value: locked.to_string(),
         },
+        previous_owner: owner.to_string(),
     };
     if !path_ok {
         return Err(JournalFault::Target);
@@ -1486,8 +1510,9 @@ pub fn journal_dacl_exact(text: &str) -> bool {
     let Some(split) = body.find('(') else {
         return false;
     };
-    let flags = &body[..split];
-    if !flags.contains('P') || flags.chars().any(|c| !matches!(c, 'P' | 'A' | 'I' | 'R')) {
+    // Exactly `P`, then the auto-inherit pairs `AI` and `AR` in either
+    // order. `D:PR` is not that: `R` by itself is not `AR`.
+    if !protected_auto_inherit_flags(&body[..split]) {
         return false;
     }
     let body = &body[split..];
@@ -1512,6 +1537,45 @@ pub fn journal_dacl_exact(text: &str) -> bool {
         }
     }
     count == 2 && system && admins
+}
+
+fn owner_sid_ok(owner: &str) -> bool {
+    if owner.is_empty() {
+        return true;
+    }
+    if owner.len() >= 96 {
+        return false;
+    }
+    if !owner
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return false;
+    }
+    owner.starts_with("S-1-") || owner == "SY" || owner == "BA"
+}
+
+fn protected_auto_inherit_flags(flags: &str) -> bool {
+    let Some(rest) = flags.strip_prefix('P') else {
+        return false;
+    };
+    let mut rest = rest;
+    let mut saw_ai = false;
+    let mut saw_ar = false;
+    loop {
+        if !saw_ai && let Some(next) = rest.strip_prefix("AI") {
+            saw_ai = true;
+            rest = next;
+            continue;
+        }
+        if !saw_ar && let Some(next) = rest.strip_prefix("AR") {
+            saw_ar = true;
+            rest = next;
+            continue;
+        }
+        break;
+    }
+    rest.is_empty()
 }
 
 pub fn dir_fault_log(fault: DirFault) -> &'static str {
@@ -2127,6 +2191,11 @@ mod tests {
         assert!(!journal_dacl_exact("D:P(A;;FA;;;SY)(A;;FA;;;WD)"));
         assert!(!journal_dacl_exact("D:P(A;OICI;FA;;;SY)(A;;FA;;;BA)"));
         assert!(!journal_dacl_exact("D:P(D;;FA;;;SY)(A;;FA;;;BA)"));
+        assert!(!journal_dacl_exact("D:PR(A;;FA;;;SY)(A;;FA;;;BA)"));
+        assert!(!journal_dacl_exact("D:PA(A;;FA;;;SY)(A;;FA;;;BA)"));
+        assert!(journal_dacl_exact("D:PAR(A;;FA;;;SY)(A;;FA;;;BA)"));
+        assert!(journal_dacl_exact("D:PAIAR(A;;FA;;;BA)(A;;FA;;;SY)"));
+        assert!(journal_dacl_exact("D:PARAI(A;;FA;;;SY)(A;;FA;;;BA)"));
     }
 
     #[test]

@@ -235,11 +235,22 @@ fn config_acl_round_trip(guard: &mut Guard) -> Result<(), String> {
             softlock_service::testing_dacl(&path)
                 .ok()
                 .is_some_and(|current| current == original)
+                && softlock_service::testing_owner(&path)
+                    .ok()
+                    .is_some_and(|current| current.eq_ignore_ascii_case(&owner))
                 && owner_rights_allowed(&path)
         });
         hard_stop(guard)?;
         if !restored {
-            return Err("boot after the host was gone did not restore the config ACL".to_string());
+            let now_owner = softlock_service::testing_owner(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
+            let now_dacl = softlock_service::testing_dacl(&path)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| error);
+            return Err(format!(
+                "boot after the host was gone did not restore the config descriptor (owner {now_owner} wanted {owner} dacl {now_dacl})"
+            ));
         }
         Ok(())
     }
