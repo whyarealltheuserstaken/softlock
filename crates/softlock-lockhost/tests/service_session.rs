@@ -57,6 +57,7 @@ struct Session {
     log: PathBuf,
     pin_dir: PathBuf,
     config_dir: PathBuf,
+    journal_dir: PathBuf,
     extra: u64,
 }
 
@@ -143,6 +144,7 @@ impl Session {
             log,
             pin_dir,
             config_dir,
+            journal_dir,
             extra,
         };
         // `hello` used to block inside `ReadFile`, so this deadline was never
@@ -239,6 +241,8 @@ impl Session {
             .env("SOFTLOCK_STUB_OS_LOCK", "1")
             .env("SOFTLOCK_PIN_DIR", &self.pin_dir)
             .env("SOFTLOCK_LOG", &self.log)
+            .env("SOFTLOCK_JOURNAL_DIR", &self.journal_dir)
+            .env("SOFTLOCK_CONFIG_DIR", &self.config_dir)
             .env("SOFTLOCK_PIPE", &self.pipe)
             .env("SOFTLOCK_RUN_NONCE", extra.to_string())
             .env("SOFTLOCK_INSTALL_DIR", r"C:\no\such\install")

@@ -15,7 +15,7 @@ use softlock_core::{
     commit_then_change, encode_document, executable_may_run_as_system, fault_log, held_start,
     lockdown_document, lockdown_policy, mark_workstation_clear, original_previous, parse_document,
     reassert_write, recovery_action, release_os_hold, repair_action, repair_entry_name,
-    restore_action_for, restore_backoff, restore_sid, service_start_action, with_config_acl,
+    restore_action_for, restore_backoff, restore_sid, with_config_acl,
     workstation_value_after_attempt,
 };
 

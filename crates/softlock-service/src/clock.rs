@@ -8,15 +8,19 @@
 use softlock_core::ClockSample;
 
 pub fn password_clock() -> ClockSample {
-    #[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+    #[cfg(feature = "simulated-physical")]
     if let Some(sample) = file_clock() {
         return sample;
     }
     real_clock()
 }
 
-#[cfg(any(feature = "simulated-physical", feature = "live-fail-closed"))]
+#[cfg(feature = "simulated-physical")]
 fn file_clock() -> Option<ClockSample> {
+    #[cfg(windows)]
+    if softlock_windows::runner_may_lock().is_err() {
+        return None;
+    }
     let path = std::env::var("SOFTLOCK_CLOCK_FILE").ok()?;
     let text = std::fs::read_to_string(path).ok()?;
     let mut parts = text.split_whitespace();

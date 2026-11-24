@@ -8,6 +8,7 @@
 //! Unlocked.
 
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
@@ -653,6 +654,17 @@ impl Authority {
     }
 
     fn decide_password(&mut self, secret: Secret) -> ServiceToHost {
+        // OsLocked and StayOsLocked must not spend a Windows bad-password
+        // count. Refuse before the policy read, the account read, the stamp,
+        // and LogonUser.
+        if !self.grant_allowed() {
+            drop(secret);
+            audit(
+                "unlock",
+                &[("method", "os_password"), ("result", "rejected")],
+            );
+            return self.password_prompt(false);
+        }
         let policy = self.lockout_policy();
         let now = crate::clock::password_clock();
         if self.password_off.is_some() || self.journal_block_holds(policy, now) {

@@ -192,6 +192,9 @@ fn session_identity() -> Result<Identity, ()> {
 
 #[cfg(feature = "simulated-physical")]
 fn overridden_account() -> Option<Result<Identity, ()>> {
+    if softlock_windows::runner_may_lock().is_err() {
+        return None;
+    }
     let user = std::env::var("SOFTLOCK_SESSION_USER").ok()?;
     let domain = std::env::var("SOFTLOCK_SESSION_DOMAIN").unwrap_or_else(|_| ".".to_string());
     if user.is_empty()
