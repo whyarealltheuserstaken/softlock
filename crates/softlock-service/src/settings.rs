@@ -602,10 +602,12 @@ pub fn register_sign_in_recovery() {
     }
     let task = format!("{SERVICE_NAME}-restore");
     let command = format!("\"{}\" --repair-settings", exe.display());
-    let created = command_status(Command::new(r"C:\Windows\System32\schtasks.exe").args([
+    let mut created_task = Command::new(r"C:\Windows\System32\schtasks.exe");
+    created_task.args([
         "/Create", "/F", "/TN", &task, "/SC", "ONLOGON", "/RU", "SYSTEM", "/RL", "HIGHEST", "/TR",
         &command,
-    ]));
+    ]);
+    let created = command_status(&mut created_task);
     if !created {
         crate::audit(
             "settings",
@@ -613,9 +615,9 @@ pub fn register_sign_in_recovery() {
         );
         return;
     }
-    let present = command_status(
-        Command::new(r"C:\Windows\System32\schtasks.exe").args(["/Query", "/TN", &task]),
-    );
+    let mut query_task = Command::new(r"C:\Windows\System32\schtasks.exe");
+    query_task.args(["/Query", "/TN", &task]);
+    let present = command_status(&mut query_task);
     if !present {
         crate::audit(
             "settings",
@@ -629,7 +631,7 @@ pub fn register_sign_in_recovery() {
     }
 }
 
-fn command_status(mut command: Command) -> bool {
+fn command_status(command: &mut Command) -> bool {
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

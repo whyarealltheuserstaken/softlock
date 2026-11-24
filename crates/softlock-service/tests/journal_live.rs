@@ -1971,14 +1971,21 @@ fn status_body() -> &'static str {
 }
 
 trait BoundedCommand {
-    fn status_within(self, limit: Duration, what: &str)
-    -> Result<std::process::ExitStatus, String>;
-    fn output_within(self, limit: Duration, what: &str) -> Result<std::process::Output, String>;
+    fn status_within(
+        &mut self,
+        limit: Duration,
+        what: &str,
+    ) -> Result<std::process::ExitStatus, String>;
+    fn output_within(
+        &mut self,
+        limit: Duration,
+        what: &str,
+    ) -> Result<std::process::Output, String>;
 }
 
 impl BoundedCommand for Command {
     fn status_within(
-        mut self,
+        &mut self,
         limit: Duration,
         what: &str,
     ) -> Result<std::process::ExitStatus, String> {
@@ -1989,7 +1996,7 @@ impl BoundedCommand for Command {
     }
 
     fn output_within(
-        mut self,
+        &mut self,
         limit: Duration,
         what: &str,
     ) -> Result<std::process::Output, String> {
@@ -2001,7 +2008,7 @@ impl BoundedCommand for Command {
 }
 
 fn finish_command(
-    mut command: Command,
+    command: &mut Command,
     limit: Duration,
     what: &str,
 ) -> Result<std::process::Output, String> {
