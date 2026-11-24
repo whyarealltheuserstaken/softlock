@@ -197,9 +197,7 @@ pub fn decline_config() -> bool {
         return false;
     }
     DECLINE_AT.store(5, Ordering::Relaxed);
-    if let Ok(view) = view_slot().lock() {
-        publish(&view);
-    }
+    publish_current();
     DECLINE_AT.store(6, Ordering::Relaxed);
     true
 }
@@ -226,9 +224,7 @@ pub fn accept_config() -> bool {
     }) {
         Ok(ResponseKind::Applied) => {
             if !keep_hotkey_registered(&previous_hotkey, &pending, previous) {
-                if let Ok(view) = view_slot().lock() {
-                    publish(&view);
-                }
+                publish_current();
                 return false;
             }
             CONFIG_OFFER.store(false, Ordering::Release);
@@ -239,9 +235,7 @@ pub fn accept_config() -> bool {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner()) = String::new();
             refresh_hotkey();
-            if let Ok(view) = view_slot().lock() {
-                publish(&view);
-            }
+            publish_current();
             true
         }
         Ok(ResponseKind::Invalid { errors }) => {
@@ -378,6 +372,11 @@ pub fn send_pin(pin: Secret) -> PinSend {
 
 pub fn current_notice() -> String {
     notice_text()
+}
+
+fn publish_current() {
+    let view = current_view();
+    publish(&view);
 }
 
 fn publish(view: &OwnerView) {
@@ -629,9 +628,7 @@ fn observe_config(seen: &mut String) {
                             *CONFIG_ERRORS
                                 .lock()
                                 .unwrap_or_else(|poison| poison.into_inner()) = errors.join("\n");
-                            if let Ok(view) = view_slot().lock() {
-                                publish(&view);
-                            }
+                            publish_current();
                         }
                         Ok(ResponseKind::Applied) => {
                             if keep_hotkey_registered(&previous_hotkey, seen, Some(effective)) {
@@ -640,9 +637,7 @@ fn observe_config(seen: &mut String) {
                                     .unwrap_or_else(|poison| poison.into_inner()) = String::new();
                             }
                             refresh_hotkey();
-                            if let Ok(view) = view_slot().lock() {
-                                publish(&view);
-                            }
+                            publish_current();
                         }
                         _ => {}
                     }
@@ -653,9 +648,7 @@ fn observe_config(seen: &mut String) {
                 *PENDING_CONFIG
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner()) = disk;
-                if let Ok(view) = view_slot().lock() {
-                    publish(&view);
-                }
+                publish_current();
             }
             actions::ConfigDisk::Unchanged => {}
         }
@@ -668,9 +661,7 @@ fn observe_config(seen: &mut String) {
         if *slot != errors {
             *slot = errors;
             drop(slot);
-            if let Ok(view) = view_slot().lock() {
-                publish(&view);
-            }
+            publish_current();
         }
     }
 }
