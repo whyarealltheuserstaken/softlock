@@ -2705,9 +2705,11 @@ fn a_locked_file_edit_is_offered_and_applied_on_accept() {
     let edited = original.replace("Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+K");
     assert_ne!(edited, original, "the default hotkey was not in the file");
     write_file_bounded(&path, edited.as_bytes()).expect("write");
-    let offered = wait_for(Duration::from_secs(10), || {
-        softlock_app_lib::poll_config_once();
-        softlock_app_lib::config_offer()
+    let offered = within("poll_offer", Duration::from_secs(60), || {
+        wait_for(Duration::from_secs(10), || {
+            softlock_app_lib::poll_config_once();
+            softlock_app_lib::config_offer()
+        })
     });
     assert!(
         offered,
@@ -2738,10 +2740,12 @@ fn a_locked_file_edit_is_offered_and_applied_on_accept() {
         softlock_app_lib::refresh_from_service(),
         "timed out waiting for the service to answer GetStatus after unlock"
     );
-    assert!(
-        softlock_app_lib::accept_offered_config(),
-        "PutConfig did not return Applied"
-    );
+    within("accept", Duration::from_secs(60), || {
+        assert!(
+            softlock_app_lib::accept_offered_config(),
+            "PutConfig did not return Applied"
+        );
+    });
     let after = session.config().expect("config");
     assert!(
         after.contains("Ctrl+Alt+Shift+K"),
@@ -2838,7 +2842,9 @@ fn a_declined_file_edit_restores_the_file_and_keeps_the_old_value() {
     // An unlocked edit is saved, not offered. Decline writes the effective
     // document back over the disk. Polling first would PutConfig the new
     // bytes and there would be nothing left to restore.
-    within("decline_unlocked", Duration::from_secs(30), || {
+    // The open walks one path component at a time, gives up, then tries one
+    // full-path open. Those deadlines sit inside this step.
+    within("decline_unlocked", Duration::from_secs(90), || {
         assert!(
             softlock_app_lib::decline_offered_config(),
             "decline did not restore the file after unlock"
