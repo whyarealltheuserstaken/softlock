@@ -2,7 +2,7 @@
 
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -210,21 +210,36 @@ fn take_and_release_inhibit() -> Result<bool, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("systemd-inhibit: {err}"))?;
-    thread::sleep(Duration::from_millis(200));
-    if let Ok(Some(status)) = child.try_wait() {
-        let err = read_stderr(&mut child);
-        return Err(format!("systemd-inhibit exited {status}: {err}"));
+    // logind publishes the lock after the helper starts. One sample at 200ms
+    // misses that on a busy runner.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut shown = false;
+    let mut last_list = String::new();
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            let err = read_stderr(&mut child);
+            return Err(format!("systemd-inhibit exited {status}: {err}"));
+        }
+        if let Ok(out) = Command::new("systemd-inhibit").arg("--list").output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let err = String::from_utf8_lossy(&out.stderr);
+            last_list = if text.trim().is_empty() {
+                err.trim().to_string()
+            } else {
+                text.trim().to_string()
+            };
+            if parse_inhibit_list(&text, "linux-hardware-suite")
+                || parse_inhibit_list(&err, "linux-hardware-suite")
+            {
+                shown = true;
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
     }
-    let list = Command::new("systemd-inhibit").arg("--list").output().ok();
-    let shown = list
-        .as_ref()
-        .map(|out| {
-            parse_inhibit_list(
-                &String::from_utf8_lossy(&out.stdout),
-                "linux-hardware-suite",
-            )
-        })
-        .unwrap_or(false);
     let _ = child.kill();
     let _ = child.wait();
     thread::sleep(Duration::from_millis(100));
@@ -241,7 +256,11 @@ fn take_and_release_inhibit() -> Result<bool, String> {
     if still {
         return Err("inhibit still listed after release".into());
     }
-    Ok(shown)
+    if !shown {
+        let snippet: String = last_list.chars().take(400).collect();
+        return Err(format!("list did not name us: {snippet}"));
+    }
+    Ok(true)
 }
 
 fn read_stderr(child: &mut std::process::Child) -> String {

@@ -13,7 +13,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_ACCESS_RIGHTS};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    TerminateProcess,
+};
 
 #[test]
 fn live_fail_closed() {
@@ -116,30 +119,42 @@ fn live_fail_closed() {
             .unwrap_or(0)
     };
     let _ = fs::remove_file(&mark);
-    let started = Instant::now();
-    match case.as_str() {
+    let started = match case.as_str() {
         "kill-host" => {
             let pid = host_before.expect("lock host");
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/F"])
-                .output();
+            let process = unsafe {
+                OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid).expect("open host")
+            };
+            let started = Instant::now();
+            unsafe {
+                let _ = TerminateProcess(process, 1);
+                let _ = CloseHandle(process);
+            }
+            started
         }
         "suspend-host" => {
             suspend_process(host_before.expect("lock host"));
+            Instant::now()
         }
         "kill-service" => {
             child.kill().expect("kill service");
+            Instant::now()
         }
         "stop-while-locked" => {
             fs::write(&stop_file, b"stop").expect("stop file");
+            Instant::now()
         }
         "unhealthy-guard" => {
             fs::write(&guard_file, b"down").expect("guard file");
+            Instant::now()
         }
-        "tray-hard-lock" => post_tray_hard_lock(&hwnd_file),
-        "hold-ready" | "exit-before-ready" => {}
+        "tray-hard-lock" => {
+            post_tray_hard_lock(&hwnd_file);
+            Instant::now()
+        }
+        "hold-ready" | "exit-before-ready" => Instant::now(),
         other => panic!("unknown case {other}"),
-    }
+    };
     let mut confirmed_at = None;
     while started.elapsed() < Duration::from_secs(1) {
         if case != "kill-service"

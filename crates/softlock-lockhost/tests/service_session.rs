@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard, Once};
 use std::thread;
 use std::time::{Duration, Instant};
+use zeroize::Zeroize;
 
 use softlock_core::pipe_name;
 use softlock_lockhost::{RunNonce, set_run_nonce};
@@ -56,6 +57,7 @@ struct Session {
     log: PathBuf,
     pin_dir: PathBuf,
     config_dir: PathBuf,
+    journal_dir: PathBuf,
     extra: u64,
 }
 
@@ -142,6 +144,7 @@ impl Session {
             log,
             pin_dir,
             config_dir,
+            journal_dir,
             extra,
         };
         // `hello` used to block inside `ReadFile`, so this deadline was never
@@ -210,6 +213,48 @@ impl Session {
             let _ = windows::Win32::Foundation::CloseHandle(handle);
         }
         String::from_utf8(response).map_err(|error| error.to_string())
+    }
+
+    fn wait_until(&self, mut ready: impl FnMut(&Self) -> bool, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if ready(self) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready(self), "timed out waiting for the service");
+    }
+
+    /// Replace the service process and leave the lock host running. Startup
+    /// then sees a live host and keeps the journal, including the backoff.
+    fn relaunch(&mut self, extra_env: &[(&str, &str)]) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        thread::sleep(Duration::from_millis(300));
+        let nonce = RunNonce::random().expect("run nonce");
+        set_run_nonce(nonce);
+        let extra = nonce.as_extra_info();
+        let mut command = Command::new(service_exe());
+        command
+            .arg("--foreground")
+            .env("SOFTLOCK_STUB_OS_LOCK", "1")
+            .env("SOFTLOCK_PIN_DIR", &self.pin_dir)
+            .env("SOFTLOCK_LOG", &self.log)
+            .env("SOFTLOCK_JOURNAL_DIR", &self.journal_dir)
+            .env("SOFTLOCK_CONFIG_DIR", &self.config_dir)
+            .env("SOFTLOCK_PIPE", &self.pipe)
+            .env("SOFTLOCK_RUN_NONCE", extra.to_string())
+            .env("SOFTLOCK_INSTALL_DIR", r"C:\no\such\install")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        self.child = command.spawn().expect("service process");
+        self.extra = extra;
+        self.wait_until(|session| session.hello().is_ok(), Duration::from_secs(15));
     }
 }
 
@@ -553,6 +598,650 @@ fn type_pin(extra: u64) {
         send_virtual_key(u16::from(*byte), extra).expect("digit");
     }
     send_virtual_key(VK_RETURN, extra).expect("submit");
+}
+
+const VK_TAB: u16 = 0x09;
+const VK_SHIFT: u16 = 0x10;
+
+fn type_password(text: &str, extra: u64) {
+    send_virtual_key(VK_F13, extra).expect("wake");
+    thread::sleep(Duration::from_millis(150));
+    for ch in text.chars() {
+        type_character(ch, extra);
+        thread::sleep(Duration::from_millis(15));
+    }
+    send_virtual_key(VK_RETURN, extra).expect("submit");
+}
+
+fn type_character(ch: char, extra: u64) {
+    let unit = u16::try_from(ch as u32).unwrap_or(0);
+    let packed = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::VkKeyScanW(unit) };
+    assert!(
+        packed >= 0,
+        "the runner layout has no key for a test character"
+    );
+    let vk = (packed as u16) & 0xff;
+    let shift = packed as u16 & 0x100 != 0;
+    if shift {
+        send_shifted(vk, extra);
+    } else {
+        send_virtual_key(vk, extra).expect("key");
+    }
+}
+
+fn send_shifted(virtual_key: u16, extra: u64) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
+    // Shift is down before the character and still down when the hook records it.
+    let inputs = [
+        tagged_key(VK_SHIFT, false, extra),
+        tagged_key(virtual_key, false, extra),
+        tagged_key(virtual_key, true, extra),
+        tagged_key(VK_SHIFT, true, extra),
+    ];
+    let inserted = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    assert!(inserted == 4, "SendInput did not deliver the shifted key");
+}
+
+fn tagged_key(
+    virtual_key: u16,
+    up: bool,
+    extra: u64,
+) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    };
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(virtual_key),
+                wScan: 0,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
+                time: 0,
+                dwExtraInfo: extra as usize,
+            },
+        },
+    }
+}
+
+fn unlocked(session: &Session) -> bool {
+    session
+        .status()
+        .ok()
+        .is_some_and(|status| status.contains("\"Unlocked\""))
+}
+
+fn require_hosted_runner() {
+    softlock_windows::runner_may_lock().expect("seam 3 password tests run only on a hosted runner");
+}
+
+struct LockoutGuard {
+    threshold: String,
+    duration: String,
+    window: String,
+}
+
+impl LockoutGuard {
+    fn set(threshold: u32) -> Self {
+        Self::set_window(threshold, 1, 1)
+    }
+
+    fn set_window(threshold: u32, duration: u32, window: u32) -> Self {
+        require_hosted_runner();
+        let current = Command::new("net.exe")
+            .args(["accounts"])
+            .output()
+            .expect("net accounts");
+        let text = String::from_utf8_lossy(&current.stdout).to_string();
+        let saved = Self {
+            threshold: policy_field(&text, "Lockout threshold"),
+            duration: policy_field(&text, "Lockout duration (minutes)"),
+            window: policy_field(&text, "Lockout observation window (minutes)"),
+        };
+        apply_lockout(threshold, duration, window);
+        saved
+    }
+}
+
+impl Drop for LockoutGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("net.exe")
+            .args([
+                "accounts",
+                &format!("/lockoutthreshold:{}", policy_number(&self.threshold)),
+                &format!("/lockoutduration:{}", policy_number(&self.duration)),
+                &format!("/lockoutwindow:{}", policy_number(&self.window)),
+            ])
+            .output();
+    }
+}
+
+fn policy_field(text: &str, label: &str) -> String {
+    text.lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix(label)?;
+            Some(rest.trim().trim_start_matches(':').trim().to_string())
+        })
+        .unwrap_or_else(|| panic!("net accounts did not report {label}"))
+}
+
+fn policy_number(value: &str) -> String {
+    if value.eq_ignore_ascii_case("never") {
+        "0".to_string()
+    } else {
+        value.chars().filter(|ch| ch.is_ascii_digit()).collect()
+    }
+}
+
+fn apply_lockout(threshold: u32, duration: u32, window: u32) {
+    let output = Command::new("net.exe")
+        .args([
+            "accounts",
+            &format!("/lockoutthreshold:{threshold}"),
+            &format!("/lockoutduration:{duration}"),
+            &format!("/lockoutwindow:{window}"),
+        ])
+        .output()
+        .expect("net accounts");
+    assert!(
+        output.status.success(),
+        "could not set the lockout policy: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+struct PasswordAccount {
+    name: String,
+    password: String,
+}
+
+impl PasswordAccount {
+    fn create() -> Self {
+        Self::named("")
+    }
+
+    fn named(suffix: &str) -> Self {
+        require_hosted_runner();
+        // Short names and a known-good password. `net user` on the runner
+        // rejects a password that contains three consecutive characters of
+        // the account name, and a long random password was rejected outright.
+        let name = format!("xq{suffix}");
+        let password = match suffix {
+            "a" => "Aa1!QkzzMm9v".to_string(),
+            "b" => "Bb2@RlaaNn8w".to_string(),
+            _ => "Cc3#SmbbOo7x".to_string(),
+        };
+        assert!(
+            !password_shares_name_token(&password, &name),
+            "the test password overlaps the account name"
+        );
+        let _ = Command::new("net.exe")
+            .args(["user", &name, "/delete"])
+            .output();
+        let added = Command::new("net.exe")
+            .args(["user", &name, &password, "/add"])
+            .output()
+            .expect("net user");
+        assert!(
+            added.status.success(),
+            "could not create the local test account: {}",
+            net_user_failure(&added)
+        );
+        Self { name, password }
+    }
+
+    fn session_env(&self) -> [(&str, &str); 2] {
+        [
+            ("SOFTLOCK_SESSION_USER", self.name.as_str()),
+            ("SOFTLOCK_SESSION_DOMAIN", "."),
+        ]
+    }
+}
+
+impl Drop for PasswordAccount {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        let _ = Command::new("net.exe")
+            .args(["user", &self.name, "/delete"])
+            .output();
+    }
+}
+
+fn password_shares_name_token(password: &str, name: &str) -> bool {
+    let password = password.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    let chars: Vec<char> = name.chars().collect();
+    chars.windows(3).any(|token| {
+        let text: String = token.iter().collect();
+        password.contains(&text)
+    })
+}
+
+fn net_user_failure(output: &std::process::Output) -> String {
+    let text = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    let kind = if text.contains("password") {
+        "password-policy"
+    } else if text.contains("exists") {
+        "exists"
+    } else if text.contains("denied") {
+        "denied"
+    } else if text.contains("syntax") {
+        "syntax"
+    } else {
+        "other"
+    };
+    format!("{kind} ({})", output.status)
+}
+
+fn forget_password_attempts() {
+    let data = softlock_service::service_data_directory();
+    let Some(parent) = data.parent() else {
+        return;
+    };
+    let path = parent
+        .join(format!("{}Journal", softlock_core::SERVICE_NAME))
+        .join("journal.json");
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+}
+
+fn assert_not_locked_out(name: &str) {
+    let info = softlock_service::account_lockout(name).expect("account info");
+    assert!(
+        !info.locked_out,
+        "the test account locked out after bad_password_count={}",
+        info.bad_password_count
+    );
+}
+
+#[test]
+fn right_password_unlocks_and_wrong_password_does_not() {
+    let _guard = gate();
+    forget_password_attempts();
+    let _policy = LockoutGuard::set(10);
+    let account = PasswordAccount::create();
+    let clock = std::env::temp_dir().join(format!("sl-clock-{}", std::process::id()));
+    let _ = fs::remove_file(&clock);
+    let clock_text = clock.display().to_string();
+    let base = account.session_env();
+    let env = [
+        base[0],
+        base[1],
+        ("SOFTLOCK_CLOCK_FILE", clock_text.as_str()),
+    ];
+    let session = Session::launch_extra(None, false, "1", None, &env);
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    let locked = session.lock().expect("lock");
+    assert!(
+        locked.contains("Accepted"),
+        "lock was not accepted: {locked}"
+    );
+    type_password("wrong-password-value", session.extra);
+    assert!(
+        !wait_for(Duration::from_secs(3), || unlocked(&session)),
+        "a wrong password unlocked"
+    );
+    // The first failure waits 30s. Move both test clocks past that wait and
+    // keep them inside the one-minute observation window.
+    advance_clock(&clock, 31_000, 31_000);
+    type_password(&account.password, session.extra);
+    assert!(
+        wait_for(Duration::from_secs(20), || unlocked(&session)),
+        "the account password did not unlock"
+    );
+    assert_not_locked_out(&account.name);
+    let log = fs::read_to_string(&session.log).unwrap_or_default();
+    assert!(!log.contains(&account.password), "password reached the log");
+    assert!(
+        !log.contains("wrong-password-value"),
+        "a typed password reached the log"
+    );
+}
+
+#[test]
+fn service_log_omits_the_password() {
+    let _guard = gate();
+    forget_password_attempts();
+    let _policy = LockoutGuard::set(10);
+    let account = PasswordAccount::create();
+    let session = Session::launch_extra(None, false, "1", None, &account.session_env());
+    session.lock().expect("lock");
+    type_password(&account.password, session.extra);
+    assert!(
+        wait_for(Duration::from_secs(20), || unlocked(&session)),
+        "the account password did not unlock"
+    );
+    let log = fs::read_to_string(&session.log).unwrap_or_default();
+    assert!(!log.contains(&account.password), "password reached the log");
+}
+
+#[test]
+fn another_accounts_password_does_not_unlock() {
+    let _guard = gate();
+    forget_password_attempts();
+    let _policy = LockoutGuard::set(10);
+    let session_user = PasswordAccount::named("a");
+    let other = PasswordAccount::named("b");
+    let session = Session::launch_extra(None, false, "1", None, &session_user.session_env());
+    session.lock().expect("lock");
+    type_password(&other.password, session.extra);
+    assert!(
+        !wait_for(Duration::from_secs(4), || unlocked(&session)),
+        "another account's password unlocked the locked session"
+    );
+    let log = fs::read_to_string(&session.log).unwrap_or_default();
+    assert!(!log.contains(&other.password), "password reached the log");
+    assert!(
+        !log.contains(&session_user.password),
+        "password reached the log"
+    );
+}
+
+#[test]
+fn tab_switches_from_pin_to_password() {
+    let _guard = gate();
+    forget_password_attempts();
+    let _policy = LockoutGuard::set(10);
+    let account = PasswordAccount::create();
+    let session = Session::launch_extra(None, true, "1", None, &account.session_env());
+    session.set_pin().expect("set pin");
+    session.lock().expect("lock");
+    type_password(&account.password, session.extra);
+    assert!(
+        !wait_for(Duration::from_secs(4), || unlocked(&session)),
+        "a password typed into the PIN field unlocked"
+    );
+    send_virtual_key(VK_TAB, session.extra).expect("tab");
+    thread::sleep(Duration::from_millis(100));
+    type_password(&account.password, session.extra);
+    assert!(
+        wait_for(Duration::from_secs(20), || unlocked(&session)),
+        "Tab did not switch the prompt to the account password"
+    );
+}
+
+#[test]
+fn backoff_survives_a_service_restart() {
+    let _guard = gate();
+    forget_password_attempts();
+    let _policy = LockoutGuard::set(10);
+    let account = PasswordAccount::create();
+    let env = account.session_env();
+    let mut session = Session::launch_extra(None, false, "1", None, &env);
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    session.lock().expect("lock");
+    for _ in 0..4 {
+        type_password("wrong-password-value", session.extra);
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert_not_locked_out(&account.name);
+    session.relaunch(&env);
+    assert!(
+        wait_for(Duration::from_secs(8), || {
+            physical_is_blocked(&probe, session.extra)
+        }),
+        "the replacement host did not take the keyboard"
+    );
+    let status = session.status().expect("status");
+    assert!(
+        !status.contains("\"Unlocked\""),
+        "restart unlocked: {status}"
+    );
+    type_password(&account.password, session.extra);
+    assert!(
+        !wait_for(Duration::from_secs(3), || unlocked(&session)),
+        "the correct password unlocked during the backoff"
+    );
+    thread::sleep(Duration::from_secs(31));
+    type_password(&account.password, session.extra);
+    assert!(
+        wait_for(Duration::from_secs(20), || unlocked(&session)),
+        "the correct password did not unlock after the backoff"
+    );
+    assert_not_locked_out(&account.name);
+    let log = fs::read_to_string(&session.log).unwrap_or_default();
+    assert!(!log.contains(&account.password), "password reached the log");
+    assert!(
+        !log.contains("wrong-password-value"),
+        "a typed password reached the log"
+    );
+}
+
+#[test]
+fn password_attempts_stay_under_the_lockout_threshold() {
+    let _guard = gate();
+    forget_password_attempts();
+    let _policy = LockoutGuard::set_window(5, 10, 10);
+    let account = PasswordAccount::create();
+    let clock = std::env::temp_dir().join(format!("sl-cap-{}", std::process::id()));
+    let _ = fs::remove_file(&clock);
+    let clock_text = clock.display().to_string();
+    let base = account.session_env();
+    let env = [
+        base[0],
+        base[1],
+        ("SOFTLOCK_CLOCK_FILE", clock_text.as_str()),
+    ];
+    let session = Session::launch_extra(None, true, "1", None, &env);
+    session.set_pin().expect("set pin");
+    session.lock().expect("lock");
+    // The first key only opens the prompt. Tab after that switches to the password.
+    send_virtual_key(VK_F13, session.extra).expect("open prompt");
+    thread::sleep(Duration::from_millis(200));
+    send_virtual_key(VK_TAB, session.extra).expect("tab");
+    thread::sleep(Duration::from_millis(200));
+    for step in 0..3 {
+        type_password("wrong-password-value", session.extra);
+        thread::sleep(Duration::from_millis(400));
+        if step == 0 {
+            advance_clock(&clock, 31_000, 31_000);
+        } else if step == 1 {
+            advance_clock(&clock, 61_000, 61_000);
+        }
+    }
+    assert!(
+        wait_for(Duration::from_secs(8), || {
+            prompt_says("Password unavailable")
+        }),
+        "the prompt did not report the password path exhausted ({})",
+        prompt_debug(&session)
+    );
+    assert!(
+        prompt_says("Enter PIN"),
+        "the exhausted prompt did not offer the PIN"
+    );
+    let mid = softlock_service::account_lockout(&account.name).expect("mid");
+    assert_eq!(
+        mid.bad_password_count, 3,
+        "the password path called LogonUser more or less than the cap"
+    );
+    assert!(!mid.locked_out, "the account locked inside the cap");
+    // Age only the oldest failure, on both clocks. The latest failure is
+    // still inside the 10-minute window, so Windows has not reset the count.
+    advance_clock(&clock, 520_000, 520_000);
+    send_virtual_key(VK_TAB, session.extra).expect("tab");
+    thread::sleep(Duration::from_millis(150));
+    for _ in 0..8 {
+        type_password("wrong-password-value", session.extra);
+        thread::sleep(Duration::from_millis(200));
+    }
+    let after = softlock_service::account_lockout(&account.name).expect("after");
+    assert_eq!(
+        after.bad_password_count, 3,
+        "an attempt after the cap called LogonUser"
+    );
+    assert!(!after.locked_out, "the account locked out");
+    let log = fs::read_to_string(&session.log).unwrap_or_default();
+    assert!(
+        log.contains("result=exhausted"),
+        "the service did not record exhaustion: {log}"
+    );
+    assert!(
+        !log.contains("wrong-password-value"),
+        "a typed password reached the log"
+    );
+    assert!(!log.contains(&account.password), "password reached the log");
+}
+
+fn advance_clock(path: &Path, tick_delta: u64, wall_delta: u64) {
+    let (base_tick, base_wall) = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| {
+            let mut parts = text.split_whitespace();
+            let tick = parts.next()?.parse().ok()?;
+            let wall = parts.next()?.parse().ok()?;
+            Some((tick, wall))
+        })
+        .unwrap_or_else(|| {
+            let tick = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+            let wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(0))
+                .unwrap_or(0);
+            (tick, wall)
+        });
+    fs::write(
+        path,
+        format!(
+            "{} {}",
+            base_tick.saturating_add(tick_delta),
+            base_wall.saturating_add(wall_delta)
+        ),
+    )
+    .expect("test clock");
+}
+
+fn prompt_says(needle: &str) -> bool {
+    *PROMPT_NEEDLE.lock().expect("needle") = needle.to_string();
+    OVERLAY_TITLES.lock().expect("titles").clear();
+    let mut found = false;
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::EnumWindows(
+            Some(enum_window_title),
+            windows::Win32::Foundation::LPARAM(&mut found as *mut bool as isize),
+        );
+    }
+    found
+}
+
+fn prompt_debug(session: &Session) -> String {
+    let _ = prompt_says("Password unavailable");
+    let titles = OVERLAY_TITLES.lock().expect("titles").join("; ");
+    let log = fs::read_to_string(&session.log).unwrap_or_default();
+    let mut lines: Vec<&str> = log.lines().rev().take(8).collect();
+    lines.reverse();
+    format!("overlay=[{titles}] log={}", lines.join(" | "))
+}
+
+static PROMPT_NEEDLE: Mutex<String> = Mutex::new(String::new());
+static OVERLAY_TITLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+unsafe extern "system" fn enum_window_title(
+    hwnd: windows::Win32::Foundation::HWND,
+    param: windows::Win32::Foundation::LPARAM,
+) -> windows::core::BOOL {
+    let mut class = [0u16; 64];
+    let class_len =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class) };
+    if class_len <= 0 {
+        return windows::core::BOOL(1);
+    }
+    let class_name = String::from_utf16_lossy(&class[..class_len as usize]);
+    if class_name != "softlock_overlay" {
+        return windows::core::BOOL(1);
+    }
+    let mut buf = [0u16; 256];
+    let count = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buf) };
+    if count > 0 {
+        let text = String::from_utf16_lossy(&buf[..count as usize]);
+        OVERLAY_TITLES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(text.clone());
+        let needle = PROMPT_NEEDLE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if text.contains(needle.as_str()) {
+            unsafe {
+                *(param.0 as *mut bool) = true;
+            }
+            return windows::core::BOOL(0);
+        }
+    }
+    windows::core::BOOL(1)
+}
+
+#[test]
+fn outside_failures_stop_the_password_path_before_the_threshold() {
+    let _guard = gate();
+    forget_password_attempts();
+    let _policy = LockoutGuard::set_window(5, 30, 30);
+    let account = PasswordAccount::create();
+    let wrong = softlock_core::Secret::new(b"wrong-password-value");
+    for _ in 0..3 {
+        assert!(
+            !softlock_service::network_logon(&account.name, ".", &wrong),
+            "an outside wrong password was accepted"
+        );
+    }
+    let seeded = softlock_service::account_lockout(&account.name).expect("seeded");
+    assert_eq!(seeded.bad_password_count, 3);
+    assert!(!seeded.locked_out, "seeding locked the account");
+    let env = account.session_env();
+    let session = Session::launch_extra(None, false, "1", None, &env);
+    session.lock().expect("lock");
+    for _ in 0..4 {
+        type_password("wrong-password-value", session.extra);
+        thread::sleep(Duration::from_millis(300));
+    }
+    let after = softlock_service::account_lockout(&account.name).expect("after");
+    assert_eq!(
+        after.bad_password_count, 3,
+        "the password path called LogonUser after outside failures had used the margin"
+    );
+    assert!(!after.locked_out, "the account locked out");
+}
+
+#[test]
+fn network_logon_lockout_count() {
+    let _guard = gate();
+    let _policy = LockoutGuard::set(3);
+    let account = PasswordAccount::create();
+    let before = softlock_service::account_lockout(&account.name).expect("before");
+    let wrong = softlock_core::Secret::new(b"wrong-password-value");
+    let mut accepted = 0u32;
+    for _ in 0..4 {
+        if softlock_service::network_logon(&account.name, ".", &wrong) {
+            accepted += 1;
+        }
+    }
+    let after = softlock_service::account_lockout(&account.name).expect("after");
+    assert_eq!(before.bad_password_count, 0);
+    assert!(!before.locked_out);
+    assert_eq!(accepted, 0, "a wrong network logon was accepted");
+    assert_eq!(
+        after.bad_password_count, 3,
+        "a rejected network logon did not reach the threshold"
+    );
+    assert!(
+        after.locked_out,
+        "the account did not lock at the threshold"
+    );
+    println!(
+        "lockout-measure threshold=3 before_bad={} after_bad={} before_locked={} after_locked={} wrong_logons_accepted={}",
+        before.bad_password_count,
+        after.bad_password_count,
+        before.locked_out,
+        after.locked_out,
+        accepted
+    );
 }
 
 #[test]

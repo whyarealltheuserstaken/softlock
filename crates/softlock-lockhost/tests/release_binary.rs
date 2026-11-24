@@ -11,6 +11,9 @@ const DEV_SYMBOL: &[u8] = b"softlock_dev_launch_marker";
 const LIVE_STRING: &[u8] = b"softlock-live-fail-closed-marker";
 const LIVE_SYMBOL: &[u8] = b"softlock_live_fail_closed_marker";
 const PIN_STRING: &[u8] = b"softlock-present-physical-pin";
+const CLOCK_FILE: &[u8] = b"SOFTLOCK_CLOCK_FILE";
+const SESSION_USER: &[u8] = b"SOFTLOCK_SESSION_USER";
+const SESSION_DOMAIN: &[u8] = b"SOFTLOCK_SESSION_DOMAIN";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Hit {
@@ -37,6 +40,12 @@ fn scanner_rejects_each_marker_on_its_own() {
     fs::write(&dev_string_only, padding(DEV_STRING)).unwrap();
     fs::write(&dev_symbol_only, padding(DEV_SYMBOL)).unwrap();
     fs::write(&clean, b"release binary without the test feature").unwrap();
+    let clock = root.join("clock.exe");
+    let session_user = root.join("user.dll");
+    let session_domain = root.join("domain.dll");
+    fs::write(&clock, padding(CLOCK_FILE)).unwrap();
+    fs::write(&session_user, padding(SESSION_USER)).unwrap();
+    fs::write(&session_domain, padding(SESSION_DOMAIN)).unwrap();
 
     let string_hits = scan(&root, "string-only.rlib");
     assert!(
@@ -66,6 +75,13 @@ fn scanner_rejects_each_marker_on_its_own() {
         scan(&root, "clean.dll").is_empty(),
         "a clean file must not trip the check"
     );
+    assert!(
+        scan(&root, "clock.exe")
+            .iter()
+            .any(|hit| hit.string && !hit.symbol)
+    );
+    assert!(scan(&root, "user.dll").iter().any(|hit| hit.string));
+    assert!(scan(&root, "domain.dll").iter().any(|hit| hit.string));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -268,11 +284,21 @@ fn scan(root: &Path, name_filter: &str) -> Vec<Hit> {
         let live_string = contains(&bytes, LIVE_STRING);
         let live_symbol = contains(&bytes, LIVE_SYMBOL);
         let pin_string = contains(&bytes, PIN_STRING);
-        if string || symbol || dev_string || dev_symbol || live_string || live_symbol || pin_string
+        let env_hook = contains(&bytes, CLOCK_FILE)
+            || contains(&bytes, SESSION_USER)
+            || contains(&bytes, SESSION_DOMAIN);
+        if string
+            || symbol
+            || dev_string
+            || dev_symbol
+            || live_string
+            || live_symbol
+            || pin_string
+            || env_hook
         {
             hits.push(Hit {
                 path: path.display().to_string(),
-                string,
+                string: string || env_hook,
                 symbol,
                 dev_string,
                 dev_symbol,

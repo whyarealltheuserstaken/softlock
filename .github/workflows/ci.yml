@@ -121,6 +121,17 @@ jobs:
             grep -F "the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut ... ok" target/live-hooks-service.txt
             grep -F "an_unlock_from_an_absent_logon_stays_os_locked ... ok" target/live-hooks-service.txt
             grep -F "the_same_logon_on_the_console_clears_os_locked ... ok" target/live-hooks-service.txt
+            cargo test --locked -p softlock-service --features simulated-physical,live-fail-closed --lib \
+              -- file_clock_returns_none_when_the_runner_may_not_lock \
+                 overridden_account_returns_none_when_the_runner_may_not_lock \
+                 password_attempts_round_trip_an_owner_returned_boot \
+                 password_attempts_round_trip_a_keep_os_lock_revert \
+                 --test-threads=1 \
+              2>&1 | tee target/password-gates.txt
+            grep -F "file_clock_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "overridden_account_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_an_owner_returned_boot ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_a_keep_os_lock_revert ... ok" target/password-gates.txt
           fi
       - name: test-support stays out of product builds
         shell: bash
@@ -251,6 +262,17 @@ jobs:
             grep -F "the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut ... ok" target/live-hooks-service.txt
             grep -F "an_unlock_from_an_absent_logon_stays_os_locked ... ok" target/live-hooks-service.txt
             grep -F "the_same_logon_on_the_console_clears_os_locked ... ok" target/live-hooks-service.txt
+            cargo test --locked -p softlock-service --features simulated-physical,live-fail-closed --lib \
+              -- file_clock_returns_none_when_the_runner_may_not_lock \
+                 overridden_account_returns_none_when_the_runner_may_not_lock \
+                 password_attempts_round_trip_an_owner_returned_boot \
+                 password_attempts_round_trip_a_keep_os_lock_revert \
+                 --test-threads=1 \
+              2>&1 | tee target/password-gates.txt
+            grep -F "file_clock_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "overridden_account_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_an_owner_returned_boot ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_a_keep_os_lock_revert ... ok" target/password-gates.txt
           fi
       - name: test-support stays out of product builds
         shell: bash
@@ -405,6 +427,17 @@ jobs:
             grep -F "the_pin_environment_is_not_forwarded_when_the_runner_gate_is_shut ... ok" target/live-hooks-service.txt
             grep -F "an_unlock_from_an_absent_logon_stays_os_locked ... ok" target/live-hooks-service.txt
             grep -F "the_same_logon_on_the_console_clears_os_locked ... ok" target/live-hooks-service.txt
+            cargo test --locked -p softlock-service --features simulated-physical,live-fail-closed --lib \
+              -- file_clock_returns_none_when_the_runner_may_not_lock \
+                 overridden_account_returns_none_when_the_runner_may_not_lock \
+                 password_attempts_round_trip_an_owner_returned_boot \
+                 password_attempts_round_trip_a_keep_os_lock_revert \
+                 --test-threads=1 \
+              2>&1 | tee target/password-gates.txt
+            grep -F "file_clock_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "overridden_account_returns_none_when_the_runner_may_not_lock ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_an_owner_returned_boot ... ok" target/password-gates.txt
+            grep -F "password_attempts_round_trip_a_keep_os_lock_revert ... ok" target/password-gates.txt
           fi
       - name: test-support stays out of product builds
         shell: bash
@@ -647,6 +680,7 @@ jobs:
           grep -F "a_stale_base_revision_returns_conflict ... ok" target/seam2-service.txt
           grep -F "an_absent_value_is_deleted_after_a_restart_mid_lock ... ok" target/seam2-service.txt
           grep -F "get_config_and_validate_config_work_for_lock_client ... ok" target/seam2-service.txt
+          grep -F "os_locked_password_writes_no_stamp_and_does_not_log_on ... ok" target/seam2-service.txt
           cargo build --locked -p softlock-service -p softlock-lockhost \
             --features softlock-service/simulated-physical,softlock-lockhost/simulated-physical \
             --target x86_64-pc-windows-msvc
@@ -683,6 +717,23 @@ jobs:
           test "$arming_ms" -lt 500
           grep -F "private_pin_unlocks_and_the_hash_is_not_user_readable ... ok" target/seam3-service.txt
           grep -F "service_log_omits_the_pin_and_the_note ... ok" target/seam3-service.txt
+          grep -F "right_password_unlocks_and_wrong_password_does_not ... ok" target/seam3-service.txt
+          grep -F "service_log_omits_the_password ... ok" target/seam3-service.txt
+          grep -F "another_accounts_password_does_not_unlock ... ok" target/seam3-service.txt
+          grep -F "tab_switches_from_pin_to_password ... ok" target/seam3-service.txt
+          grep -F "backoff_survives_a_service_restart ... ok" target/seam3-service.txt
+          grep -F "password_attempts_stay_under_the_lockout_threshold ... ok" target/seam3-service.txt
+          grep -F "lockout-measure threshold=3" target/seam3-service.txt
+          awk '{ gsub(/\r/, "") }
+               /^test network_logon_lockout_count \.\.\./ {
+                 found = 1
+                 if ($0 ~ / ok$/) { exit 0 }
+                 pending = 1
+                 next
+               }
+               pending && /^test / { exit 1 }
+               pending && /^ok$/ { pending = 0; exit 0 }
+               END { exit (found && !pending ? 0 : 1) }' target/seam3-service.txt
           grep -F "panic_while_os_lock_is_down_is_closed_by_the_service ... ok" target/seam3-service.txt
           grep -F "emergency_after_both_os_locks_fail_is_closed_by_the_service ... ok" target/seam3-service.txt
           grep -F "installed_service_runs_as_local_system_and_rejects_session_zero ... ok" target/seam3-service.txt

@@ -8,10 +8,12 @@
 //! Unlocked.
 
 use std::path::{Path, PathBuf};
-
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
+use crate::password_shape::PasswordLogon;
 use softlock_core::{
     CONFIG_ERRORS_NAME, Event, GuardHealth, HeartbeatReport, HostToService, LaunchNonce,
     LockController, LockSource, LockState, MethodId, OverlayHealth, RequestKind, ResponseKind,
@@ -21,6 +23,17 @@ use softlock_core::{
 
 use crate::log::{audit, source_name};
 use crate::platform::{ARM_READY_LIMIT, ArmWait, ServicePlatform};
+
+#[cfg(test)]
+pub(crate) static PASSWORD_LOGON_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static LOCKOUT_POLICY_READS: AtomicUsize = AtomicUsize::new(0);
+
+fn password_path_off(code: u32) -> bool {
+    // 1909 locked out, 1330 password expired, 1907 must change, 1385 logon
+    // type not granted, 1327 account restriction, 1311 no logon servers.
+    matches!(code, 1909 | 1330 | 1907 | 1385 | 1327 | 1311)
+}
 
 const SILENCE: Duration = Duration::from_millis(750);
 const OS_LOCK_RETRY: Duration = Duration::from_secs(1);
@@ -71,6 +84,19 @@ pub struct Authority {
     /// The hung host is still alive and has to be replaced.
     arm_replace: bool,
     config_dir: Option<PathBuf>,
+    /// Monotonic deadline for the PIN backoff. Wall-clock changes do not
+    /// move `Instant`, so they cannot expire this early. Password waits are
+    /// not this deadline.
+    backoff_deadline: Option<Instant>,
+    /// Password failures that still count inside the Windows observation
+    /// window. PIN failures are not stored here.
+    password_attempts: Vec<softlock_core::PasswordStamp>,
+    /// Set when the journal cannot be read. Holds until the live observation
+    /// window has passed on both clocks since this stamp.
+    password_journal_block: Option<softlock_core::PasswordStamp>,
+    /// A logon result that means further password checks cannot be safe for
+    /// this lock. Cleared when the next lock starts.
+    password_off: Option<u32>,
 }
 
 impl Authority {
@@ -87,7 +113,38 @@ impl Authority {
             arm_deadline: None,
             arm_replace: false,
             config_dir: None,
+            backoff_deadline: None,
+            password_attempts: Vec::new(),
+            password_journal_block: None,
+            password_off: None,
         }
+    }
+
+    /// Copy password attempts the settings journal still has. Called after the
+    /// engine boots, including when the lock itself has already been reverted.
+    pub fn adopt_password_window(&mut self) {
+        #[cfg(windows)]
+        if let Some(engine) = self.controller.platform_mut().settings_mut() {
+            self.password_attempts = engine.password_attempts();
+        }
+    }
+
+    /// The journal cannot be read. Fill the live policy's attempt cap and
+    /// hold the path for one observation window, instead of a single stamp
+    /// against the fail-closed limit of one.
+    pub fn block_password_path(&mut self) {
+        let policy = self.lockout_policy();
+        let now = crate::clock::password_clock();
+        let stamp = softlock_core::PasswordStamp {
+            tick: now.tick.max(1),
+            wall_ms: now.wall_ms.max(1),
+        };
+        if let Some(limit) = softlock_core::password_attempt_limit(policy.threshold)
+            && limit > 0
+        {
+            self.password_attempts = vec![stamp; limit as usize];
+        }
+        self.password_journal_block = Some(stamp);
     }
 
     /// Loads a file that already exists when the service starts. A document
@@ -112,6 +169,19 @@ impl Authority {
         } else {
             Some(message.to_string())
         }
+    }
+
+    pub fn unlock_offers(&self) -> (bool, bool) {
+        (self.pin_hash.is_some(), true)
+    }
+
+    pub fn arm_backoff_from_controller(&mut self, now: Instant) {
+        let delay = self.controller.backoff_delay();
+        self.backoff_deadline = if delay.is_zero() {
+            None
+        } else {
+            Some(now + delay)
+        };
     }
 
     pub fn platform_mut(&mut self) -> &mut ServicePlatform {
@@ -420,6 +490,11 @@ impl Authority {
     /// Respawns when the host is gone. Retries the OS lock while it is down.
     /// Neither result is Unlocked.
     pub fn poll_host(&mut self, now: Instant, process_alive: bool) -> HostAction {
+        self.expire_backoff(now);
+        #[cfg(windows)]
+        if crate::windows::chain_running() {
+            return HostAction::Hold;
+        }
         let stale = self
             .last_beat
             .is_some_and(|last| now.saturating_duration_since(last) >= SILENCE);
@@ -523,17 +598,21 @@ impl Authority {
     }
 
     fn decide_secret(&mut self, method: &str, secret: Secret) -> ServiceToHost {
+        self.expire_backoff(Instant::now());
         let method_id = MethodId::new(method);
+        if method == MethodId::os_password().as_str() {
+            return self.decide_password(secret);
+        }
         let backoff = self.controller.backoff_delay();
         if !backoff.is_zero() {
             self.controller.handle(Event::SubmitSecret {
                 method: method_id,
                 secret,
             });
-            return ServiceToHost::PromptResult {
-                accepted: false,
-                backoff_ms: u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
-            };
+            return self.prompt_refused();
+        }
+        if method != MethodId::softlock_pin().as_str() {
+            return self.note_rejected(method_id, secret);
         }
         let matched = self
             .pin_hash
@@ -542,10 +621,7 @@ impl Authority {
         if matched && self.grant_allowed() {
             drop(secret);
             let Some(stored) = self.launch.take() else {
-                return ServiceToHost::PromptResult {
-                    accepted: false,
-                    backoff_ms: 0,
-                };
+                return self.prompt_refused();
             };
             let mut bytes = *stored.as_bytes();
             // AdoptLaunchNonce followed by Verified always matches. Both
@@ -561,6 +637,7 @@ impl Authority {
                 nonce: LaunchNonce::from_bytes(bytes),
             });
             bytes.zeroize();
+            self.backoff_deadline = None;
             audit("unlock", &[("method", "softlock_pin")]);
             // The host is still up until it reads Disarm and removes its hooks.
             // Clearing the launch flag here must not look like a lost host, or
@@ -571,19 +648,291 @@ impl Authority {
         }
         if matched {
             drop(secret);
-            return ServiceToHost::PromptResult {
-                accepted: false,
-                backoff_ms: 0,
-            };
+            return self.prompt_refused();
         }
-        self.controller.handle(Event::SubmitSecret {
-            method: method_id,
-            secret,
-        });
-        let backoff = self.controller.backoff_delay();
+        self.note_rejected(method_id, secret)
+    }
+
+    fn decide_password(&mut self, secret: Secret) -> ServiceToHost {
+        // OsLocked and StayOsLocked must not spend a Windows bad-password
+        // count. Refuse before the policy read, the account read, the stamp,
+        // and LogonUser.
+        if !self.grant_allowed() {
+            drop(secret);
+            audit(
+                "unlock",
+                &[("method", "os_password"), ("result", "rejected")],
+            );
+            return self.password_prompt(false);
+        }
+        let policy = self.lockout_policy();
+        let now = crate::clock::password_clock();
+        if self.password_off.is_some() || self.journal_block_holds(policy, now) {
+            drop(secret);
+            let code = self
+                .password_off
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "journal".to_string());
+            audit(
+                "unlock",
+                &[
+                    ("method", "os_password"),
+                    ("result", "exhausted"),
+                    ("code", code.as_str()),
+                ],
+            );
+            return self.password_prompt(true);
+        }
+        let gate = softlock_core::password_gate(&self.password_attempts, policy, now);
+        if !gate.allow {
+            drop(secret);
+            let result = if gate.exhausted {
+                "exhausted"
+            } else {
+                "waiting"
+            };
+            audit("unlock", &[("method", "os_password"), ("result", result)]);
+            return self.password_prompt(gate.exhausted);
+        }
+        // The account's own bad-password count includes failures from the
+        // sign-in screen, RDP, and other programs. Refuse before LogonUser
+        // when one more failure would reach the threshold, or when the read
+        // fails. A failed read is not treated as zero.
+        #[cfg(windows)]
+        if !crate::password::account_allows_logon(policy) {
+            drop(secret);
+            audit(
+                "unlock",
+                &[
+                    ("method", "os_password"),
+                    ("result", "exhausted"),
+                    ("reason", "account"),
+                ],
+            );
+            return self.password_prompt(true);
+        }
+        if !crate::password_shape::password_accepted_shape(secret.expose()) {
+            drop(secret);
+            audit(
+                "unlock",
+                &[("method", "os_password"), ("result", "rejected")],
+            );
+            return self.password_prompt(false);
+        }
+        // Commit the failure before the logon call. A crash during LogonUser
+        // then still counts. A save that does not land refuses the call.
+        if self.password_attempts.len() < 1_000 {
+            self.password_attempts.push(softlock_core::PasswordStamp {
+                tick: now.tick.max(1),
+                wall_ms: now.wall_ms.max(1),
+            });
+        }
+        if self.persist_password_attempts().is_err() {
+            drop(secret);
+            audit(
+                "unlock",
+                &[
+                    ("method", "os_password"),
+                    ("result", "exhausted"),
+                    ("reason", "journal"),
+                ],
+            );
+            return self.password_prompt(true);
+        }
+        let outcome = {
+            #[cfg(windows)]
+            {
+                #[cfg(test)]
+                PASSWORD_LOGON_CALLS.fetch_add(1, Ordering::SeqCst);
+                crate::password::verify_session_password(&secret)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = &secret;
+                #[cfg(test)]
+                PASSWORD_LOGON_CALLS.fetch_add(1, Ordering::SeqCst);
+                PasswordLogon::Failed(1326)
+            }
+        };
+        drop(secret);
+        match outcome {
+            PasswordLogon::Verified => self.finish_verified_password(),
+            PasswordLogon::Mismatch => {
+                self.undo_pending_stamp();
+                audit(
+                    "unlock",
+                    &[("method", "os_password"), ("result", "rejected")],
+                );
+                self.password_prompt(false)
+            }
+            PasswordLogon::Failed(code) => {
+                let code_text = code.to_string();
+                if code == 1326 {
+                    audit(
+                        "unlock",
+                        &[
+                            ("method", "os_password"),
+                            ("result", "rejected"),
+                            ("code", code_text.as_str()),
+                        ],
+                    );
+                    let after = softlock_core::password_gate(&self.password_attempts, policy, now);
+                    self.password_prompt(after.exhausted)
+                } else if password_path_off(code) {
+                    self.undo_pending_stamp();
+                    self.password_off = Some(code);
+                    audit(
+                        "unlock",
+                        &[
+                            ("method", "os_password"),
+                            ("result", "off"),
+                            ("code", code_text.as_str()),
+                        ],
+                    );
+                    self.password_prompt(true)
+                } else {
+                    // The stamp stays. An unknown failure may still have
+                    // counted, and the code is the only thing logged.
+                    audit(
+                        "unlock",
+                        &[
+                            ("method", "os_password"),
+                            ("result", "rejected"),
+                            ("code", code_text.as_str()),
+                        ],
+                    );
+                    let after = softlock_core::password_gate(&self.password_attempts, policy, now);
+                    self.password_prompt(after.exhausted)
+                }
+            }
+        }
+    }
+
+    fn journal_block_holds(
+        &self,
+        policy: softlock_core::LockoutPolicy,
+        now: softlock_core::ClockSample,
+    ) -> bool {
+        let Some(stamp) = self.password_journal_block else {
+            return false;
+        };
+        let window = if policy.window.is_zero() {
+            softlock_core::unreadable_lockout_policy().window
+        } else {
+            policy.window
+        };
+        softlock_core::stamp_inside_window(stamp, window, now)
+    }
+
+    fn undo_pending_stamp(&mut self) {
+        self.password_attempts.pop();
+        let _ = self.persist_password_attempts();
+    }
+
+    fn lockout_policy(&self) -> softlock_core::LockoutPolicy {
+        #[cfg(test)]
+        LOCKOUT_POLICY_READS.fetch_add(1, Ordering::SeqCst);
+        #[cfg(windows)]
+        {
+            crate::password::read_lockout_policy()
+        }
+        #[cfg(not(windows))]
+        {
+            softlock_core::unreadable_lockout_policy()
+        }
+    }
+
+    fn persist_password_attempts(&mut self) -> Result<(), &'static str> {
+        #[cfg(windows)]
+        {
+            let attempts = self.password_attempts.clone();
+            let Some(engine) = self.controller.platform_mut().settings_mut() else {
+                return Err("journal");
+            };
+            engine.store_password_attempts(&attempts)
+        }
+        #[cfg(not(windows))]
+        {
+            Err("journal")
+        }
+    }
+
+    fn password_prompt(&self, exhausted: bool) -> ServiceToHost {
         ServiceToHost::PromptResult {
             accepted: false,
-            backoff_ms: u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+            backoff_ms: 0,
+            password_path: true,
+            password_exhausted: exhausted,
+        }
+    }
+
+    fn note_rejected(&mut self, method: MethodId, secret: Secret) -> ServiceToHost {
+        self.controller
+            .handle(Event::SubmitSecret { method, secret });
+        self.remember_backoff();
+        self.prompt_refused()
+    }
+
+    fn prompt_refused(&self) -> ServiceToHost {
+        ServiceToHost::PromptResult {
+            accepted: false,
+            backoff_ms: self.backoff_remaining_ms(),
+            password_path: false,
+            password_exhausted: false,
+        }
+    }
+
+    /// The controller clock does not advance, so its delay stays at the full
+    /// wait. The host is told the time left on the monotonic deadline.
+    fn backoff_remaining_ms(&self) -> u64 {
+        let left = match self.backoff_deadline {
+            Some(due) => due.saturating_duration_since(Instant::now()),
+            None => self.controller.backoff_delay(),
+        };
+        u64::try_from(left.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn remember_backoff(&mut self) {
+        let delay = self.controller.backoff_delay();
+        self.backoff_deadline = if delay.is_zero() {
+            None
+        } else {
+            Some(Instant::now() + delay)
+        };
+        self.persist_backoff();
+    }
+
+    fn persist_backoff(&mut self) {
+        #[cfg(windows)]
+        {
+            let failures = self.controller.failure_count();
+            let delay_ms = u64::try_from(self.controller.backoff_delay().as_millis()).unwrap_or(0);
+            let written = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+            let until = written.saturating_add(delay_ms);
+            let wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            let Some(engine) = self.controller.platform_mut().settings_mut() else {
+                return;
+            };
+            if engine
+                .store_backoff(failures, until, written, wall)
+                .is_err()
+            {
+                audit("backoff", &[("result", "kept"), ("reason", "journal")]);
+            }
+        }
+    }
+
+    fn expire_backoff(&mut self, now: Instant) {
+        if self.controller.backoff_delay().is_zero() {
+            self.backoff_deadline = None;
+            return;
+        }
+        if self.backoff_deadline.is_some_and(|due| now >= due) {
+            self.backoff_deadline = None;
+            self.controller.handle(Event::BackoffElapsed);
         }
     }
 
@@ -591,6 +940,56 @@ impl Authority {
         matches!(self.controller.state(), LockState::Locked { .. })
             || (self.controller.os_lock_unavailable()
                 && matches!(self.controller.state(), LockState::FailingClosed { .. }))
+    }
+
+    /// A correct password disarms only when [`Self::grant_allowed`] is true.
+    /// `OsLocked` and `StayOsLocked` are refused here, before `Verified` is
+    /// delivered, so the disconnect guard is not bypassed.
+    fn finish_verified_password(&mut self) -> ServiceToHost {
+        if !self.grant_allowed() {
+            self.undo_pending_stamp();
+            audit(
+                "unlock",
+                &[("method", "os_password"), ("result", "rejected")],
+            );
+            return self.password_prompt(false);
+        }
+        let kept = self.password_attempts.clone();
+        self.password_attempts.clear();
+        self.password_journal_block = None;
+        self.password_off = None;
+        if self.persist_password_attempts().is_err() {
+            self.password_attempts = kept;
+            audit(
+                "unlock",
+                &[
+                    ("method", "os_password"),
+                    ("result", "rejected"),
+                    ("reason", "journal"),
+                ],
+            );
+            return self.password_prompt(false);
+        }
+        let Some(stored) = self.launch.take() else {
+            audit(
+                "unlock",
+                &[("method", "os_password"), ("result", "rejected")],
+            );
+            return self.password_prompt(false);
+        };
+        let mut bytes = *stored.as_bytes();
+        self.controller.handle(Event::AdoptLaunchNonce {
+            nonce: LaunchNonce::from_bytes(bytes),
+        });
+        self.controller.handle(Event::Verified {
+            nonce: LaunchNonce::from_bytes(bytes),
+        });
+        bytes.zeroize();
+        self.backoff_deadline = None;
+        audit("unlock", &[("method", "os_password"), ("result", "ok")]);
+        self.controller.acknowledge_recovery();
+        self.host_ready = false;
+        ServiceToHost::Disarm
     }
 
     fn matches_launch(&self, presented: &LaunchNonce) -> bool {
@@ -667,6 +1066,7 @@ impl Authority {
     }
 
     fn remember_lock(&mut self, source: LockSource, note: Option<&str>) {
+        self.password_off = None;
         let noted = if note.is_some() { "yes" } else { "no" };
         let len = note.map(str::len).unwrap_or(0);
         self.note_len = note.map(str::len);
@@ -836,10 +1236,11 @@ pub fn stub_os_lock() -> bool {
 #[cfg(test)]
 mod host_ready_tests {
     use softlock_core::{
-        HostToService, LaunchNonce, LockSource, LockState, RequestKind, ResponseKind, Role,
-        StateName,
+        Event, HostToService, Journal, LaunchNonce, LockSource, LockState, RequestKind,
+        ResponseKind, Role, Secret, ServiceToHost, StateName,
     };
 
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     use super::{Authority, HostAction, HostLoss};
@@ -1016,6 +1417,80 @@ mod host_ready_tests {
         );
         assert!(!wait.is_waiting(), "the arm slot stayed waiting");
         assert_eq!(action, HostAction::Respawn { arm: true });
+    }
+
+    #[test]
+    fn a_correct_password_while_os_locked_is_refused() {
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), true);
+        let mut journal = Journal::empty();
+        journal.mark_os_held();
+        authority.notify(Event::ServiceStarted {
+            journal,
+            session_active: false,
+        });
+        assert!(matches!(authority.state(), LockState::OsLocked { .. }));
+        assert!(!authority.grant_allowed());
+        authority
+            .password_attempts
+            .push(softlock_core::PasswordStamp {
+                tick: 1,
+                wall_ms: 1,
+            });
+        let reply = authority.finish_verified_password();
+        assert!(
+            !matches!(reply, ServiceToHost::Disarm),
+            "a correct password disarmed from OsLocked"
+        );
+        assert!(
+            matches!(authority.state(), LockState::OsLocked { .. }),
+            "OsLocked changed after a correct password"
+        );
+        assert!(
+            authority.password_attempts.is_empty(),
+            "the refused password kept a stamp"
+        );
+        assert!(!authority.returned_to_unlocked());
+    }
+
+    #[test]
+    fn os_locked_password_writes_no_stamp_and_does_not_log_on() {
+        let mut authority = Authority::new(ServicePlatform::new(OsLock::Fails), true);
+        let mut journal = Journal::empty();
+        journal.mark_os_held();
+        authority.notify(Event::ServiceStarted {
+            journal,
+            session_active: false,
+        });
+        assert!(matches!(authority.state(), LockState::OsLocked { .. }));
+        let logons = super::PASSWORD_LOGON_CALLS.load(Ordering::SeqCst);
+        let reads = super::LOCKOUT_POLICY_READS.load(Ordering::SeqCst);
+        let reply = authority.decide_password(Secret::new(b"correct-horse"));
+        assert!(
+            matches!(
+                reply,
+                ServiceToHost::PromptResult {
+                    accepted: false,
+                    password_path: true,
+                    ..
+                }
+            ),
+            "an OsLocked password was not refused at the prompt"
+        );
+        assert!(
+            authority.password_attempts.is_empty(),
+            "OsLocked wrote a password stamp"
+        );
+        assert_eq!(
+            super::PASSWORD_LOGON_CALLS.load(Ordering::SeqCst),
+            logons,
+            "OsLocked called LogonUser"
+        );
+        assert_eq!(
+            super::LOCKOUT_POLICY_READS.load(Ordering::SeqCst),
+            reads,
+            "OsLocked read the lockout policy"
+        );
+        assert!(matches!(authority.state(), LockState::OsLocked { .. }));
     }
 }
 

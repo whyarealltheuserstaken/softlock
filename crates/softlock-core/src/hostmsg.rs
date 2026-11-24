@@ -21,6 +21,12 @@ pub enum ServiceToHost {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// Which secret fields the prompt may offer. Password is the account
+    /// password. PIN is this product's PIN, and only when a hash is stored.
+    Methods {
+        pin: bool,
+        password: bool,
+    },
     Disarm,
     /// Lock the signed-in session. The Service confirms it and disconnects
     /// the console itself when this does not. The host must not disconnect.
@@ -28,6 +34,14 @@ pub enum ServiceToHost {
     PromptResult {
         accepted: bool,
         backoff_ms: u64,
+        /// This result is for the account password. The host must not apply
+        /// it to the PIN backoff, and it must not swallow PIN keystrokes.
+        #[serde(default)]
+        password_path: bool,
+        /// The password budget for this observation window is used up.
+        /// The prompt says so and keeps the PIN available.
+        #[serde(default)]
+        password_exhausted: bool,
     },
 }
 

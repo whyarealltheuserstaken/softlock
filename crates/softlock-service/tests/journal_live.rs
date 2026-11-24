@@ -592,11 +592,14 @@ fn console_user_sid() -> Result<String, String> {
 
 fn kill_before_apply(guard: &mut Guard, previous: &str, order: KillOrder) -> Result<(), String> {
     realign()?;
-    set_taskmgr(previous)?;
     let pause = guard_dir().join(format!("pause-{}-{previous}", order_name(order)));
     let _ = fs::remove_file(&pause);
     let before = journal_text();
+    // The previous service can still be stopping. Set the value only after
+    // it has exited, or its re-assert puts the old dword back and this lock
+    // never becomes the journal the restart restores.
     spawn_service(guard, Some("before"), &pause, true)?;
+    set_taskmgr(previous)?;
     wait_pipe()?;
     lock_in_background();
     let journal = journal_file();
@@ -642,15 +645,17 @@ fn kill_before_apply(guard: &mut Guard, previous: &str, order: KillOrder) -> Res
 
 fn kill_after_apply(guard: &mut Guard, order: KillOrder) -> Result<(), String> {
     realign()?;
-    set_taskmgr("absent")?;
     let pause = guard_dir().join(format!("pause-after-{}", order_name(order)));
     let _ = fs::remove_file(&pause);
+    // A service that is still stopping can write the locked dword back after
+    // this delete. Set the value only after that process has exited.
+    spawn_service(guard, Some("after"), &pause, true)?;
+    set_taskmgr("absent")?;
     // Hold the service after the registry write. Killing both processes
     // leaves the journal durable. The restart is the same boot. It must
     // OS-lock or leave the session OS-held, and must not end Unlocked while
     // the session is active. Settings are restored once that lock is
     // confirmed (SPEC section 7).
-    spawn_service(guard, Some("after"), &pause, true)?;
     wait_pipe()?;
     lock_in_background();
     let applied = wait_until(Duration::from_secs(20), || query_taskmgr() == "1");
@@ -799,9 +804,9 @@ fn powershell(script: &str) -> Result<String, String> {
 }
 
 fn reassert_and_repair(guard: &mut Guard) -> Result<(), String> {
-    set_taskmgr("absent")?;
     let pause = guard_dir().join("pause-reassert");
     spawn_service(guard, None, &pause, true)?;
+    set_taskmgr("absent")?;
     wait_pipe()?;
     transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
     if !wait_until(Duration::from_secs(20), || query_taskmgr() == "1") {
@@ -1098,10 +1103,10 @@ fn type_pin_keys() -> Result<(), String> {
 }
 
 fn recover_active(guard: &mut Guard) -> Result<(), String> {
-    set_taskmgr("0")?;
     let pause = guard_dir().join("pause-active");
     let _ = fs::remove_file(&pause);
     spawn_service(guard, Some("after"), &pause, true)?;
+    set_taskmgr("0")?;
     wait_pipe()?;
     lock_in_background();
     if !wait_until(Duration::from_secs(20), || {
@@ -1272,6 +1277,33 @@ fn ensure_service() -> Result<(), String> {
     } else {
         Err("sc create failed".to_string())
     }
+}
+
+/// Boot a service that should revert a leftover journal. A boot that still
+/// sees the host we just killed fails closed and leaves the registry locked.
+/// One more boot is the bound; both waits stay inside this test.
+fn restart_until(
+    guard: &mut Guard,
+    pause_file: &Path,
+    attach: bool,
+    mut ready: impl FnMut() -> bool,
+) -> bool {
+    for attempt in 0..2 {
+        let _ = wait_until(Duration::from_secs(5), || !host_running());
+        if host_running() {
+            return false;
+        }
+        if spawn_service(guard, None, pause_file, attach).is_err() {
+            return false;
+        }
+        if wait_until(Duration::from_secs(20), &mut ready) {
+            return true;
+        }
+        if attempt == 0 && hard_stop(guard).is_err() {
+            return false;
+        }
+    }
+    false
 }
 
 fn spawn_service(
@@ -1521,9 +1553,27 @@ fn suspend_pid(image: &str, pid: u32) -> Result<(), String> {
                 Ok(())
             };
         };
-        let status = NtSuspendProcess(process.0);
+        // Suspending a process that is still inside the loader returns
+        // STATUS_DLL_INIT_FAILED. The host is alive; the call can succeed
+        // once that init finishes.
+        // STATUS_DLL_INIT_FAILED: still inside the loader.
+        // STATUS_PROCESS_IS_TERMINATING: already leaving, so there is
+        // nothing left to freeze.
+        const DLL_INIT_FAILED: i32 = 0xC000_0142_u32 as i32;
+        const PROCESS_IS_TERMINATING: i32 = 0xC000_010A_u32 as i32;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut status = NtSuspendProcess(process.0);
+        let mut tries = 1u32;
+        while status == DLL_INIT_FAILED && tries < 40 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+            status = NtSuspendProcess(process.0);
+            tries += 1;
+        }
         let _ = windows::Win32::Foundation::CloseHandle(process);
-        if status == 0 || image_pid(image) != Some(pid) {
+        if status == 0
+            || image_pid(image) != Some(pid)
+            || (status == PROCESS_IS_TERMINATING && image_pid(image) != Some(pid))
+        {
             Ok(())
         } else {
             Err(format!("suspend {image} returned {status}"))
@@ -1867,11 +1917,11 @@ fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
         (MACHINE, "ConsentPromptBehaviorAdmin", "5", "1"),
         (MACHINE, "ConsentPromptBehaviorUser", "3", "0"),
     ];
+    let pause = guard_dir().join("pause-rows");
+    spawn_service(guard, None, &pause, true)?;
     for (key, name, previous, _) in chosen {
         set_value(key, name, previous)?;
     }
-    let pause = guard_dir().join("pause-rows");
-    spawn_service(guard, None, &pause, true)?;
     wait_pipe()?;
     transact(&pipe_name(), lock_now()).map_err(|error| format!("lock: {error}"))?;
     if !wait_until(Duration::from_secs(20), || {
@@ -1885,9 +1935,7 @@ fn every_row_restores(guard: &mut Guard) -> Result<(), String> {
         ));
     }
     hard_stop(guard)?;
-    let _ = wait_until(Duration::from_secs(5), || !host_running());
-    spawn_service(guard, None, &pause, true)?;
-    let restored = wait_until(Duration::from_secs(25), || {
+    let restored = restart_until(guard, &pause, true, || {
         chosen
             .iter()
             .all(|(key, name, previous, _)| query_value(key, name) == *previous)

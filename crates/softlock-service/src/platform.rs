@@ -76,6 +76,11 @@ impl ServicePlatform {
     }
 
     #[cfg(windows)]
+    pub fn settings_mut(&mut self) -> Option<&mut crate::settings::SettingsEngine> {
+        self.settings.as_mut()
+    }
+
+    #[cfg(windows)]
     pub fn poll_settings(&mut self) -> Result<(), &'static str> {
         let Some(engine) = self.settings.as_mut() else {
             return Ok(());

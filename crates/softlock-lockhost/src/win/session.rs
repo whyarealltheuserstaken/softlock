@@ -32,6 +32,9 @@ pub const OVERLAY_MARKER: (u8, u8, u8) = (1, 255, 2);
 pub(crate) static SESSION: AtomicPtr<Shared> = AtomicPtr::new(std::ptr::null_mut());
 
 const PIN_CHAR_LIMIT: u32 = 128;
+const PASSWORD_CHAR_LIMIT: u32 = 127;
+const METHOD_PIN: u8 = 0;
+const METHOD_PASSWORD: u8 = 1;
 
 pub struct DevConfig {
     /// Decides a PIN. The host does not hash it and does not draw the nonce.
@@ -41,10 +44,21 @@ pub struct DevConfig {
 }
 
 pub(crate) enum PipeCommand {
-    Arm { message: Option<String> },
+    Arm {
+        message: Option<String>,
+    },
     Disarm,
     OsLock,
     Quit,
+    Methods {
+        pin: bool,
+        password: bool,
+    },
+    Backoff {
+        ms: u64,
+        password_path: bool,
+        password_exhausted: bool,
+    },
 }
 
 pub(crate) enum PipeReport {
@@ -56,7 +70,10 @@ pub(crate) enum PipeReport {
         guard: GuardHealth,
         overlay: OverlayHealth,
     },
-    Secret(Secret),
+    Secret {
+        method: u8,
+        secret: Secret,
+    },
     GuardDown,
 }
 
@@ -323,6 +340,15 @@ pub(crate) struct Shared {
     pub wake: AtomicU64,
     pub prompt_open: AtomicBool,
     pub pin_chars: AtomicU32,
+    pub prompt_method: AtomicU8,
+    pub offer_pin: AtomicBool,
+    pub offer_password: AtomicBool,
+    pub shift_down: AtomicBool,
+    pub ctrl_down: AtomicBool,
+    pub alt_down: AtomicBool,
+    pub caps_lock: AtomicBool,
+    pub backoff_until: AtomicU64,
+    pub password_exhausted: AtomicBool,
     pub locked: AtomicBool,
     pub stop: AtomicBool,
     pub fail: AtomicBool,
@@ -390,6 +416,15 @@ impl Shared {
             wake: AtomicU64::new(0),
             prompt_open: AtomicBool::new(false),
             pin_chars: AtomicU32::new(0),
+            prompt_method: AtomicU8::new(METHOD_PIN),
+            offer_pin: AtomicBool::new(true),
+            offer_password: AtomicBool::new(true),
+            shift_down: AtomicBool::new(false),
+            ctrl_down: AtomicBool::new(false),
+            alt_down: AtomicBool::new(false),
+            caps_lock: AtomicBool::new(false),
+            backoff_until: AtomicU64::new(0),
+            password_exhausted: AtomicBool::new(false),
             locked: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             fail: AtomicBool::new(false),
@@ -549,6 +584,12 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             Some(PipeCommand::Quit) => service_gone = true,
             Some(PipeCommand::Arm { message }) => overlay::set_message(message.as_deref()),
+            Some(PipeCommand::Methods { pin, password }) => apply_methods(&shared, pin, password),
+            Some(PipeCommand::Backoff {
+                ms,
+                password_path,
+                password_exhausted,
+            }) => apply_prompt(&shared, &mut entry, ms, password_path, password_exhausted),
             None => {}
         }
         if service_gone {
@@ -970,6 +1011,12 @@ struct PinEntry {
     bytes: Vec<u8>,
     chars: u32,
     layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+    /// One mark per typed password slot, including keys that did not finish.
+    marks: Vec<crate::key_decode::PasswordKeyMark>,
+    /// A password key produced no character. Submitting would guess.
+    untranslated: bool,
+    /// `ToUnicodeEx` is waiting for the next key to compose this one.
+    dead_pending: bool,
 }
 
 impl Default for PinEntry {
@@ -980,6 +1027,9 @@ impl Default for PinEntry {
             bytes: Vec::with_capacity(PIN_CHAR_LIMIT as usize * 4),
             chars: 0,
             layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL(std::ptr::null_mut()),
+            marks: Vec::new(),
+            untranslated: false,
+            dead_pending: false,
         }
     }
 }
@@ -1016,8 +1066,10 @@ fn open_prompt(
         return;
     }
     entry.layout = owner_layout();
+    let caps = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x14) } & 1 != 0;
+    shared.caps_lock.store(caps, Ordering::Release);
     controller.handle(Event::PromptOpened {
-        method: MethodId::softlock_pin(),
+        method: current_method(shared),
     });
     overlay::invalidate(shared);
 }
@@ -1033,7 +1085,15 @@ fn on_key(
         return;
     }
     const VK_BACK: u16 = 0x08;
+    const VK_TAB: u16 = 0x09;
     const VK_RETURN: u16 = 0x0D;
+    if in_backoff(shared) {
+        return;
+    }
+    if event.vk == VK_TAB {
+        switch_method(shared, entry);
+        return;
+    }
     if event.vk == VK_RETURN {
         submit(controller, shared, entry);
         return;
@@ -1044,19 +1104,52 @@ fn on_key(
         overlay::invalidate(shared);
         return;
     }
-    if entry.chars >= PIN_CHAR_LIMIT {
+    let limit = if shared.prompt_method.load(Ordering::Acquire) == METHOD_PASSWORD {
+        PASSWORD_CHAR_LIMIT
+    } else {
+        PIN_CHAR_LIMIT
+    };
+    if entry.chars >= limit {
         return;
     }
-    if let Some(mut encoded) = translate(entry.layout, event) {
-        entry.bytes.extend_from_slice(&encoded);
-        encoded.zeroize();
-        entry.chars = entry.chars.saturating_add(1);
-        shared.pin_chars.store(entry.chars, Ordering::Release);
-        overlay::invalidate(shared);
+    let password = shared.prompt_method.load(Ordering::Acquire) == METHOD_PASSWORD;
+    match translate(entry.layout, event, password) {
+        crate::key_decode::DecodedKey::Text(mut encoded) => {
+            if password {
+                entry.marks.push(crate::key_decode::PasswordKeyMark::Text);
+            }
+            entry.bytes.extend_from_slice(&encoded);
+            encoded.zeroize();
+            entry.chars = entry.chars.saturating_add(1);
+            refresh_password_flags(entry);
+            shared.pin_chars.store(entry.chars, Ordering::Release);
+            overlay::invalidate(shared);
+        }
+        other if password && crate::key_decode::password_key_failed(event.vk, &other) => {
+            entry
+                .marks
+                .push(crate::key_decode::password_key_mark(&other));
+            entry.chars = entry.chars.saturating_add(1);
+            refresh_password_flags(entry);
+            shared.pin_chars.store(entry.chars, Ordering::Release);
+            overlay::invalidate(shared);
+        }
+        _ => {}
     }
 }
 
 fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: &mut PinEntry) {
+    let password = current_method(shared).as_str() == MethodId::os_password().as_str();
+    if password && !crate::key_decode::password_may_submit(entry.untranslated, entry.dead_pending) {
+        entry.bytes.zeroize();
+        entry.chars = 0;
+        entry.marks.clear();
+        entry.untranslated = false;
+        entry.dead_pending = false;
+        shared.pin_chars.store(0, Ordering::Release);
+        overlay::invalidate(shared);
+        return;
+    }
     #[cfg(feature = "live-fail-closed")]
     note_test_pin(entry.bytes.len());
     let secret = Secret::new(&entry.bytes);
@@ -1064,6 +1157,7 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
     // next PIN reuses this buffer instead of abandoning a copy.
     entry.bytes.zeroize();
     entry.chars = 0;
+    entry.marks.clear();
     // `pin_chars` stays at the submitted length until the hash and the
     // controller have finished. Publishing zero first lets the next PIN's
     // keys queue during Argon2 and then look lost to a short wait.
@@ -1071,8 +1165,22 @@ fn submit(controller: &mut LockController<WinPlatform>, shared: &Shared, entry: 
         shared.pin_chars.store(0, Ordering::Release);
         overlay::invalidate(shared);
     };
+    let method = current_method(shared);
     if shared.pipe_mode.load(Ordering::Acquire) {
-        publish(shared, PipeReport::Secret(secret));
+        publish(
+            shared,
+            PipeReport::Secret {
+                method: shared.prompt_method.load(Ordering::Acquire),
+                secret,
+            },
+        );
+        finish(shared);
+        return;
+    }
+    // The host never checks an account password. The Service is the only
+    // process that may call the logon API, and this path has no pipe to it.
+    if method.as_str() == MethodId::os_password().as_str() {
+        controller.handle(Event::SubmitSecret { method, secret });
         finish(shared);
         return;
     }
@@ -1141,35 +1249,65 @@ fn pop_char(entry: &mut PinEntry) {
     if entry.chars == 0 {
         return;
     }
-    while entry
-        .bytes
-        .last()
-        .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+    let mark = entry.marks.pop();
+    if mark != Some(crate::key_decode::PasswordKeyMark::Untranslated)
+        && mark != Some(crate::key_decode::PasswordKeyMark::Dead)
     {
+        while entry
+            .bytes
+            .last()
+            .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+        {
+            if let Some(slot) = entry.bytes.last_mut() {
+                *slot = 0;
+            }
+            entry.bytes.pop();
+        }
         if let Some(slot) = entry.bytes.last_mut() {
             *slot = 0;
         }
         entry.bytes.pop();
     }
-    if let Some(slot) = entry.bytes.last_mut() {
-        *slot = 0;
-    }
-    entry.bytes.pop();
     entry.chars -= 1;
+    refresh_password_flags(entry);
+}
+
+fn refresh_password_flags(entry: &mut PinEntry) {
+    let (untranslated, dead_pending) = crate::key_decode::password_flags(&entry.marks);
+    entry.untranslated = untranslated;
+    entry.dead_pending = dead_pending;
 }
 
 fn translate(
     layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
     event: RawEvent,
-) -> Option<Vec<u8>> {
+    password: bool,
+) -> crate::key_decode::DecodedKey {
     let mut state = [0u8; 256];
     unsafe {
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardState(&mut state);
     }
-    // Ambient Shift or Alt would turn a digit into a symbol. The forwarded
-    // key is the one the hook stored, without whatever else is latched.
-    for modifier in [0x10usize, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5] {
+    // Ambient Shift, Ctrl, or Alt would change the character. The hook stored
+    // the modifiers that were down with this key. Caps Lock is a toggle.
+    // AltGr is Ctrl+Alt. A password key that still produces no text is
+    // untranslated and is not submitted.
+    for modifier in [
+        0x10usize, 0x11, 0x12, 0x14, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+    ] {
         state[modifier] = 0;
+    }
+    if password && event.mods & 1 != 0 {
+        state[0x10] = 0x80;
+        state[0xA0] = 0x80;
+    }
+    if password && event.mods & 2 != 0 && event.mods & 4 != 0 {
+        state[0x11] = 0x80;
+        state[0xA2] = 0x80;
+        state[0x12] = 0x80;
+        state[0xA5] = 0x80;
+    }
+    if password && event.mods & 8 != 0 {
+        state[0x14] = 0x01;
     }
     let index = event.vk as usize;
     if index < state.len() {
@@ -1200,11 +1338,13 @@ fn translate(
         }
     }
     buffer.fill(0);
-    if produced.is_empty() {
-        fallback_digit(event.vk).map(|byte| vec![byte])
-    } else {
-        Some(produced)
+    if !password && produced.is_empty() {
+        return match fallback_digit(event.vk) {
+            Some(byte) => crate::key_decode::DecodedKey::Text(vec![byte]),
+            None => crate::key_decode::DecodedKey::Untranslated,
+        };
     }
+    crate::key_decode::classify_translation(written, &produced)
 }
 
 fn fallback_digit(vk: u16) -> Option<u8> {
@@ -1258,6 +1398,92 @@ fn note_test_pin(len: usize) {
     );
 }
 
+fn current_method(shared: &Shared) -> MethodId {
+    if shared.prompt_method.load(Ordering::Acquire) == METHOD_PASSWORD {
+        MethodId::os_password()
+    } else {
+        MethodId::softlock_pin()
+    }
+}
+
+fn apply_methods(shared: &Shared, pin: bool, password: bool) {
+    shared.offer_pin.store(pin, Ordering::Release);
+    shared.offer_password.store(password, Ordering::Release);
+    if password && !pin {
+        shared
+            .prompt_method
+            .store(METHOD_PASSWORD, Ordering::Release);
+    } else if pin {
+        shared.prompt_method.store(METHOD_PIN, Ordering::Release);
+    }
+}
+
+fn switch_method(shared: &Shared, entry: &mut PinEntry) {
+    let pin = shared.offer_pin.load(Ordering::Acquire);
+    let password = shared.offer_password.load(Ordering::Acquire);
+    if !(pin && password) {
+        return;
+    }
+    let next = if shared.prompt_method.load(Ordering::Acquire) == METHOD_PASSWORD {
+        METHOD_PIN
+    } else {
+        METHOD_PASSWORD
+    };
+    entry.bytes.zeroize();
+    entry.chars = 0;
+    entry.marks.clear();
+    entry.untranslated = false;
+    entry.dead_pending = false;
+    shared.prompt_method.store(next, Ordering::Release);
+    shared.pin_chars.store(0, Ordering::Release);
+    overlay::invalidate(shared);
+}
+
+fn in_backoff(shared: &Shared) -> bool {
+    let until = shared.backoff_until.load(Ordering::Acquire);
+    until != 0 && monotonic_tick() < until
+}
+
+fn apply_prompt(
+    shared: &Shared,
+    entry: &mut PinEntry,
+    ms: u64,
+    password_path: bool,
+    password_exhausted: bool,
+) {
+    if !password_path {
+        set_backoff(shared, ms);
+    }
+    shared
+        .password_exhausted
+        .store(password_exhausted, Ordering::Release);
+    if password_exhausted && shared.offer_pin.load(Ordering::Acquire) {
+        entry.bytes.zeroize();
+        entry.chars = 0;
+        entry.marks.clear();
+        entry.untranslated = false;
+        entry.dead_pending = false;
+        shared.pin_chars.store(0, Ordering::Release);
+        shared.prompt_method.store(METHOD_PIN, Ordering::Release);
+    }
+    overlay::invalidate(shared);
+}
+
+fn set_backoff(shared: &Shared, ms: u64) {
+    if ms == 0 {
+        shared.backoff_until.store(0, Ordering::Release);
+        return;
+    }
+    shared
+        .backoff_until
+        .store(monotonic_tick().saturating_add(ms), Ordering::Release);
+    overlay::invalidate(shared);
+}
+
+fn monotonic_tick() -> u64 {
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+}
+
 fn publish(shared: &Shared, report: PipeReport) {
     if let Some(sender) = shared
         .reports
@@ -1289,6 +1515,20 @@ fn wait_for_arm(shared: &Shared) -> bool {
                 return true;
             }
             Some(PipeCommand::Disarm) => return false,
+            Some(PipeCommand::Methods { pin, password }) => apply_methods(shared, pin, password),
+            Some(PipeCommand::Backoff {
+                ms,
+                password_path,
+                password_exhausted,
+            }) => {
+                if !password_path {
+                    set_backoff(shared, ms);
+                }
+                shared
+                    .password_exhausted
+                    .store(password_exhausted, Ordering::Release);
+                overlay::invalidate(shared);
+            }
             Some(PipeCommand::OsLock) => failclosed::schedule_workstation_lock(),
             // Hooks are installed only after Arm. Quit before that is not
             // Locked, Arming, or FailingClosed, so it must not call the OS lock.
@@ -1398,7 +1638,19 @@ fn host_read_loop(mut file: std::fs::File, commands: std::sync::mpsc::Sender<Pip
             Ok(softlock_core::ServiceToHost::Arm { message }) => Some(PipeCommand::Arm { message }),
             Ok(softlock_core::ServiceToHost::Disarm) => Some(PipeCommand::Disarm),
             Ok(softlock_core::ServiceToHost::OsLock) => Some(PipeCommand::OsLock),
-            Ok(softlock_core::ServiceToHost::PromptResult { .. }) => None,
+            Ok(softlock_core::ServiceToHost::Methods { pin, password }) => {
+                Some(PipeCommand::Methods { pin, password })
+            }
+            Ok(softlock_core::ServiceToHost::PromptResult {
+                backoff_ms,
+                password_path,
+                password_exhausted,
+                ..
+            }) => Some(PipeCommand::Backoff {
+                ms: backoff_ms,
+                password_path,
+                password_exhausted,
+            }),
             _ => None,
         };
         if let Some(command) = command
@@ -1433,8 +1685,13 @@ fn host_write_loop(
                 guard,
                 overlay,
             } => host_heartbeat_frame(id, *seq, *guard, *overlay, &nonce).ok(),
-            PipeReport::Secret(secret) => {
-                host_secret_frame(id, MethodId::softlock_pin().as_str(), secret, &nonce).ok()
+            PipeReport::Secret { method, secret } => {
+                let name = if *method == METHOD_PASSWORD {
+                    MethodId::os_password()
+                } else {
+                    MethodId::softlock_pin()
+                };
+                host_secret_frame(id, name.as_str(), secret, &nonce).ok()
             }
             PipeReport::GuardDown => host_guard_down_frame(id, &nonce).ok(),
         };

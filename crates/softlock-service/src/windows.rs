@@ -403,6 +403,7 @@ fn install_journal(authority: &mut Authority) {
         Ok(mut engine) => match engine.boot() {
             Ok(crate::settings::Boot::FailClosed(journal)) => {
                 authority.platform_mut().install_engine(engine);
+                authority.adopt_password_window();
                 authority.notify(Event::ServiceStarted {
                     journal,
                     session_active: true,
@@ -411,6 +412,7 @@ fn install_journal(authority: &mut Authority) {
             Ok(crate::settings::Boot::StayOsLocked) => {
                 let owner_back = engine.owner_back();
                 authority.platform_mut().install_engine(engine);
+                authority.adopt_password_window();
                 // A restart does not see the disconnect that confirmed the
                 // lock. Hold that disconnect anyway, and remember the owner
                 // was away when this boot did not find them on the console.
@@ -426,15 +428,16 @@ fn install_journal(authority: &mut Authority) {
                     session_active: false,
                 });
             }
-            Ok(_) => authority.platform_mut().install_engine(engine),
+            Ok(_) => {
+                authority.platform_mut().install_engine(engine);
+                authority.adopt_password_window();
+            }
             Err(reason) => {
                 crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
                 authority.platform_mut().require_settings();
-                let mut journal = softlock_core::Journal::empty();
-                journal.mark_locked();
-                journal.flush();
+                authority.block_password_path();
                 authority.notify(Event::ServiceStarted {
-                    journal,
+                    journal: unreadable_journal(),
                     session_active: true,
                 });
             }
@@ -442,11 +445,9 @@ fn install_journal(authority: &mut Authority) {
         Err(reason) => {
             crate::audit("settings", &[("result", "failed"), ("reason", reason)]);
             authority.platform_mut().require_settings();
-            let mut journal = softlock_core::Journal::empty();
-            journal.mark_locked();
-            journal.flush();
+            authority.block_password_path();
             authority.notify(Event::ServiceStarted {
-                journal,
+                journal: unreadable_journal(),
                 session_active: true,
             });
         }
@@ -460,7 +461,19 @@ fn install_journal(authority: &mut Authority) {
             Err(_) => authority.load_existing_config(""),
         }
     }
+    authority.arm_backoff_from_controller(std::time::Instant::now());
     crate::settings::register_sign_in_recovery();
+}
+
+/// A journal that cannot be read stays locked and keeps a full backoff.
+/// A missing file is not this path: that boot is idle.
+fn unreadable_journal() -> softlock_core::Journal {
+    let mut journal = softlock_core::Journal::empty();
+    journal.mark_locked();
+    journal.set_failures(9);
+    journal.set_wait_ms(15 * 60 * 1000);
+    journal.flush();
+    journal
 }
 
 fn poll_journal(authority: &Arc<Mutex<Authority>>) {
@@ -756,6 +769,19 @@ fn supervise(
     let mut next_id = 10u64;
     while !STOP.load(Ordering::Acquire) {
         if arm.is_waiting() && !arm_sent {
+            let (pin, password) = authority
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .unlock_offers();
+            next_id = next_id.saturating_add(1);
+            if let Ok(frame) = encode_service(next_id, &ServiceToHost::Methods { pin, password })
+                && let Some(tx) = writer
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone()
+            {
+                let _ = tx.send(frame);
+            }
             next_id = next_id.saturating_add(1);
             if let Some(frame) = arm_frame(&authority, next_id)
                 && let Some(tx) = writer
@@ -817,6 +843,16 @@ fn supervise(
                 *writer.lock().unwrap_or_else(|poison| poison.into_inner()) =
                     Some(child.writer.clone());
                 if arm_again {
+                    let (pin, password) = authority
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .unlock_offers();
+                    next_id = next_id.saturating_add(1);
+                    if let Ok(frame) =
+                        encode_service(next_id, &ServiceToHost::Methods { pin, password })
+                    {
+                        let _ = child.writer.send(frame);
+                    }
                     next_id = next_id.saturating_add(1);
                     if let Some(frame) = arm_frame(&authority, next_id) {
                         let _ = child.writer.send(frame);
@@ -2383,6 +2419,10 @@ mod settings_boot {
             says_locked: false,
             os_confirmed: true,
             failures: 0,
+            backoff_until_tick: 0,
+            written_tick: 0,
+            written_wall_ms: 0,
+            password_attempts: Vec::new(),
             entries: Vec::new(),
             lock: Some(softlock_core::LockIdentity {
                 boot: 1,

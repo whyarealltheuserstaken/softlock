@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 
 use softlock_core::PRODUCT_DISPLAY_NAME;
 use softlock_core::{
-    CONFIG_DIR, CONFIG_FILE, CommitFault, HardenError, HeldStart, Journal, JournalEntry,
-    JournalFault, LOCKDOWN, ProductState, RepairAction, SERVICE_NAME, SettingValue,
-    SettingsJournal, StartAction, allowed_previous_for, commit_then_change, encode_document,
-    executable_may_run_as_system, fault_log, held_start, lockdown_document, lockdown_policy,
-    mark_workstation_clear, original_previous, parse_document, reassert_write, recovery_action,
-    release_os_hold, repair_action, repair_entry_name, restore_action_for, restore_sid,
-    with_config_acl, workstation_value_after_attempt,
+    BackoffRecord, BackoffRestore, CONFIG_DIR, CONFIG_FILE, ClockSample, CommitFault, HardenError,
+    HeldStart, Journal, JournalEntry, JournalFault, LOCKDOWN, ProductState, RepairAction,
+    SERVICE_NAME, SettingValue, SettingsJournal, StartAction, allowed_previous_for,
+    commit_then_change, encode_document, executable_may_run_as_system, fault_log, held_start,
+    lockdown_document, lockdown_policy, mark_workstation_clear, original_previous, parse_document,
+    reassert_write, recovery_action, release_os_hold, repair_action, repair_entry_name,
+    restore_action_for, restore_backoff, restore_sid, with_config_acl,
+    workstation_value_after_attempt,
 };
 
 use crate::journal_store::{load_journal, save_journal};
@@ -52,6 +53,9 @@ pub struct SettingsEngine {
     last: Instant,
     watcher: Mutex<Option<JoinHandle<()>>>,
     keep_os_lock: bool,
+    /// Password failures that still count toward Windows lockout. Revert keeps
+    /// them. A successful password check clears them.
+    password_attempts: Vec<softlock_core::PasswordStamp>,
 }
 
 impl SettingsEngine {
@@ -71,6 +75,7 @@ impl SettingsEngine {
             last: Instant::now(),
             watcher: Mutex::new(None),
             keep_os_lock: false,
+            password_attempts: Vec::new(),
         })
     }
 
@@ -78,12 +83,41 @@ impl SettingsEngine {
         self.keep_os_lock = keep;
     }
 
+    pub fn password_attempts(&self) -> Vec<softlock_core::PasswordStamp> {
+        self.password_attempts.clone()
+    }
+
+    /// Rewrite the password-attempt list. Lockdown rows stay. A missing
+    /// journal file is a failure: the caller must not call `LogonUser`.
+    pub fn store_password_attempts(
+        &mut self,
+        attempts: &[softlock_core::PasswordStamp],
+    ) -> Result<(), &'static str> {
+        self.password_attempts = attempts.to_vec();
+        if let Some(pending) = self.pending.as_mut() {
+            pending.password_attempts = self.password_attempts.clone();
+        }
+        let Some(text) = load_journal().map_err(|_| "unreadable")? else {
+            return Err("missing");
+        };
+        let mut doc = parse_document(text.as_bytes()).map_err(|_| "malformed")?;
+        doc.password_attempts = self.password_attempts.clone();
+        let bytes = encode_document(&doc).map_err(|_| "malformed")?;
+        save_journal(&bytes).map_err(|_| "not-durable")?;
+        Ok(())
+    }
+
+    fn remember_password(&mut self, doc: &SettingsJournal) {
+        self.password_attempts = doc.password_attempts.clone();
+    }
+
     pub fn boot(&mut self) -> Result<Boot, &'static str> {
-        let loaded = load_journal().map_err(|_| "journal")?;
+        let loaded = load_journal().map_err(|_| "unreadable")?;
         let Some(text) = loaded else {
             return Ok(Boot::Idle);
         };
-        let doc = parse_document(text.as_bytes()).map_err(fault_log)?;
+        let doc = parse_document(text.as_bytes()).map_err(|_| "malformed")?;
+        self.remember_password(&doc);
         if doc.is_empty() {
             return Ok(Boot::Idle);
         }
@@ -98,7 +132,9 @@ impl SettingsEngine {
                     if !release_os_hold(fact) {
                         return Ok(Boot::StayOsLocked);
                     }
-                    let empty = encode_document(&SettingsJournal::empty()).map_err(fault_log)?;
+                    let cleared =
+                        SettingsJournal::keeping_password_attempts(&self.password_attempts);
+                    let empty = encode_document(&cleared).map_err(fault_log)?;
                     save_journal(&empty).map_err(|_| "not-durable")?;
                     Ok(Boot::Idle)
                 }
@@ -207,6 +243,7 @@ impl SettingsEngine {
                 HardenError::Failed
             })?;
         }
+        doc.password_attempts = self.password_attempts.clone();
         self.pending = Some(doc);
         for (target, value) in &previous {
             let locked = lockdown_policy(target)
@@ -427,19 +464,38 @@ impl SettingsEngine {
             self.write_previous(&entry.target, entry.previous.clone())?;
         }
         let next = if self.keep_os_lock {
-            let mut held = SettingsJournal::empty();
-            held.sid = doc.sid.clone();
-            held.os_confirmed = true;
-            held.lock = doc.lock;
-            held
+            SettingsJournal::os_held_keeping_password(doc)
         } else {
-            SettingsJournal::empty()
+            SettingsJournal::keeping_password_attempts(&doc.password_attempts)
         };
+        self.password_attempts = next.password_attempts.clone();
         let empty = encode_document(&next).map_err(|_| "malformed")?;
         save_journal(&empty).map_err(|_| "not-durable")?;
         SKIP_WORKSTATION.store(false, Ordering::Release);
         self.release();
         crate::audit("settings", &[("result", "restored"), ("rows", "lockdown")]);
+        Ok(())
+    }
+
+    /// Rewrite the failure count and the backoff deadline. The lockdown rows
+    /// stay. A failed write leaves the in-memory count in place.
+    pub fn store_backoff(
+        &mut self,
+        failures: u32,
+        until_tick: u64,
+        written_tick: u64,
+        written_wall_ms: u64,
+    ) -> Result<(), &'static str> {
+        let Some(text) = load_journal().map_err(|_| "unreadable")? else {
+            return Err("unreadable");
+        };
+        let mut doc = parse_document(text.as_bytes()).map_err(|_| "malformed")?;
+        doc.failures = failures;
+        doc.backoff_until_tick = until_tick;
+        doc.written_tick = written_tick;
+        doc.written_wall_ms = written_wall_ms;
+        let bytes = encode_document(&doc).map_err(|_| "malformed")?;
+        save_journal(&bytes).map_err(|_| "not-durable")?;
         Ok(())
     }
 
@@ -499,11 +555,38 @@ fn memory_journal(doc: &SettingsJournal) -> Journal {
         });
     }
     journal.set_failures(doc.failures());
+    let sample = clock_sample();
+    let wait = match restore_backoff(
+        BackoffRecord {
+            failures: doc.failures(),
+            written_tick: doc.written_tick,
+            until_tick: doc.backoff_until_tick,
+            written_wall_ms: doc.written_wall_ms,
+        },
+        sample,
+    ) {
+        BackoffRestore::Clear => 0,
+        BackoffRestore::Wait(delay) => u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+    };
+    journal.set_wait_ms(wait);
     if doc.says_locked() {
         journal.mark_locked();
     }
     journal.flush();
     journal
+}
+
+fn clock_sample() -> ClockSample {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use windows::Win32::System::SystemInformation::GetTickCount64;
+    let wall_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    ClockSample {
+        tick: unsafe { GetTickCount64() },
+        wall_ms,
+    }
 }
 
 /// Journal the clear, then delete `DisableLockWorkstation`. A failed save
@@ -1001,5 +1084,119 @@ mod path_and_menu {
         let reparse_file = write_menu_new(&linked_cmd, b"nope\r\n");
         assert_eq!(body, b"@echo off\r\nnew\r\n");
         assert!(reparse_file.is_err(), "a symlink command was rewritten");
+    }
+}
+
+#[cfg(all(test, feature = "simulated-physical", feature = "live-fail-closed"))]
+mod password_journal {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use softlock_core::{LockIdentity, PasswordStamp, SettingsJournal, parse_document};
+
+    use super::{Boot, SettingsEngine};
+    use crate::journal_store::{load_journal, save_journal};
+    use crate::taskmgr::{clear_forced_console, force_console_for_test};
+
+    fn with_journal(test: impl FnOnce()) {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sl-pw-journal-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("journal dir");
+        let previous = std::env::var("SOFTLOCK_JOURNAL_DIR").ok();
+        struct Restore {
+            dir: std::path::PathBuf,
+            previous: Option<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                clear_forced_console();
+                unsafe {
+                    match &self.previous {
+                        Some(value) => std::env::set_var("SOFTLOCK_JOURNAL_DIR", value),
+                        None => std::env::remove_var("SOFTLOCK_JOURNAL_DIR"),
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+        let _restore = Restore {
+            dir: dir.clone(),
+            previous,
+        };
+        unsafe { std::env::set_var("SOFTLOCK_JOURNAL_DIR", &dir) };
+        assert!(
+            crate::authority::test_path("SOFTLOCK_JOURNAL_DIR").is_some(),
+            "the journal override is refused"
+        );
+        super::fail_open_for_test(false);
+        force_console_for_test(true, 0x1001);
+        test();
+    }
+
+    fn stamp() -> PasswordStamp {
+        PasswordStamp {
+            tick: 90_000,
+            wall_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn held_with(stamp: PasswordStamp) -> SettingsJournal {
+        let mut held = SettingsJournal::os_held_keeping_password(
+            &SettingsJournal::keeping_password_attempts(std::slice::from_ref(&stamp)),
+        );
+        held.sid = "S-1-5-21-1-2-3-1001".to_string();
+        held.lock = Some(LockIdentity {
+            boot: 1,
+            session: 1,
+            logon: 0x1001,
+        });
+        held
+    }
+
+    #[test]
+    fn password_attempts_round_trip_an_owner_returned_boot() {
+        with_journal(|| {
+            let stamp = stamp();
+            let held = held_with(stamp);
+            let bytes = softlock_core::encode_document(&held).expect("encode");
+            save_journal(&bytes).expect("save");
+            let mut engine = SettingsEngine::open().expect("engine");
+            let boot = engine.boot().expect("boot");
+            assert!(
+                matches!(boot, Boot::Idle),
+                "OwnerReturned did not clear the hold"
+            );
+            assert_eq!(engine.password_attempts(), vec![stamp]);
+            let text = load_journal().expect("load").expect("file");
+            let parsed = parse_document(text.as_bytes()).expect("parse");
+            assert_eq!(parsed.password_attempts, vec![stamp]);
+            assert!(!parsed.os_confirmed);
+            assert!(parsed.entries().is_empty());
+        });
+    }
+
+    #[test]
+    fn password_attempts_round_trip_a_keep_os_lock_revert() {
+        with_journal(|| {
+            let stamp = stamp();
+            let source = held_with(stamp);
+            let mut engine = SettingsEngine::open().expect("engine");
+            engine.keep_os_lock_after_revert(true);
+            engine.revert_document(&source).expect("revert");
+            let text = load_journal().expect("load").expect("file");
+            let parsed = parse_document(text.as_bytes()).expect("parse");
+            assert_eq!(parsed.password_attempts, vec![stamp]);
+            assert!(parsed.os_confirmed);
+            assert_eq!(parsed.sid, source.sid);
+            assert_eq!(parsed.lock, source.lock);
+            assert!(parsed.entries().is_empty());
+            let mut again = SettingsEngine::open().expect("engine");
+            let _boot = again.boot().expect("boot");
+            assert_eq!(again.password_attempts(), vec![stamp]);
+            let after = load_journal().expect("load").expect("file");
+            let parsed = parse_document(after.as_bytes()).expect("parse");
+            assert_eq!(parsed.password_attempts, vec![stamp]);
+        });
     }
 }

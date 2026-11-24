@@ -78,6 +78,9 @@ pub enum Event {
     Repair,
     /// The platform could not put a locked setting back.
     ReassertFailed,
+    /// The service monotonic clock says the saved delay has elapsed.
+    /// The failure count stays. This is not an unlock.
+    BackoffElapsed,
 }
 
 pub struct LockController<P> {
@@ -182,6 +185,7 @@ impl<P: Platform> LockController<P> {
                     self.fail_closed(FailReason::RevertFailed);
                 }
             }
+            Event::BackoffElapsed => self.on_backoff_elapsed(),
         }
     }
 
@@ -362,6 +366,8 @@ impl<P: Platform> LockController<P> {
     fn start_lock(&mut self, source: LockSource) {
         self.failure_count = 0;
         self.backoff_until = None;
+        self.journal.set_failures(0);
+        self.journal.set_wait_ms(0);
         self.last_heartbeat_seq = None;
         self.enter_arm(source, ArmStep::Journal);
         if self.automatic() {
@@ -652,6 +658,13 @@ impl<P: Platform> LockController<P> {
             drop(secret);
             return;
         }
+        // The password path has its own counter in the Service. It must not
+        // move the PIN count, and a controller verdict must not unlock on it.
+        if method.as_str() == MethodId::os_password().as_str() {
+            drop(secret);
+            self.reject("SubmitSecret");
+            return;
+        }
         if !self.backoff_delay().is_zero() {
             drop(secret);
             self.reject("SubmitSecret");
@@ -674,8 +687,10 @@ impl<P: Platform> LockController<P> {
     fn note_failure(&mut self) {
         self.failure_count = self.failure_count.saturating_add(1);
         self.journal.set_failures(self.failure_count);
-        self.journal.flush();
         let delay = crate::backoff::delay_after_failure(self.failure_count);
+        self.journal
+            .set_wait_ms(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+        self.journal.flush();
         let prompt = if delay.is_zero() {
             self.backoff_until = None;
             PromptState::Idle
@@ -862,6 +877,19 @@ impl<P: Platform> LockController<P> {
         }
     }
 
+    fn on_backoff_elapsed(&mut self) {
+        self.backoff_until = None;
+        let LockState::Locked { source, prompt } = self.state.clone() else {
+            return;
+        };
+        if matches!(prompt, PromptState::Backoff { .. }) {
+            self.enter(LockState::Locked {
+                source,
+                prompt: PromptState::Idle,
+            });
+        }
+    }
+
     fn on_service_started(&mut self, journal: Journal, session_active: bool) {
         if journal.os_held() {
             // Policies are already restored. The console is not active.
@@ -876,6 +904,15 @@ impl<P: Platform> LockController<P> {
         }
         let says_locked = journal.says_locked();
         self.failure_count = journal.failures();
+        let stamped = Duration::from_millis(journal.wait_ms());
+        let wait = if stamped.is_zero() {
+            crate::backoff::delay_after_failure(self.failure_count)
+        } else {
+            stamped
+        };
+        if !wait.is_zero() {
+            self.backoff_until = Some(self.now.saturating_add(wait));
+        }
         self.journal = journal;
         self.enter(LockState::Recovering);
         if !self.automatic() {

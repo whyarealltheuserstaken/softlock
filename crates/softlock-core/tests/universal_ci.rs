@@ -122,6 +122,9 @@ fn universal_job_lipos_thins_and_scans_each_slice_and_the_app() {
     .expect("read release_binary.rs");
     assert!(scanner.contains("softlock-dev-launch-marker"));
     assert!(scanner.contains("softlock_dev_launch_marker"));
+    assert!(scanner.contains("SOFTLOCK_CLOCK_FILE"));
+    assert!(scanner.contains("SOFTLOCK_SESSION_USER"));
+    assert!(scanner.contains("SOFTLOCK_SESSION_DOMAIN"));
     assert!(text.contains("npm run tauri build -- --target universal-apple-darwin"));
     assert!(
         text.contains("scan_release target/universal/tauri "),

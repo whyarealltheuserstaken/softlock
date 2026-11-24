@@ -22,7 +22,11 @@ mod platform;
 mod settings_journal;
 mod state;
 
-pub use backoff::delay_after_failure;
+pub use backoff::{
+    BackoffRecord, BackoffRestore, ClockSample, LockoutPolicy, PasswordGate, PasswordStamp,
+    delay_after_failure, password_attempt_limit, password_escalation, password_gate,
+    restore_backoff, stamp_inside_window, unreadable_lockout_policy,
+};
 pub use config::{
     CONFIG_ERRORS_NAME, CONFIG_FILE_NAME, Config, HotkeyChord, MAX_CONFIG_BYTES, UserConfig,
     hotkey_in_document, parse_hotkey, published_schema_json, schema_accepts_document,

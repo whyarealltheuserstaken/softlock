@@ -15,6 +15,9 @@ pub struct Journal {
     durable: Vec<JournalEntry>,
     failures: u32,
     durable_failures: u32,
+    /// Milliseconds of backoff a restart should still enforce.
+    wait_ms: u64,
+    durable_wait_ms: u64,
     says_locked: bool,
     durable_says_locked: bool,
     /// Policies were reverted after a confirmed OS lock. A restart stays
@@ -31,6 +34,8 @@ impl Journal {
             durable: Vec::new(),
             failures: 0,
             durable_failures: 0,
+            wait_ms: 0,
+            durable_wait_ms: 0,
             says_locked: false,
             durable_says_locked: false,
             os_held: false,
@@ -58,9 +63,15 @@ impl Journal {
         self.flushed = false;
     }
 
+    pub fn set_wait_ms(&mut self, wait_ms: u64) {
+        self.wait_ms = wait_ms;
+        self.flushed = false;
+    }
+
     pub fn flush(&mut self) {
         self.durable.clone_from(&self.entries);
         self.durable_failures = self.failures;
+        self.durable_wait_ms = self.wait_ms;
         self.durable_says_locked = self.says_locked;
         self.durable_os_held = self.os_held;
         self.flushed = true;
@@ -74,6 +85,8 @@ impl Journal {
             durable: self.durable.clone(),
             failures: self.durable_failures,
             durable_failures: self.durable_failures,
+            wait_ms: self.durable_wait_ms,
+            durable_wait_ms: self.durable_wait_ms,
             says_locked: self.durable_says_locked,
             durable_says_locked: self.durable_says_locked,
             os_held: self.durable_os_held,
@@ -87,6 +100,8 @@ impl Journal {
         self.durable.clear();
         self.failures = 0;
         self.durable_failures = 0;
+        self.wait_ms = 0;
+        self.durable_wait_ms = 0;
         self.says_locked = false;
         self.durable_says_locked = false;
         self.os_held = false;
@@ -104,6 +119,10 @@ impl Journal {
 
     pub fn failures(&self) -> u32 {
         self.failures
+    }
+
+    pub fn wait_ms(&self) -> u64 {
+        self.wait_ms
     }
 
     pub fn says_locked(&self) -> bool {

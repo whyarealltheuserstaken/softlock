@@ -454,7 +454,39 @@ unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         note_physical(shared);
         let down = !info.flags.contains(LLKHF_UP)
             && (wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize);
+        if vk == 0x10 || vk == 0xA0 || vk == 0xA1 {
+            shared
+                .shift_down
+                .store(down, std::sync::atomic::Ordering::Release);
+            return LRESULT(1);
+        }
+        if vk == 0x11 || vk == 0xA2 || vk == 0xA3 {
+            shared
+                .ctrl_down
+                .store(down, std::sync::atomic::Ordering::Release);
+            return LRESULT(1);
+        }
+        if vk == 0x12 || vk == 0xA4 || vk == 0xA5 {
+            shared
+                .alt_down
+                .store(down, std::sync::atomic::Ordering::Release);
+            return LRESULT(1);
+        }
+        if vk == 0x14 {
+            if down {
+                let caps = shared.caps_lock.load(std::sync::atomic::Ordering::Acquire);
+                shared
+                    .caps_lock
+                    .store(!caps, std::sync::atomic::Ordering::Release);
+            }
+            return LRESULT(1);
+        }
         if down {
+            let shift = u8::from(shared.shift_down.load(std::sync::atomic::Ordering::Acquire));
+            let ctrl = u8::from(shared.ctrl_down.load(std::sync::atomic::Ordering::Acquire));
+            let alt = u8::from(shared.alt_down.load(std::sync::atomic::Ordering::Acquire));
+            let caps = u8::from(shared.caps_lock.load(std::sync::atomic::Ordering::Acquire));
+            let mods = shift | (ctrl << 1) | (alt << 2) | (caps << 3);
             shared
                 .wake
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -462,6 +494,7 @@ unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 kind: KIND_KEY,
                 vk,
                 scan: info.scanCode as u16,
+                mods,
             });
         }
         LRESULT(1)
@@ -526,6 +559,7 @@ unsafe fn mouse_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 kind: KIND_CLICK,
                 vk: 0,
                 scan: 0,
+                mods: 0,
             });
         } else if message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL {
             shared
@@ -535,6 +569,7 @@ unsafe fn mouse_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 kind: KIND_WHEEL,
                 vk: 0,
                 scan: 0,
+                mods: 0,
             });
         }
         LRESULT(1)

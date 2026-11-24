@@ -18,10 +18,10 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, HWND_TOPMOST, LWA_ALPHA,
     MA_NOACTIVATE, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
-    WDA_EXCLUDEFROMCAPTURE, WINDOWPOS, WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND,
-    WM_MOUSEACTIVATE, WM_PAINT, WM_WINDOWPOSCHANGED, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos,
+    SetWindowTextW, ShowWindow, WDA_EXCLUDEFROMCAPTURE, WINDOWPOS, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_PAINT, WM_WINDOWPOSCHANGED, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -105,15 +105,34 @@ pub(crate) fn destroy(shared: &Shared) {
 }
 
 pub(crate) fn invalidate(shared: &Shared) {
+    let title = status_title(shared);
     let windows = shared
         .windows
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     for hwnd in windows.iter().copied() {
         unsafe {
+            let _ = SetWindowTextW(hwnd_from(hwnd), PCWSTR(title.as_ptr()));
             let _ = InvalidateRect(Some(hwnd_from(hwnd)), None, true);
         }
     }
+}
+
+fn status_title(shared: &Shared) -> Vec<u16> {
+    let exhausted = shared
+        .password_exhausted
+        .load(std::sync::atomic::Ordering::Acquire);
+    let pin = shared.offer_pin.load(std::sync::atomic::Ordering::Acquire);
+    let text = if exhausted && pin {
+        "Password unavailable. Enter PIN"
+    } else if exhausted {
+        "Password unavailable"
+    } else {
+        PRODUCT_DISPLAY_NAME
+    };
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units.push(0);
+    units
 }
 
 pub(crate) fn minute_now() -> u16 {
@@ -347,7 +366,36 @@ fn caption() -> Vec<u16> {
     };
     let text = if prompt {
         let dots = "\u{25cf}".repeat(chars as usize);
-        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nEnter PIN\n{dots}{notice}{custom}")
+        let (label, switch) = shared
+            .map(|shared| {
+                let pin = shared.offer_pin.load(std::sync::atomic::Ordering::Acquire);
+                let password = shared
+                    .offer_password
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let method = shared
+                    .prompt_method
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let exhausted = shared
+                    .password_exhausted
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let label = if exhausted {
+                    "Password unavailable"
+                } else if method == 1 {
+                    "Enter password"
+                } else {
+                    "Enter PIN"
+                };
+                let switch = if exhausted && pin {
+                    "\nEnter PIN"
+                } else if pin && password {
+                    "\nTab switches"
+                } else {
+                    ""
+                };
+                (label, switch)
+            })
+            .unwrap_or(("Enter PIN", ""));
+        format!("{PRODUCT_DISPLAY_NAME}\n{clock}\n{label}{switch}\n{dots}{notice}{custom}")
     } else {
         format!("{PRODUCT_DISPLAY_NAME}\n{clock}\nPress any key to unlock{notice}{custom}")
     };
