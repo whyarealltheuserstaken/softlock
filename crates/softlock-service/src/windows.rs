@@ -2419,6 +2419,10 @@ mod settings_boot {
             says_locked: false,
             os_confirmed: true,
             failures: 0,
+            backoff_until_tick: 0,
+            written_tick: 0,
+            written_wall_ms: 0,
+            password_attempts: Vec::new(),
             entries: Vec::new(),
             lock: Some(softlock_core::LockIdentity {
                 boot: 1,
