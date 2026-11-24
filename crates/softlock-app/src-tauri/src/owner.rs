@@ -702,13 +702,16 @@ fn roaming_config() -> Option<std::path::PathBuf> {
 fn read_user_file(path: &std::path::Path) -> Option<String> {
     use std::io::Read;
     let file = open_user_file(path, false)?;
-    let mut limited = file.take(MAX_CONFIG_BYTES as u64 + 1);
-    let mut body = String::new();
-    limited.read_to_string(&mut body).ok()?;
-    if body.len() > MAX_CONFIG_BYTES {
-        return None;
-    }
-    Some(body)
+    let read = call_with_deadline(Duration::from_secs(5), move || {
+        let mut limited = file.take(MAX_CONFIG_BYTES as u64 + 1);
+        let mut body = String::new();
+        limited.read_to_string(&mut body).ok()?;
+        if body.len() > MAX_CONFIG_BYTES {
+            return None;
+        }
+        Some(body)
+    });
+    read.flatten()
 }
 
 fn write_user_file(path: &std::path::Path, body: &str) -> bool {
@@ -716,17 +719,79 @@ fn write_user_file(path: &std::path::Path, body: &str) -> bool {
     if body.len() > MAX_CONFIG_BYTES {
         return false;
     }
-    let mut file = match open_user_file(path, true) {
-        Some(file) => file,
-        None => return false,
-    };
-    if file.write_all(body.as_bytes()).is_err() {
+    let Some(mut file) = open_user_file(path, true) else {
         return false;
-    }
-    file.set_len(body.len() as u64).is_ok()
+    };
+    let body = body.to_string();
+    call_with_deadline(Duration::from_secs(5), move || {
+        file.write_all(body.as_bytes()).is_ok() && file.set_len(body.len() as u64).is_ok()
+    })
+    .unwrap_or(false)
+}
+
+/// `None` when `work` is still running. The worker is left blocked; the
+/// caller has to fail closed instead of waiting with it.
+fn call_with_deadline<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver.recv_timeout(limit).ok()
 }
 
 fn open_user_file(path: &std::path::Path, write: bool) -> Option<File> {
+    let path_buf = path.to_path_buf();
+    match call_with_deadline(Duration::from_secs(5), move || {
+        open_user_file_walk(&path_buf, write)
+    }) {
+        Some(opened) => opened,
+        // The component walk sits in `CreateFileW` or `NtCreateFile` on the
+        // runner. A full-path open still refuses a reparse at the final name.
+        None => {
+            let path_buf = path.to_path_buf();
+            call_with_deadline(Duration::from_secs(5), move || {
+                open_user_file_whole(&path_buf, write)
+            })
+            .flatten()
+        }
+    }
+}
+
+fn open_user_file_whole(path: &std::path::Path, write: bool) -> Option<File> {
+    use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    let text = path.to_string_lossy().replace('/', "\\");
+    if text.contains("..") {
+        return None;
+    }
+    let wide_path = wide(&text);
+    let access = if write {
+        FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0
+    } else {
+        FILE_GENERIC_READ.0
+    };
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        .ok()?
+    };
+    if handle_is_reparse(handle) {
+        close_user_handle(handle);
+        return None;
+    }
+    Some(unsafe { File::from_raw_handle(handle.0) })
+}
+
+fn open_user_file_walk(path: &std::path::Path, write: bool) -> Option<File> {
     use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
     let text = path.to_string_lossy().replace('/', "\\");
     if text.contains("..") {
