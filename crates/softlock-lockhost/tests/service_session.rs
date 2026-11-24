@@ -1453,7 +1453,9 @@ fn remove_service(name: &str) {
     }
     let _ = Command::new("sc.exe").args(["stop", name]).output_bounded();
     thread::sleep(Duration::from_millis(300));
-    let _ = Command::new("sc.exe").args(["delete", name]).output_bounded();
+    let _ = Command::new("sc.exe")
+        .args(["delete", name])
+        .output_bounded();
 }
 
 fn service_pid(name: &str) -> Option<String> {
