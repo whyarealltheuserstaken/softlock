@@ -6,6 +6,7 @@
 //! states, and active power requests. The diff helpers are pure and run on
 //! every platform.
 
+mod coverage;
 mod model;
 mod pixels;
 mod powercfg;
@@ -13,6 +14,7 @@ mod powercfg;
 #[cfg(windows)]
 mod win;
 
+pub use coverage::{ScreenRect, stray, uncovered};
 pub use model::{
     DeviceChange, DeviceDiff, DeviceSnapshot, PowerDiff, PowerRequest, PowerRequestKind,
     PowerSnapshot, RegistryChange, RegistryData, RegistryDiff, RegistryPath, RegistryRoot,
@@ -38,6 +40,11 @@ fn dev_launch_dependencies() {
 
 #[cfg(all(windows, feature = "simulated-physical"))]
 pub use win::classify_observed;
+#[cfg(windows)]
+pub use win::{
+    AttachedOutput, OsIdentity, ResolutionChange, attach_output, change_primary_resolution,
+    detached_output, monitor_rects, os_identity, window_rect,
+};
 #[cfg(windows)]
 pub use win::{
     CaptureMethod, DeviceInfo, FocusState, HarnessError, HookObservation, KeyboardFocus,

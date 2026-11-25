@@ -1,5 +1,6 @@
 mod capture;
 mod devices;
+mod display;
 mod error;
 mod hook;
 mod power;
@@ -8,6 +9,10 @@ mod registry;
 
 pub use capture::{CaptureMethod, MethodCapture, capture_marker, capture_near, window_pixels};
 pub use devices::{DeviceInfo, snapshot_devices};
+pub use display::{
+    AttachedOutput, OsIdentity, ResolutionChange, attach_output, change_primary_resolution,
+    detached_output, monitor_rects, os_identity, window_rect,
+};
 pub use error::HarnessError;
 #[cfg(feature = "simulated-physical")]
 pub use hook::classify_observed;

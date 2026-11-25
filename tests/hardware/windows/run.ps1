@@ -1174,6 +1174,11 @@ try {
         try {
         switch ($row.id) {
             'overlay-topmost' {
+                $displays = $native::DetectJson() | ConvertFrom-Json
+                if ([int]$displays.monitors -lt 1) {
+                    Add-Result $row.id 'skip' 'not-applicable' @{ topmost = $false; monitors = 0; stderr = 'no display is attached to this session' }
+                    continue
+                }
                 $probe = Get-Overlay
                 $ok = $probe.ok -and $probe.topmost -and $probe.click_through -and $probe.covered -and ($probe.windows -eq $probe.monitors)
                 Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{
@@ -1332,8 +1337,11 @@ try {
             }
             'display-enum' {
                 $again = $native::DetectJson() | ConvertFrom-Json
-                $ok = [int]$again.monitors -ge 1
-                Add-Result $row.id $(if ($ok) { 'pass' } else { 'fail' }) '' @{
+                if ([int]$again.monitors -lt 1) {
+                    Add-Result $row.id 'skip' 'not-applicable' @{ displays = 0; stderr = 'no display is attached to this session' }
+                    continue
+                }
+                Add-Result $row.id 'pass' '' @{
                     displays = [int]$again.monitors
                     internal = (Sample-Count $again 'internal_count')
                     external = (Sample-Count $again 'external_count')

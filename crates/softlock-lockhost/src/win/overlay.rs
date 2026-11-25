@@ -44,7 +44,18 @@ pub(crate) fn set_message(message: Option<&str>) {
     }
 }
 
+/// Shows one window per current monitor. Also the rebuild after a display
+/// change: the new set is built and shown before any old window is
+/// destroyed, so no moment has the desktop uncovered. If the new set cannot
+/// be built, the old windows stay up and the caller reports the guard down.
 pub(crate) fn create(shared: &Shared) -> Result<(), ()> {
+    let created = build_windows()?;
+    let old = install(shared, created);
+    destroy_handles(&old);
+    Ok(())
+}
+
+fn build_windows() -> Result<Vec<isize>, ()> {
     register_class()?;
     let monitors = monitor_rects();
     if monitors.is_empty() {
@@ -68,11 +79,19 @@ pub(crate) fn create(shared: &Shared) -> Result<(), ()> {
         }
         created.push(hwnd.0 as isize);
     }
+    Ok(created)
+}
+
+/// Publishes `created` as the overlay and returns the windows it replaced.
+fn install(shared: &Shared, created: Vec<isize>) -> Vec<isize> {
     let count = created.len() as u32;
-    *shared
-        .windows
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner()) = created;
+    let old = std::mem::replace(
+        &mut *shared
+            .windows
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()),
+        created,
+    );
     shared
         .monitors
         .store(count, std::sync::atomic::Ordering::Release);
@@ -82,7 +101,7 @@ pub(crate) fn create(shared: &Shared) -> Result<(), ()> {
     shared
         .topmost
         .store(true, std::sync::atomic::Ordering::Release);
-    Ok(())
+    old
 }
 
 pub(crate) fn destroy(shared: &Shared) {
