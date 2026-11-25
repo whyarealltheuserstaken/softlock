@@ -46,9 +46,10 @@ fn the_display_step_checks_every_case_or_its_unproven_line() {
     for needle in [
         "--test display_change",
         "runner product=",
-        "a_resolution_change_while_locked_keeps_every_monitor_covered ... ok",
-        "a_scale_change_is_covered_or_named_unproven ... ok",
-        "an_added_display_is_covered_and_a_removed_one_drops_out_or_named_unproven ... ok",
+        "test a_resolution_change_while_locked_keeps_every_monitor_covered ...",
+        "test a_scale_change_is_covered_or_named_unproven ...",
+        "test an_added_display_is_covered_and_a_removed_one_drops_out_or_named_unproven ...",
+        "test result: ok. 3 passed; 0 failed",
         "resolution change [0-9]+x[0-9]+ -> [0-9]+x[0-9]+ covered=",
         "display-dpi (covered=|unproven in CI)",
         "display-add (covered=|unproven in CI)",
