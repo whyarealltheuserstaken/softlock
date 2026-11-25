@@ -638,6 +638,29 @@ jobs:
                pending && /^test / { exit 1 }
                pending && /^ok$/ { pending = 0; exit 0 }
                END { exit (found && !pending ? 0 : 1) }' target/seam3-lock-host.txt
+      - name: Display change while locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          # On failure, the key lines become annotations, which are readable
+          # without signing in to download the job log.
+          trap 'grep -E "panicked|FAILED|unproven|resolution|runner product|display-|did not|returned" target/seam3-display.txt | head -n 20 | sed "s/^/::error::/"' ERR
+          # Ticket 36 (#89). Changes only modes the image already has; a case
+          # the image cannot do prints "unproven in CI" instead.
+          cargo test --locked -p softlock-seam3 --features dev-launch --target x86_64-pc-windows-msvc --test display_change -- --test-threads=1 --nocapture \
+            2>&1 | tee target/seam3-display.txt
+          grep -E "runner product=" target/seam3-display.txt
+          # --nocapture prints each test's lines between its name and "ok",
+          # so check the names ran and the summary passed all three.
+          grep -F "test a_resolution_change_while_locked_keeps_every_monitor_covered ..." target/seam3-display.txt
+          grep -F "test a_scale_change_is_covered_or_named_unproven ..." target/seam3-display.txt
+          grep -F "test an_added_display_is_covered_and_a_removed_one_drops_out_or_named_unproven ..." target/seam3-display.txt
+          grep -F "test result: ok. 3 passed; 0 failed" target/seam3-display.txt
+          grep -E "resolution change [0-9]+x[0-9]+ -> [0-9]+x[0-9]+ covered=" target/seam3-display.txt
+          grep -E "display-dpi (covered=|unproven in CI)" target/seam3-display.txt
+          grep -E "display-add (covered=|unproven in CI)" target/seam3-display.txt
+          grep -E "display-remove (covered=|unproven in CI)" target/seam3-display.txt
       - name: Callback panic loop
         shell: bash
         run: |

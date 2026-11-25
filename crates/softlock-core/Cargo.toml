@@ -29,6 +29,9 @@ zeroize = { version = "1.8.2", default-features = false, features = ["alloc"] }
 name = "pin"
 
 [[test]]
+name = "display_change_ci"
+
+[[test]]
 name = "seam1"
 required-features = ["test-support"]
 

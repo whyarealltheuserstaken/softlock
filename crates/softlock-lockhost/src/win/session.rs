@@ -616,12 +616,12 @@ fn ui_main(shared: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<Duration, 
             }
         }
         retry_os_lock(&mut controller, &shared, &mut os_retry_at);
-        if shared.display_changed.swap(false, Ordering::AcqRel) {
-            overlay::destroy(&shared);
-            if overlay::create(&shared).is_err() {
-                report_guard_down(&mut controller, &shared);
-                note_controller(&controller, &shared);
-            }
+        // A display change rebuilds the overlay; `create` shows the new set
+        // before it destroys the old one.
+        if shared.display_changed.swap(false, Ordering::AcqRel) && overlay::create(&shared).is_err()
+        {
+            report_guard_down(&mut controller, &shared);
+            note_controller(&controller, &shared);
         }
         // OS lock confirmed: the controller already disarmed. Leave.
         // Unavailable: stay. The guard, the overlay, and the PIN remain.
