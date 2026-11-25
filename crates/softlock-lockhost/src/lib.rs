@@ -24,7 +24,7 @@ mod marker;
 #[cfg(windows)]
 mod win;
 
-pub use classify::{HookInput, InputClass, classify};
+pub use classify::{HookInput, InputClass, classify, swallowed_even_if_injected};
 #[cfg(feature = "simulated-physical")]
 pub use classify::{RunNonce, clear_run_nonce, set_run_nonce};
 #[cfg(feature = "dev-launch")]

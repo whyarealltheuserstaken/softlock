@@ -63,6 +63,17 @@ pub fn classify(input: HookInput) -> InputClass {
     }
 }
 
+/// Browser, volume, media, and app-launch keys (`VK_BROWSER_BACK` 0xA6
+/// through `VK_LAUNCH_APP2` 0xB7). SPEC user story 12 blocks media keys
+/// from the physical keyboard while locked, but the HID consumer driver
+/// delivers a laptop's volume knob and media keys as injected `VK_VOLUME_*`
+/// with scan code 0, so the injected flag cannot tell them from an agent.
+/// The guard swallows this range from every source while locked. Agents that
+/// need volume use the audio API, not keys.
+pub fn swallowed_even_if_injected(vk: u16) -> bool {
+    (0xA6..=0xB7).contains(&vk)
+}
+
 /// `dwExtraInfo` the journal test writes. Same literal as `journal_live`.
 #[cfg(feature = "live-fail-closed")]
 const PRESENT_PHYSICAL_EXTRA: u64 = 0x5048_5953_5049_4E31;
@@ -181,7 +192,20 @@ pub fn clear_run_nonce() {
 
 #[cfg(test)]
 mod tests {
-    use super::{HookInput, InputClass, classify};
+    use super::{HookInput, InputClass, classify, swallowed_even_if_injected};
+
+    /// Laptop volume knobs and media keys arrive through the HID consumer
+    /// driver as injected `VK_VOLUME_*` with scan code 0 (Henry's ThinkBook,
+    /// 24 Nov 2026). They must not pass as agent input.
+    #[test]
+    fn media_volume_browser_and_launch_keys_are_swallowed_even_if_injected() {
+        for vk in 0xA6..=0xB7u16 {
+            assert!(swallowed_even_if_injected(vk), "vk 0x{vk:02X} passes");
+        }
+        for vk in [0x41u16, 0x0D, 0x09, 0x7C, 0xA5, 0xB8, 0xBA] {
+            assert!(!swallowed_even_if_injected(vk), "vk 0x{vk:02X} blocked");
+        }
+    }
 
     #[cfg(not(feature = "simulated-physical"))]
     #[test]
