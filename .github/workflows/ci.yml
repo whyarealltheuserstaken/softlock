@@ -602,6 +602,7 @@ jobs:
             2>&1 | tee target/seam3-lock-host.txt
           grep -F "injected_keys_and_clicks_reach_the_probe_while_locked ... ok" target/seam3-lock-host.txt
           grep -F "locking_leaves_keyboard_focus_unchanged ... ok" target/seam3-lock-host.txt
+          grep -F "injected_media_keys_are_swallowed_while_locked ... ok" target/seam3-lock-host.txt
           grep -F "captures_omit_the_overlay_marker ... ok" target/seam3-lock-host.txt
           grep -F "simulated_physical_mouse_does_not_move_the_cursor ... ok" target/seam3-lock-host.txt
           arming=$(grep -E "arming_stays_under_500ms_and_swallows_physical_keys \.\.\. arming took [0-9]+ ms ok" target/seam3-lock-host.txt)

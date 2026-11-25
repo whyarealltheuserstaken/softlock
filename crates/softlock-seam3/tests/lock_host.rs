@@ -140,6 +140,37 @@ fn injected_keys_and_clicks_reach_the_probe_while_locked() {
     );
 }
 
+/// A laptop volume knob arrives as injected `VK_VOLUME_*` (HID consumer
+/// driver, scan code 0). Untagged injected media keys stand in for it.
+#[test]
+fn injected_media_keys_are_swallowed_while_locked() {
+    const VK_MEDIA_STOP: u16 = 0xB2;
+    let _guard = gate();
+    let probe = Probe::open().expect("probe");
+    probe.claim_focus();
+    send_virtual_key(VK_MEDIA_STOP, 0).expect("media key before lock");
+    probe
+        .wait_for_key(VK_MEDIA_STOP, Duration::from_secs(3))
+        .expect("the probe cannot see a media key even before locking");
+
+    let lock = arm("unused", None);
+    let before = probe.inputs().len();
+    send_virtual_key(VK_MEDIA_STOP, 0).expect("media key while locked");
+    send_virtual_key(VK_F13, 0).expect("ordinary injected key while locked");
+    probe
+        .wait_for_key(VK_F13, Duration::from_secs(3))
+        .expect("ordinary injected key did not reach the probe");
+    let after: Vec<u16> = probe.inputs()[before..]
+        .iter()
+        .map(|input| input.virtual_key)
+        .collect();
+    assert!(
+        !after.contains(&VK_MEDIA_STOP),
+        "an injected media key reached the probe while locked: {after:?}"
+    );
+    drop(lock);
+}
+
 #[test]
 fn locking_leaves_keyboard_focus_unchanged() {
     let _guard = gate();

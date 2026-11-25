@@ -447,6 +447,9 @@ unsafe fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         {
             panic!("lock host hook callback");
         }
+        if crate::classify::swallowed_even_if_injected(vk) {
+            return LRESULT(1);
+        }
         let injected = info.flags.contains(LLKHF_INJECTED);
         if !blocks(injected, extra) {
             return CallNextHookEx(None, code, wparam, lparam);
