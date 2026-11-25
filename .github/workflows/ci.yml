@@ -643,6 +643,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target
+          # On failure, the key lines become annotations, which are readable
+          # without signing in to download the job log.
+          trap 'grep -E "panicked|FAILED|unproven|resolution|runner product|display-|did not|returned" target/seam3-display.txt | head -n 20 | sed "s/^/::error::/"' ERR
           # Ticket 36 (#89). Changes only modes the image already has; a case
           # the image cannot do prints "unproven in CI" instead.
           cargo test --locked -p softlock-seam3 --features dev-launch --target x86_64-pc-windows-msvc --test display_change -- --test-threads=1 --nocapture \
